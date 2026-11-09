@@ -5,6 +5,7 @@ members = [
     "crates/velo-worktree",
     "crates/velo-agent",
     "crates/velo-daemon",
+    "crates/velo-relay",
     "crates/velo-cli",
 ]
 
@@ -36,3 +37,4 @@ velo-protocol = { path = "crates/velo-protocol" }
 velo-worktree = { path = "crates/velo-worktree" }
 velo-agent = { path = "crates/velo-agent" }
 velo-daemon = { path = "crates/velo-daemon" }
+velo-relay = { path = "crates/velo-relay" }

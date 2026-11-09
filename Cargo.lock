@@ -1432,6 +1432,7 @@ dependencies = [
  "uuid",
  "velo-daemon",
  "velo-protocol",
+ "velo-relay",
  "velo-worktree",
 ]
 
@@ -1461,6 +1462,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "velo-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

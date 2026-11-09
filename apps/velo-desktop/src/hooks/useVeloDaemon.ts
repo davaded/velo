@@ -189,6 +189,82 @@ export function useVeloDaemon(daemonUrl = DEFAULT_DAEMON_URL, wsUrl = DEFAULT_WS
     [daemonUrl, fetchSessions]
   );
 
+  const advisorSession = useCallback(
+    async (
+      sessionId: string,
+      advisorProvider: AgentProvider,
+      focusQuestion?: string
+    ): Promise<SessionInfo> => {
+      const res = await fetch(`${daemonUrl}/api/sessions/${sessionId}/advisor`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          advisor_provider: advisorProvider,
+          focus_question: focusQuestion || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to spawn advisor");
+      }
+      await fetchSessions();
+      return data as SessionInfo;
+    },
+    [daemonUrl, fetchSessions]
+  );
+
+  const createCommittee = useCallback(
+    async (
+      providers: AgentProvider[],
+      prompt: string,
+      repoPath: string,
+      namePrefix?: string
+    ): Promise<SessionInfo[]> => {
+      const res = await fetch(`${daemonUrl}/api/committee`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name_prefix: namePrefix || null,
+          providers,
+          prompt,
+          repo_path: repoPath,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to dispatch committee");
+      }
+      await fetchSessions();
+      return (data.sessions || []) as SessionInfo[];
+    },
+    [daemonUrl, fetchSessions]
+  );
+
+  const createLoopSession = useCallback(
+    async (payload: {
+      name?: string;
+      provider: AgentProvider;
+      prompt: string;
+      check_command: string;
+      max_iterations: number;
+      repo_path: string;
+      branch?: string;
+    }): Promise<SessionInfo> => {
+      const res = await fetch(`${daemonUrl}/api/loop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to start self-healing loop");
+      }
+      await fetchSessions();
+      return data as SessionInfo;
+    },
+    [daemonUrl, fetchSessions]
+  );
+
   return {
     connected,
     sessions,
@@ -200,5 +276,8 @@ export function useVeloDaemon(daemonUrl = DEFAULT_DAEMON_URL, wsUrl = DEFAULT_WS
     stopSession,
     sendInput,
     handoffSession,
+    advisorSession,
+    createCommittee,
+    createLoopSession,
   };
 }

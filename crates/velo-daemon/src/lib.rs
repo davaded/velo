@@ -12,20 +12,24 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::{RwLock, broadcast};
+use tokio::{
+    process::Command,
+    sync::{RwLock, broadcast},
+};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use velo_agent::{AgentHandle, AgentSpawner};
 use velo_protocol::{
-    AgentEvent, CreateSessionRequest, HandoffSessionRequest, SessionInfo, SessionInputRequest,
-    SessionStatus, WsClientMessage, WsServerMessage,
+    AdvisorSessionRequest, AgentEvent, AgentProvider, CommitteeRequest, CreateSessionRequest,
+    HandoffSessionRequest, LoopSessionRequest, SessionInfo, SessionInputRequest, SessionStatus,
+    WsClientMessage, WsServerMessage,
 };
 use velo_worktree::{WorktreeManager, default_velo_home};
 
@@ -157,27 +161,57 @@ impl DaemonState {
             .provision_worktree(&repo_path, session_id, req.branch.as_deref())
             .await?;
 
+        self.spawn_in_existing_worktree(
+            session_id,
+            req.name,
+            req.provider,
+            req.prompt,
+            provision.repo_root,
+            provision.worktree_path,
+            provision.branch,
+            req.use_pty,
+            req.parent_session_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_in_existing_worktree(
+        &self,
+        session_id: Uuid,
+        custom_name: Option<String>,
+        provider: AgentProvider,
+        prompt: String,
+        repo_root: PathBuf,
+        worktree_path: PathBuf,
+        branch: String,
+        use_pty: bool,
+        parent_session_id: Option<Uuid>,
+    ) -> Result<SessionInfo> {
         let short_id = &session_id.to_string()[..8];
-        let name = req
-            .name
+        let name = custom_name
             .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| format!("{}-{}", req.provider, short_id));
+            .unwrap_or_else(|| format!("{}-{}", provider, short_id));
+
+        let diff_stats = WorktreeManager::compute_diff_stats(&worktree_path)
+            .await
+            .unwrap_or_default();
 
         let now = Utc::now();
         let mut session = SessionInfo {
             id: session_id,
             name,
-            provider: req.provider.clone(),
-            prompt: req.prompt.clone(),
-            repo_root: provision.repo_root.to_string_lossy().to_string(),
-            worktree_path: provision.worktree_path.to_string_lossy().to_string(),
-            branch: provision.branch,
+            provider: provider.clone(),
+            prompt: prompt.clone(),
+            repo_root: repo_root.to_string_lossy().to_string(),
+            worktree_path: worktree_path.to_string_lossy().to_string(),
+            branch,
             status: SessionStatus::Starting,
             pid: None,
-            diff_stats: Default::default(),
+            diff_stats,
             created_at: now,
             updated_at: now,
-            parent_session_id: req.parent_session_id,
+            parent_session_id,
         };
 
         {
@@ -187,10 +221,10 @@ impl DaemonState {
 
         let handle = AgentSpawner::spawn_agent(
             session_id,
-            req.provider,
-            req.prompt,
-            provision.worktree_path,
-            req.use_pty,
+            provider,
+            prompt,
+            worktree_path,
+            use_pty,
             self.event_tx.clone(),
         )
         .await?;
@@ -241,14 +275,23 @@ fn add_cors_headers(res: &mut Response) {
 
 pub fn build_router(state: DaemonState) -> Router {
     Router::new()
-        .route("/", get(ui_index_handler)).route("/assets/{file}", get(ui_asset_handler)).route("/api/health", get(health_handler))
-        .route("/api/sessions", get(list_sessions_handler).post(create_session_handler))
+        .route("/", get(ui_index_handler))
+        .route("/assets/{file}", get(ui_asset_handler))
+        .route("/api/health", get(health_handler))
+        .route(
+            "/api/sessions",
+            get(list_sessions_handler).post(create_session_handler),
+        )
         .route("/api/sessions/{id}", get(get_session_handler))
         .route("/api/sessions/{id}/events", get(get_session_events_handler))
         .route("/api/sessions/{id}/diff", get(get_session_diff_handler))
         .route("/api/sessions/{id}/input", post(send_input_handler))
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
         .route("/api/sessions/{id}/handoff", post(handoff_session_handler))
+        .route("/api/sessions/{id}/advisor", post(advisor_session_handler))
+        .route("/api/committee", post(committee_handler))
+        .route("/api/loop", post(loop_handler))
+        .route("/mcp", post(mcp_jsonrpc_handler))
         .route("/ws", get(ws_handler))
         .layer(middleware::from_fn(cors_middleware))
         .with_state(state)
@@ -441,57 +484,494 @@ async fn handoff_session_handler(
 
     let new_session_id = Uuid::new_v4();
     let short_id = &new_session_id.to_string()[..8];
-    let now = Utc::now();
-    let mut new_session = SessionInfo {
-        id: new_session_id,
-        name: format!("handoff-{}-{}", req.target_provider, short_id),
-        provider: req.target_provider.clone(),
-        prompt: handoff_prompt.clone(),
-        repo_root: source_session.repo_root.clone(),
-        worktree_path: source_session.worktree_path.clone(),
-        branch: source_session.branch.clone(),
-        status: SessionStatus::Starting,
-        pid: None,
-        diff_stats,
-        created_at: now,
-        updated_at: now,
-        parent_session_id: Some(source_session.id),
-    };
-
+    match state
+        .spawn_in_existing_worktree(
+            new_session_id,
+            Some(format!("handoff-{}-{}", req.target_provider, short_id)),
+            req.target_provider,
+            handoff_prompt,
+            PathBuf::from(&source_session.repo_root),
+            PathBuf::from(&source_session.worktree_path),
+            source_session.branch,
+            false,
+            Some(source_session.id),
+        )
+        .await
     {
-        let mut guard = state.inner.write().await;
-        guard.sessions.insert(new_session_id, new_session.clone());
-    }
-
-    match AgentSpawner::spawn_agent(
-        new_session_id,
-        req.target_provider,
-        handoff_prompt,
-        PathBuf::from(&source_session.worktree_path),
-        false,
-        state.event_tx.clone(),
-    )
-    .await
-    {
-        Ok(handle) => {
-            new_session.pid = handle.pid;
-            new_session.status = SessionStatus::Running;
-            let mut guard = state.inner.write().await;
-            if let Some(s) = guard.sessions.get_mut(&new_session_id) {
-                s.pid = handle.pid;
-                s.status = SessionStatus::Running;
-            }
-            guard.handles.insert(new_session_id, handle);
-            drop(guard);
-            let _ = state.persist_sessions().await;
-            (StatusCode::CREATED, Json(json!(new_session))).into_response()
-        }
+        Ok(session) => (StatusCode::CREATED, Json(json!(session))).into_response(),
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": err.to_string() })),
         )
             .into_response(),
     }
+}
+
+/// Phase 3 Skill 1 (`/velo-advisor`): Spin up an independent secondary agent to review changes & provide a second opinion.
+async fn advisor_session_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<AdvisorSessionRequest>,
+) -> impl IntoResponse {
+    let source_session = {
+        let guard = state.inner.read().await;
+        match guard.sessions.get(&id).cloned() {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Target session not found" })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let wt_path = Path::new(&source_session.worktree_path);
+    let diff_stats = WorktreeManager::compute_diff_stats(wt_path)
+        .await
+        .unwrap_or_default();
+
+    let focus = req.focus_question.unwrap_or_else(|| {
+        "Review the current git diff for bugs, edge cases, race conditions, and architectural improvements. Do NOT modify files unless asked.".to_string()
+    });
+
+    let advisor_prompt = format!(
+        "[VELO ADVISOR REVIEW for session {} ({}) on branch `{}`]\n\
+         Original Task: {}\n\
+         Modified Files ({}): {}\n\
+         Advisor Focus: {}",
+        &source_session.id.to_string()[..8],
+        source_session.provider,
+        source_session.branch,
+        source_session.prompt,
+        diff_stats.files_changed,
+        diff_stats.modified_files.join(", "),
+        focus
+    );
+
+    let advisor_id = Uuid::new_v4();
+    let short_id = &advisor_id.to_string()[..8];
+    match state
+        .spawn_in_existing_worktree(
+            advisor_id,
+            Some(format!("advisor-{}-{}", req.advisor_provider, short_id)),
+            req.advisor_provider,
+            advisor_prompt,
+            PathBuf::from(&source_session.repo_root),
+            PathBuf::from(&source_session.worktree_path),
+            source_session.branch,
+            false,
+            Some(source_session.id),
+        )
+        .await
+    {
+        Ok(session) => (StatusCode::CREATED, Json(json!(session))).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Phase 3 Skill 2 (`/velo-committee`): Fan out the same problem to multiple contrasting agents in separate isolated worktrees.
+async fn committee_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<CommitteeRequest>,
+) -> impl IntoResponse {
+    if req.providers.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "At least one agent provider is required for a committee" })),
+        )
+            .into_response();
+    }
+
+    let committee_tag = &Uuid::new_v4().to_string()[..6];
+    let prefix = req
+        .name_prefix
+        .unwrap_or_else(|| format!("committee-{}", committee_tag));
+
+    let mut spawned = Vec::new();
+    let mut errors = Vec::new();
+
+    for (idx, provider) in req.providers.into_iter().enumerate() {
+        let branch = format!("velo/{}-{}-{}", prefix, provider, idx + 1);
+        let session_name = format!("{}-{}", prefix, provider);
+        let create_req = CreateSessionRequest {
+            name: Some(session_name),
+            provider,
+            prompt: req.prompt.clone(),
+            repo_path: req.repo_path.clone(),
+            branch: Some(branch),
+            use_pty: false,
+            parent_session_id: None,
+        };
+        match state.create_session(create_req).await {
+            Ok(s) => spawned.push(s),
+            Err(e) => errors.push(e.to_string()),
+        }
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "committee": prefix,
+            "sessions": spawned,
+            "errors": errors,
+        })),
+    )
+        .into_response()
+}
+
+/// Phase 3 Skill 3 (`/velo-loop`): Automated test-driven verification loop.
+/// Runs the agent in an isolated worktree, then verifies with `check_command`.
+/// If `check_command` fails, automatically re-invokes the agent with the failure output up to `max_iterations`.
+async fn loop_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<LoopSessionRequest>,
+) -> impl IntoResponse {
+    let max_iters = req.max_iterations.clamp(1, 10);
+    let initial_prompt = format!(
+        "[VELO LOOP Iteration 1/{}]\nTask: {}\nAcceptance Check Command: `{}`",
+        max_iters, req.prompt, req.check_command
+    );
+
+    let create_req = CreateSessionRequest {
+        name: req
+            .name
+            .clone()
+            .or_else(|| Some(format!("loop-{}", req.provider))),
+        provider: req.provider.clone(),
+        prompt: initial_prompt,
+        repo_path: req.repo_path.clone(),
+        branch: req.branch.clone(),
+        use_pty: false,
+        parent_session_id: None,
+    };
+
+    let initial_session = match state.create_session(create_req).await {
+        Ok(s) => s,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    // Spawn background loop supervisor
+    let loop_state = state.clone();
+    let base_prompt = req.prompt.clone();
+    let check_cmd = req.check_command.clone();
+    let provider = req.provider.clone();
+    let repo_root = PathBuf::from(&initial_session.repo_root);
+    let wt_path = PathBuf::from(&initial_session.worktree_path);
+    let branch = initial_session.branch.clone();
+    let mut current_session_id = initial_session.id;
+
+    tokio::spawn(async move {
+        let mut rx = loop_state.event_tx.subscribe();
+        for iter in 1..=max_iters {
+            // Wait for current_session_id to finish
+            loop {
+                let Ok(ev) = rx.recv().await else { return };
+                if ev.session_id() == current_session_id {
+                    if let AgentEvent::StatusChanged { status, .. } = ev {
+                        if matches!(
+                            status,
+                            SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Stopped
+                        ) {
+                            if status == SessionStatus::Stopped {
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Execute acceptance check command inside the worktree
+            let _ = loop_state.event_tx.send(AgentEvent::ToolCallRequested {
+                session_id: current_session_id,
+                tool_id: format!("velo-check-{}", iter),
+                tool_name: "velo_acceptance_check".to_string(),
+                arguments: json!({ "command": check_cmd, "iteration": iter }),
+                timestamp: Utc::now(),
+            });
+
+            let check_out = Command::new("sh")
+                .args(["-c", &check_cmd])
+                .current_dir(&wt_path)
+                .output()
+                .await;
+
+            match check_out {
+                Ok(out) if out.status.success() => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let _ = loop_state.event_tx.send(AgentEvent::ToolCallCompleted {
+                        session_id: current_session_id,
+                        tool_id: format!("velo-check-{}", iter),
+                        output: format!("✅ Acceptance check `{}` PASSED!\n{}", check_cmd, stdout),
+                        is_error: false,
+                        timestamp: Utc::now(),
+                    });
+                    return;
+                }
+                Ok(out) => {
+                    let combined = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let _ = loop_state.event_tx.send(AgentEvent::ToolCallCompleted {
+                        session_id: current_session_id,
+                        tool_id: format!("velo-check-{}", iter),
+                        output: format!(
+                            "❌ Acceptance check `{}` FAILED (iteration {}/{}):\n{}",
+                            check_cmd,
+                            iter,
+                            max_iters,
+                            combined.trim()
+                        ),
+                        is_error: true,
+                        timestamp: Utc::now(),
+                    });
+
+                    if iter >= max_iters {
+                        return;
+                    }
+
+                    // Spawn next healing iteration in the same worktree
+                    let next_iter = iter + 1;
+                    let next_id = Uuid::new_v4();
+                    let healing_prompt = format!(
+                        "[VELO LOOP Self-Heal Iteration {}/{}]\n\
+                         Original Task: {}\n\
+                         Acceptance Command `{}` failed with output:\n{}\n\
+                         Fix the issue so the acceptance command passes.",
+                        next_iter,
+                        max_iters,
+                        base_prompt,
+                        check_cmd,
+                        combined.trim()
+                    );
+
+                    match loop_state
+                        .spawn_in_existing_worktree(
+                            next_id,
+                            Some(format!("loop-{}-iter{}", provider, next_iter)),
+                            provider.clone(),
+                            healing_prompt,
+                            repo_root.clone(),
+                            wt_path.clone(),
+                            branch.clone(),
+                            false,
+                            Some(current_session_id),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            current_session_id = next_id;
+                        }
+                        Err(_) => return,
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    (StatusCode::CREATED, Json(json!(initial_session))).into_response()
+}
+
+/// Phase 3 Built-in MCP Server JSON-RPC 2.0 endpoint (`POST /mcp`).
+/// Allows any MCP-capable coding agent to list sessions, inspect diffs, or spawn/handoff peer agents.
+pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+    match method {
+        "initialize" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {
+                    "name": "velo-mcp-server",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "tools": {}
+                }
+            }
+        }),
+        "tools/list" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "velo_list_sessions",
+                        "description": "List all parallel coding agent sessions and their Git worktree diff stats",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "velo_spawn_agent",
+                        "description": "Spawn a new coding agent (claude, codex, opencode) inside an isolated Git worktree",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "provider": { "type": "string", "description": "claude, codex, or opencode" },
+                                "prompt": { "type": "string", "description": "Task instructions" },
+                                "repo_path": { "type": "string", "description": "Repository root path" },
+                                "branch": { "type": "string", "description": "Branch name" }
+                            },
+                            "required": ["provider", "prompt", "repo_path"]
+                        }
+                    },
+                    {
+                        "name": "velo_get_diff",
+                        "description": "Get the live unified git diff for a session's isolated worktree",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "session_id": { "type": "string", "description": "Session UUID" }
+                            },
+                            "required": ["session_id"]
+                        }
+                    }
+                ]
+            }
+        }),
+        "tools/call" => {
+            let tool_name = payload
+                .pointer("/params/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args = payload
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+
+            match tool_name {
+                "velo_list_sessions" => {
+                    let guard = state.inner.read().await;
+                    let list: Vec<&SessionInfo> = guard.sessions.values().collect();
+                    let text = serde_json::to_string_pretty(&list).unwrap_or_default();
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": text }]
+                        }
+                    })
+                }
+                "velo_spawn_agent" => {
+                    let provider_str = args
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("claude");
+                    let prompt = args
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let repo_path = args
+                        .get("repo_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(".")
+                        .to_string();
+                    let branch = args
+                        .get("branch")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    let req = CreateSessionRequest {
+                        name: None,
+                        provider: AgentProvider::from_str_loose(provider_str),
+                        prompt,
+                        repo_path,
+                        branch,
+                        use_pty: false,
+                        parent_session_id: None,
+                    };
+                    match state.create_session(req).await {
+                        Ok(s) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&s).unwrap_or_default() }]
+                            }
+                        }),
+                        Err(e) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "isError": true,
+                                "content": [{ "type": "text", "text": e.to_string() }]
+                            }
+                        }),
+                    }
+                }
+                "velo_get_diff" => {
+                    let sid_str = args
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if let Ok(sid) = Uuid::parse_str(sid_str) {
+                        let wt = {
+                            let guard = state.inner.read().await;
+                            guard.sessions.get(&sid).map(|s| PathBuf::from(&s.worktree_path))
+                        };
+                        if let Some(path) = wt {
+                            let diff = WorktreeManager::get_unified_diff(&path)
+                                .await
+                                .unwrap_or_default();
+                            return json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "content": [{ "type": "text", "text": diff }]
+                                }
+                            });
+                        }
+                    }
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "isError": true,
+                            "content": [{ "type": "text", "text": "Session not found" }]
+                        }
+                    })
+                }
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": format!("Unknown tool: {}", tool_name) }
+                }),
+            }
+        }
+        _ => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": format!("Method not found: {}", method) }
+        }),
+    }
+}
+
+async fn mcp_jsonrpc_handler(
+    State(state): State<DaemonState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let resp = handle_mcp_request(&state, payload).await;
+    Json(resp)
 }
 
 async fn ws_handler(
@@ -548,6 +1028,51 @@ async fn handle_ws_client(socket: WebSocket, state: DaemonState) {
             }
             else => break,
         }
+    }
+}
+
+async fn ui_index_handler() -> impl IntoResponse {
+    let dist_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/velo-desktop/dist");
+    let index_path = dist_dir.join("index.html");
+    match tokio::fs::read_to_string(&index_path).await {
+        Ok(html) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "Velo Daemon is running. Build UI with `pnpm --dir apps/velo-desktop build`."
+                .to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn ui_asset_handler(AxumPath(file): AxumPath<String>) -> impl IntoResponse {
+    let dist_assets = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../apps/velo-desktop/dist/assets");
+    let clean_name = Path::new(&file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let full_path = dist_assets.join(clean_name);
+
+    let content_type = if clean_name.ends_with(".js") {
+        "application/javascript; charset=utf-8"
+    } else if clean_name.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if clean_name.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "application/octet-stream"
+    };
+
+    match tokio::fs::read(&full_path).await {
+        Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -621,55 +1146,29 @@ mod tests {
         assert_eq!(updated.status, SessionStatus::Completed);
         assert_eq!(updated.diff_stats.files_changed, 1);
         assert_eq!(updated.diff_stats.insertions, 1);
-
         drop(guard);
+
+        // Verify built-in MCP Server tools/list & velo_list_sessions
+        let mcp_list = handle_mcp_request(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "velo_list_sessions",
+                    "arguments": {}
+                }
+            }),
+        )
+        .await;
+        let mcp_text = mcp_list
+            .pointer("/result/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(mcp_text.contains("feat/auto-edit"));
+
         let _ = tokio::fs::remove_dir_all(&temp_base).await;
         Ok(())
-    }
-}
-
-async fn ui_index_handler() -> impl IntoResponse {
-    let dist_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/velo-desktop/dist");
-    let index_path = dist_dir.join("index.html");
-    match tokio::fs::read_to_string(&index_path).await {
-        Ok(html) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            html,
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "Velo Daemon is running. Build UI with `pnpm --dir apps/velo-desktop build`."
-                .to_string(),
-        )
-            .into_response(),
-    }
-}
-
-async fn ui_asset_handler(AxumPath(file): AxumPath<String>) -> impl IntoResponse {
-    let dist_assets = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../apps/velo-desktop/dist/assets");
-    // Prevent path traversal
-    let clean_name = Path::new(&file)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let full_path = dist_assets.join(clean_name);
-
-    let content_type = if clean_name.ends_with(".js") {
-        "application/javascript; charset=utf-8"
-    } else if clean_name.ends_with(".css") {
-        "text/css; charset=utf-8"
-    } else if clean_name.ends_with(".svg") {
-        "image/svg+xml"
-    } else {
-        "application/octet-stream"
-    };
-
-    match tokio::fs::read(&full_path).await {
-        Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], bytes).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

@@ -222,3 +222,31 @@ pub enum WsServerMessage {
     SessionsSnapshot { sessions: Vec<SessionInfo> },
     Pong,
 }
+
+/// Request payload for `/velo-advisor`: spin up a secondary agent to review an existing session's worktree & diff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvisorSessionRequest {
+    pub advisor_provider: AgentProvider,
+    pub focus_question: Option<String>,
+}
+
+/// Request payload for `/velo-committee`: dispatch multiple contrasting agents in parallel isolated worktrees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitteeRequest {
+    pub name_prefix: Option<String>,
+    pub providers: Vec<AgentProvider>,
+    pub prompt: String,
+    pub repo_path: String,
+}
+
+/// Request payload for `/velo-loop`: run an agent continuously against an acceptance command (e.g. `cargo test`) until it passes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopSessionRequest {
+    pub name: Option<String>,
+    pub provider: AgentProvider,
+    pub prompt: String,
+    pub check_command: String,
+    pub max_iterations: u32,
+    pub repo_path: String,
+    pub branch: Option<String>,
+}

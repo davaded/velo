@@ -41,7 +41,7 @@ export default function App() {
     createSession,
     stopSession,
     sendInput,
-    handoffSession,
+    handoffSession, advisorSession,
   } = useVeloDaemon();
 
   const [selectedId, setSelectedId] = useState<string | null>(null);

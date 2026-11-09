@@ -11,14 +11,16 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 use tracing_subscriber::EnvFilter;
 use velo_protocol::{
-    AgentEvent, AgentProvider, CreateSessionRequest, DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT,
-    HandoffSessionRequest, SessionInfo, WsServerMessage,
+    AdvisorSessionRequest, AgentEvent, AgentProvider, CommitteeRequest, CreateSessionRequest,
+    DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, HandoffSessionRequest, LoopSessionRequest,
+    SessionInfo, WsServerMessage,
 };
+use velo_relay::{DEFAULT_RELAY_PORT, PairingTicket};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,7 +39,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start the Velo background daemon
+    /// Start the Velo background daemon (and embedded Web UI on port 6767)
     Up {
         /// Run in foreground instead of detaching
         #[arg(short, long)]
@@ -112,6 +114,81 @@ enum Commands {
         #[arg(short, long)]
         instructions: Option<String>,
     },
+
+    /// Spin up an independent secondary agent to review a session's diff & provide a second opinion
+    Advisor {
+        /// Target session ID or prefix to review
+        session: String,
+
+        /// Advisor agent provider (`codex`, `claude`, `opencode`)
+        #[arg(short, long, default_value = "codex")]
+        agent: String,
+
+        /// Specific question or review focus for the advisor
+        #[arg(short, long)]
+        question: Option<String>,
+    },
+
+    /// Dispatch multiple contrasting agents in parallel isolated worktrees to solve a task
+    Committee {
+        /// Problem statement or task prompt for the committee
+        prompt: String,
+
+        /// Comma-separated list of agent providers (e.g. `claude,codex,opencode`)
+        #[arg(short, long, default_value = "claude,codex")]
+        agents: String,
+
+        /// Target repository directory
+        #[arg(short, long)]
+        repo: Option<PathBuf>,
+
+        /// Optional committee name prefix
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+
+    /// Run an agent in a test-driven self-healing loop until an acceptance command passes
+    Loop {
+        /// Task prompt for the coding agent
+        prompt: String,
+
+        /// Shell command that must exit 0 to pass acceptance (e.g. `cargo test` or `pnpm test`)
+        #[arg(short, long)]
+        check: String,
+
+        /// Coding agent provider (`claude`, `codex`, `opencode`)
+        #[arg(short, long, default_value = "claude")]
+        agent: String,
+
+        /// Maximum self-healing iterations
+        #[arg(short, long, default_value_t = 3)]
+        max_iterations: u32,
+
+        /// Target repository directory
+        #[arg(short, long)]
+        repo: Option<PathBuf>,
+
+        /// Optional Git branch name
+        #[arg(short, long)]
+        branch: Option<String>,
+    },
+
+    /// Start Velo's stdio MCP (Model Context Protocol) server for Claude Code / Cursor / Codex
+    Mcp,
+
+    /// Generate an E2EE pairing ticket & terminal QR code for mobile/remote control
+    Pair {
+        /// Relay WebSocket URL
+        #[arg(long, default_value_t = format!("ws://127.0.0.1:{}", DEFAULT_RELAY_PORT))]
+        relay: String,
+    },
+
+    /// Run the self-hosted Velo E2EE WebSocket relay server
+    Relay {
+        /// Listen address for the relay server
+        #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_RELAY_PORT))]
+        listen: String,
+    },
 }
 
 #[tokio::main]
@@ -120,6 +197,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -134,34 +212,35 @@ async fn main() -> Result<()> {
                 velo_daemon::run_daemon_server(sock_addr).await?;
             } else {
                 ensure_daemon_running(addr).await?;
-                println!("⚡ Velo daemon is running at http://{}", addr);
+                println!("⚡ Velo daemon & Web UI running at http://{}", addr);
             }
         }
-        Commands::Status => {
-            match http_get_json::<Value>(addr, "/api/health").await {
-                Ok(health) => {
-                    let sessions: Vec<SessionInfo> =
-                        http_get_json(addr, "/api/sessions").await.unwrap_or_default();
-                    let running = sessions
-                        .iter()
-                        .filter(|s| s.status == velo_protocol::SessionStatus::Running)
-                        .count();
-                    println!("⚡ Velo Daemon: ONLINE (http://{})", addr);
-                    println!(
-                        "   Version:     {}",
-                        health.get("version").and_then(|v| v.as_str()).unwrap_or("0.1.0")
-                    );
-                    println!(
-                        "   Sessions:    {} total ({} running)",
-                        sessions.len(),
-                        running
-                    );
-                }
-                Err(_) => {
-                    println!("⚪ Velo Daemon: OFFLINE (run `velo up` to start)");
-                }
+        Commands::Status => match http_get_json::<Value>(addr, "/api/health").await {
+            Ok(health) => {
+                let sessions: Vec<SessionInfo> =
+                    http_get_json(addr, "/api/sessions").await.unwrap_or_default();
+                let running = sessions
+                    .iter()
+                    .filter(|s| s.status == velo_protocol::SessionStatus::Running)
+                    .count();
+                println!("⚡ Velo Daemon: ONLINE (http://{})", addr);
+                println!(
+                    "   Version:     {}",
+                    health
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0.1.0")
+                );
+                println!(
+                    "   Sessions:    {} total ({} running)",
+                    sessions.len(),
+                    running
+                );
             }
-        }
+            Err(_) => {
+                println!("⚪ Velo Daemon: OFFLINE (run `velo up` to start)");
+            }
+        },
         Commands::Run {
             prompt,
             agent,
@@ -193,13 +272,18 @@ async fn main() -> Result<()> {
             println!("   Agent:     {} (PID: {:?})", session.provider, session.pid);
             println!("   Branch:    {}", session.branch);
             println!("   Worktree:  {}", session.worktree_path);
-            println!("   Logs:      velo logs {} --follow", &session.id.to_string()[..8]);
+            println!(
+                "   Logs:      velo logs {} --follow",
+                &session.id.to_string()[..8]
+            );
         }
         Commands::Ps => {
             ensure_daemon_running(addr).await?;
             let sessions: Vec<SessionInfo> = http_get_json(addr, "/api/sessions").await?;
             if sessions.is_empty() {
-                println!("No sessions found. Start one with: velo run --agent claude \"your task\"");
+                println!(
+                    "No sessions found. Start one with: velo run --agent claude \"your task\""
+                );
                 return Ok(());
             }
 
@@ -300,7 +384,11 @@ async fn main() -> Result<()> {
                 &serde_json::json!({}),
             )
             .await?;
-            println!("🛑 Stopped session {} ({})", &target.id.to_string()[..8], target.name);
+            println!(
+                "🛑 Stopped session {} ({})",
+                &target.id.to_string()[..8],
+                target.name
+            );
         }
         Commands::Handoff {
             session,
@@ -327,6 +415,145 @@ async fn main() -> Result<()> {
             );
             println!("   Shared Branch:   {}", new_session.branch);
             println!("   Shared Worktree: {}", new_session.worktree_path);
+        }
+        Commands::Advisor {
+            session,
+            agent,
+            question,
+        } => {
+            ensure_daemon_running(addr).await?;
+            let target = resolve_session(addr, &session).await?;
+            let req = AdvisorSessionRequest {
+                advisor_provider: AgentProvider::from_str_loose(&agent),
+                focus_question: question,
+            };
+            let advisor_session: SessionInfo = http_post_json(
+                addr,
+                &format!("/api/sessions/{}/advisor", target.id),
+                &req,
+            )
+            .await?;
+            println!(
+                "🧠 Spawned Advisor Session [{}] ({}) reviewing [{}]",
+                &advisor_session.id.to_string()[..8],
+                advisor_session.provider,
+                &target.id.to_string()[..8]
+            );
+            println!(
+                "   Logs: velo logs {} --follow",
+                &advisor_session.id.to_string()[..8]
+            );
+        }
+        Commands::Committee {
+            prompt,
+            agents,
+            repo,
+            name,
+        } => {
+            ensure_daemon_running(addr).await?;
+            let repo_dir = match repo {
+                Some(p) => p,
+                None => env::current_dir().context("Failed to get current directory")?,
+            };
+            let abs_repo = repo_dir.canonicalize().unwrap_or(repo_dir);
+            let providers: Vec<AgentProvider> = agents
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(AgentProvider::from_str_loose)
+                .collect();
+
+            let req = CommitteeRequest {
+                name_prefix: name,
+                providers,
+                prompt,
+                repo_path: abs_repo.to_string_lossy().to_string(),
+            };
+            let resp: Value = http_post_json(addr, "/api/committee", &req).await?;
+            println!(
+                "🏛️  Dispatched Agent Committee `{}`:",
+                resp.get("committee").and_then(|v| v.as_str()).unwrap_or("")
+            );
+            if let Some(arr) = resp.get("sessions").and_then(|v| v.as_array()) {
+                for item in arr {
+                    let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let prov = item.get("provider").and_then(|v| v.as_str()).unwrap_or("custom");
+                    let br = item.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("   • [{}] {:<10} branch: {}", &id[..8.min(id.len())], prov, br);
+                }
+            }
+        }
+        Commands::Loop {
+            prompt,
+            check,
+            agent,
+            max_iterations,
+            repo,
+            branch,
+        } => {
+            ensure_daemon_running(addr).await?;
+            let repo_dir = match repo {
+                Some(p) => p,
+                None => env::current_dir().context("Failed to get current directory")?,
+            };
+            let abs_repo = repo_dir.canonicalize().unwrap_or(repo_dir);
+
+            let req = LoopSessionRequest {
+                name: None,
+                provider: AgentProvider::from_str_loose(&agent),
+                prompt,
+                check_command: check.clone(),
+                max_iterations,
+                repo_path: abs_repo.to_string_lossy().to_string(),
+                branch,
+            };
+            let session: SessionInfo = http_post_json(addr, "/api/loop", &req).await?;
+            println!(
+                "🔄 Started Self-Healing Loop [{}] (max {} iterations)",
+                &session.id.to_string()[..8],
+                max_iterations
+            );
+            println!("   Agent:    {}", session.provider);
+            println!("   Check:    `{}`", check);
+            println!("   Worktree: {}", session.worktree_path);
+            println!(
+                "   Logs:     velo logs {} --follow",
+                &session.id.to_string()[..8]
+            );
+        }
+        Commands::Mcp => {
+            ensure_daemon_running(addr).await?;
+            let stdin = tokio::io::stdin();
+            let mut stdout = tokio::io::stdout();
+            let mut lines = BufReader::new(stdin).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(req_val) = serde_json::from_str::<Value>(&line) {
+                    if let Ok(resp_val) = http_post_json::<Value, Value>(addr, "/mcp", &req_val).await {
+                        let out_line = format!("{}\n", serde_json::to_string(&resp_val)?);
+                        let _ = stdout.write_all(out_line.as_bytes()).await;
+                        let _ = stdout.flush().await;
+                    }
+                }
+            }
+        }
+        Commands::Pair { relay } => {
+            ensure_daemon_running(addr).await?;
+            let ticket = PairingTicket::generate(&relay, addr);
+            println!("🔐 Velo End-to-End Encrypted (E2EE) Mobile/Remote Pairing");
+            println!("{}", ticket.render_terminal_qr());
+            println!("   Pairing URI:  {}", ticket.pairing_uri);
+            println!("   Relay Room:   {}", ticket.room_id);
+            println!("   Shared Key:   {}… (256-bit)", &ticket.shared_key_hex[..16]);
+            println!("   Local Web UI: http://{}", addr);
+        }
+        Commands::Relay { listen } => {
+            let sock_addr: SocketAddr = listen
+                .parse()
+                .with_context(|| format!("Invalid relay listen address: {}", listen))?;
+            println!("🛰️  Starting Velo E2EE Relay Server on ws://{}", sock_addr);
+            velo_relay::run_relay_server(sock_addr).await?;
         }
     }
 
@@ -373,7 +600,12 @@ fn print_agent_event(ev: &AgentEvent) {
             ..
         } => {
             let prefix = if *is_error { "❌" } else { "✅" };
-            println!("{} [tool_result: {}] {}", prefix, tool_id, truncate(output, 160));
+            println!(
+                "{} [tool_result: {}] {}",
+                prefix,
+                tool_id,
+                truncate(output, 160)
+            );
         }
         AgentEvent::PermissionRequested {
             tool_name,
@@ -439,13 +671,11 @@ async fn ensure_daemon_running(addr: &str) -> Result<()> {
     bail!("Timed out waiting for velo daemon to start on {}", addr)
 }
 
-/// Minimal zero-dependency HTTP/1.1 GET JSON helper over Tokio TcpStream.
 async fn http_get_json<T: DeserializeOwned>(addr: &str, path: &str) -> Result<T> {
     let raw = raw_http_request(addr, "GET", path, None).await?;
     serde_json::from_str(&raw).with_context(|| format!("Invalid JSON response from GET {}", path))
 }
 
-/// Minimal zero-dependency HTTP/1.1 POST JSON helper over Tokio TcpStream.
 async fn http_post_json<B: serde::Serialize, T: DeserializeOwned>(
     addr: &str,
     path: &str,

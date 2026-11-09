@@ -23,3 +23,4 @@ chrono.workspace = true
 velo-protocol.workspace = true
 velo-worktree.workspace = true
 velo-daemon.workspace = true
+velo-relay.workspace = true
