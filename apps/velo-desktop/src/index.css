@@ -1,42 +1,33 @@
 @import "tailwindcss";
 
 :root {
-  --canvas-bg: #050609;
-  --mesh-a: rgba(99, 102, 241, 0.14);
-  --mesh-b: rgba(6, 182, 212, 0.11);
-  --surface-glass: rgba(14, 16, 24, 0.78);
-  --surface-0: #0B0D13;
-  --surface-1: #11141D;
-  --surface-2: #181C28;
-  --surface-3: #252B3D;
-  --fg: #F8FAFC;
-  --fg-muted: #94A3B8;
-  --fg-extra-muted: #64748B;
-  --border-subtle: rgba(255, 255, 255, 0.07);
-  --border-accent: rgba(255, 255, 255, 0.15);
-  --accent: #6366F1;
-  --accent-bright: #818CF8;
-  --accent-glow: rgba(99, 102, 241, 0.28);
-  --secondary: #06B6D4;
-  --status-success: #10B981;
-  --status-danger: #F43F5E;
-  --status-warning: #F59E0B;
-  --destructive: #F43F5E;
-  --dot-success: #10B981;
-  --dot-danger: #F43F5E;
-  --dot-warning: #F59E0B;
-  --dot-running: #06B6D4;
+  /* Pure Monochrome Zinc/Carbon Palette (A3) + Semantic Highlights Only */
+  --canvas-bg: #09090b;
+  --surface-rail: #0c0c0e;
+  --surface-0: #111114;
+  --surface-1: #16161a;
+  --surface-2: #1f1f24;
+  --surface-3: #2c2c33;
+  --fg: #fafafa;
+  --fg-muted: #a1a1aa;
+  --fg-subtle: #63636e;
+  --border-hairline: #232329;
+  --border-strong: #383842;
 
-  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+  /* Strictly Semantic Status & Diff Highlights */
+  --sem-success: #34d399;
+  --sem-danger: #f87171;
+  --sem-warning: #fbbf24;
+  --sem-running: #38bdf8;
+
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", "Geist Mono", Menlo, monospace;
-
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
-  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 * {
   box-sizing: border-box;
-  border-color: var(--border-subtle);
+  border-color: var(--border-hairline);
 }
 
 html,
@@ -48,9 +39,6 @@ body,
   height: 100%;
   overflow: hidden;
   background-color: var(--canvas-bg);
-  background-image:
-    radial-gradient(60% 50% at 15% 0%, var(--mesh-a), transparent 100%),
-    radial-gradient(50% 45% at 88% 100%, var(--mesh-b), transparent 100%);
   color: var(--fg);
   font-family: var(--font-sans);
   font-size: 13px;
@@ -72,43 +60,156 @@ body,
   width: 5px;
   height: 5px;
 }
-
 ::-webkit-scrollbar-track {
   background: transparent;
 }
-
 ::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.16);
+  background: rgba(161, 161, 170, 0.16);
   border-radius: 9999px;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(148, 163, 184, 0.32);
+/* ============================================================================
+   3 Switchable Material Variants (A2: 都出一个版本我看看)
+   ============================================================================ */
+
+/* Variant A: 极简锐利冷峻风 (shadcn/ui + Linear — 1px sharp hairline, flat matte, tight radius) */
+.velo-variant-a {
+  --card-radius: 6px;
+  --chip-radius: 4px;
+  --btn-radius: 5px;
+}
+.velo-variant-a .v-canvas {
+  background: #09090b;
+}
+.velo-variant-a .v-surface {
+  background: #111114;
+  border: 1px solid #242429;
+  border-radius: 6px;
+  box-shadow: none;
+}
+.velo-variant-a .v-composer {
+  background: #121215;
+  border: 1px solid #2a2a30;
+  border-radius: 8px;
+  box-shadow: none;
+}
+.velo-variant-a .v-chip {
+  background: #18181c;
+  border: 1px solid #27272d;
+  border-radius: 4px;
+}
+.velo-variant-a .v-primary-btn {
+  background: #fafafa;
+  color: #09090b;
+  border-radius: 5px;
+  font-weight: 600;
 }
 
-/* Velo Glass Bento Card */
-.velo-bento-card {
-  background-color: var(--surface-0);
-  border: 1px solid var(--border-subtle);
-  border-radius: 18px;
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
-    0 18px 40px -12px rgba(0, 0, 0, 0.65);
+/* Variant B: AI 原生微光质感 (Beautiful UI + beUI — frosted glass, pill radius, silver shimmer) */
+.velo-variant-b {
+  --card-radius: 14px;
+  --chip-radius: 9999px;
+  --btn-radius: 9999px;
 }
-
-.velo-glass-pill {
-  background-color: var(--surface-glass);
+.velo-variant-b .v-canvas {
+  background: radial-gradient(75% 240px at 50% 0%, rgba(255, 255, 255, 0.055), #09090b 75%);
+}
+.velo-variant-b .v-surface {
+  background: rgba(22, 22, 26, 0.72);
   backdrop-filter: blur(18px);
   -webkit-backdrop-filter: blur(18px);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 14px;
+  box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.65);
+}
+.velo-variant-b .v-composer {
+  background: rgba(26, 26, 31, 0.78);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 18px;
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.09),
-    0 8px 24px -6px rgba(0, 0, 0, 0.5);
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 20px 44px -12px rgba(0, 0, 0, 0.75);
+}
+.velo-variant-b .v-chip {
+  background: rgba(39, 39, 45, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 9999px;
+}
+.velo-variant-b .v-primary-btn {
+  background: linear-gradient(180deg, #ffffff 0%, #d4d4d8 100%);
+  color: #09090b;
+  border-radius: 9999px;
+  font-weight: 600;
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.22);
 }
 
-.velo-dot-matrix {
-  background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
-  background-size: 20px 20px;
+/* Variant C: 硬件立体拟物风 (Rare UI — metallic top-edge specular light, 3D tactile keycaps & buttons) */
+.velo-variant-c {
+  --card-radius: 10px;
+  --chip-radius: 6px;
+  --btn-radius: 7px;
+}
+.velo-variant-c .v-canvas {
+  background: #0a0a0d;
+}
+.velo-variant-c .v-surface {
+  background: linear-gradient(180deg, #1b1b20 0%, #121216 100%);
+  border: 1px solid #2e2e36;
+  border-radius: 10px;
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+    0 8px 20px -4px rgba(0, 0, 0, 0.75);
+}
+.velo-variant-c .v-composer {
+  background: linear-gradient(180deg, #1f1f25 0%, #141418 100%);
+  border: 1px solid #363640;
+  border-radius: 12px;
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
+    0 3px 0 0 #050507,
+    0 16px 32px -6px rgba(0, 0, 0, 0.8);
+}
+.velo-variant-c .v-chip {
+  background: linear-gradient(180deg, #27272e 0%, #1b1b20 100%);
+  border: 1px solid #383842;
+  border-radius: 6px;
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
+    0 2px 0 0 #08080a;
+}
+.velo-variant-c .v-primary-btn {
+  background: linear-gradient(180deg, #fafafa 0%, #a1a1aa 100%);
+  color: #09090b;
+  border-radius: 7px;
+  font-weight: 700;
+  box-shadow:
+    inset 0 1px 0 0 #ffffff,
+    0 2px 0 0 #3f3f46,
+    0 5px 12px rgba(0, 0, 0, 0.65);
+}
+.velo-variant-c .v-primary-btn:active {
+  transform: translateY(1.5px);
+}
+
+/* Monochrome Shimmer & Spring Animations */
+@keyframes mono-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.beautiful-shimmer-text {
+  background: linear-gradient(90deg, #71717a 0%, #fafafa 50%, #71717a 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: mono-shimmer 2.4s infinite linear;
 }
 
 @keyframes velo-spin {
@@ -121,140 +222,28 @@ body,
 }
 
 .paseo-status-ring {
-  width: 11px;
-  height: 11px;
+  width: 10px;
+  height: 10px;
   border-radius: 9999px;
-  border: 2px solid rgba(6, 182, 212, 0.22);
-  border-top-color: var(--dot-running);
-  animation: velo-spin 0.75s linear infinite;
-}
-
-@keyframes ai-shimmer {
-  0% {
-    background-position: -200% 0;
-  }
-  100% {
-    background-position: 200% 0;
-  }
-}
-
-.beautiful-shimmer-text {
-  background: linear-gradient(
-    90deg,
-    var(--fg-muted) 0%,
-    var(--fg) 45%,
-    var(--accent-bright) 55%,
-    var(--fg-muted) 100%
-  );
-  background-size: 200% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: ai-shimmer 2.5s infinite linear;
-}
-
-.rare-specular-surface {
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.09),
-    0 12px 32px -8px rgba(0, 0, 0, 0.55);
-}
-
-.rare-specular-pill {
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
-    0 2px 5px 0 rgba(0, 0, 0, 0.25);
+  border: 1.75px solid rgba(56, 189, 248, 0.25);
+  border-top-color: var(--sem-running);
+  animation: velo-spin 0.8s linear infinite;
 }
 
 .rare-keycap {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 19px;
-  min-width: 19px;
+  height: 18px;
+  min-width: 18px;
   padding: 0 5px;
-  border-radius: 5px;
+  border-radius: 4px;
   font-family: var(--font-mono);
   font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-  background-color: var(--surface-2);
-  color: var(--fg-muted);
-  border: 1px solid var(--border-accent);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.10),
-    0 1.5px 0 0 rgba(0, 0, 0, 0.4);
-}
-
-.rare-3d-button {
-  background: linear-gradient(180deg, var(--accent-bright) 0%, var(--accent) 100%);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.35),
-    0 4px 14px -2px var(--accent-glow),
-    0 2px 4px -1px rgba(0, 0, 0, 0.5);
-  transition:
-    transform 150ms var(--ease-spring),
-    box-shadow 150ms var(--ease-spring),
-    filter 150ms ease;
-}
-
-.rare-3d-button:hover:not(:disabled) {
-  filter: brightness(1.08);
-  transform: translateY(-1px);
-}
-
-.rare-3d-button:active:not(:disabled) {
-  transform: translateY(1px) scale(0.96);
-}
-
-@keyframes t-modal-in {
-  0% {
-    opacity: 0;
-    transform: scale(0.95) translateY(8px);
-    filter: blur(5px);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-    filter: blur(0px);
-  }
-}
-
-@keyframes t-fade-blur-in {
-  0% {
-    opacity: 0;
-    transform: translateY(6px);
-    filter: blur(4px);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0);
-    filter: blur(0px);
-  }
-}
-
-@keyframes t-toast-slide-in {
-  0% {
-    opacity: 0;
-    transform: translateY(14px) scale(0.94);
-    filter: blur(4px);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-    filter: blur(0);
-  }
-}
-
-.t-modal-scale {
-  animation: t-modal-in 230ms var(--ease-spring) forwards;
-}
-
-.t-blur-swap {
-  animation: t-fade-blur-in 210ms var(--ease-out-expo) forwards;
-}
-
-.t-toast-enter {
-  animation: t-toast-slide-in 260ms var(--ease-spring) forwards;
+  background-color: #18181c;
+  color: #a1a1aa;
+  border: 1px solid #2e2e36;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 0 #050507;
 }
 
 .t-grid-collapse {
@@ -262,31 +251,13 @@ body,
   grid-template-rows: 0fr;
   opacity: 0;
   transition:
-    grid-template-rows 230ms var(--ease-spring),
-    opacity 190ms var(--ease-out-expo);
+    grid-template-rows 220ms var(--ease-spring),
+    opacity 180ms ease;
 }
-
 .t-grid-collapse.t-expanded {
   grid-template-rows: 1fr;
   opacity: 1;
 }
-
 .t-grid-collapse-inner {
   overflow: hidden;
-}
-
-.paseo-indent-rail {
-  position: relative;
-  padding-left: 16px;
-}
-
-.paseo-indent-rail::before {
-  content: "";
-  position: absolute;
-  left: 5px;
-  top: 4px;
-  bottom: 4px;
-  width: 1.5px;
-  background: linear-gradient(180deg, var(--accent) 0%, var(--border-subtle) 100%);
-  border-radius: 99px;
 }
