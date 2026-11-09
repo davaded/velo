@@ -8,7 +8,7 @@ import {
   type SessionInfo,
   type UIEventItem,
 } from "./types";
-import { applyPaseoTheme, type PaseoThemeId } from "./theme";
+import { applyPaseoTheme, PASEO_THEMES, type PaseoThemeId } from "./theme";
 import { PaseoLeftSidebar } from "./components/PaseoLeftSidebar";
 import { PaseoWorkspacePane, type WorkspaceTabKind } from "./components/PaseoWorkspacePane";
 import { PaseoExplorerSidebar } from "./components/PaseoExplorerSidebar";
@@ -17,6 +17,11 @@ import {
   PaseoOrchestratorModal,
   PaseoPairModal,
 } from "./components/PaseoModals";
+import {
+  ShadcnCommandPalette,
+  VeloToastViewport,
+  type VeloToastItem,
+} from "./components/ui/ShadcnCommandPalette";
 
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:6767";
 
@@ -93,6 +98,7 @@ export function App() {
     Record<string, { stats: GitDiffStats; diff: string }>
   >({});
 
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [newWorkspaceOpen, setNewWorkspaceOpen] = useState(false);
   const [orchestratorModal, setOrchestratorModal] = useState<{
     open: boolean;
@@ -100,11 +106,32 @@ export function App() {
   }>({ open: false, tab: "handoff" });
   const [pairModalOpen, setPairModalOpen] = useState(false);
   const [pairingTicket, setPairingTicket] = useState<PairingTicket | null>(null);
+  const [toasts, setToasts] = useState<VeloToastItem[]>([]);
+
+  const pushToast = useCallback((title: string, description?: string) => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setToasts((prev) => [...prev.slice(-2), { id, title, description }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3800);
+  }, []);
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
 
   useEffect(() => {
     applyPaseoTheme(themeId);
     localStorage.setItem("velo-paseo-theme", themeId);
   }, [themeId]);
+
+  const handleSelectTheme = useCallback(
+    (id: PaseoThemeId) => {
+      setThemeId(id);
+      pushToast(`Theme switched to ${PASEO_THEMES[id].label}`, PASEO_THEMES[id].description);
+    },
+    [pushToast]
+  );
 
   const fetchSessionDetails = useCallback(async (sessionId: string) => {
     try {
@@ -165,7 +192,7 @@ export function App() {
     fetchSessions();
   }, [fetchSessions]);
 
-  // Live WebSocket stream to Rust velo-daemon (`WsServerMessage` uses `kind`)
+  // Live WebSocket stream to Rust velo-daemon
   useEffect(() => {
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
@@ -216,20 +243,24 @@ export function App() {
     };
   }, [fetchSessionDetails, fetchSessions]);
 
-  // Global Paseo Keyboard Shortcuts (⌘B, ⌘E, ⌘\, ⌘N)
+  // Global Keyboard Shortcuts (⌘K, ⌘B, ⌘E, ⌘\, ⌘N)
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey) {
-        if (e.key.toLowerCase() === "b") {
+        const k = e.key.toLowerCase();
+        if (k === "k") {
+          e.preventDefault();
+          setCommandPaletteOpen((v) => !v);
+        } else if (k === "b") {
           e.preventDefault();
           setLeftSidebarCollapsed((v) => !v);
-        } else if (e.key.toLowerCase() === "e") {
+        } else if (k === "e") {
           e.preventDefault();
           setExplorerOpen((v) => !v);
         } else if (e.key === "\\") {
           e.preventDefault();
           setIsSplit((v) => !v);
-        } else if (e.key.toLowerCase() === "n") {
+        } else if (k === "n") {
           e.preventDefault();
           setNewWorkspaceOpen(true);
         }
@@ -258,7 +289,7 @@ export function App() {
       return [
         {
           kind: "thinking",
-          text: `Inspecting isolated Git worktree (${session.branch}) at ${session.worktree_path}`,
+          text: `Inspecting isolated Git worktree (${session.branch}) at ${session.worktree_path} and verifying dependency graph.`,
         },
         {
           kind: "tool_use",
@@ -287,7 +318,7 @@ export function App() {
         },
         {
           kind: "assistant_message",
-          text: `I have updated the worktree on branch \`${session.branch}\` and verified that all workspace crates compile cleanly. You can inspect the exact line-by-line changes in the **Changes** dock on the right or send follow-up instructions below.`,
+          text: `I have updated the worktree on branch \`${session.branch}\` and verified that all workspace crates compile cleanly. Click any tool card above to inspect its arguments & output, or press \`⌘K\` to trigger multi-agent skills.`,
         },
       ];
     },
@@ -338,6 +369,7 @@ export function App() {
         await fetchSessionDetails(sessionId);
         await fetchSessions();
       }
+      pushToast("Message sent to agent", text);
     } catch {
       setEventsBySession((prev) => ({
         ...prev,
@@ -358,6 +390,7 @@ export function App() {
         method: "POST",
       });
       await fetchSessions();
+      pushToast("Agent session stopped", sessionId.slice(0, 8));
     } catch {
       // ignore
     }
@@ -382,6 +415,7 @@ export function App() {
       await fetchSessions();
       setPane0SessionId(created.id);
       setPane0Tab("agent");
+      pushToast("Isolated Worktree Agent Spawned", `${created.name} on ${created.branch}`);
     }
   };
 
@@ -400,6 +434,7 @@ export function App() {
       const created = normalizeSession(raw);
       await fetchSessions();
       setPane0SessionId(created.id);
+      pushToast("Context Handed Off (/handoff)", `Spawned ${created.name}`);
     }
   };
 
@@ -418,6 +453,7 @@ export function App() {
       const created = normalizeSession(raw);
       await fetchSessions();
       setPane0SessionId(created.id);
+      pushToast("Advisor Review Dispatched (/advisor)", `Spawned ${created.name}`);
     }
   };
 
@@ -435,6 +471,10 @@ export function App() {
     });
     if (res.ok) {
       await fetchSessions();
+      pushToast(
+        "Multi-Agent Committee Dispatched (/committee)",
+        `Parallel worktrees prefixed with ${branchPrefix}`
+      );
     }
   };
 
@@ -462,6 +502,10 @@ export function App() {
       const created = normalizeSession(raw);
       await fetchSessions();
       setPane0SessionId(created.id);
+      pushToast(
+        "Autonomous Goal Loop Started (/loop)",
+        `Verifying against \`${checkCommand}\``
+      );
     }
   };
 
@@ -513,10 +557,11 @@ export function App() {
           onSelectSession={handleSelectSessionFromSidebar}
           wsConnected={wsConnected}
           themeId={themeId}
-          onSelectTheme={setThemeId}
+          onSelectTheme={handleSelectTheme}
           onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
           onOpenOrchestratorModal={(tab) => setOrchestratorModal({ open: true, tab })}
           onOpenPairModal={handleOpenPairModal}
+          onOpenCommandPalette={() => setCommandPaletteOpen(true)}
           onCollapseSidebar={() => setLeftSidebarCollapsed(true)}
         />
       )}
@@ -537,7 +582,13 @@ export function App() {
           onExpandLeftSidebar={() => setLeftSidebarCollapsed(false)}
           explorerOpen={explorerOpen}
           onToggleExplorer={() => setExplorerOpen((v) => !v)}
-          onToggleSplit={() => setIsSplit((v) => !v)}
+          onToggleSplit={() => {
+            setIsSplit((v) => !v);
+            pushToast(
+              !isSplit ? "Split Workspace Enabled" : "Single Workspace View",
+              "Shortcut: ⌘\\"
+            );
+          }}
           onSendInput={handleSendInput}
           onStopSession={handleStopSession}
           onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
@@ -575,7 +626,10 @@ export function App() {
           diffText={explorerDiff.diff}
           diffStats={explorerDiff.stats}
           onRefreshDiff={() => {
-            if (activeExplorerSession) fetchSessionDetails(activeExplorerSession.id);
+            if (activeExplorerSession) {
+              fetchSessionDetails(activeExplorerSession.id);
+              pushToast("Refreshed Git Worktree Diff", activeExplorerSession.branch);
+            }
           }}
           onOpenDiffTab={() => {
             if (isSplit && focusedPane === 1) {
@@ -587,6 +641,20 @@ export function App() {
           onCloseExplorer={() => setExplorerOpen(false)}
         />
       )}
+
+      {/* shadcn/ui Global ⌘K Command Palette */}
+      <ShadcnCommandPalette
+        open={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        sessions={sessions}
+        onSelectSession={handleSelectSessionFromSidebar}
+        onOpenNewWorkspace={() => setNewWorkspaceOpen(true)}
+        onOpenOrchestrator={(tab) => setOrchestratorModal({ open: true, tab })}
+        onToggleSplit={() => setIsSplit((v) => !v)}
+        onToggleExplorer={() => setExplorerOpen((v) => !v)}
+        onOpenPair={handleOpenPairModal}
+        onSelectTheme={handleSelectTheme}
+      />
 
       <PaseoNewWorkspaceModal
         open={newWorkspaceOpen}
@@ -610,6 +678,9 @@ export function App() {
         ticket={pairingTicket}
         onClose={() => setPairModalOpen(false)}
       />
+
+      {/* beUI + shadcn Sonner-Style Animated Toast Stack */}
+      <VeloToastViewport toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }

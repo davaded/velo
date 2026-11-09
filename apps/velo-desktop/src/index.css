@@ -26,6 +26,11 @@
 
   --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", "Segoe UI", Roboto, sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", "Geist Mono", Menlo, Monaco, Consolas, monospace;
+
+  /* transitions.dev semantic motion tokens */
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-snappy: cubic-bezier(0.2, 0, 0, 1);
 }
 
 * {
@@ -60,7 +65,7 @@ body,
   font-feature-settings: "liga" 1, "calt" 1;
 }
 
-/* Paseo ultra-thin custom scrollbars */
+/* Custom ultra-thin scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -79,7 +84,7 @@ body,
   background: rgba(161, 165, 164, 0.32);
 }
 
-/* Paseo StatusRing animation for active/running workspaces */
+/* Paseo StatusRing animation */
 @keyframes paseo-spin {
   0% {
     transform: rotate(0deg);
@@ -95,10 +100,10 @@ body,
   border-radius: 9999px;
   border: 1.75px solid rgba(92, 170, 246, 0.25);
   border-top-color: var(--dot-running);
-  animation: paseo-spin 0.9s linear infinite;
+  animation: paseo-spin 0.85s linear infinite;
 }
 
-/* Paseo IndentRail for nested tool calls & turn traces */
+/* Paseo IndentRail */
 .paseo-indent-rail {
   position: relative;
   padding-left: 14px;
@@ -113,4 +118,167 @@ body,
   width: 1.5px;
   background-color: var(--border-accent);
   border-radius: 1px;
+}
+
+/* ============================================================================
+   1. Beautiful UI (beautifului.dev) — AI Reasoning Shimmer & Agent Primitives
+   ============================================================================ */
+@keyframes ai-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.beautiful-shimmer-text {
+  background: linear-gradient(
+    90deg,
+    var(--fg-muted) 0%,
+    var(--fg) 45%,
+    var(--accent-bright) 55%,
+    var(--fg-muted) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: ai-shimmer 2.8s infinite linear;
+}
+
+/* ============================================================================
+   2. Rare UI (rareui.com) — Specular Inner Borders, Tactile Keycaps & Spotlight
+   ============================================================================ */
+.rare-specular-surface {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.07),
+    0 8px 24px -6px rgba(0, 0, 0, 0.45);
+}
+
+.rare-specular-pill {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
+    0 1px 2px 0 rgba(0, 0, 0, 0.25);
+}
+
+.rare-keycap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  background-color: var(--surface-1);
+  color: var(--fg-muted);
+  border: 1px solid var(--border-accent);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
+    0 1.5px 0 0 var(--border-subtle);
+}
+
+.rare-3d-button {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
+    0 2px 6px -1px rgba(0, 0, 0, 0.4);
+  transition: transform 140ms var(--ease-spring), box-shadow 140ms var(--ease-spring), filter 140ms ease;
+}
+
+.rare-3d-button:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-0.5px);
+}
+
+.rare-3d-button:active:not(:disabled) {
+  transform: translateY(1px) scale(0.97);
+}
+
+/* ============================================================================
+   3. Transitions.dev (transitions.dev) — Semantic CSS Spring & Blur-Swap Motion
+   ============================================================================ */
+@keyframes t-modal-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.96) translateY(6px);
+    filter: blur(4px);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+    filter: blur(0px);
+  }
+}
+
+@keyframes t-fade-blur-in {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+    filter: blur(3px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0px);
+  }
+}
+
+@keyframes t-toast-slide-in {
+  0% {
+    opacity: 0;
+    transform: translateY(14px) scale(0.94);
+    filter: blur(4px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+.t-modal-scale {
+  animation: t-modal-in 220ms var(--ease-spring) forwards;
+}
+
+.t-blur-swap {
+  animation: t-fade-blur-in 200ms var(--ease-out-expo) forwards;
+}
+
+.t-toast-enter {
+  animation: t-toast-slide-in 260ms var(--ease-spring) forwards;
+}
+
+/* Smooth 0fr -> 1fr grid height transition from transitions.dev */
+.t-grid-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 220ms var(--ease-spring),
+    opacity 180ms var(--ease-out-expo);
+}
+
+.t-grid-collapse.t-expanded {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.t-grid-collapse-inner {
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .t-modal-scale,
+  .t-blur-swap,
+  .t-toast-enter,
+  .beautiful-shimmer-text {
+    animation: none !important;
+  }
+  .t-grid-collapse {
+    transition: none !important;
+  }
 }

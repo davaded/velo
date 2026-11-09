@@ -3,9 +3,6 @@ import {
   ArrowRightLeft,
   ArrowUp,
   Bot,
-  CheckCircle2,
-  ChevronDown,
-  ChevronRight,
   Columns2,
   Cpu,
   FileCode2,
@@ -20,12 +17,17 @@ import {
   Sparkles,
   Square,
   Terminal,
-  Wrench,
   X,
 } from "lucide-react";
 import type { GitDiffStats, SessionInfo, UIEventItem } from "../types";
 import { providerDisplayName } from "./PaseoLeftSidebar";
 import { parseUnifiedDiffToFiles } from "./PaseoExplorerSidebar";
+import {
+  BeautifulContextMeter,
+  BeautifulThinkingBlock,
+  BeautifulToolCallCard,
+} from "./ui/BeautifulAgentPrimitives";
+import { RareSpotlightCard } from "./ui/RareSpotlightCard";
 
 export type WorkspaceTabKind = "agent" | "diff" | "terminal" | "new_tab";
 
@@ -100,7 +102,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
   onOpenOrchestratorModal,
 }) => {
   const [composerText, setComposerText] = useState("");
-  const [expandedItems, setExpandedItems] = useState<Record<number, boolean>>({});
   const [sending, setSending] = useState(false);
   const streamEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -139,10 +140,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
     }
   };
 
-  const toggleItemExpanded = (idx: number) => {
-    setExpandedItems((prev) => ({ ...prev, [idx]: !prev[idx] }));
-  };
-
   const renderStatusDot = (status?: SessionInfo["status"]) => {
     if (status === "running" || status === "starting") {
       return <span className="paseo-status-ring shrink-0" />;
@@ -165,6 +162,12 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
     const root = session?.repo_root || "/Users/daiyudai/code/velo";
     return root.split("/").filter(Boolean).pop() || "velo";
   }, [session?.repo_root]);
+
+  const estimatedContextTokens = useMemo(() => {
+    const base = 24000;
+    const extra = events.length * 1850 + composerText.length * 4;
+    return base + extra;
+  }, [events.length, composerText.length]);
 
   return (
     <section
@@ -200,7 +203,9 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
 
           <button
             onClick={() => onChangeTab("agent")}
-            className="h-[27px] px-2.5 rounded-[6px] flex items-center gap-2 text-[12px] font-medium transition-colors cursor-pointer shrink-0 max-w-[190px]"
+            className={`h-[27px] px-2.5 rounded-[6px] flex items-center gap-2 text-[12px] font-medium transition-all cursor-pointer shrink-0 max-w-[190px] ${
+              activeTab === "agent" ? "rare-specular-pill" : ""
+            }`}
             style={{
               backgroundColor: activeTab === "agent" ? "var(--surface-2)" : "transparent",
               color: activeTab === "agent" ? "var(--fg)" : "var(--fg-muted)",
@@ -216,7 +221,9 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
 
           <button
             onClick={() => onChangeTab("diff")}
-            className="h-[27px] px-2.5 rounded-[6px] flex items-center gap-1.5 text-[12px] font-medium transition-colors cursor-pointer shrink-0"
+            className={`h-[27px] px-2.5 rounded-[6px] flex items-center gap-1.5 text-[12px] font-medium transition-all cursor-pointer shrink-0 ${
+              activeTab === "diff" ? "rare-specular-pill" : ""
+            }`}
             style={{
               backgroundColor: activeTab === "diff" ? "var(--surface-2)" : "transparent",
               color: activeTab === "diff" ? "var(--fg)" : "var(--fg-muted)",
@@ -243,7 +250,9 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
 
           <button
             onClick={() => onChangeTab("terminal")}
-            className="h-[27px] px-2.5 rounded-[6px] flex items-center gap-1.5 text-[12px] font-medium transition-colors cursor-pointer shrink-0"
+            className={`h-[27px] px-2.5 rounded-[6px] flex items-center gap-1.5 text-[12px] font-medium transition-all cursor-pointer shrink-0 ${
+              activeTab === "terminal" ? "rare-specular-pill" : ""
+            }`}
             style={{
               backgroundColor: activeTab === "terminal" ? "var(--surface-2)" : "transparent",
               color: activeTab === "terminal" ? "var(--fg)" : "var(--fg-muted)",
@@ -259,7 +268,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
 
           <button
             onClick={() => onChangeTab("new_tab")}
-            title="New Tab Launcher (⌘T)"
+            title="New Tab Launcher"
             className="w-[27px] h-[27px] rounded-[6px] flex items-center justify-center transition-colors cursor-pointer shrink-0 hover:bg-[var(--surface-2)]"
             style={{
               backgroundColor: activeTab === "new_tab" ? "var(--surface-2)" : "transparent",
@@ -378,7 +387,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
               </button>
             )}
             <span
-              className="font-mono-code text-[10.5px] px-1.5 py-0.5 rounded"
+              className="font-mono-code text-[10.5px] px-1.5 py-0.5 rounded rare-specular-pill"
               style={{
                 backgroundColor: "var(--surface-1)",
                 color: "var(--fg-muted)",
@@ -390,15 +399,15 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
         </div>
       )}
 
-      {/* 3. Main Tab Body */}
+      {/* 3. Main Tab Body: AI-Native Stream powered by Beautiful UI & Transitions.dev */}
       {activeTab === "agent" && (
-        <div className="flex-1 flex flex-col min-h-0 relative">
+        <div className="flex-1 flex flex-col min-h-0 relative t-blur-swap">
           <div className="flex-1 overflow-y-auto px-4 pt-5 pb-6 selectable-text">
             <div className="max-w-[760px] mx-auto space-y-3.5">
               {session && (
                 <div className="flex justify-end">
                   <div
-                    className="max-w-[85%] rounded-[12px] px-3.5 py-2.5 text-[13px] leading-relaxed border"
+                    className="max-w-[85%] rounded-[12px] px-3.5 py-2.5 text-[13px] leading-relaxed border rare-specular-pill"
                     style={{
                       backgroundColor: "var(--surface-2)",
                       borderColor: "var(--border-accent)",
@@ -411,13 +420,61 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
               )}
 
               {events.map((ev, idx) => {
-                const isExpanded = !!expandedItems[idx];
+                // Pair consecutive tool_use + tool_result into a single BeautifulToolCallCard
+                if (ev.kind === "tool_use") {
+                  const nextEv = events[idx + 1];
+                  const pairedOutput =
+                    nextEv && nextEv.kind === "tool_result" ? nextEv.output : undefined;
+                  const pairedError =
+                    nextEv && nextEv.kind === "tool_result" ? nextEv.is_error : false;
+
+                  return (
+                    <BeautifulToolCallCard
+                      key={idx}
+                      toolName={ev.tool_name}
+                      input={ev.input}
+                      output={pairedOutput}
+                      isError={pairedError}
+                      onOpenDiffTab={() => onChangeTab("diff")}
+                    />
+                  );
+                }
+
+                if (ev.kind === "tool_result") {
+                  const prevEv = idx > 0 ? events[idx - 1] : null;
+                  if (prevEv && prevEv.kind === "tool_use") {
+                    // Already rendered inside the paired BeautifulToolCallCard above
+                    return null;
+                  }
+                  return (
+                    <BeautifulToolCallCard
+                      key={idx}
+                      toolName={ev.tool_name}
+                      input={{}}
+                      output={ev.output}
+                      isError={ev.is_error}
+                      onOpenDiffTab={() => onChangeTab("diff")}
+                    />
+                  );
+                }
+
+                if (ev.kind === "thinking") {
+                  return (
+                    <BeautifulThinkingBlock
+                      key={idx}
+                      text={ev.text}
+                      isStreaming={
+                        session?.status === "running" && idx === events.length - 1
+                      }
+                    />
+                  );
+                }
 
                 if (ev.kind === "user_input") {
                   return (
-                    <div key={idx} className="flex justify-end pt-1">
+                    <div key={idx} className="flex justify-end pt-1 t-blur-swap">
                       <div
-                        className="max-w-[85%] rounded-[12px] px-3.5 py-2 text-[13px] leading-relaxed border"
+                        className="max-w-[85%] rounded-[12px] px-3.5 py-2 text-[13px] leading-relaxed border rare-specular-pill"
                         style={{
                           backgroundColor: "var(--surface-2)",
                           borderColor: "var(--border-accent)",
@@ -430,141 +487,9 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                   );
                 }
 
-                if (ev.kind === "thinking") {
-                  return (
-                    <div key={idx} className="space-y-1">
-                      <button
-                        onClick={() => toggleItemExpanded(idx)}
-                        className="inline-flex items-center gap-1.5 px-2 py-1 rounded-[6px] text-[12px] transition-colors cursor-pointer hover:bg-[var(--surface-1)]"
-                        style={{ color: "var(--fg-muted)" }}
-                      >
-                        {isExpanded ? (
-                          <ChevronDown className="w-3.5 h-3.5" />
-                        ) : (
-                          <ChevronRight className="w-3.5 h-3.5" />
-                        )}
-                        <Sparkles
-                          className="w-3.5 h-3.5"
-                          style={{ color: "var(--accent-bright)" }}
-                        />
-                        <span className="font-medium">Thought process</span>
-                        <span
-                          className="truncate max-w-[420px]"
-                          style={{ color: "var(--fg-extra-muted)" }}
-                        >
-                          — {ev.text}
-                        </span>
-                      </button>
-
-                      {isExpanded && (
-                        <div
-                          className="paseo-indent-rail ml-2 text-[12.5px] leading-relaxed py-1"
-                          style={{ color: "var(--fg-muted)" }}
-                        >
-                          {ev.text}
-                        </div>
-                      )}
-                    </div>
-                  );
-                }
-
-                if (ev.kind === "tool_use") {
-                  const fileArg =
-                    typeof ev.input === "object" && ev.input !== null
-                      ? (ev.input as Record<string, unknown>).file ||
-                        (ev.input as Record<string, unknown>).path ||
-                        (ev.input as Record<string, unknown>).command
-                      : null;
-
-                  return (
-                    <div key={idx} className="space-y-1">
-                      <button
-                        onClick={() => toggleItemExpanded(idx)}
-                        className="inline-flex items-center gap-2 px-2.5 py-1 rounded-[6px] text-[12px] border transition-colors cursor-pointer hover:bg-[var(--surface-2)]"
-                        style={{
-                          backgroundColor: "var(--surface-1)",
-                          borderColor: "var(--border-subtle)",
-                          color: "var(--fg)",
-                        }}
-                      >
-                        {isExpanded ? (
-                          <ChevronDown
-                            className="w-3.5 h-3.5"
-                            style={{ color: "var(--fg-extra-muted)" }}
-                          />
-                        ) : (
-                          <ChevronRight
-                            className="w-3.5 h-3.5"
-                            style={{ color: "var(--fg-extra-muted)" }}
-                          />
-                        )}
-                        <Wrench
-                          className="w-3.5 h-3.5"
-                          style={{ color: "var(--accent-bright)" }}
-                        />
-                        <span className="font-mono-code font-medium text-[11.5px]">
-                          {ev.tool_name}
-                        </span>
-                        {fileArg != null && (
-                          <span
-                            className="font-mono-code text-[11px] px-1.5 py-0.2 rounded"
-                            style={{
-                              backgroundColor: "var(--surface-2)",
-                              color: "var(--fg-muted)",
-                            }}
-                          >
-                            {String(fileArg)}
-                          </span>
-                        )}
-                      </button>
-
-                      {isExpanded && (
-                        <div className="paseo-indent-rail ml-2">
-                          <pre
-                            className="font-mono-code text-[11.5px] p-2.5 rounded-[6px] border overflow-x-auto"
-                            style={{
-                              backgroundColor: "var(--surface-1)",
-                              borderColor: "var(--border-subtle)",
-                              color: "var(--fg-muted)",
-                            }}
-                          >
-                            {JSON.stringify(ev.input, null, 2)}
-                          </pre>
-                        </div>
-                      )}
-                    </div>
-                  );
-                }
-
-                if (ev.kind === "tool_result") {
-                  return (
-                    <div key={idx} className="paseo-indent-rail ml-2">
-                      <div
-                        className="inline-flex items-center gap-2 px-2.5 py-1 rounded-[6px] text-[11.5px] font-mono-code"
-                        style={{
-                          backgroundColor: ev.is_error
-                            ? "rgba(216, 132, 123, 0.12)"
-                            : "var(--surface-1)",
-                          color: ev.is_error ? "var(--status-danger)" : "var(--fg-muted)",
-                        }}
-                      >
-                        <CheckCircle2
-                          className="w-3.5 h-3.5 shrink-0"
-                          style={{
-                            color: ev.is_error
-                              ? "var(--status-danger)"
-                              : "var(--status-success)",
-                          }}
-                        />
-                        <span className="whitespace-pre-wrap">{ev.output}</span>
-                      </div>
-                    </div>
-                  );
-                }
-
                 if (ev.kind === "assistant_message") {
                   return (
-                    <div key={idx} className="space-y-2 pt-1">
+                    <div key={idx} className="space-y-2 pt-1 t-blur-swap">
                       <div
                         className="text-[13.5px] leading-[1.68] whitespace-pre-wrap"
                         style={{ color: "var(--fg)" }}
@@ -594,6 +519,14 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                           style={{ color: "var(--accent-bright)" }}
                         >
                           Ask Advisor
+                        </button>
+                        <span>·</span>
+                        <button
+                          onClick={() => onChangeTab("diff")}
+                          className="hover:underline cursor-pointer"
+                          style={{ color: "var(--fg-muted)" }}
+                        >
+                          Inspect Diff
                         </button>
                       </div>
                     </div>
@@ -639,12 +572,12 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
             </div>
           </div>
 
-          {/* 4. Paseo Docked Bottom Composer */}
+          {/* 4. Docked Bottom Composer with Specular Highlight & BeautifulContextMeter */}
           <div className="px-4 pb-3.5 pt-1 shrink-0">
             <div className="max-w-[760px] mx-auto relative">
               {matchingSlashCommands.length > 0 && (
                 <div
-                  className="absolute bottom-full left-0 mb-2 w-full max-w-[440px] rounded-[10px] border p-1.5 shadow-2xl z-30"
+                  className="absolute bottom-full left-0 mb-2 w-full max-w-[440px] rounded-[10px] border p-1.5 z-30 rare-specular-surface t-modal-scale"
                   style={{
                     backgroundColor: "var(--surface-2)",
                     borderColor: "var(--border-accent)",
@@ -687,22 +620,14 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                           {item.desc}
                         </p>
                       </div>
-                      <span
-                        className="font-mono-code text-[10px] px-1.5 py-0.5 rounded"
-                        style={{
-                          backgroundColor: "var(--surface-3)",
-                          color: "var(--fg)",
-                        }}
-                      >
-                        Run
-                      </span>
+                      <kbd className="rare-keycap">↵</kbd>
                     </button>
                   ))}
                 </div>
               )}
 
               <div
-                className="rounded-[12px] border transition-colors shadow-lg"
+                className="rounded-[12px] border transition-colors rare-specular-surface"
                 style={{
                   backgroundColor: "var(--surface-2)",
                   borderColor: isFocusedPane
@@ -722,7 +647,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                   }}
                   placeholder={
                     session
-                      ? `Message ${session.name} or type / for multi-agent commands (/handoff, /advisor, /committee, /loop)...`
+                      ? `Message ${session.name} or type / for skills (/handoff, /advisor, /committee, /loop)...`
                       : "Select or create a workspace..."
                   }
                   className="w-full bg-transparent px-3.5 pt-3 pb-1.5 text-[13px] resize-none focus:outline-none"
@@ -732,7 +657,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                 <div className="px-2.5 pb-2 pt-1 flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span
-                      className="h-[24px] px-2 rounded-full text-[11px] font-medium flex items-center gap-1.5 border"
+                      className="h-[24px] px-2 rounded-full text-[11px] font-medium flex items-center gap-1.5 border rare-specular-pill"
                       style={{
                         backgroundColor: "var(--surface-1)",
                         borderColor: "var(--border-subtle)",
@@ -747,7 +672,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                     </span>
 
                     <span
-                      className="h-[24px] px-2 rounded-full text-[11px] flex items-center gap-1 border"
+                      className="h-[24px] px-2 rounded-full text-[11px] flex items-center gap-1 border rare-specular-pill"
                       style={{
                         backgroundColor: "var(--surface-1)",
                         borderColor: "var(--border-subtle)",
@@ -757,6 +682,8 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                       <Cpu className="w-3 h-3" />
                       Auto-Edit
                     </span>
+
+                    <BeautifulContextMeter usedTokens={estimatedContextTokens} />
 
                     <button
                       type="button"
@@ -768,7 +695,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                         color: "var(--accent-bright)",
                       }}
                     >
-                      /commands
+                      /skills
                     </button>
                   </div>
 
@@ -778,7 +705,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                         type="button"
                         onClick={() => onStopSession(session.id)}
                         title="Stop Agent"
-                        className="w-[28px] h-[28px] rounded-full flex items-center justify-center transition-transform active:scale-95 cursor-pointer"
+                        className="w-[28px] h-[28px] rounded-full flex items-center justify-center cursor-pointer rare-3d-button"
                         style={{
                           backgroundColor: "var(--destructive)",
                           color: "#ffffff",
@@ -792,7 +719,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                         disabled={!composerText.trim() || sending}
                         onClick={handleComposerSubmit}
                         title="Send Message (Enter)"
-                        className="w-[28px] h-[28px] rounded-full flex items-center justify-center transition-all cursor-pointer disabled:opacity-35"
+                        className="w-[28px] h-[28px] rounded-full flex items-center justify-center cursor-pointer disabled:opacity-35 rare-3d-button"
                         style={{
                           backgroundColor: composerText.trim()
                             ? "var(--accent)"
@@ -813,10 +740,10 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
 
       {/* Working Diff Tab View */}
       {activeTab === "diff" && (
-        <div className="flex-1 overflow-y-auto p-4 space-y-4 selectable-text">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4 selectable-text t-blur-swap">
           <div className="max-w-[960px] mx-auto space-y-4">
             <div
-              className="flex items-center justify-between px-3.5 py-2.5 rounded-[8px] border"
+              className="flex items-center justify-between px-3.5 py-2.5 rounded-[8px] border rare-specular-pill"
               style={{
                 backgroundColor: "var(--surface-1)",
                 borderColor: "var(--border-subtle)",
@@ -847,7 +774,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
             {parsedDiffFiles.map((file) => (
               <div
                 key={file.path}
-                className="rounded-[8px] border overflow-hidden"
+                className="rounded-[8px] border overflow-hidden rare-specular-surface"
                 style={{
                   backgroundColor: "var(--surface-sidebar)",
                   borderColor: "var(--border-subtle)",
@@ -936,9 +863,9 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
 
       {/* Terminal (PTY) Tab View */}
       {activeTab === "terminal" && (
-        <div className="flex-1 flex flex-col min-h-0 p-4">
+        <div className="flex-1 flex flex-col min-h-0 p-4 t-blur-swap">
           <div
-            className="flex-1 rounded-[8px] border p-3.5 font-mono-code text-[12px] overflow-y-auto selectable-text space-y-1.5"
+            className="flex-1 rounded-[8px] border p-3.5 font-mono-code text-[12px] overflow-y-auto selectable-text space-y-1.5 rare-specular-surface"
             style={{
               backgroundColor: "var(--surface-sidebar)",
               borderColor: "var(--border-subtle)",
@@ -986,125 +913,76 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
         </div>
       )}
 
-      {/* "+" NewTabPanel Launcher */}
+      {/* "+" NewTabPanel Launcher powered by Rare UI Spotlight Cards */}
       {activeTab === "new_tab" && (
-        <div className="flex-1 overflow-y-auto p-6 flex items-center justify-center">
-          <div className="max-w-[540px] w-full space-y-5">
+        <div className="flex-1 overflow-y-auto p-6 flex items-center justify-center t-blur-swap">
+          <div className="max-w-[580px] w-full space-y-5">
             <div className="space-y-1">
               <h2 className="text-[15px] font-semibold" style={{ color: "var(--fg)" }}>
                 Open in Workspace
               </h2>
               <p className="text-[12px]" style={{ color: "var(--fg-muted)" }}>
-                Launch an agent, multi-agent workflow, or tool tab in{" "}
+                Launch an isolated agent or multi-agent workflow in{" "}
                 <span className="font-mono-code" style={{ color: "var(--accent-bright)" }}>
                   {session?.branch ?? "current worktree"}
                 </span>
               </p>
             </div>
 
-            <div className="grid grid-cols-2 gap-2.5">
-              <button
+            <div className="grid grid-cols-2 gap-3">
+              <RareSpotlightCard
                 onClick={onOpenNewWorkspaceModal}
-                className="p-3 rounded-[8px] border text-left transition-colors cursor-pointer hover:bg-[var(--surface-2)]"
-                style={{
-                  backgroundColor: "var(--surface-1)",
-                  borderColor: "var(--border-subtle)",
-                }}
-              >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[12.5px] font-semibold flex items-center gap-1.5">
+                shortcut="⌘N"
+                badge="Worktree"
+                title={
+                  <>
                     <Bot className="w-4 h-4" style={{ color: "var(--accent-bright)" }} />
-                    New Isolated Agent
-                  </span>
-                  <span
-                    className="font-mono-code text-[10px]"
-                    style={{ color: "var(--fg-extra-muted)" }}
-                  >
-                    ⌘N
-                  </span>
-                </div>
-                <p className="text-[11px]" style={{ color: "var(--fg-muted)" }}>
-                  Spawn Claude Code, Codex, or OpenCode in a fresh Git worktree
-                </p>
-              </button>
+                    <span>New Isolated Agent</span>
+                  </>
+                }
+                subtitle="Spawn Claude Code, Codex, or OpenCode in a fresh Git worktree"
+              />
 
-              <button
+              <RareSpotlightCard
                 onClick={() => onOpenOrchestratorModal("handoff")}
-                className="p-3 rounded-[8px] border text-left transition-colors cursor-pointer hover:bg-[var(--surface-2)]"
-                style={{
-                  backgroundColor: "var(--surface-1)",
-                  borderColor: "var(--border-subtle)",
-                }}
-              >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[12.5px] font-semibold flex items-center gap-1.5">
+                shortcut="/handoff"
+                title={
+                  <>
                     <ArrowRightLeft
                       className="w-4 h-4"
                       style={{ color: "var(--accent-bright)" }}
                     />
-                    Handoff Context
-                  </span>
-                  <span
-                    className="font-mono-code text-[10px]"
-                    style={{ color: "var(--fg-extra-muted)" }}
-                  >
-                    /handoff
-                  </span>
-                </div>
-                <p className="text-[11px]" style={{ color: "var(--fg-muted)" }}>
-                  Hand off current worktree & transcript to another agent provider
-                </p>
-              </button>
+                    <span>Handoff Context</span>
+                  </>
+                }
+                subtitle="Hand off current worktree & transcript to another agent provider"
+              />
 
-              <button
+              <RareSpotlightCard
                 onClick={() => onOpenOrchestratorModal("committee")}
-                className="p-3 rounded-[8px] border text-left transition-colors cursor-pointer hover:bg-[var(--surface-2)]"
-                style={{
-                  backgroundColor: "var(--surface-1)",
-                  borderColor: "var(--border-subtle)",
-                }}
-              >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[12.5px] font-semibold flex items-center gap-1.5">
+                shortcut="/committee"
+                badge="Parallel"
+                title={
+                  <>
                     <Layers className="w-4 h-4" style={{ color: "var(--accent-bright)" }} />
-                    Multi-Agent Committee
-                  </span>
-                  <span
-                    className="font-mono-code text-[10px]"
-                    style={{ color: "var(--fg-extra-muted)" }}
-                  >
-                    /committee
-                  </span>
-                </div>
-                <p className="text-[11px]" style={{ color: "var(--fg-muted)" }}>
-                  Run parallel review across Claude + Codex in isolated worktrees
-                </p>
-              </button>
+                    <span>Multi-Agent Committee</span>
+                  </>
+                }
+                subtitle="Run parallel review across Claude + Codex in isolated worktrees"
+              />
 
-              <button
+              <RareSpotlightCard
                 onClick={() => onOpenOrchestratorModal("loop")}
-                className="p-3 rounded-[8px] border text-left transition-colors cursor-pointer hover:bg-[var(--surface-2)]"
-                style={{
-                  backgroundColor: "var(--surface-1)",
-                  borderColor: "var(--border-subtle)",
-                }}
-              >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[12.5px] font-semibold flex items-center gap-1.5">
+                shortcut="/loop"
+                badge="Self-Heal"
+                title={
+                  <>
                     <Repeat className="w-4 h-4" style={{ color: "var(--accent-bright)" }} />
-                    Autonomous Goal Loop
-                  </span>
-                  <span
-                    className="font-mono-code text-[10px]"
-                    style={{ color: "var(--fg-extra-muted)" }}
-                  >
-                    /loop
-                  </span>
-                </div>
-                <p className="text-[11px]" style={{ color: "var(--fg-muted)" }}>
-                  Iterative self-healing verification loop until check passes
-                </p>
-              </button>
+                    <span>Autonomous Goal Loop</span>
+                  </>
+                }
+                subtitle="Iterative self-healing verification loop until check passes"
+              />
             </div>
           </div>
         </div>

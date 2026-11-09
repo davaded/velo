@@ -2,6 +2,7 @@ import React, { useMemo, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
+  Command,
   FolderGit2,
   GitBranch,
   Palette,
@@ -26,6 +27,7 @@ interface PaseoLeftSidebarProps {
   onOpenNewWorkspaceModal: () => void;
   onOpenOrchestratorModal: (tab: "handoff" | "advisor" | "committee" | "loop") => void;
   onOpenPairModal: () => void;
+  onOpenCommandPalette: () => void;
   onCollapseSidebar: () => void;
 }
 
@@ -65,6 +67,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
   onOpenNewWorkspaceModal,
   onOpenOrchestratorModal,
   onOpenPairModal,
+  onOpenCommandPalette,
   onCollapseSidebar,
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
@@ -147,9 +150,14 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
       <button
         key={session.id}
         onClick={() => onSelectSession(session.id)}
-        className="w-full text-left group relative flex flex-col gap-0.5 px-2.5 py-1.5 rounded-[6px] transition-colors cursor-pointer"
+        className={`w-full text-left group relative flex flex-col gap-0.5 px-2.5 py-1.5 rounded-[7px] transition-all cursor-pointer ${
+          selected ? "rare-specular-pill" : ""
+        }`}
         style={{
           backgroundColor: selected ? "var(--surface-2)" : "transparent",
+          border: selected
+            ? "1px solid var(--border-accent)"
+            : "1px solid transparent",
         }}
         onMouseEnter={(e) => {
           if (!selected) e.currentTarget.style.backgroundColor = "var(--surface-1)";
@@ -184,12 +192,9 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
                 </span>
               </span>
             ) : index < 9 ? (
-              <span
-                className="font-mono-code text-[10px] opacity-0 group-hover:opacity-100 transition-opacity"
-                style={{ color: "var(--fg-extra-muted)" }}
-              >
+              <kbd className="rare-keycap opacity-0 group-hover:opacity-100 transition-opacity">
                 ⌘{index + 1}
-              </span>
+              </kbd>
             ) : null}
           </div>
         </div>
@@ -233,12 +238,13 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
 
   return (
     <aside
-      className="w-[260px] shrink-0 h-full flex flex-col border-r select-none"
+      className="w-[264px] shrink-0 h-full flex flex-col border-r select-none"
       style={{
         backgroundColor: "var(--surface-sidebar)",
         borderColor: "var(--border-subtle)",
       }}
     >
+      {/* Top Sidebar Header */}
       <div
         className="h-[38px] px-2.5 flex items-center justify-between border-b shrink-0"
         style={{ borderColor: "var(--border-subtle)" }}
@@ -260,22 +266,30 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
                 backgroundColor: wsConnected ? "var(--dot-success)" : "var(--dot-danger)",
               }}
             />
-            <span className="text-[12px] font-semibold tracking-tight truncate">
+            <span className="text-[12.5px] font-semibold tracking-tight truncate">
               Velo
             </span>
             <span
-              className="font-mono-code text-[10px] px-1.5 py-0.2 rounded"
+              className="font-mono-code text-[10px] px-1.5 py-0.2 rounded rare-specular-pill"
               style={{
                 backgroundColor: "var(--surface-2)",
-                color: "var(--fg-muted)",
+                color: "var(--accent-bright)",
               }}
             >
-              local
+              daemon
             </span>
           </div>
         </div>
 
         <div className="flex items-center gap-1">
+          <button
+            onClick={onOpenCommandPalette}
+            title="Command Palette (⌘K)"
+            className="w-6 h-6 rounded-[5px] flex items-center justify-center transition-colors cursor-pointer hover:bg-[var(--surface-2)]"
+            style={{ color: "var(--fg-muted)" }}
+          >
+            <Command className="w-3.5 h-3.5" />
+          </button>
           <button
             onClick={() => onOpenOrchestratorModal("committee")}
             title="Multi-Agent Workflows (Handoff / Advisor / Committee / Loop)"
@@ -295,9 +309,10 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
         </div>
       </div>
 
-      <div className="px-2.5 pt-2 pb-1.5 flex flex-col gap-1.5 shrink-0">
+      {/* shadcn/ui Command Bar + Segmented Group Switcher */}
+      <div className="px-2.5 pt-2 pb-1.5 flex flex-col gap-2 shrink-0">
         <div
-          className="flex items-center gap-1.5 px-2 h-[26px] rounded-[6px] border"
+          className="flex items-center gap-1.5 px-2.5 h-[28px] rounded-[7px] border rare-specular-pill"
           style={{
             backgroundColor: "var(--surface-1)",
             borderColor: "var(--border-subtle)",
@@ -308,32 +323,38 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Filter workspaces..."
+            placeholder="Filter or press ⌘K..."
             className="w-full bg-transparent text-[11.5px] focus:outline-none"
             style={{ color: "var(--fg)" }}
           />
-          {searchQuery && (
-            <button
-              onClick={() => setSearchQuery("")}
-              className="text-[10px] cursor-pointer"
-              style={{ color: "var(--fg-extra-muted)" }}
-            >
-              Esc
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onOpenCommandPalette}
+            className="rare-keycap cursor-pointer hover:brightness-110"
+            title="Open Command Palette (⌘K)"
+          >
+            ⌘K
+          </button>
         </div>
 
-        <div className="flex items-center justify-between px-1 pt-0.5">
+        {/* shadcn/beUI Segmented Pill Switcher */}
+        <div className="flex items-center justify-between px-0.5">
           <span
-            className="text-[10.5px] font-medium uppercase tracking-wider"
+            className="text-[10.5px] font-semibold uppercase tracking-wider"
             style={{ color: "var(--fg-extra-muted)" }}
           >
             Workspaces ({filteredSessions.length})
           </span>
-          <div className="flex items-center gap-1 text-[10.5px]">
+          <div
+            className="p-0.5 rounded-[6px] flex items-center gap-0.5 border"
+            style={{
+              backgroundColor: "var(--surface-0)",
+              borderColor: "var(--border-subtle)",
+            }}
+          >
             <button
               onClick={() => setGroupMode("project")}
-              className="px-1.5 py-0.5 rounded cursor-pointer transition-colors"
+              className="px-2 py-0.5 rounded-[4px] text-[10.5px] font-medium cursor-pointer transition-all"
               style={{
                 backgroundColor: groupMode === "project" ? "var(--surface-2)" : "transparent",
                 color: groupMode === "project" ? "var(--fg)" : "var(--fg-extra-muted)",
@@ -343,7 +364,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
             </button>
             <button
               onClick={() => setGroupMode("status")}
-              className="px-1.5 py-0.5 rounded cursor-pointer transition-colors"
+              className="px-2 py-0.5 rounded-[4px] text-[10.5px] font-medium cursor-pointer transition-all"
               style={{
                 backgroundColor: groupMode === "status" ? "var(--surface-2)" : "transparent",
                 color: groupMode === "status" ? "var(--fg)" : "var(--fg-extra-muted)",
@@ -355,6 +376,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
         </div>
       </div>
 
+      {/* Scrollable Workspace Tree */}
       <div className="flex-1 overflow-y-auto px-1.5 py-1 space-y-2">
         {groupMode === "project" ? (
           projectGroups.map(([repoName, items]) => {
@@ -405,11 +427,11 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
                   </button>
                 </div>
 
-                {!isCollapsed && (
-                  <div className="space-y-0.5">
+                <div className={`t-grid-collapse ${!isCollapsed ? "t-expanded" : ""}`}>
+                  <div className="t-grid-collapse-inner space-y-0.5">
                     {items.map((session, idx) => renderWorkspaceRow(session, idx))}
                   </div>
-                )}
+                </div>
               </div>
             );
           })
@@ -446,7 +468,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
             </p>
             <button
               onClick={onOpenNewWorkspaceModal}
-              className="px-2.5 py-1 rounded-[6px] text-[11.5px] font-medium cursor-pointer"
+              className="px-2.5 py-1 rounded-[6px] text-[11.5px] font-medium cursor-pointer rare-3d-button"
               style={{
                 backgroundColor: "var(--accent)",
                 color: "#ffffff",
@@ -458,6 +480,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
         )}
       </div>
 
+      {/* Bottom Footer Bar */}
       <div
         className="h-[38px] px-2.5 border-t flex items-center justify-between relative shrink-0"
         style={{ borderColor: "var(--border-subtle)" }}
@@ -501,9 +524,9 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
           <button
             onClick={() => setShowThemeMenu((v) => !v)}
             title="Switch Paseo Theme"
-            className="h-6 px-2 rounded-[5px] flex items-center gap-1 text-[11px] transition-colors cursor-pointer hover:bg-[var(--surface-2)]"
+            className="h-6 px-2 rounded-[5px] flex items-center gap-1 text-[11px] transition-colors cursor-pointer hover:bg-[var(--surface-2)] rare-specular-pill"
             style={{
-              backgroundColor: showThemeMenu ? "var(--surface-2)" : "transparent",
+              backgroundColor: showThemeMenu ? "var(--surface-2)" : "var(--surface-1)",
               color: "var(--fg-muted)",
             }}
           >
@@ -514,7 +537,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
 
         {showThemeMenu && (
           <div
-            className="absolute bottom-[44px] right-2 w-[196px] rounded-[8px] border p-1 shadow-2xl z-50"
+            className="absolute bottom-[44px] right-2 w-[204px] rounded-[9px] border p-1.5 z-50 rare-specular-surface t-modal-scale"
             style={{
               backgroundColor: "var(--surface-2)",
               borderColor: "var(--border-accent)",
@@ -536,7 +559,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
                     onSelectTheme(id);
                     setShowThemeMenu(false);
                   }}
-                  className="w-full px-2 py-1.5 rounded-[5px] flex items-center justify-between text-left text-[11.5px] transition-colors cursor-pointer hover:bg-[var(--surface-1)]"
+                  className="w-full px-2 py-1.5 rounded-[6px] flex items-center justify-between text-left text-[11.5px] transition-colors cursor-pointer hover:bg-[var(--surface-1)]"
                   style={{
                     backgroundColor: active ? "var(--surface-1)" : "transparent",
                     color: active ? "var(--fg)" : "var(--fg-muted)",
