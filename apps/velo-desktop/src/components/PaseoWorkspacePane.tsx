@@ -186,7 +186,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
   return (
     <section
       onClick={onFocusPane}
-      className="flex-1 min-w-0 h-full flex flex-col overflow-hidden velo-island velo-stage-aurora"
+      className="flex-1 min-w-0 h-full flex flex-col overflow-hidden velo-bento-card velo-stage-aurora"
     >
       {/* 1. Top Segmented Mode Bar (beUI Morphing Dock + shadcn Tabs) */}
       <header
