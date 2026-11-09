@@ -1,29 +1,116 @@
 @import "tailwindcss";
 
-@layer base {
-  :root {
-    color-scheme: dark;
-  }
+:root {
+  --surface-sidebar: #141716;
+  --surface-0: #181B1A;
+  --surface-1: #1E2120;
+  --surface-2: #272A29;
+  --surface-3: #434645;
+  --surface-4: #606463;
+  --fg: #fafafa;
+  --fg-muted: #A1A5A4;
+  --fg-extra-muted: #717574;
+  --border-subtle: #252B2A;
+  --border-accent: #2F3534;
+  --accent: #20744A;
+  --accent-bright: #7ccba0;
+  --destructive: #c64f43;
+  --status-success: #6cb17b;
+  --status-danger: #d8847b;
+  --status-warning: #c09664;
+  --status-merged: #a890d5;
+  --dot-success: #35c264;
+  --dot-danger: #f7796d;
+  --dot-warning: #db932e;
+  --dot-running: #5caaf6;
 
-  body {
-    background-color: #09090b;
-    color: #f4f4f5;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
-    -webkit-font-smoothing: antialiased;
-  }
+  --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Geist Mono", Menlo, Monaco, Consolas, monospace;
+}
 
-  ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+* {
+  box-sizing: border-box;
+  border-color: var(--border-subtle);
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--surface-0);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: none;
+}
+
+.selectable-text {
+  user-select: text;
+}
+
+.font-mono-code {
+  font-family: var(--font-mono);
+  font-feature-settings: "liga" 1, "calt" 1;
+}
+
+/* Paseo ultra-thin custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(161, 165, 164, 0.16);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(161, 165, 164, 0.32);
+}
+
+/* Paseo StatusRing animation for active/running workspaces */
+@keyframes paseo-spin {
+  0% {
+    transform: rotate(0deg);
   }
-  ::-webkit-scrollbar-track {
-    background: transparent;
+  100% {
+    transform: rotate(360deg);
   }
-  ::-webkit-scrollbar-thumb {
-    background: rgba(113, 113, 122, 0.28);
-    border-radius: 9999px;
-  }
-  ::-webkit-scrollbar-thumb:hover {
-    background: rgba(161, 161, 170, 0.48);
-  }
+}
+
+.paseo-status-ring {
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
+  border: 1.75px solid rgba(92, 170, 246, 0.25);
+  border-top-color: var(--dot-running);
+  animation: paseo-spin 0.9s linear infinite;
+}
+
+/* Paseo IndentRail for nested tool calls & turn traces */
+.paseo-indent-rail {
+  position: relative;
+  padding-left: 14px;
+}
+
+.paseo-indent-rail::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 2px;
+  bottom: 2px;
+  width: 1.5px;
+  background-color: var(--border-accent);
+  border-radius: 1px;
 }

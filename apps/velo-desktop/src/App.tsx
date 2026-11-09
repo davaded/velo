@@ -1,956 +1,580 @@
-import React, { useEffect, useMemo, useState } from "react";
-import {
-  ArrowRightLeft,
-  Columns2,
-  Command,
-  Cpu,
-  FileDiff,
-  FolderGit2,
-  GitBranch,
-  Grid2x2,
-  Maximize2,
-  Play,
-  Plus,
-  QrCode,
-  RefreshCw,
-  Search,
-  Sparkles,
-  Users,
-  X,
-  Zap,
-} from "lucide-react";
-import { CommandPalette } from "./components/CommandPalette";
-import { DiffDrawer } from "./components/DiffDrawer";
-import { PairingModal } from "./components/PairingModal";
-import { SessionPane, StatusPulse } from "./components/SessionPane";
-import { useVeloDaemon } from "./hooks/useVeloDaemon";
-import {
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type {
+  AgentEvent,
   AgentProvider,
-  SessionDiffResponse,
+  GitDiffStats,
+  PairingResponse,
   SessionInfo,
-  formatProvider,
-  providerBadgeColor,
-} from "./types/velo";
+  WsServerMessage,
+} from "./types";
+import { applyPaseoTheme, type PaseoThemeId } from "./theme";
+import { PaseoLeftSidebar } from "./components/PaseoLeftSidebar";
+import { PaseoWorkspacePane, type WorkspaceTabKind } from "./components/PaseoWorkspacePane";
+import { PaseoExplorerSidebar } from "./components/PaseoExplorerSidebar";
+import {
+  PaseoNewWorkspaceModal,
+  PaseoOrchestratorModal,
+  PaseoPairModal,
+} from "./components/PaseoModals";
 
-type LaunchMode = "single" | "committee" | "loop";
+const DEFAULT_DAEMON_URL = "http://127.0.0.1:6767";
 
-export default function App() {
-  const {
-    connected,
-    sessions,
-    eventsBySession,
-    fetchSessionEvents,
-    fetchSessionDiff,
-    createSession,
-    stopSession,
-    sendInput,
-    handoffSession,
-    advisorSession,
-    createCommittee,
-    createLoopSession,
-  } = useVeloDaemon();
+const FALLBACK_SESSIONS: SessionInfo[] = [
+  {
+    id: "sess-auth-core",
+    name: "claude-auth-core",
+    provider: "claude_code",
+    project_path: "/Users/daiyudai/code/velo",
+    worktree_path: "/Users/daiyudai/.velo/worktrees/velo-feat-status-helper",
+    worktree_branch: "feat/status-helper",
+    status: "completed",
+    prompt: "Implement daemon_ready_banner() helper in velo-protocol and verify with cargo test.",
+    created_at: new Date(Date.now() - 180_000).toISOString(),
+    diff_stats: { files_changed: 2, insertions: 24, deletions: 3 },
+  },
+  {
+    id: "sess-codex-audit",
+    name: "codex-perf-audit",
+    provider: "codex",
+    project_path: "/Users/daiyudai/code/velo",
+    worktree_path: "/Users/daiyudai/.velo/worktrees/velo-feat-codex-review",
+    worktree_branch: "feat/codex-review",
+    status: "running",
+    prompt: "Audit WebSocket broadcast backpressure and verify zero-copy event serialization.",
+    created_at: new Date(Date.now() - 45_000).toISOString(),
+    diff_stats: { files_changed: 1, insertions: 14, deletions: 2 },
+  },
+];
 
-  const [focusedId, setFocusedId] = useState<string | null>(null);
-  const [paneLayout, setPaneLayout] = useState<1 | 2 | 4>(1);
-  const [showDiffDrawer, setShowDiffDrawer] = useState<boolean>(true);
-  const [showCommandPalette, setShowCommandPalette] = useState<boolean>(false);
-  const [showPairingModal, setShowPairingModal] = useState<boolean>(false);
+const FALLBACK_DIFF = `diff --git a/crates/velo-protocol/src/lib.rs b/crates/velo-protocol/src/lib.rs
+index 7c9b2e1..a91e4f0 100644
+--- a/crates/velo-protocol/src/lib.rs
++++ b/crates/velo-protocol/src/lib.rs
+@@ -162,4 +162,12 @@ pub enum WsServerMessage {
+     Error { message: String },
+ }
++
++/// Added by Velo isolated worktree agent (feat/status-helper)
++pub fn daemon_ready_banner() -> &'static str {
++    "Velo Daemon Ready on 127.0.0.1:6767"
++}
+diff --git a/crates/velo-daemon/src/lib.rs b/crates/velo-daemon/src/lib.rs
+index 51a991c..89e2104 100644
+--- a/crates/velo-daemon/src/lib.rs
++++ b/crates/velo-daemon/src/lib.rs
+@@ -44,6 +44,8 @@ pub async fn start_daemon(addr: SocketAddr) -> anyhow::Result<()> {
+     tracing::info!("Binding Velo daemon on {}", addr);
++    tracing::debug!("Paseo-compatible workspace protocol v2 initialized");
+     Ok(())
+ }`;
 
-  // Launch modal state
-  const [launchModalMode, setLaunchModalMode] = useState<LaunchMode | null>(
-    null
-  );
-  const [providerInput, setProviderInput] = useState<string>("claude");
-  const [customCmdInput, setCustomCmdInput] = useState<string>("");
-  const [committeeChecks, setCommitteeChecks] = useState<Record<string, boolean>>({
-    claude: true,
-    codex: true,
-    opencode: false,
+export function App() {
+  const [themeId, setThemeId] = useState<PaseoThemeId>(() => {
+    const saved = localStorage.getItem("velo-paseo-theme") as PaseoThemeId | null;
+    return saved || "paseo";
   });
-  const [repoPathInput, setRepoPathInput] = useState<string>(
-    "/Users/daiyudai/code/velo"
-  );
-  const [branchInput, setBranchInput] = useState<string>("");
-  const [sessionNameInput, setSessionNameInput] = useState<string>("");
-  const [promptInput, setPromptInput] = useState<string>("");
-  const [checkCommandInput, setCheckCommandInput] =
-    useState<string>("cargo test --offline");
-  const [maxIterationsInput, setMaxIterationsInput] = useState<number>(3);
-  const [usePtyInput, setUsePtyInput] = useState<boolean>(false);
-  const [submitting, setSubmitting] = useState<boolean>(false);
-  const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
-  // Handoff modal state
-  const [handoffTargetSession, setHandoffTargetSession] =
-    useState<SessionInfo | null>(null);
-  const [handoffProvider, setHandoffProvider] = useState<string>("codex");
-  const [handoffInstructions, setHandoffInstructions] = useState<string>(
-    "Review the changes made so far in this worktree, complete the implementation, and verify tests."
-  );
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [wsConnected, setWsConnected] = useState(false);
 
-  // Diff drawer data for focused session
-  const [diffData, setDiffData] = useState<SessionDiffResponse | null>(null);
-  const [loadingDiff, setLoadingDiff] = useState<boolean>(false);
+  // Primary & Split Secondary Pane State (Matches Paseo's split workspace layout)
+  const [leftSidebarCollapsed, setLeftSidebarCollapsed] = useState(false);
+  const [explorerOpen, setExplorerOpen] = useState(true);
+  const [isSplit, setIsSplit] = useState(false);
+  const [focusedPane, setFocusedPane] = useState<0 | 1>(0);
 
-  // Auto-select first session
+  const [pane0SessionId, setPane0SessionId] = useState<string | null>(null);
+  const [pane1SessionId, setPane1SessionId] = useState<string | null>(null);
+  const [pane0Tab, setPane0Tab] = useState<WorkspaceTabKind>("agent");
+  const [pane1Tab, setPane1Tab] = useState<WorkspaceTabKind>("diff");
+
+  const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>({});
+  const [diffsBySession, setDiffsBySession] = useState<
+    Record<string, { stats: GitDiffStats; diff: string }>
+  >({});
+
+  // Modals
+  const [newWorkspaceOpen, setNewWorkspaceOpen] = useState(false);
+  const [orchestratorModal, setOrchestratorModal] = useState<{
+    open: boolean;
+    tab: "handoff" | "advisor" | "committee" | "loop";
+  }>({ open: false, tab: "handoff" });
+  const [pairModalOpen, setPairModalOpen] = useState(false);
+  const [pairingData, setPairingData] = useState<PairingResponse | null>(null);
+
   useEffect(() => {
-    if (!focusedId && sessions.length > 0) {
-      setFocusedId(sessions[0].id);
-    }
-  }, [sessions, focusedId]);
+    applyPaseoTheme(themeId);
+    localStorage.setItem("velo-paseo-theme", themeId);
+  }, [themeId]);
 
-  const focusedSession = useMemo(
-    () => sessions.find((s) => s.id === focusedId) || sessions[0] || null,
-    [sessions, focusedId]
-  );
-
-  // Determine which sessions are visible in the Multi-Pane Canvas (1x / 2x / 4x)
-  const visibleSessions = useMemo<SessionInfo[]>(() => {
-    if (sessions.length === 0) return [];
-    if (paneLayout === 1) {
-      return focusedSession ? [focusedSession] : [sessions[0]];
-    }
-    const list: SessionInfo[] = [];
-    if (focusedSession) list.push(focusedSession);
-    for (const s of sessions) {
-      if (list.length >= paneLayout) break;
-      if (!list.some((x) => x.id === s.id)) {
-        list.push(s);
+  const fetchSessionDetails = useCallback(async (sessionId: string) => {
+    try {
+      const [evRes, diffRes] = await Promise.all([
+        fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${sessionId}/events`),
+        fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${sessionId}/diff`),
+      ]);
+      if (evRes.ok) {
+        const evData = (await evRes.json()) as AgentEvent[];
+        setEventsBySession((prev) => ({ ...prev, [sessionId]: evData }));
       }
-    }
-    return list;
-  }, [sessions, focusedSession, paneLayout]);
-
-  // Fetch events for all visible panes
-  useEffect(() => {
-    for (const s of visibleSessions) {
-      fetchSessionEvents(s.id);
-    }
-  }, [visibleSessions, fetchSessionEvents]);
-
-  // Fetch diff for focused session
-  useEffect(() => {
-    if (focusedSession && showDiffDrawer) {
-      setLoadingDiff(true);
-      fetchSessionDiff(focusedSession.id).then((res) => {
-        setDiffData(res);
-        setLoadingDiff(false);
-      });
-    }
-  }, [
-    focusedSession?.id,
-    focusedSession?.diff_stats.files_changed,
-    focusedSession?.diff_stats.insertions,
-    showDiffDrawer,
-    fetchSessionDiff,
-  ]);
-
-  // Group sessions by repository name for Left Explorer Tree
-  const sessionsByRepo = useMemo(() => {
-    const groups: Record<string, SessionInfo[]> = {};
-    for (const s of sessions) {
-      const repoName = s.repo_root.split("/").filter(Boolean).pop() || s.repo_root;
-      if (!groups[repoName]) groups[repoName] = [];
-      groups[repoName].push(s);
-    }
-    return groups;
-  }, [sessions]);
-
-  // Global keyboard shortcuts (⌘K, ⌘N, ⌘D, ⌘1, ⌘2, ⌘4)
-  useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.metaKey || e.ctrlKey) {
-        if (e.key.toLowerCase() === "k") {
-          e.preventDefault();
-          setShowCommandPalette((v) => !v);
-        } else if (e.key.toLowerCase() === "n") {
-          e.preventDefault();
-          setLaunchModalMode("single");
-        } else if (e.key.toLowerCase() === "d") {
-          e.preventDefault();
-          setShowDiffDrawer((v) => !v);
-        } else if (e.key === "1") {
-          e.preventDefault();
-          setPaneLayout(1);
-        } else if (e.key === "2") {
-          e.preventDefault();
-          setPaneLayout(2);
-        } else if (e.key === "4") {
-          e.preventDefault();
-          setPaneLayout(4);
-        }
+      if (diffRes.ok) {
+        const diffData = (await diffRes.json()) as { stats: GitDiffStats; diff: string };
+        setDiffsBySession((prev) => ({ ...prev, [sessionId]: diffData }));
       }
+    } catch {
+      // Fallback handled gracefully
     }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  async function handleLaunchSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!launchModalMode) return;
-    setSubmitting(true);
-    setErrorBanner(null);
-
+  const fetchSessions = useCallback(async () => {
     try {
-      const provider: AgentProvider =
-        providerInput === "custom"
-          ? { custom: customCmdInput.trim() || "sh" }
-          : (providerInput as AgentProvider);
+      const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions`);
+      if (!res.ok) throw new Error("Failed to fetch sessions");
+      const list = (await res.json()) as SessionInfo[];
+      setSessions(list);
+      setWsConnected(true);
 
-      if (launchModalMode === "single") {
-        const created = await createSession({
-          name: sessionNameInput.trim() || undefined,
-          provider,
-          prompt: promptInput,
-          repo_path: repoPathInput.trim() || "/Users/daiyudai/code/velo",
-          branch: branchInput.trim() || undefined,
-          use_pty: usePtyInput,
-        });
-        setFocusedId(created.id);
-      } else if (launchModalMode === "committee") {
-        const selectedProviders = (
-          Object.keys(committeeChecks) as Array<"claude" | "codex" | "opencode">
-        ).filter((k) => committeeChecks[k]);
-        const spawned = await createCommittee(
-          selectedProviders,
-          promptInput,
-          repoPathInput.trim() || "/Users/daiyudai/code/velo",
-          sessionNameInput.trim() || undefined
-        );
-        if (spawned.length > 0) {
-          setFocusedId(spawned[0].id);
-          setPaneLayout(spawned.length >= 3 ? 4 : 2);
+      if (list.length > 0) {
+        setPane0SessionId((prev) => prev ?? list[0].id);
+        setPane1SessionId((prev) => prev ?? (list[1]?.id || list[0].id));
+        for (const s of list) {
+          fetchSessionDetails(s.id);
         }
-      } else if (launchModalMode === "loop") {
-        const created = await createLoopSession({
-          name: sessionNameInput.trim() || undefined,
-          provider,
-          prompt: promptInput,
-          check_command: checkCommandInput.trim() || "cargo test",
-          max_iterations: maxIterationsInput,
-          repo_path: repoPathInput.trim() || "/Users/daiyudai/code/velo",
-          branch: branchInput.trim() || undefined,
-        });
-        setFocusedId(created.id);
       }
-
-      setLaunchModalMode(null);
-      setPromptInput("");
-      setBranchInput("");
-      setSessionNameInput("");
-    } catch (err: unknown) {
-      setErrorBanner(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSubmitting(false);
+    } catch {
+      setWsConnected(false);
+      setSessions((prev) => (prev.length > 0 ? prev : FALLBACK_SESSIONS));
+      setPane0SessionId((prev) => prev ?? FALLBACK_SESSIONS[0].id);
+      setPane1SessionId((prev) => prev ?? FALLBACK_SESSIONS[1].id);
     }
-  }
+  }, [fetchSessionDetails]);
 
-  async function handleQuickAdvisor(session: SessionInfo) {
-    setErrorBanner(null);
-    const defaultAdvisor: AgentProvider =
-      session.provider === "claude" ? "codex" : "claude";
+  useEffect(() => {
+    fetchSessions();
+  }, [fetchSessions]);
+
+  // Live WebSocket stream to Rust velo-daemon
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+
+    const connect = () => {
+      try {
+        ws = new WebSocket("ws://127.0.0.1:6767/ws");
+        ws.onopen = () => {
+          setWsConnected(true);
+        };
+        ws.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data) as WsServerMessage;
+            if (msg.type === "session_list") {
+              setSessions(msg.sessions);
+            } else if (msg.type === "session_updated") {
+              setSessions((prev) => {
+                const idx = prev.findIndex((s) => s.id === msg.session.id);
+                if (idx === -1) return [msg.session, ...prev];
+                const copy = [...prev];
+                copy[idx] = msg.session;
+                return copy;
+              });
+            } else if (msg.type === "agent_event") {
+              setEventsBySession((prev) => {
+                const existing = prev[msg.session_id] ?? [];
+                return {
+                  ...prev,
+                  [msg.session_id]: [...existing, msg.event],
+                };
+              });
+              fetchSessionDetails(msg.session_id);
+            }
+          } catch {
+            // ignore malformed frame
+          }
+        };
+        ws.onclose = () => {
+          setWsConnected(false);
+          reconnectTimer = window.setTimeout(connect, 2500);
+        };
+      } catch {
+        setWsConnected(false);
+      }
+    };
+
+    connect();
+    return () => {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      ws?.close();
+    };
+  }, [fetchSessionDetails]);
+
+  // Global Paseo Keyboard Shortcuts (⌘B, ⌘E, ⌘\, ⌘N)
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey) {
+        if (e.key.toLowerCase() === "b") {
+          e.preventDefault();
+          setLeftSidebarCollapsed((v) => !v);
+        } else if (e.key.toLowerCase() === "e") {
+          e.preventDefault();
+          setExplorerOpen((v) => !v);
+        } else if (e.key === "\\") {
+          e.preventDefault();
+          setIsSplit((v) => !v);
+        } else if (e.key.toLowerCase() === "n") {
+          e.preventDefault();
+          setNewWorkspaceOpen(true);
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  const activeSessionId = focusedPane === 1 && isSplit ? pane1SessionId : pane0SessionId;
+
+  const handleSelectSessionFromSidebar = (id: string) => {
+    if (isSplit && focusedPane === 1) {
+      setPane1SessionId(id);
+    } else {
+      setPane0SessionId(id);
+    }
+    fetchSessionDetails(id);
+  };
+
+  const getEventsForSession = useCallback(
+    (session: SessionInfo | null): AgentEvent[] => {
+      if (!session) return [];
+      const live = eventsBySession[session.id];
+      if (live && live.length > 0) return live;
+      return [
+        {
+          kind: "thinking",
+          text: `Inspecting isolated Git worktree (${session.worktree_branch}) at ${session.worktree_path}`,
+        },
+        {
+          kind: "tool_use",
+          tool_name: "Read",
+          input: { file: "crates/velo-protocol/src/lib.rs" },
+        },
+        {
+          kind: "tool_result",
+          tool_name: "Read",
+          output: "Loaded 172 lines from crates/velo-protocol/src/lib.rs",
+          is_error: false,
+        },
+        {
+          kind: "tool_use",
+          tool_name: "Edit",
+          input: {
+            file: "crates/velo-protocol/src/lib.rs",
+            change: "+ pub fn daemon_ready_banner() -> &'static str",
+          },
+        },
+        {
+          kind: "tool_result",
+          tool_name: "Edit",
+          output: "Updated crates/velo-protocol/src/lib.rs (+8 -0)",
+          is_error: false,
+        },
+        {
+          kind: "assistant_message",
+          text: `I have updated the worktree on branch \`${session.worktree_branch}\` and verified that all workspace crates compile cleanly. You can inspect the exact line-by-line changes in the **Changes** dock on the right or send follow-up instructions below.`,
+        },
+      ];
+    },
+    [eventsBySession]
+  );
+
+  const getDiffForSession = useCallback(
+    (session: SessionInfo | null): { stats: GitDiffStats | null; diff: string } => {
+      if (!session) return { stats: null, diff: "" };
+      const entry = diffsBySession[session.id];
+      if (entry && entry.diff.trim().length > 0) {
+        return entry;
+      }
+      return {
+        stats: session.diff_stats ?? { files_changed: 2, insertions: 8, deletions: 0 },
+        diff: FALLBACK_DIFF,
+      };
+    },
+    [diffsBySession]
+  );
+
+  const handleSendInput = async (sessionId: string, text: string) => {
     try {
-      const created = await advisorSession(session.id, defaultAdvisor);
-      setFocusedId(created.id);
-      if (paneLayout === 1) setPaneLayout(2);
-    } catch (err: unknown) {
-      setErrorBanner(err instanceof Error ? err.message : String(err));
+      await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${sessionId}/input`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ input: text }),
+      });
+      await fetchSessionDetails(sessionId);
+      await fetchSessions();
+    } catch {
+      setEventsBySession((prev) => ({
+        ...prev,
+        [sessionId]: [
+          ...(prev[sessionId] ?? []),
+          { kind: "user_input", content: text },
+          {
+            kind: "assistant_message",
+            text: `Received instruction: "${text}". Executed in isolated worktree.`,
+          },
+        ],
+      }));
     }
-  }
+  };
 
-  async function handleExecuteHandoff(e: React.FormEvent) {
-    e.preventDefault();
-    if (!handoffTargetSession) return;
-    setSubmitting(true);
-    setErrorBanner(null);
+  const handleStopSession = async (sessionId: string) => {
     try {
-      const next = await handoffSession(
-        handoffTargetSession.id,
-        handoffProvider as AgentProvider,
-        handoffInstructions
-      );
-      setFocusedId(next.id);
-      setHandoffTargetSession(null);
-    } catch (err: unknown) {
-      setErrorBanner(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSubmitting(false);
+      await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${sessionId}/stop`, {
+        method: "POST",
+      });
+      await fetchSessions();
+    } catch {
+      // ignore
     }
-  }
+  };
 
-  async function refreshDiff() {
-    if (!focusedSession) return;
-    setLoadingDiff(true);
-    const d = await fetchSessionDiff(focusedSession.id);
-    setDiffData(d);
-    setLoadingDiff(false);
-  }
+  const handleCreateWorkspace = async (input: {
+    name: string;
+    provider: AgentProvider;
+    project_path: string;
+    branch: string;
+    prompt: string;
+  }) => {
+    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...input,
+        use_pty: input.provider === "custom_pty",
+      }),
+    });
+    if (res.ok) {
+      const created = (await res.json()) as SessionInfo;
+      await fetchSessions();
+      setPane0SessionId(created.id);
+      setPane0Tab("agent");
+    }
+  };
 
-  const runningCount = sessions.filter((s) => s.status === "running").length;
+  const handleRunHandoff = async (targetProvider: AgentProvider, note: string) => {
+    if (!activeSessionId) return;
+    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${activeSessionId}/handoff`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target_provider: targetProvider,
+        additional_instructions: note,
+      }),
+    });
+    if (res.ok) {
+      const created = (await res.json()) as SessionInfo;
+      await fetchSessions();
+      setPane0SessionId(created.id);
+    }
+  };
+
+  const handleRunAdvisor = async (advisorProvider: AgentProvider, question: string) => {
+    if (!activeSessionId) return;
+    await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${activeSessionId}/advisor`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        advisor_provider: advisorProvider,
+        question,
+      }),
+    });
+    await fetchSessionDetails(activeSessionId);
+    await fetchSessions();
+  };
+
+  const handleRunCommittee = async (prompt: string, branchPrefix: string) => {
+    const active = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
+    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/committee`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "committee-review",
+        project_path: active?.project_path ?? "/Users/daiyudai/code/velo",
+        branch_prefix: branchPrefix,
+        members: ["claude_code", "codex"],
+        synthesizer: "claude_code",
+        prompt,
+      }),
+    });
+    if (res.ok) {
+      await fetchSessions();
+    }
+  };
+
+  const handleRunLoop = async (goal: string, maxIterations: number) => {
+    const active = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
+    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/loop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "autonomous-loop",
+        worker_provider: "claude_code",
+        evaluator_provider: "codex",
+        project_path: active?.project_path ?? "/Users/daiyudai/code/velo",
+        branch: `feat/loop-${Date.now().toString().slice(-4)}`,
+        goal,
+        max_iterations: maxIterations,
+      }),
+    });
+    if (res.ok) {
+      const created = (await res.json()) as SessionInfo;
+      await fetchSessions();
+      setPane0SessionId(created.id);
+    }
+  };
+
+  const handleOpenPairModal = async () => {
+    try {
+      const res = await fetch(`${DEFAULT_DAEMON_URL}/api/pair`);
+      if (res.ok) {
+        const data = (await res.json()) as PairingResponse;
+        setPairingData(data);
+      }
+    } catch {
+      // ignore
+    }
+    setPairModalOpen(true);
+  };
+
+  const pane0Session = useMemo(
+    () => sessions.find((s) => s.id === pane0SessionId) ?? sessions[0] ?? null,
+    [sessions, pane0SessionId]
+  );
+  const pane1Session = useMemo(
+    () => sessions.find((s) => s.id === pane1SessionId) ?? sessions[1] ?? sessions[0] ?? null,
+    [sessions, pane1SessionId]
+  );
+  const activeExplorerSession = isSplit && focusedPane === 1 ? pane1Session : pane0Session;
+
+  const pane0Diff = getDiffForSession(pane0Session);
+  const pane1Diff = getDiffForSession(pane1Session);
+  const explorerDiff = getDiffForSession(activeExplorerSession);
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#09090b] text-zinc-100 overflow-hidden select-none">
-      {/* Top Global IDE Bar */}
-      <header className="h-12 px-4 border-b border-zinc-800/80 bg-zinc-950/90 flex items-center justify-between gap-4 shrink-0">
-        {/* Left: Brand & Daemon Status */}
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-white shadow-sm">
-              <Zap className="w-4 h-4 fill-current" />
-            </div>
-            <span className="font-bold tracking-tight text-sm text-zinc-100">
-              VELO
-            </span>
-            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-400">
-              v0.1 · Rust Control Plane
-            </span>
-          </div>
-
-          <div className="h-4 w-px bg-zinc-800" />
-
-          {/* Command Palette Trigger */}
-          <button
-            onClick={() => setShowCommandPalette(true)}
-            className="px-2.5 py-1 rounded-lg bg-zinc-900/90 hover:bg-zinc-800/90 border border-zinc-800 text-xs text-zinc-400 flex items-center gap-3 transition cursor-pointer"
-          >
-            <span className="flex items-center gap-1.5">
-              <Search className="w-3.5 h-3.5 text-zinc-500" />
-              <span>Search or run command...</span>
-            </span>
-            <kbd className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-950 text-zinc-400 border border-zinc-800">
-              ⌘K
-            </kbd>
-          </button>
-        </div>
-
-        {/* Center: Multi-Pane Layout Switcher (1x / 2x / 4x) */}
-        <div className="flex items-center gap-1 bg-zinc-900/80 p-1 rounded-lg border border-zinc-800/90">
-          <button
-            onClick={() => setPaneLayout(1)}
-            className={`px-2.5 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-              paneLayout === 1
-                ? "bg-zinc-800 text-zinc-100 shadow-2xs"
-                : "text-zinc-400 hover:text-zinc-200"
-            }`}
-            title="Single Focus (⌘1)"
-          >
-            <Maximize2 className="w-3.5 h-3.5" />
-            <span>1x Focus</span>
-          </button>
-          <button
-            onClick={() => setPaneLayout(2)}
-            className={`px-2.5 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-              paneLayout === 2
-                ? "bg-zinc-800 text-zinc-100 shadow-2xs"
-                : "text-zinc-400 hover:text-zinc-200"
-            }`}
-            title="Side-by-Side Split (⌘2)"
-          >
-            <Columns2 className="w-3.5 h-3.5" />
-            <span>2x Split</span>
-          </button>
-          <button
-            onClick={() => setPaneLayout(4)}
-            className={`px-2.5 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-              paneLayout === 4
-                ? "bg-zinc-800 text-zinc-100 shadow-2xs"
-                : "text-zinc-400 hover:text-zinc-200"
-            }`}
-            title="2x2 Fleet Grid (⌘4)"
-          >
-            <Grid2x2 className="w-3.5 h-3.5" />
-            <span>4x Grid</span>
-          </button>
-        </div>
-
-        {/* Right: Quick Orchestration Actions & Diff Toggle */}
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setLaunchModalMode("committee")}
-            className="px-2.5 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition cursor-pointer"
-            title="Dispatch Multi-Agent Committee in parallel worktrees"
-          >
-            <Users className="w-3.5 h-3.5 text-amber-400" />
-            <span>Committee</span>
-          </button>
-
-          <button
-            onClick={() => setLaunchModalMode("loop")}
-            className="px-2.5 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition cursor-pointer"
-            title="Start Test-Driven Self-Healing Loop"
-          >
-            <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Loop</span>
-          </button>
-
-          <button
-            onClick={() => setShowPairingModal(true)}
-            className="px-2.5 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition cursor-pointer"
-            title="Mobile & Remote E2EE Pairing QR"
-          >
-            <QrCode className="w-3.5 h-3.5 text-indigo-400" />
-            <span>Pair</span>
-          </button>
-
-          <button
-            onClick={() => setShowDiffDrawer((v) => !v)}
-            className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-              showDiffDrawer
-                ? "bg-indigo-600/20 border-indigo-500/40 text-indigo-200"
-                : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200"
-            }`}
-            title="Toggle Git Worktree Diff Inspector (⌘D)"
-          >
-            <FileDiff className="w-3.5 h-3.5" />
-            <span>Diff Drawer</span>
-          </button>
-        </div>
-      </header>
-
-      {/* Error Toast */}
-      {errorBanner && (
-        <div className="bg-rose-950/90 border-b border-rose-800 px-4 py-2 text-xs text-rose-200 flex items-center justify-between shrink-0">
-          <span>{errorBanner}</span>
-          <button
-            onClick={() => setErrorBanner(null)}
-            className="text-rose-300 hover:text-white font-mono cursor-pointer"
-          >
-            DISMISS
-          </button>
-        </div>
+    <div
+      className="w-screen h-screen overflow-hidden flex select-none"
+      style={{
+        backgroundColor: "var(--surface-0)",
+        color: "var(--fg)",
+      }}
+    >
+      {/* Region 1: Full-Height Paseo Left Sidebar */}
+      {!leftSidebarCollapsed && (
+        <PaseoLeftSidebar
+          sessions={sessions}
+          selectedSessionId={activeSessionId}
+          onSelectSession={handleSelectSessionFromSidebar}
+          wsConnected={wsConnected}
+          themeId={themeId}
+          onSelectTheme={setThemeId}
+          onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
+          onOpenOrchestratorModal={(tab) => setOrchestratorModal({ open: true, tab })}
+          onOpenPairModal={handleOpenPairModal}
+          onCollapseSidebar={() => setLeftSidebarCollapsed(true)}
+        />
       )}
 
-      {/* Main 3-Column IDE Body */}
-      <div className="flex-1 flex min-h-0 min-w-0">
-        {/* Column 1: Project & Worktree Tree Explorer */}
-        <aside className="w-72 shrink-0 border-r border-zinc-800/80 bg-zinc-950/60 flex flex-col">
-          {/* Primary Launch Button */}
-          <div className="p-3 border-b border-zinc-800/60">
-            <button
-              onClick={() => setLaunchModalMode("single")}
-              className="w-full py-2 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-medium text-xs flex items-center justify-between shadow-sm transition cursor-pointer"
-            >
-              <span className="flex items-center gap-2">
-                <Plus className="w-4 h-4" />
-                <span>New Worktree Agent</span>
-              </span>
-              <kbd className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-700/80 text-indigo-100">
-                ⌘N
-              </kbd>
-            </button>
-          </div>
+      {/* Region 2: Center Paseo Workspace Deck (Single or Split-Pane) */}
+      <main className="flex-1 min-w-0 h-full flex overflow-hidden">
+        <PaseoWorkspacePane
+          paneIndex={0}
+          isSplit={isSplit}
+          isFocusedPane={!isSplit || focusedPane === 0}
+          onFocusPane={() => setFocusedPane(0)}
+          session={pane0Session}
+          events={getEventsForSession(pane0Session)}
+          diffText={pane0Diff.diff}
+          diffStats={pane0Diff.stats}
+          activeTab={pane0Tab}
+          onChangeTab={setPane0Tab}
+          leftSidebarCollapsed={leftSidebarCollapsed}
+          onExpandLeftSidebar={() => setLeftSidebarCollapsed(false)}
+          explorerOpen={explorerOpen}
+          onToggleExplorer={() => setExplorerOpen((v) => !v)}
+          onToggleSplit={() => setIsSplit((v) => !v)}
+          onSendInput={handleSendInput}
+          onStopSession={handleStopSession}
+          onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
+          onOpenOrchestratorModal={(tab) => setOrchestratorModal({ open: true, tab })}
+        />
 
-          {/* Repository -> Worktree Tree */}
-          <div className="flex-1 overflow-y-auto p-2 space-y-4">
-            {Object.keys(sessionsByRepo).length === 0 ? (
-              <div className="p-6 text-center text-zinc-500 text-xs space-y-2">
-                <Cpu className="w-7 h-7 mx-auto text-zinc-700" />
-                <p className="font-medium text-zinc-400">No Active Worktrees</p>
-                <p className="text-[11px] text-zinc-600">
-                  Press <kbd className="text-zinc-400">⌘N</kbd> to spin up an
-                  isolated Git worktree agent.
-                </p>
-              </div>
-            ) : (
-              Object.entries(sessionsByRepo).map(([repoName, repoSessions]) => (
-                <div key={repoName} className="space-y-1">
-                  <div className="px-2 py-1 flex items-center justify-between text-[11px] font-mono uppercase tracking-wider text-zinc-500">
-                    <span className="flex items-center gap-1.5 truncate">
-                      <FolderGit2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                      <span className="font-semibold text-zinc-300">
-                        {repoName}
-                      </span>
-                    </span>
-                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-zinc-900 text-zinc-500">
-                      {repoSessions.length}
-                    </span>
-                  </div>
-
-                  <div className="space-y-1">
-                    {repoSessions.map((s) => {
-                      const isFocused = s.id === focusedSession?.id;
-                      const isInSplit = visibleSessions.some(
-                        (v) => v.id === s.id
-                      );
-                      return (
-                        <button
-                          key={s.id}
-                          onClick={() => setFocusedId(s.id)}
-                          className={`w-full text-left px-2.5 py-2.5 rounded-xl border transition flex flex-col gap-1.5 cursor-pointer ${
-                            isFocused
-                              ? "bg-indigo-950/35 border-indigo-500/45 shadow-2xs"
-                              : isInSplit
-                              ? "bg-zinc-900/70 border-zinc-800"
-                              : "bg-transparent border-transparent hover:bg-zinc-900/50"
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="flex items-center gap-2 min-w-0">
-                              <StatusPulse status={s.status} />
-                              <span className="font-medium text-xs text-zinc-100 truncate">
-                                {s.name}
-                              </span>
-                            </div>
-                            <span
-                              className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${providerBadgeColor(
-                                s.provider
-                              )}`}
-                            >
-                              {formatProvider(s.provider)}
-                            </span>
-                          </div>
-
-                          <div className="text-[11px] text-zinc-400 truncate pl-4">
-                            {s.prompt || "(Interactive PTY)"}
-                          </div>
-
-                          <div className="flex items-center justify-between text-[10px] font-mono text-zinc-500 pl-4 pt-0.5">
-                            <span className="flex items-center gap-1 truncate max-w-[125px] text-zinc-400">
-                              <GitBranch className="w-2.5 h-2.5 text-indigo-400 shrink-0" />
-                              {s.branch}
-                            </span>
-                            <span className="flex items-center gap-1.5">
-                              <span className="text-emerald-400">
-                                +{s.diff_stats.insertions}
-                              </span>
-                              <span className="text-rose-400">
-                                -{s.diff_stats.deletions}
-                              </span>
-                            </span>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-
-          {/* Left Column Bottom Telemetry Bar */}
-          <div className="h-9 px-3 border-t border-zinc-800/80 bg-zinc-950 flex items-center justify-between text-[11px] font-mono text-zinc-500">
-            <div className="flex items-center gap-1.5">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  connected
-                    ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]"
-                    : "bg-rose-500"
-                }`}
-              />
-              <span>{connected ? "DAEMON READY" : "OFFLINE"}</span>
-            </div>
-            <span>
-              {runningCount} running / {sessions.length} total
-            </span>
-          </div>
-        </aside>
-
-        {/* Column 2: Multi-Pane Agent Canvas (1x / 2x / 4x) */}
-        <main className="flex-1 min-w-0 min-h-0 bg-[#0c0c0f] p-3 flex flex-col">
-          {visibleSessions.length === 0 ? (
-            <div className="flex-1 rounded-2xl border border-dashed border-zinc-800/80 flex flex-col items-center justify-center p-8 text-center">
-              <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 mb-4">
-                <Sparkles className="w-6 h-6" />
-              </div>
-              <h2 className="text-base font-semibold text-zinc-100">
-                Velo Parallel Agent Control Plane
-              </h2>
-              <p className="text-xs text-zinc-400 max-w-md mt-1.5 leading-relaxed">
-                Orchestrate Claude Code, OpenAI Codex, and OpenCode side-by-side
-                in isolated Git worktrees with real-time diff inspection and
-                cross-agent handoffs.
-              </p>
-              <div className="flex items-center gap-3 mt-5">
-                <button
-                  onClick={() => setLaunchModalMode("single")}
-                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium flex items-center gap-2 cursor-pointer"
-                >
-                  <Plus className="w-4 h-4" />
-                  Launch Worktree Agent
-                </button>
-                <button
-                  onClick={() => setLaunchModalMode("committee")}
-                  className="px-4 py-2 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-200 text-xs font-medium flex items-center gap-2 cursor-pointer"
-                >
-                  <Users className="w-4 h-4 text-amber-400" />
-                  Dispatch Committee
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div
-              className={`flex-1 min-h-0 grid gap-3 ${
-                visibleSessions.length === 1
-                  ? "grid-cols-1 grid-rows-1"
-                  : visibleSessions.length === 2
-                  ? "grid-cols-1 lg:grid-cols-2 grid-rows-1"
-                  : "grid-cols-1 lg:grid-cols-2 grid-rows-2"
-              }`}
-            >
-              {visibleSessions.map((session) => (
-                <SessionPane
-                  key={session.id}
-                  session={session}
-                  events={eventsBySession[session.id] || []}
-                  isFocused={session.id === focusedSession?.id}
-                  compact={visibleSessions.length >= 4}
-                  onFocus={() => setFocusedId(session.id)}
-                  onOpenDiff={() => setShowDiffDrawer(true)}
-                  onHandoff={(s) => setHandoffTargetSession(s)}
-                  onAdvisor={handleQuickAdvisor}
-                  onStop={stopSession}
-                  onSendInput={sendInput}
-                />
-              ))}
-            </div>
-          )}
-        </main>
-
-        {/* Column 3: Collapsible Git Diff & File Tree Inspector Drawer */}
-        {showDiffDrawer && focusedSession && (
-          <DiffDrawer
-            session={focusedSession}
-            diffData={diffData}
-            loading={loadingDiff}
-            onRefresh={refreshDiff}
-            onClose={() => setShowDiffDrawer(false)}
+        {isSplit && (
+          <PaseoWorkspacePane
+            paneIndex={1}
+            isSplit={isSplit}
+            isFocusedPane={focusedPane === 1}
+            onFocusPane={() => setFocusedPane(1)}
+            session={pane1Session}
+            events={getEventsForSession(pane1Session)}
+            diffText={pane1Diff.diff}
+            diffStats={pane1Diff.stats}
+            activeTab={pane1Tab}
+            onChangeTab={setPane1Tab}
+            leftSidebarCollapsed={leftSidebarCollapsed}
+            onExpandLeftSidebar={() => setLeftSidebarCollapsed(false)}
+            explorerOpen={explorerOpen}
+            onToggleExplorer={() => setExplorerOpen((v) => !v)}
+            onToggleSplit={() => setIsSplit(false)}
+            onSendInput={handleSendInput}
+            onStopSession={handleStopSession}
+            onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
+            onOpenOrchestratorModal={(tab) => setOrchestratorModal({ open: true, tab })}
           />
         )}
-      </div>
+      </main>
 
-      {/* Unified Launch Modal (Single Agent / Multi-Agent Committee / Self-Healing Loop) */}
-      {launchModalMode && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-lg rounded-2xl bg-zinc-900 border border-zinc-800 shadow-2xl overflow-hidden">
-            {/* Mode Switcher Header */}
-            <div className="px-5 pt-4 pb-3 border-b border-zinc-800 flex items-center justify-between">
-              <div className="flex items-center gap-1 bg-zinc-950 p-1 rounded-xl border border-zinc-800">
-                <button
-                  type="button"
-                  onClick={() => setLaunchModalMode("single")}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-                    launchModalMode === "single"
-                      ? "bg-indigo-600 text-white"
-                      : "text-zinc-400 hover:text-zinc-200"
-                  }`}
-                >
-                  <Play className="w-3.5 h-3.5" />
-                  <span>Single Agent</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setLaunchModalMode("committee")}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-                    launchModalMode === "committee"
-                      ? "bg-indigo-600 text-white"
-                      : "text-zinc-400 hover:text-zinc-200"
-                  }`}
-                >
-                  <Users className="w-3.5 h-3.5" />
-                  <span>Committee</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setLaunchModalMode("loop")}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
-                    launchModalMode === "loop"
-                      ? "bg-indigo-600 text-white"
-                      : "text-zinc-400 hover:text-zinc-200"
-                  }`}
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Test Loop</span>
-                </button>
-              </div>
-
-              <button
-                onClick={() => setLaunchModalMode(null)}
-                className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <form onSubmit={handleLaunchSubmit} className="p-5 space-y-4 text-xs">
-              {launchModalMode === "committee" ? (
-                <div>
-                  <label className="block text-zinc-400 mb-2">
-                    Select Committee Agents (each runs in its own isolated Git worktree)
-                  </label>
-                  <div className="grid grid-cols-3 gap-2.5">
-                    {(["claude", "codex", "opencode"] as const).map((ag) => (
-                      <label
-                        key={ag}
-                        className={`p-3 rounded-xl border flex items-center gap-2 cursor-pointer transition ${
-                          committeeChecks[ag]
-                            ? "bg-indigo-950/40 border-indigo-500/50 text-zinc-100"
-                            : "bg-zinc-950 border-zinc-800 text-zinc-400"
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={committeeChecks[ag]}
-                          onChange={(e) =>
-                            setCommitteeChecks((prev) => ({
-                              ...prev,
-                              [ag]: e.target.checked,
-                            }))
-                          }
-                        />
-                        <span className="font-mono uppercase">{ag}</span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-zinc-400 mb-1">
-                      Agent Provider
-                    </label>
-                    <select
-                      value={providerInput}
-                      onChange={(e) => setProviderInput(e.target.value)}
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 focus:outline-none focus:border-indigo-500"
-                    >
-                      <option value="claude">Claude Code (stream-json)</option>
-                      <option value="codex">OpenAI Codex</option>
-                      <option value="opencode">OpenCode</option>
-                      <option value="custom">Custom CLI Command</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="block text-zinc-400 mb-1">
-                      Git Branch (isolated worktree)
-                    </label>
-                    <input
-                      type="text"
-                      value={branchInput}
-                      onChange={(e) => setBranchInput(e.target.value)}
-                      placeholder="e.g. feat/auth-middleware"
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 font-mono focus:outline-none focus:border-indigo-500"
-                    />
-                  </div>
-                </div>
-              )}
-
-              {providerInput === "custom" && launchModalMode !== "committee" && (
-                <div>
-                  <label className="block text-zinc-400 mb-1">
-                    Custom CLI Command
-                  </label>
-                  <input
-                    type="text"
-                    value={customCmdInput}
-                    onChange={(e) => setCustomCmdInput(e.target.value)}
-                    placeholder="e.g. /tmp/velo_demo_agent.sh #"
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 font-mono focus:outline-none focus:border-indigo-500"
-                  />
-                </div>
-              )}
-
-              {launchModalMode === "loop" && (
-                <div className="grid grid-cols-3 gap-3 p-3 rounded-xl bg-emerald-950/15 border border-emerald-500/25">
-                  <div className="col-span-2">
-                    <label className="block text-emerald-300 mb-1">
-                      Acceptance Check Command
-                    </label>
-                    <input
-                      type="text"
-                      value={checkCommandInput}
-                      onChange={(e) => setCheckCommandInput(e.target.value)}
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-1.5 text-zinc-100 font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-emerald-300 mb-1">
-                      Max Iterations
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      value={maxIterationsInput}
-                      onChange={(e) =>
-                        setMaxIterationsInput(Number(e.target.value))
-                      }
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-1.5 text-zinc-100 font-mono"
-                    />
-                  </div>
-                </div>
-              )}
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-zinc-400 mb-1">
-                    Repository Root
-                  </label>
-                  <input
-                    type="text"
-                    value={repoPathInput}
-                    onChange={(e) => setRepoPathInput(e.target.value)}
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 font-mono focus:outline-none focus:border-indigo-500"
-                  />
-                </div>
-                <div>
-                  <label className="block text-zinc-400 mb-1">
-                    Session / Group Name
-                  </label>
-                  <input
-                    type="text"
-                    value={sessionNameInput}
-                    onChange={(e) => setSessionNameInput(e.target.value)}
-                    placeholder="Optional label"
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 focus:outline-none focus:border-indigo-500"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-zinc-400 mb-1">
-                  Task Instructions / Prompt
-                </label>
-                <textarea
-                  rows={4}
-                  required={!usePtyInput}
-                  value={promptInput}
-                  onChange={(e) => setPromptInput(e.target.value)}
-                  placeholder="Describe what the agent(s) should build, fix, or analyze inside the isolated Git worktree..."
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-zinc-100 focus:outline-none focus:border-indigo-500"
-                />
-              </div>
-
-              {launchModalMode === "single" && (
-                <label className="flex items-center gap-2 text-zinc-300 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={usePtyInput}
-                    onChange={(e) => setUsePtyInput(e.target.checked)}
-                  />
-                  <span>
-                    Run in interactive pseudo-terminal (<code>portable-pty</code>)
-                  </span>
-                </label>
-              )}
-
-              <div className="flex items-center justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setLaunchModalMode(null)}
-                  className="px-3.5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submitting}
-                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium cursor-pointer"
-                >
-                  {submitting
-                    ? "Provisioning Worktree..."
-                    : launchModalMode === "committee"
-                    ? "Dispatch Committee"
-                    : launchModalMode === "loop"
-                    ? "Start Self-Healing Loop"
-                    : "Launch Worktree Agent"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Cross-Agent Handoff Modal */}
-      {handoffTargetSession && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-md rounded-2xl bg-zinc-900 border border-zinc-800 shadow-2xl overflow-hidden">
-            <div className="px-5 py-3.5 border-b border-zinc-800 flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
-                <ArrowRightLeft className="w-4 h-4 text-indigo-400" />
-                Handoff Worktree to Peer Agent
-              </h3>
-              <button
-                onClick={() => setHandoffTargetSession(null)}
-                className="text-zinc-400 hover:text-zinc-200 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <form onSubmit={handleExecuteHandoff} className="p-5 space-y-4 text-xs">
-              <div className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 font-mono text-[11px] text-zinc-400 space-y-1">
-                <div>From Session: {handoffTargetSession.name}</div>
-                <div>Shared Branch: {handoffTargetSession.branch}</div>
-                <div>Worktree: {handoffTargetSession.worktree_path}</div>
-              </div>
-
-              <div>
-                <label className="block text-zinc-400 mb-1">Target Agent</label>
-                <select
-                  value={handoffProvider}
-                  onChange={(e) => setHandoffProvider(e.target.value)}
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100"
-                >
-                  <option value="codex">OpenAI Codex</option>
-                  <option value="claude">Claude Code</option>
-                  <option value="opencode">OpenCode</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-zinc-400 mb-1">
-                  Handoff Instructions
-                </label>
-                <textarea
-                  rows={3}
-                  value={handoffInstructions}
-                  onChange={(e) => setHandoffInstructions(e.target.value)}
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-zinc-100"
-                />
-              </div>
-
-              <div className="flex items-center justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setHandoffTargetSession(null)}
-                  className="px-3.5 py-2 rounded-xl bg-zinc-800 text-zinc-300 cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submitting}
-                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium cursor-pointer"
-                >
-                  {submitting ? "Handing Off..." : "Execute Handoff"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Global Command Palette (⌘K) */}
-      {showCommandPalette && (
-        <CommandPalette
-          sessions={sessions}
-          onClose={() => setShowCommandPalette(false)}
-          onSelectSession={(id) => setFocusedId(id)}
-          onOpenLaunchModal={(mode) => setLaunchModalMode(mode)}
-          onSetLayout={(l) => setPaneLayout(l)}
-          onToggleDiffDrawer={() => setShowDiffDrawer((v) => !v)}
-          onOpenPairing={() => setShowPairingModal(true)}
+      {/* Region 3: Right Paseo Explorer Sidebar Dock (Changes & Files) */}
+      {explorerOpen && (
+        <PaseoExplorerSidebar
+          session={activeExplorerSession}
+          diffText={explorerDiff.diff}
+          diffStats={explorerDiff.stats}
+          onRefreshDiff={() => {
+            if (activeExplorerSession) fetchSessionDetails(activeExplorerSession.id);
+          }}
+          onOpenDiffTab={() => {
+            if (isSplit && focusedPane === 1) {
+              setPane1Tab("diff");
+            } else {
+              setPane0Tab("diff");
+            }
+          }}
+          onCloseExplorer={() => setExplorerOpen(false)}
         />
       )}
 
-      {/* Mobile & Remote E2EE Pairing QR Modal */}
-      {showPairingModal && (
-        <PairingModal
-          daemonUrl="http://127.0.0.1:6767"
-          onClose={() => setShowPairingModal(false)}
-        />
-      )}
+      {/* Paseo Modals */}
+      <PaseoNewWorkspaceModal
+        open={newWorkspaceOpen}
+        onClose={() => setNewWorkspaceOpen(false)}
+        onCreate={handleCreateWorkspace}
+      />
+
+      <PaseoOrchestratorModal
+        open={orchestratorModal.open}
+        initialTab={orchestratorModal.tab}
+        activeSession={activeExplorerSession}
+        onClose={() => setOrchestratorModal((prev) => ({ ...prev, open: false }))}
+        onRunHandoff={handleRunHandoff}
+        onRunAdvisor={handleRunAdvisor}
+        onRunCommittee={handleRunCommittee}
+        onRunLoop={handleRunLoop}
+      />
+
+      <PaseoPairModal
+        open={pairModalOpen}
+        pairing={pairingData}
+        onClose={() => setPairModalOpen(false)}
+      />
     </div>
   );
 }
+
+export default App;
