@@ -351,15 +351,16 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                       </div>
                     </div>
 
-                    {/* Inline Compact Diff Preview inside Explorer */}
-                    {isExpanded && (
-                      <div
-                        className="border-t font-mono-code text-[10.5px] overflow-x-auto max-h-[220px] overflow-y-auto selectable-text"
-                        style={{
-                          backgroundColor: "var(--surface-0)",
-                          borderColor: "var(--border-subtle)",
-                        }}
-                      >
+                    {/* Inline Compact Diff Preview inside Explorer (transitions.dev 0fr->1fr) */}
+                    <div className={`t-grid-collapse ${isExpanded ? "t-expanded" : ""}`}>
+                      <div className="t-grid-collapse-inner">
+                        <div
+                          className="border-t font-mono-code text-[10.5px] overflow-x-auto max-h-[220px] overflow-y-auto selectable-text"
+                          style={{
+                            backgroundColor: "var(--surface-0)",
+                            borderColor: "var(--border-subtle)",
+                          }}
+                        >
                         {file.lines.slice(0, 60).map((ln, idx) => {
                           const bg =
                             ln.type === "add"
@@ -402,8 +403,9 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                             </div>
                           );
                         })}
+                        </div>
                       </div>
-                    )}
+                    </div>
                   </div>
                 );
               })
