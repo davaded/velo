@@ -238,7 +238,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
 
   return (
     <aside
-      className="w-[264px] shrink-0 h-full flex flex-col border-r select-none"
+      className="w-[268px] shrink-0 h-full flex flex-col select-none velo-sidebar-island overflow-hidden"
       style={{
         backgroundColor: "var(--surface-sidebar)",
         borderColor: "var(--border-subtle)",

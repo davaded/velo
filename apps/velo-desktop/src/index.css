@@ -1,36 +1,36 @@
 @import "tailwindcss";
 
 :root {
-  --surface-sidebar: #141716;
-  --surface-0: #181B1A;
-  --surface-1: #1E2120;
-  --surface-2: #272A29;
-  --surface-3: #434645;
-  --surface-4: #606463;
-  --fg: #fafafa;
-  --fg-muted: #A1A5A4;
-  --fg-extra-muted: #717574;
-  --border-subtle: #252B2A;
-  --border-accent: #2F3534;
-  --accent: #20744A;
-  --accent-bright: #7ccba0;
-  --destructive: #c64f43;
-  --status-success: #6cb17b;
-  --status-danger: #d8847b;
-  --status-warning: #c09664;
-  --status-merged: #a890d5;
-  --dot-success: #35c264;
-  --dot-danger: #f7796d;
-  --dot-warning: #db932e;
-  --dot-running: #5caaf6;
+  --canvas-bg: #090B0A;
+  --surface-sidebar: #101312;
+  --surface-0: #131716;
+  --surface-1: #191E1C;
+  --surface-2: #212725;
+  --surface-3: #323A37;
+  --surface-4: #525C58;
+  --fg: #F8FAFA;
+  --fg-muted: #9CA8A3;
+  --fg-extra-muted: #68736F;
+  --border-subtle: #202725;
+  --border-accent: #2E3835;
+  --accent: #10B981;
+  --accent-bright: #6EE7B7;
+  --accent-glow: rgba(16, 185, 129, 0.16);
+  --destructive: #EF4444;
+  --status-success: #34D399;
+  --status-danger: #F87171;
+  --status-warning: #FBBF24;
+  --status-merged: #A78BFA;
+  --dot-success: #10B981;
+  --dot-danger: #EF4444;
+  --dot-warning: #F59E0B;
+  --dot-running: #38BDF8;
 
-  --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI", Roboto, sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", "Geist Mono", Menlo, Monaco, Consolas, monospace;
 
-  /* transitions.dev semantic motion tokens */
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-snappy: cubic-bezier(0.2, 0, 0, 1);
 }
 
 * {
@@ -46,7 +46,7 @@ body,
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background-color: var(--surface-0);
+  background-color: var(--canvas-bg);
   color: var(--fg);
   font-family: var(--font-sans);
   font-size: 13px;
@@ -65,10 +65,10 @@ body,
   font-feature-settings: "liga" 1, "calt" 1;
 }
 
-/* Custom ultra-thin scrollbars */
+/* Scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 
 ::-webkit-scrollbar-track {
@@ -76,15 +76,49 @@ body,
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(161, 165, 164, 0.16);
+  background: rgba(156, 168, 163, 0.15);
   border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(161, 165, 164, 0.32);
+  background: rgba(156, 168, 163, 0.32);
 }
 
-/* Paseo StatusRing animation */
+/* Floating Island Architecture (beUI / Rare UI / Arc style) */
+.velo-island {
+  background-color: var(--surface-0);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.06),
+    0 12px 32px -8px rgba(0, 0, 0, 0.55);
+}
+
+.velo-sidebar-island {
+  background-color: var(--surface-sidebar);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
+    0 10px 28px -8px rgba(0, 0, 0, 0.5);
+}
+
+/* Subtle top aurora ambient glow inside main stage */
+.velo-stage-aurora {
+  background-image: radial-gradient(
+    65% 160px at 50% 0%,
+    var(--accent-glow),
+    transparent 100%
+  );
+}
+
+/* Dot Matrix Background Pattern for Mission Control & Canvas */
+.velo-dot-matrix {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+/* Status Ring Animation */
 @keyframes paseo-spin {
   0% {
     transform: rotate(0deg);
@@ -95,34 +129,22 @@ body,
 }
 
 .paseo-status-ring {
-  width: 10px;
-  height: 10px;
+  width: 11px;
+  height: 11px;
   border-radius: 9999px;
-  border: 1.75px solid rgba(92, 170, 246, 0.25);
+  border: 1.75px solid rgba(56, 189, 248, 0.25);
   border-top-color: var(--dot-running);
-  animation: paseo-spin 0.85s linear infinite;
+  animation: paseo-spin 0.8s linear infinite;
 }
 
-/* Paseo IndentRail */
-.paseo-indent-rail {
-  position: relative;
-  padding-left: 14px;
+/* Glowing status dot */
+.velo-glow-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
 }
 
-.paseo-indent-rail::before {
-  content: "";
-  position: absolute;
-  left: 4px;
-  top: 2px;
-  bottom: 2px;
-  width: 1.5px;
-  background-color: var(--border-accent);
-  border-radius: 1px;
-}
-
-/* ============================================================================
-   1. Beautiful UI (beautifului.dev) — AI Reasoning Shimmer & Agent Primitives
-   ============================================================================ */
+/* Beautiful UI Shimmer */
 @keyframes ai-shimmer {
   0% {
     background-position: -200% 0;
@@ -144,22 +166,20 @@ body,
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: ai-shimmer 2.8s infinite linear;
+  animation: ai-shimmer 2.6s infinite linear;
 }
 
-/* ============================================================================
-   2. Rare UI (rareui.com) — Specular Inner Borders, Tactile Keycaps & Spotlight
-   ============================================================================ */
+/* Rare UI Specular Surfaces, Tactile Keycaps & 3D Buttons */
 .rare-specular-surface {
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.07),
-    0 8px 24px -6px rgba(0, 0, 0, 0.45);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
+    0 10px 28px -6px rgba(0, 0, 0, 0.5);
 }
 
 .rare-specular-pill {
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
-    0 1px 2px 0 rgba(0, 0, 0, 0.25);
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.07),
+    0 1px 2px 0 rgba(0, 0, 0, 0.22);
 }
 
 .rare-keycap {
@@ -178,34 +198,36 @@ body,
   color: var(--fg-muted);
   border: 1px solid var(--border-accent);
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.08),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.09),
     0 1.5px 0 0 var(--border-subtle);
 }
 
 .rare-3d-button {
   box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
-    0 2px 6px -1px rgba(0, 0, 0, 0.4);
-  transition: transform 140ms var(--ease-spring), box-shadow 140ms var(--ease-spring), filter 140ms ease;
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.26),
+    0 3px 10px -1px var(--accent-glow),
+    0 2px 4px -1px rgba(0, 0, 0, 0.45);
+  transition:
+    transform 150ms var(--ease-spring),
+    box-shadow 150ms var(--ease-spring),
+    filter 150ms ease;
 }
 
 .rare-3d-button:hover:not(:disabled) {
-  filter: brightness(1.08);
+  filter: brightness(1.09);
   transform: translateY(-0.5px);
 }
 
 .rare-3d-button:active:not(:disabled) {
-  transform: translateY(1px) scale(0.97);
+  transform: translateY(1px) scale(0.96);
 }
 
-/* ============================================================================
-   3. Transitions.dev (transitions.dev) — Semantic CSS Spring & Blur-Swap Motion
-   ============================================================================ */
+/* Transitions.dev Motion Utilities */
 @keyframes t-modal-in {
   0% {
     opacity: 0;
-    transform: scale(0.96) translateY(6px);
-    filter: blur(4px);
+    transform: scale(0.95) translateY(8px);
+    filter: blur(5px);
   }
   100% {
     opacity: 1;
@@ -217,8 +239,8 @@ body,
 @keyframes t-fade-blur-in {
   0% {
     opacity: 0;
-    transform: translateY(4px);
-    filter: blur(3px);
+    transform: translateY(5px);
+    filter: blur(4px);
   }
   100% {
     opacity: 1;
@@ -241,25 +263,24 @@ body,
 }
 
 .t-modal-scale {
-  animation: t-modal-in 220ms var(--ease-spring) forwards;
+  animation: t-modal-in 230ms var(--ease-spring) forwards;
 }
 
 .t-blur-swap {
-  animation: t-fade-blur-in 200ms var(--ease-out-expo) forwards;
+  animation: t-fade-blur-in 210ms var(--ease-out-expo) forwards;
 }
 
 .t-toast-enter {
   animation: t-toast-slide-in 260ms var(--ease-spring) forwards;
 }
 
-/* Smooth 0fr -> 1fr grid height transition from transitions.dev */
 .t-grid-collapse {
   display: grid;
   grid-template-rows: 0fr;
   opacity: 0;
   transition:
-    grid-template-rows 220ms var(--ease-spring),
-    opacity 180ms var(--ease-out-expo);
+    grid-template-rows 230ms var(--ease-spring),
+    opacity 190ms var(--ease-out-expo);
 }
 
 .t-grid-collapse.t-expanded {
@@ -271,14 +292,18 @@ body,
   overflow: hidden;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .t-modal-scale,
-  .t-blur-swap,
-  .t-toast-enter,
-  .beautiful-shimmer-text {
-    animation: none !important;
-  }
-  .t-grid-collapse {
-    transition: none !important;
-  }
+.paseo-indent-rail {
+  position: relative;
+  padding-left: 14px;
+}
+
+.paseo-indent-rail::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 2px;
+  bottom: 2px;
+  width: 1.5px;
+  background-color: var(--border-accent);
+  border-radius: 1px;
 }

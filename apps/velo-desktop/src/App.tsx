@@ -544,9 +544,9 @@ export function App() {
 
   return (
     <div
-      className="w-screen h-screen overflow-hidden flex select-none"
+      className="w-screen h-screen overflow-hidden flex p-2 gap-2 select-none"
       style={{
-        backgroundColor: "var(--surface-0)",
+        backgroundColor: "var(--canvas-bg)",
         color: "var(--fg)",
       }}
     >
@@ -566,13 +566,16 @@ export function App() {
         />
       )}
 
-      <main className="flex-1 min-w-0 h-full flex overflow-hidden">
+      <main className="flex-1 min-w-0 h-full flex gap-2 overflow-hidden">
         <PaseoWorkspacePane
           paneIndex={0}
           isSplit={isSplit}
           isFocusedPane={!isSplit || focusedPane === 0}
           onFocusPane={() => setFocusedPane(0)}
+          sessions={sessions}
           session={pane0Session}
+          onSelectSession={handleSelectSessionFromSidebar}
+          onOpenPairModal={handleOpenPairModal}
           events={getEventsForSession(pane0Session)}
           diffText={pane0Diff.diff}
           diffStats={pane0Diff.stats}
@@ -601,7 +604,10 @@ export function App() {
             isSplit={isSplit}
             isFocusedPane={focusedPane === 1}
             onFocusPane={() => setFocusedPane(1)}
+            sessions={sessions}
             session={pane1Session}
+            onSelectSession={handleSelectSessionFromSidebar}
+            onOpenPairModal={handleOpenPairModal}
             events={getEventsForSession(pane1Session)}
             diffText={pane1Diff.diff}
             diffStats={pane1Diff.stats}

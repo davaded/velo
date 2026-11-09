@@ -6,11 +6,15 @@ import {
   FileCode2,
   Folder,
   FolderOpen,
+  GitBranch,
   GitCompare,
+  Network,
   PanelRightClose,
   RefreshCw,
+  ShieldCheck,
 } from "lucide-react";
 import type { GitDiffStats, SessionInfo } from "../types";
+import { providerDisplayName } from "./PaseoLeftSidebar";
 
 export interface ParsedDiffFile {
   path: string;
@@ -131,7 +135,7 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
   onOpenDiffTab,
   onCloseExplorer,
 }) => {
-  const [activeTab, setActiveTab] = useState<"changes" | "files">("changes");
+  const [activeTab, setActiveTab] = useState<"changes" | "files" | "topology">("changes");
   const [expandedFile, setExpandedFile] = useState<string | null>(null);
 
   const parsedFiles = useMemo(() => parseUnifiedDiffToFiles(diffText), [diffText]);
@@ -157,32 +161,32 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
   }, [parsedFiles]);
 
   return (
-    <aside
-      className="w-[300px] shrink-0 h-full flex flex-col border-l select-none"
-      style={{
-        backgroundColor: "var(--surface-sidebar)",
-        borderColor: "var(--border-subtle)",
-      }}
-    >
-      {/* Top Explorer Tab Bar (38px height, matches WorkspaceDesktopTabsRow) */}
+    <aside className="w-[310px] shrink-0 h-full flex flex-col select-none velo-sidebar-island overflow-hidden">
+      {/* Top Segmented Explorer Header (44px height) */}
       <div
-        className="h-[38px] px-2 flex items-center justify-between border-b shrink-0"
+        className="h-[44px] px-2.5 flex items-center justify-between border-b shrink-0"
         style={{ borderColor: "var(--border-subtle)" }}
       >
-        <div className="flex items-center gap-1">
+        <div
+          className="p-0.5 rounded-[8px] border flex items-center gap-0.5"
+          style={{
+            backgroundColor: "var(--surface-0)",
+            borderColor: "var(--border-subtle)",
+          }}
+        >
           <button
             onClick={() => setActiveTab("changes")}
-            className="h-[26px] px-2.5 rounded-[5px] flex items-center gap-1.5 text-[11.5px] font-medium transition-colors cursor-pointer"
+            className="h-[26px] px-2 rounded-[6px] flex items-center gap-1.5 text-[11px] font-medium transition-colors cursor-pointer"
             style={{
               backgroundColor: activeTab === "changes" ? "var(--surface-2)" : "transparent",
               color: activeTab === "changes" ? "var(--fg)" : "var(--fg-muted)",
             }}
           >
-            <GitCompare className="w-3.5 h-3.5" />
+            <GitCompare className="w-3 h-3" />
             <span>Changes</span>
             {parsedFiles.length > 0 && (
               <span
-                className="font-mono-code text-[10px] px-1.5 rounded-full"
+                className="font-mono-code text-[9.5px] px-1.5 rounded-full"
                 style={{
                   backgroundColor: "var(--surface-3)",
                   color: "var(--fg)",
@@ -195,14 +199,26 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
 
           <button
             onClick={() => setActiveTab("files")}
-            className="h-[26px] px-2.5 rounded-[5px] flex items-center gap-1.5 text-[11.5px] font-medium transition-colors cursor-pointer"
+            className="h-[26px] px-2 rounded-[6px] flex items-center gap-1.5 text-[11px] font-medium transition-colors cursor-pointer"
             style={{
               backgroundColor: activeTab === "files" ? "var(--surface-2)" : "transparent",
               color: activeTab === "files" ? "var(--fg)" : "var(--fg-muted)",
             }}
           >
-            <Folder className="w-3.5 h-3.5" />
+            <Folder className="w-3 h-3" />
             <span>Files</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab("topology")}
+            className="h-[26px] px-2 rounded-[6px] flex items-center gap-1.5 text-[11px] font-medium transition-colors cursor-pointer"
+            style={{
+              backgroundColor: activeTab === "topology" ? "var(--surface-2)" : "transparent",
+              color: activeTab === "topology" ? "var(--fg)" : "var(--fg-muted)",
+            }}
+          >
+            <Network className="w-3 h-3" />
+            <span>DAG</span>
           </button>
         </div>
 
@@ -217,7 +233,7 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
           </button>
           <button
             onClick={onCloseExplorer}
-            title="Close Explorer Dock"
+            title="Close Inspector Dock (⌘E)"
             className="w-6 h-6 rounded-[5px] flex items-center justify-center transition-colors cursor-pointer hover:bg-[var(--surface-2)]"
             style={{ color: "var(--fg-muted)" }}
           >
@@ -226,17 +242,16 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
         </div>
       </div>
 
-      {/* Tab Content */}
-      {activeTab === "changes" ? (
-        <div className="flex-1 flex flex-col min-h-0">
-          {/* Summary Sub-bar */}
+      {/* Tab 1: Changes Tree */}
+      {activeTab === "changes" && (
+        <div className="flex-1 flex flex-col min-h-0 t-blur-swap">
           <div
             className="px-3 py-2 border-b flex items-center justify-between text-[11.5px] shrink-0"
             style={{ borderColor: "var(--border-subtle)" }}
           >
             <div className="flex items-center gap-2">
               <span style={{ color: "var(--fg-muted)" }}>
-                {diffStats?.files_changed ?? parsedFiles.length} files
+                {diffStats?.files_changed ?? parsedFiles.length} modified
               </span>
               <span className="font-mono-code flex items-center gap-1 text-[11px]">
                 <span style={{ color: "var(--status-success)" }}>
@@ -253,13 +268,12 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
               className="flex items-center gap-1 text-[11px] hover:underline cursor-pointer"
               style={{ color: "var(--accent-bright)" }}
             >
-              <span>Open Diff Tab</span>
+              <span>Diff Studio</span>
               <ExternalLink className="w-2.5 h-2.5" />
             </button>
           </div>
 
-          {/* Changed Files Tree */}
-          <div className="flex-1 overflow-y-auto p-1.5 space-y-1">
+          <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
             {parsedFiles.length === 0 ? (
               <div className="px-3 py-10 text-center space-y-1.5">
                 <p className="text-[12px]" style={{ color: "var(--fg-muted)" }}>
@@ -267,9 +281,7 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                 </p>
                 <p className="text-[11px]" style={{ color: "var(--fg-extra-muted)" }}>
                   No uncommitted changes in{" "}
-                  <span className="font-mono-code">
-                    {session?.branch ?? "worktree"}
-                  </span>
+                  <span className="font-mono-code">{session?.branch ?? "worktree"}</span>
                 </p>
               </div>
             ) : (
@@ -285,13 +297,13 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                 return (
                   <div
                     key={file.path}
-                    className="rounded-[6px] overflow-hidden border"
+                    className="rounded-[8px] overflow-hidden border transition-colors"
                     style={{
-                      backgroundColor: isExpanded ? "var(--surface-1)" : "transparent",
-                      borderColor: isExpanded ? "var(--border-accent)" : "transparent",
+                      backgroundColor: isExpanded ? "var(--surface-1)" : "var(--surface-0)",
+                      borderColor: isExpanded ? "var(--border-accent)" : "var(--border-subtle)",
                     }}
                   >
-                    <div className="flex items-center justify-between px-2 py-1.5 hover:bg-[var(--surface-1)] rounded-[5px] gap-1.5">
+                    <div className="flex items-center justify-between px-2.5 py-2 hover:bg-[var(--surface-1)] gap-1.5">
                       <button
                         onClick={() =>
                           setExpandedFile((prev) => (prev === file.path ? null : file.path))
@@ -310,8 +322,11 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                           />
                         )}
                         <span
-                          className="font-mono-code text-[10px] font-bold w-3.5 text-center shrink-0"
-                          style={{ color: statusColor }}
+                          className="font-mono-code text-[10px] font-bold w-4 h-4 rounded flex items-center justify-center shrink-0"
+                          style={{
+                            backgroundColor: "var(--surface-2)",
+                            color: statusColor,
+                          }}
                         >
                           {file.status}
                         </span>
@@ -321,14 +336,6 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                         >
                           {file.fileName}
                         </span>
-                        {file.dirPath && (
-                          <span
-                            className="text-[10.5px] truncate"
-                            style={{ color: "var(--fg-extra-muted)" }}
-                          >
-                            {file.dirPath}
-                          </span>
-                        )}
                       </button>
 
                       <div className="flex items-center gap-1.5 shrink-0">
@@ -342,7 +349,7 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                         </span>
                         <button
                           onClick={() => onOpenDiffTab(file.path)}
-                          title="Open in Working Diff Tab"
+                          title="Open in Diff Studio"
                           className="p-0.5 rounded hover:bg-[var(--surface-2)] cursor-pointer"
                           style={{ color: "var(--fg-extra-muted)" }}
                         >
@@ -351,7 +358,6 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                       </div>
                     </div>
 
-                    {/* Inline Compact Diff Preview inside Explorer (transitions.dev 0fr->1fr) */}
                     <div className={`t-grid-collapse ${isExpanded ? "t-expanded" : ""}`}>
                       <div className="t-grid-collapse-inner">
                         <div
@@ -361,48 +367,48 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                             borderColor: "var(--border-subtle)",
                           }}
                         >
-                        {file.lines.slice(0, 60).map((ln, idx) => {
-                          const bg =
-                            ln.type === "add"
-                              ? "rgba(108, 177, 123, 0.14)"
-                              : ln.type === "del"
-                              ? "rgba(216, 132, 123, 0.14)"
-                              : ln.type === "hunk"
-                              ? "rgba(92, 170, 246, 0.10)"
-                              : "transparent";
-                          const fg =
-                            ln.type === "add"
-                              ? "var(--status-success)"
-                              : ln.type === "del"
-                              ? "var(--status-danger)"
-                              : ln.type === "hunk"
-                              ? "var(--dot-running)"
-                              : "var(--fg-muted)";
-                          return (
-                            <div
-                              key={idx}
-                              className="px-2 py-0.5 whitespace-pre flex items-center gap-2"
-                              style={{ backgroundColor: bg, color: fg }}
-                            >
-                              <span
-                                className="w-6 text-right shrink-0 select-none opacity-50"
-                                style={{ color: "var(--fg-extra-muted)" }}
+                          {file.lines.slice(0, 60).map((ln, idx) => {
+                            const bg =
+                              ln.type === "add"
+                                ? "rgba(52, 211, 153, 0.12)"
+                                : ln.type === "del"
+                                ? "rgba(248, 113, 113, 0.12)"
+                                : ln.type === "hunk"
+                                ? "rgba(56, 189, 248, 0.10)"
+                                : "transparent";
+                            const fg =
+                              ln.type === "add"
+                                ? "var(--status-success)"
+                                : ln.type === "del"
+                                ? "var(--status-danger)"
+                                : ln.type === "hunk"
+                                ? "var(--dot-running)"
+                                : "var(--fg-muted)";
+                            return (
+                              <div
+                                key={idx}
+                                className="px-2 py-0.5 whitespace-pre flex items-center gap-2"
+                                style={{ backgroundColor: bg, color: fg }}
                               >
-                                {ln.newLine ?? ln.oldLine ?? ""}
-                              </span>
-                              <span>
-                                {ln.type === "add"
-                                  ? "+"
-                                  : ln.type === "del"
-                                  ? "-"
-                                  : ln.type === "hunk"
-                                  ? ""
-                                  : " "}
-                                {ln.content}
-                              </span>
-                            </div>
-                          );
-                        })}
+                                <span
+                                  className="w-6 text-right shrink-0 select-none opacity-50"
+                                  style={{ color: "var(--fg-extra-muted)" }}
+                                >
+                                  {ln.newLine ?? ln.oldLine ?? ""}
+                                </span>
+                                <span>
+                                  {ln.type === "add"
+                                    ? "+"
+                                    : ln.type === "del"
+                                    ? "-"
+                                    : ln.type === "hunk"
+                                    ? ""
+                                    : " "}
+                                  {ln.content}
+                                </span>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                     </div>
@@ -412,9 +418,11 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
             )}
           </div>
         </div>
-      ) : (
-        /* Files Tab: Worktree Explorer */
-        <div className="flex-1 flex flex-col min-h-0">
+      )}
+
+      {/* Tab 2: Files Tree */}
+      {activeTab === "files" && (
+        <div className="flex-1 flex flex-col min-h-0 t-blur-swap">
           <div
             className="px-3 py-2 border-b flex items-center gap-1.5 text-[11px] font-mono-code truncate shrink-0"
             style={{
@@ -434,7 +442,7 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                 <button
                   key={item.path}
                   onClick={() => onOpenDiffTab(item.path)}
-                  className="w-full px-2 py-1.5 rounded-[5px] flex items-center justify-between gap-2 text-left hover:bg-[var(--surface-1)] transition-colors cursor-pointer"
+                  className="w-full px-2.5 py-1.5 rounded-[6px] flex items-center justify-between gap-2 text-left hover:bg-[var(--surface-1)] transition-colors cursor-pointer"
                 >
                   <div className="flex items-center gap-2 min-w-0">
                     <FileCode2
@@ -459,7 +467,7 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                     </span>
                   ) : item.note ? (
                     <span
-                      className="font-mono-code text-[10px] px-1 rounded shrink-0"
+                      className="font-mono-code text-[10px] px-1.5 rounded shrink-0"
                       style={{
                         backgroundColor: "var(--surface-2)",
                         color: "var(--fg-extra-muted)",
@@ -471,6 +479,98 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                 </button>
               );
             })}
+          </div>
+        </div>
+      )}
+
+      {/* Tab 3: Multi-Agent Orchestration DAG & Worktree Isolation Telemetry */}
+      {activeTab === "topology" && (
+        <div className="flex-1 overflow-y-auto p-3 space-y-3 t-blur-swap">
+          <div
+            className="rounded-[9px] border p-3 space-y-2 rare-specular-pill"
+            style={{
+              backgroundColor: "var(--surface-0)",
+              borderColor: "var(--border-accent)",
+            }}
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--accent-bright)" }}>
+                Worktree Isolation Sandbox
+              </span>
+              <ShieldCheck className="w-3.5 h-3.5" style={{ color: "var(--status-success)" }} />
+            </div>
+            <div className="font-mono-code text-[11px] space-y-1" style={{ color: "var(--fg-muted)" }}>
+              <div className="flex items-center gap-1.5">
+                <GitBranch className="w-3 h-3" style={{ color: "var(--accent-bright)" }} />
+                <span style={{ color: "var(--fg)" }}>{session?.branch}</span>
+              </div>
+              <div className="truncate text-[10.5px]" style={{ color: "var(--fg-extra-muted)" }}>
+                {session?.worktree_path}
+              </div>
+            </div>
+          </div>
+
+          {/* Visual DAG Lineage */}
+          <div className="space-y-2">
+            <div className="text-[10.5px] font-semibold uppercase tracking-wider px-1" style={{ color: "var(--fg-extra-muted)" }}>
+              Agent Orchestration Lineage
+            </div>
+
+            <div className="paseo-indent-rail space-y-2.5">
+              <div
+                className="rounded-[8px] border p-2.5 space-y-1"
+                style={{
+                  backgroundColor: "var(--surface-1)",
+                  borderColor: "var(--accent)",
+                }}
+              >
+                <div className="flex items-center justify-between text-[11.5px] font-semibold">
+                  <span>{session?.name ?? "Primary Agent"}</span>
+                  <span className="font-mono-code text-[10px]" style={{ color: "var(--accent-bright)" }}>
+                    {session ? providerDisplayName(session.provider) : "Claude"}
+                  </span>
+                </div>
+                <p className="text-[10.5px]" style={{ color: "var(--fg-muted)" }}>
+                  Active writer in isolated worktree
+                </p>
+              </div>
+
+              <div
+                className="rounded-[8px] border p-2.5 space-y-1"
+                style={{
+                  backgroundColor: "var(--surface-0)",
+                  borderColor: "var(--border-subtle)",
+                }}
+              >
+                <div className="flex items-center justify-between text-[11.5px] font-medium">
+                  <span>/advisor Peer Reviewer</span>
+                  <span className="font-mono-code text-[10px]" style={{ color: "var(--fg-extra-muted)" }}>
+                    Codex
+                  </span>
+                </div>
+                <p className="text-[10.5px]" style={{ color: "var(--fg-extra-muted)" }}>
+                  Read-only diff critique & concurrency audit
+                </p>
+              </div>
+
+              <div
+                className="rounded-[8px] border p-2.5 space-y-1"
+                style={{
+                  backgroundColor: "var(--surface-0)",
+                  borderColor: "var(--border-subtle)",
+                }}
+              >
+                <div className="flex items-center justify-between text-[11.5px] font-medium">
+                  <span>/loop Verification Gate</span>
+                  <span className="font-mono-code text-[10px]" style={{ color: "var(--status-success)" }}>
+                    cargo test
+                  </span>
+                </div>
+                <p className="text-[10.5px]" style={{ color: "var(--fg-extra-muted)" }}>
+                  Automated self-healing check command
+                </p>
+              </div>
+            </div>
           </div>
         </div>
       )}
