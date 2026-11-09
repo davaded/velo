@@ -1,0 +1,14 @@
+[package]
+name = "velo-worktree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+velo-protocol.workspace = true

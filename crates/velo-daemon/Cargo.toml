@@ -1,0 +1,19 @@
+[package]
+name = "velo-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+velo-protocol.workspace = true
+velo-worktree.workspace = true
+velo-agent.workspace = true
