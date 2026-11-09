@@ -2,11 +2,12 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::{
-        Path as AxumPath, State,
+        Path as AxumPath, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::Utc;
@@ -53,7 +54,6 @@ impl DaemonState {
             if let Ok(raw) = tokio::fs::read_to_string(&state_file).await {
                 if let Ok(saved) = serde_json::from_str::<Vec<SessionInfo>>(&raw) {
                     for mut s in saved {
-                        // Mark previously running sessions as stopped if daemon restarted
                         if matches!(s.status, SessionStatus::Starting | SessionStatus::Running) {
                             s.status = SessionStatus::Stopped;
                         }
@@ -160,6 +160,7 @@ impl DaemonState {
         let short_id = &session_id.to_string()[..8];
         let name = req
             .name
+            .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| format!("{}-{}", req.provider, short_id));
 
         let now = Utc::now();
@@ -211,9 +212,36 @@ impl DaemonState {
     }
 }
 
+async fn cors_middleware(req: Request, next: Next) -> Response {
+    if req.method() == Method::OPTIONS {
+        let mut res = StatusCode::NO_CONTENT.into_response();
+        add_cors_headers(&mut res);
+        return res;
+    }
+    let mut res = next.run(req).await;
+    add_cors_headers(&mut res);
+    res
+}
+
+fn add_cors_headers(res: &mut Response) {
+    let headers = res.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Content-Type, Authorization"),
+    );
+}
+
 pub fn build_router(state: DaemonState) -> Router {
     Router::new()
-        .route("/api/health", get(health_handler))
+        .route("/", get(ui_index_handler)).route("/assets/{file}", get(ui_asset_handler)).route("/api/health", get(health_handler))
         .route("/api/sessions", get(list_sessions_handler).post(create_session_handler))
         .route("/api/sessions/{id}", get(get_session_handler))
         .route("/api/sessions/{id}/events", get(get_session_events_handler))
@@ -222,6 +250,7 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
         .route("/api/sessions/{id}/handoff", post(handoff_session_handler))
         .route("/ws", get(ws_handler))
+        .layer(middleware::from_fn(cors_middleware))
         .with_state(state)
 }
 
@@ -368,7 +397,6 @@ async fn stop_session_handler(
     Json(json!({ "ok": true, "session_id": id }))
 }
 
-/// Multi-agent handoff (`/velo-handoff`): hands off an existing session's branch & worktree to another agent.
 async fn handoff_session_handler(
     State(state): State<DaemonState>,
     AxumPath(id): AxumPath<Uuid>,
@@ -411,7 +439,6 @@ async fn handoff_session_handler(
         extra
     );
 
-    // Reuse the exact same worktree directory and branch for seamless continuation!
     let new_session_id = Uuid::new_v4();
     let short_id = &new_session_id.to_string()[..8];
     let now = Utc::now();
@@ -478,7 +505,6 @@ async fn handle_ws_client(socket: WebSocket, state: DaemonState) {
     let (mut sender, mut receiver) = socket.split();
     let mut event_rx = state.event_tx.subscribe();
 
-    // Send initial snapshot of all sessions upon connection
     {
         let guard = state.inner.read().await;
         let mut sessions: Vec<SessionInfo> = guard.sessions.values().cloned().collect();
@@ -573,7 +599,6 @@ mod tests {
         };
         state.spawn_event_supervisor();
 
-        // Spawn a custom agent that edits app.rs inside its isolated worktree
         let req = CreateSessionRequest {
             name: Some("test-agent".to_string()),
             provider: velo_protocol::AgentProvider::Custom(
@@ -589,7 +614,6 @@ mod tests {
         let session = state.create_session(req).await?;
         assert_eq!(session.branch, "feat/auto-edit");
 
-        // Wait briefly for child process to complete and supervisor to update diff stats
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
         let guard = state.inner.read().await;
@@ -601,5 +625,51 @@ mod tests {
         drop(guard);
         let _ = tokio::fs::remove_dir_all(&temp_base).await;
         Ok(())
+    }
+}
+
+async fn ui_index_handler() -> impl IntoResponse {
+    let dist_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/velo-desktop/dist");
+    let index_path = dist_dir.join("index.html");
+    match tokio::fs::read_to_string(&index_path).await {
+        Ok(html) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "Velo Daemon is running. Build UI with `pnpm --dir apps/velo-desktop build`."
+                .to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn ui_asset_handler(AxumPath(file): AxumPath<String>) -> impl IntoResponse {
+    let dist_assets = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../apps/velo-desktop/dist/assets");
+    // Prevent path traversal
+    let clean_name = Path::new(&file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let full_path = dist_assets.join(clean_name);
+
+    let content_type = if clean_name.ends_with(".js") {
+        "application/javascript; charset=utf-8"
+    } else if clean_name.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if clean_name.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "application/octet-stream"
+    };
+
+    match tokio::fs::read(&full_path).await {
+        Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
