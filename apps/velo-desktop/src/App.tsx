@@ -8,10 +8,8 @@ import {
   type SessionInfo,
   type UIEventItem,
 } from "./types";
-import { applyPaseoTheme, PASEO_THEMES, type PaseoThemeId } from "./theme";
-import { PaseoLeftSidebar } from "./components/PaseoLeftSidebar";
+import { applyVeloTheme, VELO_THEMES, type VeloThemeId } from "./theme";
 import { PaseoWorkspacePane, type WorkspaceTabKind } from "./components/PaseoWorkspacePane";
-import { PaseoExplorerSidebar } from "./components/PaseoExplorerSidebar";
 import {
   PaseoNewWorkspaceModal,
   PaseoOrchestratorModal,
@@ -22,6 +20,9 @@ import {
   VeloToastViewport,
   type VeloToastItem,
 } from "./components/ui/ShadcnCommandPalette";
+import { VeloTopCapsuleBar, type VeloStudioMode } from "./components/VeloTopCapsuleBar";
+import { VeloRightBentoDeck } from "./components/VeloRightBentoDeck";
+import { VeloMissionControl } from "./components/VeloMissionControl";
 
 const DEFAULT_DAEMON_URL = "http://127.0.0.1:6767";
 
@@ -70,28 +71,22 @@ index 51a991c..89e2104 100644
 +++ b/crates/velo-daemon/src/lib.rs
 @@ -44,6 +44,8 @@ pub async fn run_daemon_server(addr: SocketAddr) -> Result<()> {
      info!("Velo daemon listening on http://{}", addr);
-+    info!("Paseo-compatible workspace protocol v2 initialized");
++    info!("Velo OS 2.0 multi-agent protocol initialized");
      Ok(())
  }`;
 
 export function App() {
-  const [themeId, setThemeId] = useState<PaseoThemeId>(() => {
-    const saved = localStorage.getItem("velo-paseo-theme") as PaseoThemeId | null;
-    return saved || "paseo";
+  const [themeId, setThemeId] = useState<VeloThemeId>(() => {
+    const saved = localStorage.getItem("velo-studio-theme") as VeloThemeId | null;
+    return saved && saved in VELO_THEMES ? saved : "obsidian";
   });
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [wsConnected, setWsConnected] = useState(false);
 
-  const [leftSidebarCollapsed, setLeftSidebarCollapsed] = useState(false);
-  const [explorerOpen, setExplorerOpen] = useState(true);
-  const [isSplit, setIsSplit] = useState(false);
-  const [focusedPane, setFocusedPane] = useState<0 | 1>(0);
-
-  const [pane0SessionId, setPane0SessionId] = useState<string | null>(null);
-  const [pane1SessionId, setPane1SessionId] = useState<string | null>(null);
-  const [pane0Tab, setPane0Tab] = useState<WorkspaceTabKind>("agent");
-  const [pane1Tab, setPane1Tab] = useState<WorkspaceTabKind>("diff");
+  const [studioMode, setStudioMode] = useState<VeloStudioMode>("studio");
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [rightBentoOpen, setRightBentoOpen] = useState(true);
 
   const [eventsBySession, setEventsBySession] = useState<Record<string, UIEventItem[]>>({});
   const [diffsBySession, setDiffsBySession] = useState<
@@ -121,14 +116,14 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    applyPaseoTheme(themeId);
-    localStorage.setItem("velo-paseo-theme", themeId);
+    applyVeloTheme(themeId);
+    localStorage.setItem("velo-studio-theme", themeId);
   }, [themeId]);
 
   const handleSelectTheme = useCallback(
-    (id: PaseoThemeId) => {
+    (id: VeloThemeId) => {
       setThemeId(id);
-      pushToast(`Theme switched to ${PASEO_THEMES[id].label}`, PASEO_THEMES[id].description);
+      pushToast(`Theme switched to ${VELO_THEMES[id].label}`, VELO_THEMES[id].badge);
     },
     [pushToast]
   );
@@ -174,8 +169,7 @@ export function App() {
       setWsConnected(true);
 
       if (list.length > 0) {
-        setPane0SessionId((prev) => prev ?? list[0].id);
-        setPane1SessionId((prev) => prev ?? (list[1]?.id || list[0].id));
+        setSelectedSessionId((prev) => prev ?? list[0].id);
         for (const s of list) {
           fetchSessionDetails(s.id);
         }
@@ -183,8 +177,7 @@ export function App() {
     } catch {
       setWsConnected(false);
       setSessions((prev) => (prev.length > 0 ? prev : FALLBACK_SESSIONS));
-      setPane0SessionId((prev) => prev ?? FALLBACK_SESSIONS[0].id);
-      setPane1SessionId((prev) => prev ?? FALLBACK_SESSIONS[1].id);
+      setSelectedSessionId((prev) => prev ?? FALLBACK_SESSIONS[0].id);
     }
   }, [fetchSessionDetails]);
 
@@ -192,7 +185,6 @@ export function App() {
     fetchSessions();
   }, [fetchSessions]);
 
-  // Live WebSocket stream to Rust velo-daemon
   useEffect(() => {
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
@@ -224,7 +216,7 @@ export function App() {
               fetchSessions();
             }
           } catch {
-            // ignore malformed frame
+            // ignore
           }
         };
         ws.onclose = () => {
@@ -243,7 +235,6 @@ export function App() {
     };
   }, [fetchSessionDetails, fetchSessions]);
 
-  // Global Keyboard Shortcuts (⌘K, ⌘B, ⌘E, ⌘\, ⌘N)
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey) {
@@ -251,15 +242,9 @@ export function App() {
         if (k === "k") {
           e.preventDefault();
           setCommandPaletteOpen((v) => !v);
-        } else if (k === "b") {
-          e.preventDefault();
-          setLeftSidebarCollapsed((v) => !v);
         } else if (k === "e") {
           e.preventDefault();
-          setExplorerOpen((v) => !v);
-        } else if (e.key === "\\") {
-          e.preventDefault();
-          setIsSplit((v) => !v);
+          setRightBentoOpen((v) => !v);
         } else if (k === "n") {
           e.preventDefault();
           setNewWorkspaceOpen(true);
@@ -270,16 +255,10 @@ export function App() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
-  const activeSessionId = focusedPane === 1 && isSplit ? pane1SessionId : pane0SessionId;
-
-  const handleSelectSessionFromSidebar = (id: string) => {
-    if (isSplit && focusedPane === 1) {
-      setPane1SessionId(id);
-    } else {
-      setPane0SessionId(id);
-    }
-    fetchSessionDetails(id);
-  };
+  const activeSession = useMemo(
+    () => sessions.find((s) => s.id === selectedSessionId) ?? sessions[0] ?? null,
+    [sessions, selectedSessionId]
+  );
 
   const getEventsForSession = useCallback(
     (session: SessionInfo | null): UIEventItem[] => {
@@ -318,7 +297,7 @@ export function App() {
         },
         {
           kind: "assistant_message",
-          text: `I have updated the worktree on branch \`${session.branch}\` and verified that all workspace crates compile cleanly. Click any tool card above to inspect its arguments & output, or press \`⌘K\` to trigger multi-agent skills.`,
+          text: `Worktree branch \`${session.branch}\` updated and verified. The synchronized diff is live in the right Bento deck — you can filter by file, run PTY verification checks, or trigger \`/handoff\` and \`/advisor\` directly.`,
         },
       ];
     },
@@ -361,7 +340,7 @@ export function App() {
             ...(prev[sessionId] ?? []),
             {
               kind: "assistant_message",
-              text: `Executed follow-up in worktree: "${text}". All checks passing.`,
+              text: `Executed in isolated worktree: "${text}". All checks passing.`,
             },
           ],
         }));
@@ -369,7 +348,7 @@ export function App() {
         await fetchSessionDetails(sessionId);
         await fetchSessions();
       }
-      pushToast("Message sent to agent", text);
+      pushToast("Dispatched to worktree agent", text);
     } catch {
       setEventsBySession((prev) => ({
         ...prev,
@@ -377,7 +356,7 @@ export function App() {
           ...(prev[sessionId] ?? []),
           {
             kind: "assistant_message",
-            text: `Received instruction: "${text}". Executed in isolated worktree.`,
+            text: `Executed instruction: "${text}" in isolated worktree.`,
           },
         ],
       }));
@@ -413,15 +392,15 @@ export function App() {
       const raw = (await res.json()) as Record<string, unknown>;
       const created = normalizeSession(raw);
       await fetchSessions();
-      setPane0SessionId(created.id);
-      setPane0Tab("agent");
+      setSelectedSessionId(created.id);
+      setStudioMode("studio");
       pushToast("Isolated Worktree Agent Spawned", `${created.name} on ${created.branch}`);
     }
   };
 
   const handleRunHandoff = async (targetProvider: AgentProvider, note: string) => {
-    if (!activeSessionId) return;
-    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${activeSessionId}/handoff`, {
+    if (!activeSession) return;
+    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${activeSession.id}/handoff`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -433,14 +412,14 @@ export function App() {
       const raw = (await res.json()) as Record<string, unknown>;
       const created = normalizeSession(raw);
       await fetchSessions();
-      setPane0SessionId(created.id);
+      setSelectedSessionId(created.id);
       pushToast("Context Handed Off (/handoff)", `Spawned ${created.name}`);
     }
   };
 
   const handleRunAdvisor = async (advisorProvider: AgentProvider, question: string) => {
-    if (!activeSessionId) return;
-    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${activeSessionId}/advisor`, {
+    if (!activeSession) return;
+    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${activeSession.id}/advisor`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -452,13 +431,12 @@ export function App() {
       const raw = (await res.json()) as Record<string, unknown>;
       const created = normalizeSession(raw);
       await fetchSessions();
-      setPane0SessionId(created.id);
+      setSelectedSessionId(created.id);
       pushToast("Advisor Review Dispatched (/advisor)", `Spawned ${created.name}`);
     }
   };
 
   const handleRunCommittee = async (prompt: string, branchPrefix: string) => {
-    const active = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
     const res = await fetch(`${DEFAULT_DAEMON_URL}/api/committee`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -466,7 +444,7 @@ export function App() {
         name_prefix: branchPrefix,
         providers: ["claude", "codex"],
         prompt,
-        repo_path: active?.repo_root ?? "/Users/daiyudai/code/velo",
+        repo_path: activeSession?.repo_root ?? "/Users/daiyudai/code/velo",
       }),
     });
     if (res.ok) {
@@ -483,7 +461,6 @@ export function App() {
     checkCommand: string,
     maxIterations: number
   ) => {
-    const active = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
     const res = await fetch(`${DEFAULT_DAEMON_URL}/api/loop`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -493,7 +470,7 @@ export function App() {
         prompt: goal,
         check_command: checkCommand,
         max_iterations: maxIterations,
-        repo_path: active?.repo_root ?? "/Users/daiyudai/code/velo",
+        repo_path: activeSession?.repo_root ?? "/Users/daiyudai/code/velo",
         branch: `feat/loop-${Date.now().toString().slice(-4)}`,
       }),
     });
@@ -501,7 +478,7 @@ export function App() {
       const raw = (await res.json()) as Record<string, unknown>;
       const created = normalizeSession(raw);
       await fetchSessions();
-      setPane0SessionId(created.id);
+      setSelectedSessionId(created.id);
       pushToast(
         "Autonomous Goal Loop Started (/loop)",
         `Verifying against \`${checkCommand}\``
@@ -528,136 +505,124 @@ export function App() {
     setPairModalOpen(true);
   };
 
-  const pane0Session = useMemo(
-    () => sessions.find((s) => s.id === pane0SessionId) ?? sessions[0] ?? null,
-    [sessions, pane0SessionId]
-  );
-  const pane1Session = useMemo(
-    () => sessions.find((s) => s.id === pane1SessionId) ?? sessions[1] ?? sessions[0] ?? null,
-    [sessions, pane1SessionId]
-  );
-  const activeExplorerSession = isSplit && focusedPane === 1 ? pane1Session : pane0Session;
+  const activeEvents = getEventsForSession(activeSession);
+  const activeDiff = getDiffForSession(activeSession);
 
-  const pane0Diff = getDiffForSession(pane0Session);
-  const pane1Diff = getDiffForSession(pane1Session);
-  const explorerDiff = getDiffForSession(activeExplorerSession);
+  const mappedPaneTab: WorkspaceTabKind =
+    studioMode === "diff"
+      ? "diff"
+      : studioMode === "terminal"
+      ? "terminal"
+      : studioMode === "fleet"
+      ? "mission"
+      : "agent";
 
   return (
-    <div
-      className="w-screen h-screen overflow-hidden flex p-2 gap-2 select-none"
-      style={{
-        backgroundColor: "var(--canvas-bg)",
-        color: "var(--fg)",
-      }}
-    >
-      {!leftSidebarCollapsed && (
-        <PaseoLeftSidebar
-          sessions={sessions}
-          selectedSessionId={activeSessionId}
-          onSelectSession={handleSelectSessionFromSidebar}
-          wsConnected={wsConnected}
-          themeId={themeId}
-          onSelectTheme={handleSelectTheme}
-          onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
-          onOpenOrchestratorModal={(tab) => setOrchestratorModal({ open: true, tab })}
-          onOpenPairModal={handleOpenPairModal}
-          onOpenCommandPalette={() => setCommandPaletteOpen(true)}
-          onCollapseSidebar={() => setLeftSidebarCollapsed(true)}
-        />
-      )}
+    <div className="w-screen h-screen overflow-hidden flex flex-col p-3 gap-3 select-none">
+      {/* 1. Velo Original Top Dynamic Capsule Bar (No Left Paseo Tree Sidebar!) */}
+      <VeloTopCapsuleBar
+        sessions={sessions}
+        selectedSessionId={activeSession?.id ?? null}
+        onSelectSession={(id) => {
+          setSelectedSessionId(id);
+          fetchSessionDetails(id);
+        }}
+        studioMode={studioMode}
+        onChangeStudioMode={setStudioMode}
+        wsConnected={wsConnected}
+        themeId={themeId}
+        onSelectTheme={handleSelectTheme}
+        onOpenNewWorkspace={() => setNewWorkspaceOpen(true)}
+        onOpenOrchestrator={(tab) => setOrchestratorModal({ open: true, tab })}
+        onOpenPairModal={handleOpenPairModal}
+        onOpenCommandPalette={() => setCommandPaletteOpen(true)}
+      />
 
-      <main className="flex-1 min-w-0 h-full flex gap-2 overflow-hidden">
-        <PaseoWorkspacePane
-          paneIndex={0}
-          isSplit={isSplit}
-          isFocusedPane={!isSplit || focusedPane === 0}
-          onFocusPane={() => setFocusedPane(0)}
-          sessions={sessions}
-          session={pane0Session}
-          onSelectSession={handleSelectSessionFromSidebar}
-          onOpenPairModal={handleOpenPairModal}
-          events={getEventsForSession(pane0Session)}
-          diffText={pane0Diff.diff}
-          diffStats={pane0Diff.stats}
-          activeTab={pane0Tab}
-          onChangeTab={setPane0Tab}
-          leftSidebarCollapsed={leftSidebarCollapsed}
-          onExpandLeftSidebar={() => setLeftSidebarCollapsed(false)}
-          explorerOpen={explorerOpen}
-          onToggleExplorer={() => setExplorerOpen((v) => !v)}
-          onToggleSplit={() => {
-            setIsSplit((v) => !v);
-            pushToast(
-              !isSplit ? "Split Workspace Enabled" : "Single Workspace View",
-              "Shortcut: ⌘\\"
-            );
-          }}
-          onSendInput={handleSendInput}
-          onStopSession={handleStopSession}
-          onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
-          onOpenOrchestratorModal={(tab) => setOrchestratorModal({ open: true, tab })}
-        />
-
-        {isSplit && (
-          <PaseoWorkspacePane
-            paneIndex={1}
-            isSplit={isSplit}
-            isFocusedPane={focusedPane === 1}
-            onFocusPane={() => setFocusedPane(1)}
+      {/* 2. Velo Dual-Stage Bento Workspace */}
+      {studioMode === "fleet" ? (
+        <div className="flex-1 min-h-0 flex velo-bento-card overflow-hidden">
+          <VeloMissionControl
             sessions={sessions}
-            session={pane1Session}
-            onSelectSession={handleSelectSessionFromSidebar}
+            selectedSessionId={activeSession?.id ?? null}
+            onSelectSessionAndOpenStream={(id) => {
+              setSelectedSessionId(id);
+              setStudioMode("studio");
+            }}
+            onSelectSessionAndOpenDiff={(id) => {
+              setSelectedSessionId(id);
+              setStudioMode("diff");
+            }}
+            onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
+            onOpenOrchestratorModal={(tab) => setOrchestratorModal({ open: true, tab })}
             onOpenPairModal={handleOpenPairModal}
-            events={getEventsForSession(pane1Session)}
-            diffText={pane1Diff.diff}
-            diffStats={pane1Diff.stats}
-            activeTab={pane1Tab}
-            onChangeTab={setPane1Tab}
-            leftSidebarCollapsed={leftSidebarCollapsed}
-            onExpandLeftSidebar={() => setLeftSidebarCollapsed(false)}
-            explorerOpen={explorerOpen}
-            onToggleExplorer={() => setExplorerOpen((v) => !v)}
-            onToggleSplit={() => setIsSplit(false)}
+          />
+        </div>
+      ) : (
+        <main className="flex-1 min-h-0 flex gap-3 overflow-hidden">
+          {/* Left Bento Card: AI Agent Conversation & Reasoning Studio */}
+          <PaseoWorkspacePane
+            paneIndex={0}
+            isSplit={false}
+            isFocusedPane={true}
+            onFocusPane={() => {}}
+            sessions={sessions}
+            session={activeSession}
+            onSelectSession={setSelectedSessionId}
+            events={activeEvents}
+            diffText={activeDiff.diff}
+            diffStats={activeDiff.stats}
+            activeTab={mappedPaneTab}
+            onChangeTab={(tab) => {
+              if (tab === "mission") setStudioMode("fleet");
+              else if (tab === "diff") setStudioMode("diff");
+              else if (tab === "terminal") setStudioMode("terminal");
+              else setStudioMode("studio");
+            }}
+            leftSidebarCollapsed={false}
+            onExpandLeftSidebar={() => {}}
+            explorerOpen={rightBentoOpen}
+            onToggleExplorer={() => setRightBentoOpen((v) => !v)}
+            onToggleSplit={() => setRightBentoOpen((v) => !v)}
             onSendInput={handleSendInput}
             onStopSession={handleStopSession}
             onOpenNewWorkspaceModal={() => setNewWorkspaceOpen(true)}
             onOpenOrchestratorModal={(tab) => setOrchestratorModal({ open: true, tab })}
+            onOpenPairModal={handleOpenPairModal}
           />
-        )}
-      </main>
 
-      {explorerOpen && (
-        <PaseoExplorerSidebar
-          session={activeExplorerSession}
-          diffText={explorerDiff.diff}
-          diffStats={explorerDiff.stats}
-          onRefreshDiff={() => {
-            if (activeExplorerSession) {
-              fetchSessionDetails(activeExplorerSession.id);
-              pushToast("Refreshed Git Worktree Diff", activeExplorerSession.branch);
-            }
-          }}
-          onOpenDiffTab={() => {
-            if (isSplit && focusedPane === 1) {
-              setPane1Tab("diff");
-            } else {
-              setPane0Tab("diff");
-            }
-          }}
-          onCloseExplorer={() => setExplorerOpen(false)}
-        />
+          {/* Right Bento Deck: Synchronized Live Code Diff, Skill Launcher & PTY Console */}
+          {studioMode === "studio" && rightBentoOpen && (
+            <VeloRightBentoDeck
+              session={activeSession}
+              events={activeEvents}
+              diffText={activeDiff.diff}
+              diffStats={activeDiff.stats}
+              onRefreshDiff={() => {
+                if (activeSession) {
+                  fetchSessionDetails(activeSession.id);
+                  pushToast("Worktree Diff Synced", activeSession.branch);
+                }
+              }}
+              onSendInput={handleSendInput}
+              onOpenOrchestrator={(tab) => setOrchestratorModal({ open: true, tab })}
+            />
+          )}
+        </main>
       )}
 
-      {/* shadcn/ui Global ⌘K Command Palette */}
+      {/* Global ⌘K Command Palette */}
       <ShadcnCommandPalette
         open={commandPaletteOpen}
         onClose={() => setCommandPaletteOpen(false)}
         sessions={sessions}
-        onSelectSession={handleSelectSessionFromSidebar}
+        onSelectSession={(id) => {
+          setSelectedSessionId(id);
+          fetchSessionDetails(id);
+        }}
         onOpenNewWorkspace={() => setNewWorkspaceOpen(true)}
         onOpenOrchestrator={(tab) => setOrchestratorModal({ open: true, tab })}
-        onToggleSplit={() => setIsSplit((v) => !v)}
-        onToggleExplorer={() => setExplorerOpen((v) => !v)}
+        onToggleSplit={() => setRightBentoOpen((v) => !v)}
+        onToggleExplorer={() => setRightBentoOpen((v) => !v)}
         onOpenPair={handleOpenPairModal}
         onSelectTheme={handleSelectTheme}
       />
@@ -671,7 +636,7 @@ export function App() {
       <PaseoOrchestratorModal
         open={orchestratorModal.open}
         initialTab={orchestratorModal.tab}
-        activeSession={activeExplorerSession}
+        activeSession={activeSession}
         onClose={() => setOrchestratorModal((prev) => ({ ...prev, open: false }))}
         onRunHandoff={handleRunHandoff}
         onRunAdvisor={handleRunAdvisor}
@@ -685,7 +650,6 @@ export function App() {
         onClose={() => setPairModalOpen(false)}
       />
 
-      {/* beUI + shadcn Sonner-Style Animated Toast Stack */}
       <VeloToastViewport toasts={toasts} onDismiss={dismissToast} />
     </div>
   );

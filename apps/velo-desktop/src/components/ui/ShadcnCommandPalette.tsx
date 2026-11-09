@@ -242,7 +242,7 @@ export const ShadcnCommandPalette: React.FC<{
         id: `theme-${id}`,
         group: "Themes",
         label: `Theme: ${spec.label}`,
-        subtitle: spec.description,
+        subtitle: spec.badge,
         icon: <Palette className="w-3.5 h-3.5" />,
         onSelect: () => {
           onSelectTheme(id);

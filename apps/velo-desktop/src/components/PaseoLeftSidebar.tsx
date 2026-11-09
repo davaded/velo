@@ -570,7 +570,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
                       className="w-3 h-3 rounded-full border"
                       style={{
                         backgroundColor: spec.colors.surface0,
-                        borderColor: spec.colors.accentBright,
+                        borderColor: spec.colors.primaryBright,
                       }}
                     />
                     <span>{spec.label}</span>
