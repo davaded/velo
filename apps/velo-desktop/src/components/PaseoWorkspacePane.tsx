@@ -23,7 +23,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import type { AgentEvent, GitDiffStats, SessionInfo } from "../types";
+import type { GitDiffStats, SessionInfo, UIEventItem } from "../types";
 import { providerDisplayName } from "./PaseoLeftSidebar";
 import { parseUnifiedDiffToFiles } from "./PaseoExplorerSidebar";
 
@@ -35,7 +35,7 @@ interface PaseoWorkspacePaneProps {
   isFocusedPane: boolean;
   onFocusPane: () => void;
   session: SessionInfo | null;
-  events: AgentEvent[];
+  events: UIEventItem[];
   diffText: string;
   diffStats: GitDiffStats | null;
   activeTab: WorkspaceTabKind;
@@ -67,13 +67,13 @@ const SLASH_COMMANDS = [
   {
     cmd: "/committee",
     label: "Run Multi-Agent Committee",
-    desc: "Parallel fan-out across multiple providers + synthesizer judge",
+    desc: "Parallel fan-out across multiple providers in isolated worktrees",
     modal: "committee" as const,
   },
   {
     cmd: "/loop",
     label: "Start Autonomous Goal Loop",
-    desc: "Worker + evaluator iterative verification loop until goal passes",
+    desc: "Iterative verification loop against an acceptance check command",
     modal: "loop" as const,
   },
 ];
@@ -121,7 +121,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
     if (!session || !composerText.trim() || sending) return;
     const trimmed = composerText.trim();
 
-    // Check if user typed a slash orchestration command
     const slashMatch = SLASH_COMMANDS.find(
       (s) => trimmed === s.cmd || trimmed.startsWith(`${s.cmd} `)
     );
@@ -162,6 +161,11 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
     );
   };
 
+  const repoDisplayName = useMemo(() => {
+    const root = session?.repo_root || "/Users/daiyudai/code/velo";
+    return root.split("/").filter(Boolean).pop() || "velo";
+  }, [session?.repo_root]);
+
   return (
     <section
       onClick={onFocusPane}
@@ -179,7 +183,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
           borderColor: "var(--border-subtle)",
         }}
       >
-        {/* Left: Expand Sidebar (if collapsed) + Browser-Style Tabs */}
         <div className="flex items-center gap-1 min-w-0 overflow-x-auto">
           {leftSidebarCollapsed && paneIndex === 0 && (
             <button
@@ -195,7 +198,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
             </button>
           )}
 
-          {/* Tab 1: Active Agent Tab */}
           <button
             onClick={() => onChangeTab("agent")}
             className="h-[27px] px-2.5 rounded-[6px] flex items-center gap-2 text-[12px] font-medium transition-colors cursor-pointer shrink-0 max-w-[190px]"
@@ -212,7 +214,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
             <span className="truncate">{session?.name ?? "Agent"}</span>
           </button>
 
-          {/* Tab 2: Working Diff Tab */}
           <button
             onClick={() => onChangeTab("diff")}
             className="h-[27px] px-2.5 rounded-[6px] flex items-center gap-1.5 text-[12px] font-medium transition-colors cursor-pointer shrink-0"
@@ -240,7 +241,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
             )}
           </button>
 
-          {/* Tab 3: Terminal (PTY) Tab */}
           <button
             onClick={() => onChangeTab("terminal")}
             className="h-[27px] px-2.5 rounded-[6px] flex items-center gap-1.5 text-[12px] font-medium transition-colors cursor-pointer shrink-0"
@@ -257,7 +257,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
             <span>Terminal</span>
           </button>
 
-          {/* Tab 4: "+" NewTabPanel Launcher */}
           <button
             onClick={() => onChangeTab("new_tab")}
             title="New Tab Launcher (⌘T)"
@@ -271,7 +270,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
           </button>
         </div>
 
-        {/* Right: Quick Handoff/Advisor + Split Pane + Explorer Dock Toggle */}
         <div className="flex items-center gap-1 shrink-0">
           <button
             onClick={() => onOpenOrchestratorModal("handoff")}
@@ -330,7 +328,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
         </div>
       </header>
 
-      {/* 2. Paseo PaneSubtitle (Compact 1-line workspace facts bar) */}
+      {/* 2. Paseo PaneSubtitle */}
       {session && (
         <div
           className="h-[29px] px-3.5 border-b flex items-center justify-between text-[11px] shrink-0"
@@ -341,9 +339,12 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
           }}
         >
           <div className="flex items-center gap-2 min-w-0 truncate">
-            <span className="flex items-center gap-1 font-medium" style={{ color: "var(--fg-muted)" }}>
+            <span
+              className="flex items-center gap-1 font-medium"
+              style={{ color: "var(--fg-muted)" }}
+            >
               <FolderGit2 className="w-3 h-3" style={{ color: "var(--accent-bright)" }} />
-              {session.project_path.split("/").filter(Boolean).pop() || "repo"}
+              {repoDisplayName}
             </span>
             <span>/</span>
             <span
@@ -351,7 +352,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
               style={{ color: "var(--fg)" }}
             >
               <GitBranch className="w-3 h-3" style={{ color: "var(--accent-bright)" }} />
-              {session.worktree_branch}
+              {session.branch}
             </span>
             <span className="hidden md:inline">·</span>
             <span
@@ -392,10 +393,8 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
       {/* 3. Main Tab Body */}
       {activeTab === "agent" && (
         <div className="flex-1 flex flex-col min-h-0 relative">
-          {/* Scrollable Agent Stream Timeline */}
           <div className="flex-1 overflow-y-auto px-4 pt-5 pb-6 selectable-text">
             <div className="max-w-[760px] mx-auto space-y-3.5">
-              {/* Initial Task Prompt Bubble (Right-aligned Paseo UserMessage) */}
               {session && (
                 <div className="flex justify-end">
                   <div
@@ -411,7 +410,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                 </div>
               )}
 
-              {/* Stream Events: Paseo ExpandableBadges + IndentRail + AssistantMessage */}
               {events.map((ev, idx) => {
                 const isExpanded = !!expandedItems[idx];
 
@@ -574,7 +572,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                         {ev.text}
                       </div>
 
-                      {/* Paseo CompletedTurnFooterRow */}
                       <div
                         className="flex items-center gap-3 text-[11px] pt-0.5 select-none"
                         style={{ color: "var(--fg-extra-muted)" }}
@@ -629,7 +626,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                       <span className="h-[1px] flex-1 bg-[var(--border-subtle)]" />
                       <span className="font-mono-code">
                         Status → {ev.status}
-                        {ev.exit_code != null ? ` (exit ${ev.exit_code})` : ""}
+                        {ev.message ? ` (${ev.message})` : ""}
                       </span>
                       <span className="h-[1px] flex-1 bg-[var(--border-subtle)]" />
                     </div>
@@ -642,10 +639,9 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
             </div>
           </div>
 
-          {/* 4. Paseo Docked Bottom Composer (ComposerDock + MessageInput + AgentControls) */}
+          {/* 4. Paseo Docked Bottom Composer */}
           <div className="px-4 pb-3.5 pt-1 shrink-0">
             <div className="max-w-[760px] mx-auto relative">
-              {/* Slash Command Autocomplete Popover */}
               {matchingSlashCommands.length > 0 && (
                 <div
                   className="absolute bottom-full left-0 mb-2 w-full max-w-[440px] rounded-[10px] border p-1.5 shadow-2xl z-30"
@@ -705,7 +701,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                 </div>
               )}
 
-              {/* Rounded Composer Box */}
               <div
                 className="rounded-[12px] border transition-colors shadow-lg"
                 style={{
@@ -715,7 +710,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                     : "var(--border-subtle)",
                 }}
               >
-                {/* TextInput Area */}
                 <textarea
                   rows={2}
                   value={composerText}
@@ -735,11 +729,8 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                   style={{ color: "var(--fg)" }}
                 />
 
-                {/* Bottom Composer Toolbar Rail (AgentControls + Trailing Submit Disc) */}
                 <div className="px-2.5 pb-2 pt-1 flex items-center justify-between gap-2">
-                  {/* Left AgentControls Pills */}
                   <div className="flex items-center gap-1.5 flex-wrap">
-                    {/* Provider Pill */}
                     <span
                       className="h-[24px] px-2 rounded-full text-[11px] font-medium flex items-center gap-1.5 border"
                       style={{
@@ -755,7 +746,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                       {session ? providerDisplayName(session.provider) : "Claude"}
                     </span>
 
-                    {/* Mode Pill */}
                     <span
                       className="h-[24px] px-2 rounded-full text-[11px] flex items-center gap-1 border"
                       style={{
@@ -768,7 +758,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                       Auto-Edit
                     </span>
 
-                    {/* Quick Slash Command Trigger Pill */}
                     <button
                       type="button"
                       onClick={() => setComposerText("/")}
@@ -783,7 +772,6 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                     </button>
                   </div>
 
-                  {/* Right Action Disc (Stop Square when running, ArrowUp Disc when ready) */}
                   <div className="flex items-center gap-2">
                     {session?.status === "running" && !composerText.trim() ? (
                       <button
@@ -840,7 +828,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                   style={{ color: "var(--accent-bright)" }}
                 />
                 <span className="text-[12.5px] font-semibold">
-                  Working Tree Diff ({session?.worktree_branch})
+                  Working Tree Diff ({session?.branch})
                 </span>
               </div>
               <div className="font-mono-code text-[12px] flex items-center gap-2">
@@ -961,7 +949,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
               # Velo Native PTY Bridge — {session?.worktree_path}
             </div>
             <div style={{ color: "var(--fg-extra-muted)" }}>
-              $ git status -sb → ## {session?.worktree_branch}
+              $ git status -sb → ## {session?.branch}
             </div>
             {events.map((ev, idx) => {
               if (ev.kind === "pty_data") {
@@ -998,7 +986,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
         </div>
       )}
 
-      {/* "+" NewTabPanel Launcher (Matches Paseo's packages/app/src/panels/new-tab-panel.tsx) */}
+      {/* "+" NewTabPanel Launcher */}
       {activeTab === "new_tab" && (
         <div className="flex-1 overflow-y-auto p-6 flex items-center justify-center">
           <div className="max-w-[540px] w-full space-y-5">
@@ -1009,7 +997,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
               <p className="text-[12px]" style={{ color: "var(--fg-muted)" }}>
                 Launch an agent, multi-agent workflow, or tool tab in{" "}
                 <span className="font-mono-code" style={{ color: "var(--accent-bright)" }}>
-                  {session?.worktree_branch ?? "current worktree"}
+                  {session?.branch ?? "current worktree"}
                 </span>
               </p>
             </div>
@@ -1089,7 +1077,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                   </span>
                 </div>
                 <p className="text-[11px]" style={{ color: "var(--fg-muted)" }}>
-                  Run parallel review across Claude + Codex + synthesizer judge
+                  Run parallel review across Claude + Codex in isolated worktrees
                 </p>
               </button>
 
@@ -1114,7 +1102,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
                   </span>
                 </div>
                 <p className="text-[11px]" style={{ color: "var(--fg-muted)" }}>
-                  Worker + Evaluator iterative verification until goal passes
+                  Iterative self-healing verification loop until check passes
                 </p>
               </button>
             </div>

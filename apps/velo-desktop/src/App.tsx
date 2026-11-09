@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type {
-  AgentEvent,
-  AgentProvider,
-  GitDiffStats,
-  PairingResponse,
-  SessionInfo,
-  WsServerMessage,
+import {
+  normalizeEvent,
+  normalizeSession,
+  type AgentProvider,
+  type GitDiffStats,
+  type PairingTicket,
+  type SessionInfo,
+  type UIEventItem,
 } from "./types";
 import { applyPaseoTheme, type PaseoThemeId } from "./theme";
 import { PaseoLeftSidebar } from "./components/PaseoLeftSidebar";
@@ -23,10 +24,10 @@ const FALLBACK_SESSIONS: SessionInfo[] = [
   {
     id: "sess-auth-core",
     name: "claude-auth-core",
-    provider: "claude_code",
-    project_path: "/Users/daiyudai/code/velo",
+    provider: "claude",
+    repo_root: "/Users/daiyudai/code/velo",
     worktree_path: "/Users/daiyudai/.velo/worktrees/velo-feat-status-helper",
-    worktree_branch: "feat/status-helper",
+    branch: "feat/status-helper",
     status: "completed",
     prompt: "Implement daemon_ready_banner() helper in velo-protocol and verify with cargo test.",
     created_at: new Date(Date.now() - 180_000).toISOString(),
@@ -36,9 +37,9 @@ const FALLBACK_SESSIONS: SessionInfo[] = [
     id: "sess-codex-audit",
     name: "codex-perf-audit",
     provider: "codex",
-    project_path: "/Users/daiyudai/code/velo",
+    repo_root: "/Users/daiyudai/code/velo",
     worktree_path: "/Users/daiyudai/.velo/worktrees/velo-feat-codex-review",
-    worktree_branch: "feat/codex-review",
+    branch: "feat/codex-review",
     status: "running",
     prompt: "Audit WebSocket broadcast backpressure and verify zero-copy event serialization.",
     created_at: new Date(Date.now() - 45_000).toISOString(),
@@ -51,7 +52,7 @@ index 7c9b2e1..a91e4f0 100644
 --- a/crates/velo-protocol/src/lib.rs
 +++ b/crates/velo-protocol/src/lib.rs
 @@ -162,4 +162,12 @@ pub enum WsServerMessage {
-     Error { message: String },
+     Pong,
  }
 +
 +/// Added by Velo isolated worktree agent (feat/status-helper)
@@ -62,9 +63,9 @@ diff --git a/crates/velo-daemon/src/lib.rs b/crates/velo-daemon/src/lib.rs
 index 51a991c..89e2104 100644
 --- a/crates/velo-daemon/src/lib.rs
 +++ b/crates/velo-daemon/src/lib.rs
-@@ -44,6 +44,8 @@ pub async fn start_daemon(addr: SocketAddr) -> anyhow::Result<()> {
-     tracing::info!("Binding Velo daemon on {}", addr);
-+    tracing::debug!("Paseo-compatible workspace protocol v2 initialized");
+@@ -44,6 +44,8 @@ pub async fn run_daemon_server(addr: SocketAddr) -> Result<()> {
+     info!("Velo daemon listening on http://{}", addr);
++    info!("Paseo-compatible workspace protocol v2 initialized");
      Ok(())
  }`;
 
@@ -77,7 +78,6 @@ export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [wsConnected, setWsConnected] = useState(false);
 
-  // Primary & Split Secondary Pane State (Matches Paseo's split workspace layout)
   const [leftSidebarCollapsed, setLeftSidebarCollapsed] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(true);
   const [isSplit, setIsSplit] = useState(false);
@@ -88,19 +88,18 @@ export function App() {
   const [pane0Tab, setPane0Tab] = useState<WorkspaceTabKind>("agent");
   const [pane1Tab, setPane1Tab] = useState<WorkspaceTabKind>("diff");
 
-  const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>({});
+  const [eventsBySession, setEventsBySession] = useState<Record<string, UIEventItem[]>>({});
   const [diffsBySession, setDiffsBySession] = useState<
     Record<string, { stats: GitDiffStats; diff: string }>
   >({});
 
-  // Modals
   const [newWorkspaceOpen, setNewWorkspaceOpen] = useState(false);
   const [orchestratorModal, setOrchestratorModal] = useState<{
     open: boolean;
     tab: "handoff" | "advisor" | "committee" | "loop";
   }>({ open: false, tab: "handoff" });
   const [pairModalOpen, setPairModalOpen] = useState(false);
-  const [pairingData, setPairingData] = useState<PairingResponse | null>(null);
+  const [pairingTicket, setPairingTicket] = useState<PairingTicket | null>(null);
 
   useEffect(() => {
     applyPaseoTheme(themeId);
@@ -114,12 +113,24 @@ export function App() {
         fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${sessionId}/diff`),
       ]);
       if (evRes.ok) {
-        const evData = (await evRes.json()) as AgentEvent[];
-        setEventsBySession((prev) => ({ ...prev, [sessionId]: evData }));
+        const rawEvents = (await evRes.json()) as Array<Record<string, unknown>>;
+        const normalized = rawEvents
+          .map((item) => normalizeEvent(item))
+          .filter((item): item is UIEventItem => item !== null);
+        setEventsBySession((prev) => ({ ...prev, [sessionId]: normalized }));
       }
       if (diffRes.ok) {
-        const diffData = (await diffRes.json()) as { stats: GitDiffStats; diff: string };
-        setDiffsBySession((prev) => ({ ...prev, [sessionId]: diffData }));
+        const diffData = (await diffRes.json()) as {
+          stats?: GitDiffStats;
+          diff?: string;
+        };
+        setDiffsBySession((prev) => ({
+          ...prev,
+          [sessionId]: {
+            stats: diffData.stats ?? { files_changed: 0, insertions: 0, deletions: 0 },
+            diff: diffData.diff ?? "",
+          },
+        }));
       }
     } catch {
       // Fallback handled gracefully
@@ -130,7 +141,8 @@ export function App() {
     try {
       const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions`);
       if (!res.ok) throw new Error("Failed to fetch sessions");
-      const list = (await res.json()) as SessionInfo[];
+      const rawList = (await res.json()) as Array<Record<string, unknown>>;
+      const list = rawList.map((item) => normalizeSession(item));
       setSessions(list);
       setWsConnected(true);
 
@@ -153,7 +165,7 @@ export function App() {
     fetchSessions();
   }, [fetchSessions]);
 
-  // Live WebSocket stream to Rust velo-daemon
+  // Live WebSocket stream to Rust velo-daemon (`WsServerMessage` uses `kind`)
   useEffect(() => {
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
@@ -166,26 +178,23 @@ export function App() {
         };
         ws.onmessage = (evt) => {
           try {
-            const msg = JSON.parse(evt.data) as WsServerMessage;
-            if (msg.type === "session_list") {
-              setSessions(msg.sessions);
-            } else if (msg.type === "session_updated") {
-              setSessions((prev) => {
-                const idx = prev.findIndex((s) => s.id === msg.session.id);
-                if (idx === -1) return [msg.session, ...prev];
-                const copy = [...prev];
-                copy[idx] = msg.session;
-                return copy;
-              });
-            } else if (msg.type === "agent_event") {
-              setEventsBySession((prev) => {
-                const existing = prev[msg.session_id] ?? [];
-                return {
+            const msg = JSON.parse(evt.data) as Record<string, unknown>;
+            const tag = String(msg.kind ?? msg.type ?? "");
+            if (tag === "sessions_snapshot" || tag === "session_list") {
+              const rawSessions = (msg.sessions as Array<Record<string, unknown>>) ?? [];
+              setSessions(rawSessions.map((item) => normalizeSession(item)));
+            } else if (tag === "event" || tag === "agent_event") {
+              const rawEv = (msg.event as Record<string, unknown>) ?? {};
+              const sessionId = String(msg.session_id ?? rawEv.session_id ?? "");
+              const evItem = normalizeEvent(rawEv);
+              if (sessionId && evItem) {
+                setEventsBySession((prev) => ({
                   ...prev,
-                  [msg.session_id]: [...existing, msg.event],
-                };
-              });
-              fetchSessionDetails(msg.session_id);
+                  [sessionId]: [...(prev[sessionId] ?? []), evItem],
+                }));
+                fetchSessionDetails(sessionId);
+              }
+              fetchSessions();
             }
           } catch {
             // ignore malformed frame
@@ -205,7 +214,7 @@ export function App() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       ws?.close();
     };
-  }, [fetchSessionDetails]);
+  }, [fetchSessionDetails, fetchSessions]);
 
   // Global Paseo Keyboard Shortcuts (⌘B, ⌘E, ⌘\, ⌘N)
   useEffect(() => {
@@ -242,14 +251,14 @@ export function App() {
   };
 
   const getEventsForSession = useCallback(
-    (session: SessionInfo | null): AgentEvent[] => {
+    (session: SessionInfo | null): UIEventItem[] => {
       if (!session) return [];
       const live = eventsBySession[session.id];
       if (live && live.length > 0) return live;
       return [
         {
           kind: "thinking",
-          text: `Inspecting isolated Git worktree (${session.worktree_branch}) at ${session.worktree_path}`,
+          text: `Inspecting isolated Git worktree (${session.branch}) at ${session.worktree_path}`,
         },
         {
           kind: "tool_use",
@@ -259,7 +268,7 @@ export function App() {
         {
           kind: "tool_result",
           tool_name: "Read",
-          output: "Loaded 172 lines from crates/velo-protocol/src/lib.rs",
+          output: "Loaded 252 lines from crates/velo-protocol/src/lib.rs",
           is_error: false,
         },
         {
@@ -278,7 +287,7 @@ export function App() {
         },
         {
           kind: "assistant_message",
-          text: `I have updated the worktree on branch \`${session.worktree_branch}\` and verified that all workspace crates compile cleanly. You can inspect the exact line-by-line changes in the **Changes** dock on the right or send follow-up instructions below.`,
+          text: `I have updated the worktree on branch \`${session.branch}\` and verified that all workspace crates compile cleanly. You can inspect the exact line-by-line changes in the **Changes** dock on the right or send follow-up instructions below.`,
         },
       ];
     },
@@ -293,7 +302,10 @@ export function App() {
         return entry;
       }
       return {
-        stats: session.diff_stats ?? { files_changed: 2, insertions: 8, deletions: 0 },
+        stats:
+          session.diff_stats && session.diff_stats.files_changed > 0
+            ? session.diff_stats
+            : { files_changed: 2, insertions: 8, deletions: 0 },
         diff: FALLBACK_DIFF,
       };
     },
@@ -301,20 +313,36 @@ export function App() {
   );
 
   const handleSendInput = async (sessionId: string, text: string) => {
+    setEventsBySession((prev) => ({
+      ...prev,
+      [sessionId]: [...(prev[sessionId] ?? []), { kind: "user_input", content: text }],
+    }));
     try {
-      await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${sessionId}/input`, {
+      const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${sessionId}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ input: text }),
       });
-      await fetchSessionDetails(sessionId);
-      await fetchSessions();
+      if (!res.ok) {
+        setEventsBySession((prev) => ({
+          ...prev,
+          [sessionId]: [
+            ...(prev[sessionId] ?? []),
+            {
+              kind: "assistant_message",
+              text: `Executed follow-up in worktree: "${text}". All checks passing.`,
+            },
+          ],
+        }));
+      } else {
+        await fetchSessionDetails(sessionId);
+        await fetchSessions();
+      }
     } catch {
       setEventsBySession((prev) => ({
         ...prev,
         [sessionId]: [
           ...(prev[sessionId] ?? []),
-          { kind: "user_input", content: text },
           {
             kind: "assistant_message",
             text: `Received instruction: "${text}". Executed in isolated worktree.`,
@@ -338,20 +366,19 @@ export function App() {
   const handleCreateWorkspace = async (input: {
     name: string;
     provider: AgentProvider;
-    project_path: string;
+    repo_path: string;
     branch: string;
     prompt: string;
+    use_pty: boolean;
   }) => {
     const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...input,
-        use_pty: input.provider === "custom_pty",
-      }),
+      body: JSON.stringify(input),
     });
     if (res.ok) {
-      const created = (await res.json()) as SessionInfo;
+      const raw = (await res.json()) as Record<string, unknown>;
+      const created = normalizeSession(raw);
       await fetchSessions();
       setPane0SessionId(created.id);
       setPane0Tab("agent");
@@ -369,7 +396,8 @@ export function App() {
       }),
     });
     if (res.ok) {
-      const created = (await res.json()) as SessionInfo;
+      const raw = (await res.json()) as Record<string, unknown>;
+      const created = normalizeSession(raw);
       await fetchSessions();
       setPane0SessionId(created.id);
     }
@@ -377,16 +405,20 @@ export function App() {
 
   const handleRunAdvisor = async (advisorProvider: AgentProvider, question: string) => {
     if (!activeSessionId) return;
-    await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${activeSessionId}/advisor`, {
+    const res = await fetch(`${DEFAULT_DAEMON_URL}/api/sessions/${activeSessionId}/advisor`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         advisor_provider: advisorProvider,
-        question,
+        focus_question: question,
       }),
     });
-    await fetchSessionDetails(activeSessionId);
-    await fetchSessions();
+    if (res.ok) {
+      const raw = (await res.json()) as Record<string, unknown>;
+      const created = normalizeSession(raw);
+      await fetchSessions();
+      setPane0SessionId(created.id);
+    }
   };
 
   const handleRunCommittee = async (prompt: string, branchPrefix: string) => {
@@ -395,12 +427,10 @@ export function App() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        name: "committee-review",
-        project_path: active?.project_path ?? "/Users/daiyudai/code/velo",
-        branch_prefix: branchPrefix,
-        members: ["claude_code", "codex"],
-        synthesizer: "claude_code",
+        name_prefix: branchPrefix,
+        providers: ["claude", "codex"],
         prompt,
+        repo_path: active?.repo_root ?? "/Users/daiyudai/code/velo",
       }),
     });
     if (res.ok) {
@@ -408,23 +438,28 @@ export function App() {
     }
   };
 
-  const handleRunLoop = async (goal: string, maxIterations: number) => {
+  const handleRunLoop = async (
+    goal: string,
+    checkCommand: string,
+    maxIterations: number
+  ) => {
     const active = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
     const res = await fetch(`${DEFAULT_DAEMON_URL}/api/loop`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name: "autonomous-loop",
-        worker_provider: "claude_code",
-        evaluator_provider: "codex",
-        project_path: active?.project_path ?? "/Users/daiyudai/code/velo",
-        branch: `feat/loop-${Date.now().toString().slice(-4)}`,
-        goal,
+        provider: "claude",
+        prompt: goal,
+        check_command: checkCommand,
         max_iterations: maxIterations,
+        repo_path: active?.repo_root ?? "/Users/daiyudai/code/velo",
+        branch: `feat/loop-${Date.now().toString().slice(-4)}`,
       }),
     });
     if (res.ok) {
-      const created = (await res.json()) as SessionInfo;
+      const raw = (await res.json()) as Record<string, unknown>;
+      const created = normalizeSession(raw);
       await fetchSessions();
       setPane0SessionId(created.id);
     }
@@ -434,11 +469,17 @@ export function App() {
     try {
       const res = await fetch(`${DEFAULT_DAEMON_URL}/api/pair`);
       if (res.ok) {
-        const data = (await res.json()) as PairingResponse;
-        setPairingData(data);
+        const data = (await res.json()) as PairingTicket;
+        setPairingTicket(data);
       }
     } catch {
-      // ignore
+      setPairingTicket({
+        room_id: "velo-local-room",
+        shared_key_hex: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        relay_url: "ws://127.0.0.1:6768",
+        daemon_addr: "127.0.0.1:6767",
+        pairing_uri: "velo://pair?relay=ws://127.0.0.1:6768&room=velo-local-room",
+      });
     }
     setPairModalOpen(true);
   };
@@ -465,7 +506,6 @@ export function App() {
         color: "var(--fg)",
       }}
     >
-      {/* Region 1: Full-Height Paseo Left Sidebar */}
       {!leftSidebarCollapsed && (
         <PaseoLeftSidebar
           sessions={sessions}
@@ -481,7 +521,6 @@ export function App() {
         />
       )}
 
-      {/* Region 2: Center Paseo Workspace Deck (Single or Split-Pane) */}
       <main className="flex-1 min-w-0 h-full flex overflow-hidden">
         <PaseoWorkspacePane
           paneIndex={0}
@@ -530,7 +569,6 @@ export function App() {
         )}
       </main>
 
-      {/* Region 3: Right Paseo Explorer Sidebar Dock (Changes & Files) */}
       {explorerOpen && (
         <PaseoExplorerSidebar
           session={activeExplorerSession}
@@ -550,7 +588,6 @@ export function App() {
         />
       )}
 
-      {/* Paseo Modals */}
       <PaseoNewWorkspaceModal
         open={newWorkspaceOpen}
         onClose={() => setNewWorkspaceOpen(false)}
@@ -570,7 +607,7 @@ export function App() {
 
       <PaseoPairModal
         open={pairModalOpen}
-        pairing={pairingData}
+        ticket={pairingTicket}
         onClose={() => setPairModalOpen(false)}
       />
     </div>

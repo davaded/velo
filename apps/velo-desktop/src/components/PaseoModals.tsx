@@ -10,7 +10,12 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import type { AgentProvider, PairingResponse, SessionInfo } from "../types";
+import {
+  renderAsciiQrForUri,
+  type AgentProvider,
+  type PairingTicket,
+  type SessionInfo,
+} from "../types";
 
 interface NewWorkspaceModalProps {
   open: boolean;
@@ -18,9 +23,10 @@ interface NewWorkspaceModalProps {
   onCreate: (input: {
     name: string;
     provider: AgentProvider;
-    project_path: string;
+    repo_path: string;
     branch: string;
     prompt: string;
+    use_pty: boolean;
   }) => Promise<void>;
 }
 
@@ -30,8 +36,10 @@ export const PaseoNewWorkspaceModal: React.FC<NewWorkspaceModalProps> = ({
   onCreate,
 }) => {
   const [name, setName] = useState("claude-feature-worker");
-  const [provider, setProvider] = useState<AgentProvider>("claude_code");
-  const [projectPath, setProjectPath] = useState("/Users/daiyudai/code/velo");
+  const [providerKey, setProviderKey] = useState<"claude" | "codex" | "opencode" | "pty">(
+    "claude"
+  );
+  const [repoPath, setRepoPath] = useState("/Users/daiyudai/code/velo");
   const [branch, setBranch] = useState("feat/paseo-ui");
   const [prompt, setPrompt] = useState(
     "Inspect the workspace architecture and implement the requested module with unit tests."
@@ -45,12 +53,15 @@ export const PaseoNewWorkspaceModal: React.FC<NewWorkspaceModalProps> = ({
     if (!name.trim() || !prompt.trim() || submitting) return;
     setSubmitting(true);
     try {
+      const provider: AgentProvider =
+        providerKey === "pty" ? { custom: "echo" } : providerKey;
       await onCreate({
         name: name.trim(),
         provider,
-        project_path: projectPath.trim(),
+        repo_path: repoPath.trim(),
         branch: branch.trim() || "feat/agent-task",
         prompt: prompt.trim(),
+        use_pty: providerKey === "pty",
       });
       onClose();
     } finally {
@@ -103,8 +114,10 @@ export const PaseoNewWorkspaceModal: React.FC<NewWorkspaceModalProps> = ({
             <div className="space-y-1">
               <label style={{ color: "var(--fg-muted)" }}>Agent Provider</label>
               <select
-                value={provider}
-                onChange={(e) => setProvider(e.target.value as AgentProvider)}
+                value={providerKey}
+                onChange={(e) =>
+                  setProviderKey(e.target.value as "claude" | "codex" | "opencode" | "pty")
+                }
                 className="w-full h-[32px] px-2.5 rounded-[6px] border text-[12px] focus:outline-none"
                 style={{
                   backgroundColor: "var(--surface-2)",
@@ -112,10 +125,10 @@ export const PaseoNewWorkspaceModal: React.FC<NewWorkspaceModalProps> = ({
                   color: "var(--fg)",
                 }}
               >
-                <option value="claude_code">Claude Code (NDJSON)</option>
+                <option value="claude">Claude Code (NDJSON)</option>
                 <option value="codex">OpenAI Codex CLI</option>
                 <option value="opencode">OpenCode Agent</option>
-                <option value="custom_pty">Interactive Shell PTY</option>
+                <option value="pty">Interactive Shell PTY</option>
               </select>
             </div>
           </div>
@@ -124,8 +137,8 @@ export const PaseoNewWorkspaceModal: React.FC<NewWorkspaceModalProps> = ({
             <div className="space-y-1">
               <label style={{ color: "var(--fg-muted)" }}>Repository Path</label>
               <input
-                value={projectPath}
-                onChange={(e) => setProjectPath(e.target.value)}
+                value={repoPath}
+                onChange={(e) => setRepoPath(e.target.value)}
                 className="w-full h-[32px] px-2.5 rounded-[6px] border font-mono-code text-[11.5px] focus:outline-none"
                 style={{
                   backgroundColor: "var(--surface-2)",
@@ -207,7 +220,7 @@ interface OrchestratorModalProps {
   onRunHandoff: (targetProvider: AgentProvider, note: string) => Promise<void>;
   onRunAdvisor: (advisorProvider: AgentProvider, question: string) => Promise<void>;
   onRunCommittee: (prompt: string, branchPrefix: string) => Promise<void>;
-  onRunLoop: (goal: string, maxIterations: number) => Promise<void>;
+  onRunLoop: (goal: string, checkCommand: string, maxIterations: number) => Promise<void>;
 }
 
 export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
@@ -221,11 +234,14 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
   onRunLoop,
 }) => {
   const [tab, setTab] = useState<"handoff" | "advisor" | "committee" | "loop">(initialTab);
-  const [targetProvider, setTargetProvider] = useState<AgentProvider>("codex");
+  const [targetProvider, setTargetProvider] = useState<"claude" | "codex" | "opencode">(
+    "codex"
+  );
   const [textInput, setTextInput] = useState(
     "Review the current implementation for edge cases, concurrency safety, and test coverage."
   );
-  const [branchPrefix, setBranchPrefix] = useState("committee/arch-review");
+  const [branchPrefix, setBranchPrefix] = useState("committee-arch");
+  const [checkCommand, setCheckCommand] = useState("cargo test --offline");
   const [maxIterations, setMaxIterations] = useState(3);
   const [busy, setBusy] = useState(false);
 
@@ -243,7 +259,7 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
       } else if (tab === "committee") {
         await onRunCommittee(textInput, branchPrefix);
       } else {
-        await onRunLoop(textInput, maxIterations);
+        await onRunLoop(textInput, checkCommand, maxIterations);
       }
       onClose();
     } finally {
@@ -260,7 +276,6 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
           borderColor: "var(--border-accent)",
         }}
       >
-        {/* Header */}
         <div
           className="px-4 py-3 border-b flex items-center justify-between"
           style={{ borderColor: "var(--border-subtle)" }}
@@ -280,7 +295,6 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
           </button>
         </div>
 
-        {/* Mode Selector Tabs */}
         <div
           className="px-3 py-2 border-b grid grid-cols-4 gap-1.5"
           style={{
@@ -323,7 +337,7 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
               <label style={{ color: "var(--fg-muted)" }}>
                 Source Session:{" "}
                 <span className="font-mono-code" style={{ color: "var(--fg)" }}>
-                  {activeSession?.name ?? "None"} ({activeSession?.worktree_branch})
+                  {activeSession?.name ?? "None"} ({activeSession?.branch})
                 </span>
               </label>
               <div className="pt-1">
@@ -332,7 +346,9 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
                 </label>
                 <select
                   value={targetProvider}
-                  onChange={(e) => setTargetProvider(e.target.value as AgentProvider)}
+                  onChange={(e) =>
+                    setTargetProvider(e.target.value as "claude" | "codex" | "opencode")
+                  }
                   className="w-full h-[32px] px-2.5 rounded-[6px] border text-[12px] focus:outline-none"
                   style={{
                     backgroundColor: "var(--surface-2)",
@@ -341,7 +357,7 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
                   }}
                 >
                   <option value="codex">OpenAI Codex CLI</option>
-                  <option value="claude_code">Claude Code</option>
+                  <option value="claude">Claude Code</option>
                   <option value="opencode">OpenCode Agent</option>
                 </select>
               </div>
@@ -351,7 +367,7 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
           {tab === "committee" && (
             <div className="space-y-1">
               <label style={{ color: "var(--fg-muted)" }}>
-                Committee Branch Prefix (spawns Claude Code + Codex + Synthesizer Judge)
+                Committee Name Prefix (spawns Claude Code + Codex in isolated worktrees)
               </label>
               <input
                 value={branchPrefix}
@@ -367,23 +383,36 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
           )}
 
           {tab === "loop" && (
-            <div className="space-y-1">
-              <label style={{ color: "var(--fg-muted)" }}>
-                Max Autonomous Verification Iterations (Worker + Evaluator)
-              </label>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={maxIterations}
-                onChange={(e) => setMaxIterations(Number(e.target.value))}
-                className="w-full h-[32px] px-2.5 rounded-[6px] border font-mono-code text-[12px] focus:outline-none"
-                style={{
-                  backgroundColor: "var(--surface-2)",
-                  borderColor: "var(--border-accent)",
-                  color: "var(--fg)",
-                }}
-              />
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <label style={{ color: "var(--fg-muted)" }}>Acceptance Check Command</label>
+                <input
+                  value={checkCommand}
+                  onChange={(e) => setCheckCommand(e.target.value)}
+                  className="w-full h-[32px] px-2.5 rounded-[6px] border font-mono-code text-[11.5px] focus:outline-none"
+                  style={{
+                    backgroundColor: "var(--surface-2)",
+                    borderColor: "var(--border-accent)",
+                    color: "var(--fg)",
+                  }}
+                />
+              </div>
+              <div className="space-y-1">
+                <label style={{ color: "var(--fg-muted)" }}>Max Self-Heal Iterations</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={maxIterations}
+                  onChange={(e) => setMaxIterations(Number(e.target.value))}
+                  className="w-full h-[32px] px-2.5 rounded-[6px] border font-mono-code text-[12px] focus:outline-none"
+                  style={{
+                    backgroundColor: "var(--surface-2)",
+                    borderColor: "var(--border-accent)",
+                    color: "var(--fg)",
+                  }}
+                />
+              </div>
             </div>
           )}
 
@@ -392,7 +421,7 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
               {tab === "handoff"
                 ? "Handoff Instructions"
                 : tab === "advisor"
-                ? "Advisor Question"
+                ? "Advisor Focus Question"
                 : tab === "committee"
                 ? "Committee Task Prompt"
                 : "Autonomous Goal Specification"}
@@ -443,12 +472,13 @@ export const PaseoOrchestratorModal: React.FC<OrchestratorModalProps> = ({
 
 interface PairModalProps {
   open: boolean;
-  pairing: PairingResponse | null;
+  ticket: PairingTicket | null;
   onClose: () => void;
 }
 
-export const PaseoPairModal: React.FC<PairModalProps> = ({ open, pairing, onClose }) => {
-  if (!open || !pairing) return null;
+export const PaseoPairModal: React.FC<PairModalProps> = ({ open, ticket, onClose }) => {
+  if (!open || !ticket) return null;
+  const qrAscii = renderAsciiQrForUri(ticket.pairing_uri);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-[2px] p-4">
@@ -485,7 +515,7 @@ export const PaseoPairModal: React.FC<PairModalProps> = ({ open, pairing, onClos
               color: "var(--accent-bright)",
             }}
           >
-            <pre className="inline-block text-left">{pairing.qr_ascii}</pre>
+            <pre className="inline-block text-left">{qrAscii}</pre>
           </div>
 
           <div
@@ -497,17 +527,17 @@ export const PaseoPairModal: React.FC<PairModalProps> = ({ open, pairing, onClos
           >
             <div className="flex items-center justify-between">
               <span style={{ color: "var(--fg-extra-muted)" }}>Room ID:</span>
-              <span style={{ color: "var(--fg)" }}>{pairing.ticket.room_id}</span>
+              <span style={{ color: "var(--fg)" }}>{ticket.room_id}</span>
             </div>
             <div className="flex items-center justify-between">
               <span style={{ color: "var(--fg-extra-muted)" }}>Shared Key:</span>
               <span className="truncate max-w-[230px]" style={{ color: "var(--accent-bright)" }}>
-                {pairing.ticket.shared_key_hex}
+                {ticket.shared_key_hex}
               </span>
             </div>
             <div className="pt-1 border-t" style={{ borderColor: "var(--border-subtle)" }}>
               <div className="truncate select-all" style={{ color: "var(--fg-muted)" }}>
-                {pairing.uri}
+                {ticket.pairing_uri}
               </div>
             </div>
           </div>

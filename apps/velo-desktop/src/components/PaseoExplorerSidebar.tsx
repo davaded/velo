@@ -268,7 +268,7 @@ export const PaseoExplorerSidebar: React.FC<PaseoExplorerSidebarProps> = ({
                 <p className="text-[11px]" style={{ color: "var(--fg-extra-muted)" }}>
                   No uncommitted changes in{" "}
                   <span className="font-mono-code">
-                    {session?.worktree_branch ?? "worktree"}
+                    {session?.branch ?? "worktree"}
                   </span>
                 </p>
               </div>

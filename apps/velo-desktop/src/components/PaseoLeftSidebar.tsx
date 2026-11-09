@@ -30,24 +30,25 @@ interface PaseoLeftSidebarProps {
 }
 
 export function providerDisplayName(provider: AgentProvider): string {
+  if (typeof provider === "object" && provider !== null && "custom" in provider) {
+    return "Custom";
+  }
   switch (provider) {
-    case "claude_code":
+    case "claude":
       return "Claude";
     case "codex":
       return "Codex";
     case "opencode":
       return "OpenCode";
-    case "gemini":
-      return "Gemini";
-    case "custom_pty":
-      return "Shell";
     default:
-      return provider;
+      return String(provider);
   }
 }
 
 function formatRelativeShort(iso: string): string {
-  const diffSec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return "now";
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
   if (diffSec < 45) return "now";
   if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
   if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
@@ -76,17 +77,18 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
     if (!q) return sessions;
     return sessions.filter(
       (s) =>
-        s.name.toLowerCase().includes(q) ||
-        s.worktree_branch.toLowerCase().includes(q) ||
-        s.project_path.toLowerCase().includes(q) ||
-        s.provider.toLowerCase().includes(q)
+        (s.name || "").toLowerCase().includes(q) ||
+        (s.branch || "").toLowerCase().includes(q) ||
+        (s.repo_root || "").toLowerCase().includes(q) ||
+        providerDisplayName(s.provider).toLowerCase().includes(q)
     );
   }, [sessions, searchQuery]);
 
   const projectGroups = useMemo(() => {
     const map = new Map<string, SessionInfo[]>();
     for (const s of filteredSessions) {
-      const repoName = s.project_path.split("/").filter(Boolean).pop() || "workspace";
+      const repoPath = s.repo_root || "/Users/daiyudai/code/velo";
+      const repoName = repoPath.split("/").filter(Boolean).pop() || "workspace";
       const list = map.get(repoName) ?? [];
       list.push(s);
       map.set(repoName, list);
@@ -95,12 +97,19 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
   }, [filteredSessions]);
 
   const statusGroups = useMemo(() => {
-    const active = filteredSessions.filter((s) => s.status === "running" || s.status === "starting");
-    const idle = filteredSessions.filter((s) => s.status === "idle");
-    const done = filteredSessions.filter((s) => s.status === "completed" || s.status === "failed");
+    const active = filteredSessions.filter(
+      (s) => s.status === "running" || s.status === "starting"
+    );
+    const waiting = filteredSessions.filter(
+      (s) => s.status === "waiting_for_permission" || s.status === "idle"
+    );
+    const done = filteredSessions.filter(
+      (s) =>
+        s.status === "completed" || s.status === "failed" || s.status === "stopped"
+    );
     return [
       { key: "active", label: "Active", items: active },
-      { key: "idle", label: "Ready", items: idle },
+      { key: "waiting", label: "Ready", items: waiting },
       { key: "done", label: "Completed", items: done },
     ].filter((g) => g.items.length > 0);
   }, [filteredSessions]);
@@ -149,7 +158,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
           if (!selected) e.currentTarget.style.backgroundColor = "transparent";
         }}
       >
-        {/* Primary Row: Status Indicator + Title + Diff Stats */}
         <div className="flex items-center justify-between gap-2 min-w-0">
           <div className="flex items-center gap-2 min-w-0">
             <div className="w-3.5 flex items-center justify-center shrink-0">
@@ -169,10 +177,10 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
             {hasDiff ? (
               <span className="font-mono-code text-[10.5px] flex items-center gap-1">
                 <span style={{ color: "var(--status-success)" }}>
-                  +{session.diff_stats!.insertions}
+                  +{session.diff_stats.insertions}
                 </span>
                 <span style={{ color: "var(--status-danger)" }}>
-                  −{session.diff_stats!.deletions}
+                  −{session.diff_stats.deletions}
                 </span>
               </span>
             ) : index < 9 ? (
@@ -186,7 +194,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
           </div>
         </div>
 
-        {/* Secondary Meta Row: Branch + Provider + Relative Time */}
         <div className="flex items-center justify-between gap-1.5 pl-[22px] min-w-0">
           <div className="flex items-center gap-1.5 min-w-0">
             <GitBranch
@@ -197,14 +204,14 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
               className="font-mono-code text-[11px] truncate"
               style={{ color: "var(--fg-extra-muted)" }}
             >
-              {session.worktree_branch}
+              {session.branch}
             </span>
             <span style={{ color: "var(--surface-4)" }}>·</span>
             <span
               className="text-[10.5px] shrink-0"
               style={{
                 color:
-                  session.provider === "claude_code"
+                  session.provider === "claude"
                     ? "var(--accent-bright)"
                     : "var(--fg-extra-muted)",
               }}
@@ -232,7 +239,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
         borderColor: "var(--border-subtle)",
       }}
     >
-      {/* Top Sidebar Header (38px height, matches WorkspaceDesktopTabsRow) */}
       <div
         className="h-[38px] px-2.5 flex items-center justify-between border-b shrink-0"
         style={{ borderColor: "var(--border-subtle)" }}
@@ -289,7 +295,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
         </div>
       </div>
 
-      {/* Filter & Group Mode Sub-bar */}
       <div className="px-2.5 pt-2 pb-1.5 flex flex-col gap-1.5 shrink-0">
         <div
           className="flex items-center gap-1.5 px-2 h-[26px] rounded-[6px] border"
@@ -318,7 +323,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
           )}
         </div>
 
-        {/* Section Header + Group Mode Switcher */}
         <div className="flex items-center justify-between px-1 pt-0.5">
           <span
             className="text-[10.5px] font-medium uppercase tracking-wider"
@@ -351,14 +355,12 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
         </div>
       </div>
 
-      {/* Scrollable Workspace List */}
       <div className="flex-1 overflow-y-auto px-1.5 py-1 space-y-2">
         {groupMode === "project" ? (
           projectGroups.map(([repoName, items]) => {
             const isCollapsed = !!collapsedProjects[repoName];
             return (
               <div key={repoName} className="space-y-0.5">
-                {/* Project Header Row */}
                 <div className="group flex items-center justify-between px-2 py-1 rounded-[5px] hover:bg-[var(--surface-1)]">
                   <button
                     onClick={() => toggleProject(repoName)}
@@ -403,7 +405,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
                   </button>
                 </div>
 
-                {/* Indented Workspace Rows */}
                 {!isCollapsed && (
                   <div className="space-y-0.5">
                     {items.map((session, idx) => renderWorkspaceRow(session, idx))}
@@ -457,7 +458,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
         )}
       </div>
 
-      {/* Bottom Paseo Footer Bar (Theme Switcher, Mobile Pair QR, MCP Status) */}
       <div
         className="h-[38px] px-2.5 border-t flex items-center justify-between relative shrink-0"
         style={{ borderColor: "var(--border-subtle)" }}
@@ -480,7 +480,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
         </div>
 
         <div className="flex items-center gap-1">
-          {/* Orchestrator quick button */}
           <button
             onClick={() => onOpenOrchestratorModal("handoff")}
             title="Agent Orchestration (/handoff, /advisor, /committee, /loop)"
@@ -490,7 +489,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
             <Sparkles className="w-3 h-3" style={{ color: "var(--accent-bright)" }} />
           </button>
 
-          {/* E2EE Mobile Pair QR */}
           <button
             onClick={onOpenPairModal}
             title="Pair Mobile App (E2EE Relay QR)"
@@ -500,7 +498,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
             <QrCode className="w-3 h-3" />
           </button>
 
-          {/* Paseo Built-in Theme Switcher */}
           <button
             onClick={() => setShowThemeMenu((v) => !v)}
             title="Switch Paseo Theme"
@@ -515,7 +512,6 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
           </button>
         </div>
 
-        {/* Theme Popover Menu */}
         {showThemeMenu && (
           <div
             className="absolute bottom-[44px] right-2 w-[196px] rounded-[8px] border p-1 shadow-2xl z-50"
