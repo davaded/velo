@@ -1451,6 +1451,7 @@ dependencies = [
  "uuid",
  "velo-agent",
  "velo-protocol",
+ "velo-relay",
  "velo-worktree",
 ]
 

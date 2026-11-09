@@ -119,9 +119,34 @@ export interface SessionDiffResponse {
   diff: string;
 }
 
+export interface PairingTicket {
+  room_id: string;
+  shared_key_hex: string;
+  relay_url: string;
+  daemon_addr: string;
+  pairing_uri: string;
+}
+
 export function formatProvider(p: AgentProvider): string {
   if (typeof p === "string") {
     return p;
   }
-  return `custom(${p.custom})`;
+  const cmd = p.custom;
+  if (cmd.length > 14) {
+    return `cmd:${cmd.slice(0, 12)}…`;
+  }
+  return `cmd:${cmd}`;
+}
+
+export function providerBadgeColor(p: AgentProvider): string {
+  if (p === "claude") {
+    return "bg-amber-500/10 text-amber-300 border-amber-500/25";
+  }
+  if (p === "codex") {
+    return "bg-emerald-500/10 text-emerald-300 border-emerald-500/25";
+  }
+  if (p === "opencode") {
+    return "bg-sky-500/10 text-sky-300 border-sky-500/25";
+  }
+  return "bg-purple-500/10 text-purple-300 border-purple-500/25";
 }

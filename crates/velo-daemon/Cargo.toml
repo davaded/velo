@@ -17,3 +17,4 @@ chrono.workspace = true
 velo-protocol.workspace = true
 velo-worktree.workspace = true
 velo-agent.workspace = true
+velo-relay.workspace = true

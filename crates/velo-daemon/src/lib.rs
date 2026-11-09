@@ -277,7 +277,7 @@ pub fn build_router(state: DaemonState) -> Router {
     Router::new()
         .route("/", get(ui_index_handler))
         .route("/assets/{file}", get(ui_asset_handler))
-        .route("/api/health", get(health_handler))
+        .route("/api/health", get(health_handler)).route("/api/pair", get(pair_ticket_handler))
         .route(
             "/api/sessions",
             get(list_sessions_handler).post(create_session_handler),
@@ -1171,4 +1171,15 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_base).await;
         Ok(())
     }
+}
+
+async fn pair_ticket_handler() -> impl IntoResponse {
+    let relay_url = format!("ws://127.0.0.1:{}", velo_relay::DEFAULT_RELAY_PORT);
+    let daemon_addr = format!(
+        "{}:{}",
+        velo_protocol::DEFAULT_DAEMON_HOST,
+        velo_protocol::DEFAULT_DAEMON_PORT
+    );
+    let ticket = velo_relay::PairingTicket::generate(&relay_url, &daemon_addr);
+    Json(ticket)
 }

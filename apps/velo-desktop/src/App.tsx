@@ -1,35 +1,38 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
-  Activity,
   ArrowRightLeft,
-  Brain,
-  CheckCircle2,
-  Code2,
+  Columns2,
+  Command,
   Cpu,
   FileDiff,
   FolderGit2,
   GitBranch,
-  Layers,
+  Grid2x2,
+  Maximize2,
   Play,
   Plus,
+  QrCode,
   RefreshCw,
-  Send,
-  Square,
-  Terminal,
-  Wrench,
-  XCircle,
+  Search,
+  Sparkles,
+  Users,
+  X,
   Zap,
 } from "lucide-react";
+import { CommandPalette } from "./components/CommandPalette";
+import { DiffDrawer } from "./components/DiffDrawer";
+import { PairingModal } from "./components/PairingModal";
+import { SessionPane, StatusPulse } from "./components/SessionPane";
 import { useVeloDaemon } from "./hooks/useVeloDaemon";
 import {
-  AgentEvent,
   AgentProvider,
   SessionDiffResponse,
-  SessionStatus,
+  SessionInfo,
   formatProvider,
+  providerBadgeColor,
 } from "./types/velo";
 
-type ActiveTab = "stream" | "diff" | "terminal";
+type LaunchMode = "single" | "committee" | "loop";
 
 export default function App() {
   const {
@@ -41,98 +44,197 @@ export default function App() {
     createSession,
     stopSession,
     sendInput,
-    handoffSession, advisorSession,
+    handoffSession,
+    advisorSession,
+    createCommittee,
+    createLoopSession,
   } = useVeloDaemon();
 
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<ActiveTab>("stream");
-  const [showNewModal, setShowNewModal] = useState(false);
-  const [showHandoffModal, setShowHandoffModal] = useState(false);
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const [paneLayout, setPaneLayout] = useState<1 | 2 | 4>(1);
+  const [showDiffDrawer, setShowDiffDrawer] = useState<boolean>(true);
+  const [showCommandPalette, setShowCommandPalette] = useState<boolean>(false);
+  const [showPairingModal, setShowPairingModal] = useState<boolean>(false);
 
-  // New session form state
+  // Launch modal state
+  const [launchModalMode, setLaunchModalMode] = useState<LaunchMode | null>(
+    null
+  );
   const [providerInput, setProviderInput] = useState<string>("claude");
   const [customCmdInput, setCustomCmdInput] = useState<string>("");
-  const [repoPathInput, setRepoPathInput] = useState<string>("/Users/daiyudai/code/velo");
+  const [committeeChecks, setCommitteeChecks] = useState<Record<string, boolean>>({
+    claude: true,
+    codex: true,
+    opencode: false,
+  });
+  const [repoPathInput, setRepoPathInput] = useState<string>(
+    "/Users/daiyudai/code/velo"
+  );
   const [branchInput, setBranchInput] = useState<string>("");
   const [sessionNameInput, setSessionNameInput] = useState<string>("");
   const [promptInput, setPromptInput] = useState<string>("");
+  const [checkCommandInput, setCheckCommandInput] =
+    useState<string>("cargo test --offline");
+  const [maxIterationsInput, setMaxIterationsInput] = useState<number>(3);
   const [usePtyInput, setUsePtyInput] = useState<boolean>(false);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   // Handoff modal state
-  const [handoffTarget, setHandoffTarget] = useState<string>("codex");
+  const [handoffTargetSession, setHandoffTargetSession] =
+    useState<SessionInfo | null>(null);
+  const [handoffProvider, setHandoffProvider] = useState<string>("codex");
   const [handoffInstructions, setHandoffInstructions] = useState<string>(
-    "Review the changes made so far, complete the remaining implementation, and run tests."
+    "Review the changes made so far in this worktree, complete the implementation, and verify tests."
   );
 
-  // Live follow-up input
-  const [stdinText, setStdinText] = useState<string>("");
-
-  // Diff viewer state
+  // Diff drawer data for focused session
   const [diffData, setDiffData] = useState<SessionDiffResponse | null>(null);
   const [loadingDiff, setLoadingDiff] = useState<boolean>(false);
 
-  const streamEndRef = useRef<HTMLDivElement | null>(null);
-
+  // Auto-select first session
   useEffect(() => {
-    if (!selectedId && sessions.length > 0) {
-      setSelectedId(sessions[0].id);
+    if (!focusedId && sessions.length > 0) {
+      setFocusedId(sessions[0].id);
     }
-  }, [sessions, selectedId]);
+  }, [sessions, focusedId]);
 
-  const activeSession = useMemo(
-    () => sessions.find((s) => s.id === selectedId) || null,
-    [sessions, selectedId]
+  const focusedSession = useMemo(
+    () => sessions.find((s) => s.id === focusedId) || sessions[0] || null,
+    [sessions, focusedId]
   );
 
-  const activeEvents = useMemo(
-    () => (selectedId ? eventsBySession[selectedId] || [] : []),
-    [eventsBySession, selectedId]
-  );
-
-  useEffect(() => {
-    if (selectedId) {
-      fetchSessionEvents(selectedId);
+  // Determine which sessions are visible in the Multi-Pane Canvas (1x / 2x / 4x)
+  const visibleSessions = useMemo<SessionInfo[]>(() => {
+    if (sessions.length === 0) return [];
+    if (paneLayout === 1) {
+      return focusedSession ? [focusedSession] : [sessions[0]];
     }
-  }, [selectedId, fetchSessionEvents]);
+    const list: SessionInfo[] = [];
+    if (focusedSession) list.push(focusedSession);
+    for (const s of sessions) {
+      if (list.length >= paneLayout) break;
+      if (!list.some((x) => x.id === s.id)) {
+        list.push(s);
+      }
+    }
+    return list;
+  }, [sessions, focusedSession, paneLayout]);
 
+  // Fetch events for all visible panes
   useEffect(() => {
-    if (selectedId && activeTab === "diff") {
+    for (const s of visibleSessions) {
+      fetchSessionEvents(s.id);
+    }
+  }, [visibleSessions, fetchSessionEvents]);
+
+  // Fetch diff for focused session
+  useEffect(() => {
+    if (focusedSession && showDiffDrawer) {
       setLoadingDiff(true);
-      fetchSessionDiff(selectedId).then((res) => {
+      fetchSessionDiff(focusedSession.id).then((res) => {
         setDiffData(res);
         setLoadingDiff(false);
       });
     }
-  }, [selectedId, activeTab, fetchSessionDiff, activeSession?.diff_stats]);
+  }, [
+    focusedSession?.id,
+    focusedSession?.diff_stats.files_changed,
+    focusedSession?.diff_stats.insertions,
+    showDiffDrawer,
+    fetchSessionDiff,
+  ]);
 
+  // Group sessions by repository name for Left Explorer Tree
+  const sessionsByRepo = useMemo(() => {
+    const groups: Record<string, SessionInfo[]> = {};
+    for (const s of sessions) {
+      const repoName = s.repo_root.split("/").filter(Boolean).pop() || s.repo_root;
+      if (!groups[repoName]) groups[repoName] = [];
+      groups[repoName].push(s);
+    }
+    return groups;
+  }, [sessions]);
+
+  // Global keyboard shortcuts (⌘K, ⌘N, ⌘D, ⌘1, ⌘2, ⌘4)
   useEffect(() => {
-    streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [activeEvents.length]);
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.metaKey || e.ctrlKey) {
+        if (e.key.toLowerCase() === "k") {
+          e.preventDefault();
+          setShowCommandPalette((v) => !v);
+        } else if (e.key.toLowerCase() === "n") {
+          e.preventDefault();
+          setLaunchModalMode("single");
+        } else if (e.key.toLowerCase() === "d") {
+          e.preventDefault();
+          setShowDiffDrawer((v) => !v);
+        } else if (e.key === "1") {
+          e.preventDefault();
+          setPaneLayout(1);
+        } else if (e.key === "2") {
+          e.preventDefault();
+          setPaneLayout(2);
+        } else if (e.key === "4") {
+          e.preventDefault();
+          setPaneLayout(4);
+        }
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
-  async function handleCreateSession(e: React.FormEvent) {
+  async function handleLaunchSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!promptInput.trim() && !usePtyInput) return;
+    if (!launchModalMode) return;
     setSubmitting(true);
     setErrorBanner(null);
 
-    const provider: AgentProvider =
-      providerInput === "custom"
-        ? { custom: customCmdInput.trim() || "sh" }
-        : (providerInput as AgentProvider);
-
     try {
-      const created = await createSession({
-        name: sessionNameInput.trim() || undefined,
-        provider,
-        prompt: promptInput,
-        repo_path: repoPathInput.trim() || "/Users/daiyudai/code/velo",
-        branch: branchInput.trim() || undefined,
-        use_pty: usePtyInput,
-      });
-      setSelectedId(created.id);
-      setShowNewModal(false);
+      const provider: AgentProvider =
+        providerInput === "custom"
+          ? { custom: customCmdInput.trim() || "sh" }
+          : (providerInput as AgentProvider);
+
+      if (launchModalMode === "single") {
+        const created = await createSession({
+          name: sessionNameInput.trim() || undefined,
+          provider,
+          prompt: promptInput,
+          repo_path: repoPathInput.trim() || "/Users/daiyudai/code/velo",
+          branch: branchInput.trim() || undefined,
+          use_pty: usePtyInput,
+        });
+        setFocusedId(created.id);
+      } else if (launchModalMode === "committee") {
+        const selectedProviders = (
+          Object.keys(committeeChecks) as Array<"claude" | "codex" | "opencode">
+        ).filter((k) => committeeChecks[k]);
+        const spawned = await createCommittee(
+          selectedProviders,
+          promptInput,
+          repoPathInput.trim() || "/Users/daiyudai/code/velo",
+          sessionNameInput.trim() || undefined
+        );
+        if (spawned.length > 0) {
+          setFocusedId(spawned[0].id);
+          setPaneLayout(spawned.length >= 3 ? 4 : 2);
+        }
+      } else if (launchModalMode === "loop") {
+        const created = await createLoopSession({
+          name: sessionNameInput.trim() || undefined,
+          provider,
+          prompt: promptInput,
+          check_command: checkCommandInput.trim() || "cargo test",
+          max_iterations: maxIterationsInput,
+          repo_path: repoPathInput.trim() || "/Users/daiyudai/code/velo",
+          branch: branchInput.trim() || undefined,
+        });
+        setFocusedId(created.id);
+      }
+
+      setLaunchModalMode(null);
       setPromptInput("");
       setBranchInput("");
       setSessionNameInput("");
@@ -143,20 +245,32 @@ export default function App() {
     }
   }
 
-  async function handleHandoff(e: React.FormEvent) {
+  async function handleQuickAdvisor(session: SessionInfo) {
+    setErrorBanner(null);
+    const defaultAdvisor: AgentProvider =
+      session.provider === "claude" ? "codex" : "claude";
+    try {
+      const created = await advisorSession(session.id, defaultAdvisor);
+      setFocusedId(created.id);
+      if (paneLayout === 1) setPaneLayout(2);
+    } catch (err: unknown) {
+      setErrorBanner(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleExecuteHandoff(e: React.FormEvent) {
     e.preventDefault();
-    if (!activeSession) return;
+    if (!handoffTargetSession) return;
     setSubmitting(true);
     setErrorBanner(null);
     try {
-      const target: AgentProvider = handoffTarget as AgentProvider;
-      const nextSession = await handoffSession(
-        activeSession.id,
-        target,
+      const next = await handoffSession(
+        handoffTargetSession.id,
+        handoffProvider as AgentProvider,
         handoffInstructions
       );
-      setSelectedId(nextSession.id);
-      setShowHandoffModal(false);
+      setFocusedId(next.id);
+      setHandoffTargetSession(null);
     } catch (err: unknown) {
       setErrorBanner(err instanceof Error ? err.message : String(err));
     } finally {
@@ -164,468 +278,464 @@ export default function App() {
     }
   }
 
-  async function handleSendStdin(e: React.FormEvent) {
-    e.preventDefault();
-    if (!activeSession || !stdinText.trim()) return;
-    const payload = stdinText;
-    setStdinText("");
-    await sendInput(activeSession.id, payload);
-  }
-
   async function refreshDiff() {
-    if (!activeSession) return;
+    if (!focusedSession) return;
     setLoadingDiff(true);
-    const d = await fetchSessionDiff(activeSession.id);
+    const d = await fetchSessionDiff(focusedSession.id);
     setDiffData(d);
     setLoadingDiff(false);
   }
 
-  return (
-    <div className="flex h-screen w-screen bg-zinc-950 text-zinc-100 font-sans">
-      {/* Left Sidebar: Worktree & Session Fleet */}
-      <aside className="w-80 flex-shrink-0 border-r border-zinc-800/80 bg-zinc-900/50 flex flex-col">
-        {/* Brand Header */}
-        <div className="h-14 px-4 border-b border-zinc-800/80 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 rounded-lg bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400">
-              <Zap className="w-4 h-4" />
-            </div>
-            <div>
-              <span className="font-semibold tracking-tight text-sm text-zinc-100">
-                VELO
-              </span>
-              <span className="ml-2 text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400">
-                Rust + Tauri
-              </span>
-            </div>
-          </div>
+  const runningCount = sessions.filter((s) => s.status === "running").length;
 
-          <div
-            className="flex items-center gap-1.5 text-xs"
-            title={
-              connected
-                ? "Connected to velo-daemon (127.0.0.1:6767)"
-                : "Daemon offline — run `velo up`"
-            }
-          >
-            <span
-              className={`w-2 h-2 rounded-full ${
-                connected
-                  ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.7)]"
-                  : "bg-rose-500"
-              }`}
-            />
-            <span className="text-[11px] font-mono text-zinc-400">
-              {connected ? "ONLINE" : "OFFLINE"}
+  return (
+    <div className="flex flex-col h-screen w-screen bg-[#09090b] text-zinc-100 overflow-hidden select-none">
+      {/* Top Global IDE Bar */}
+      <header className="h-12 px-4 border-b border-zinc-800/80 bg-zinc-950/90 flex items-center justify-between gap-4 shrink-0">
+        {/* Left: Brand & Daemon Status */}
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-white shadow-sm">
+              <Zap className="w-4 h-4 fill-current" />
+            </div>
+            <span className="font-bold tracking-tight text-sm text-zinc-100">
+              VELO
+            </span>
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-400">
+              v0.1 · Rust Control Plane
             </span>
           </div>
-        </div>
 
-        {/* New Session CTA */}
-        <div className="p-3 border-b border-zinc-800/60">
+          <div className="h-4 w-px bg-zinc-800" />
+
+          {/* Command Palette Trigger */}
           <button
-            onClick={() => setShowNewModal(true)}
-            className="w-full py-2 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-medium text-xs flex items-center justify-center gap-2 shadow-sm transition cursor-pointer"
+            onClick={() => setShowCommandPalette(true)}
+            className="px-2.5 py-1 rounded-lg bg-zinc-900/90 hover:bg-zinc-800/90 border border-zinc-800 text-xs text-zinc-400 flex items-center gap-3 transition cursor-pointer"
           >
-            <Plus className="w-4 h-4" />
-            New Worktree Agent
+            <span className="flex items-center gap-1.5">
+              <Search className="w-3.5 h-3.5 text-zinc-500" />
+              <span>Search or run command...</span>
+            </span>
+            <kbd className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-950 text-zinc-400 border border-zinc-800">
+              ⌘K
+            </kbd>
           </button>
         </div>
 
-        {/* Session List */}
-        <div className="flex-1 overflow-y-auto divide-y divide-zinc-800/40">
-          {sessions.length === 0 ? (
-            <div className="p-6 text-center text-zinc-500 text-xs space-y-2">
-              <Layers className="w-6 h-6 mx-auto text-zinc-600" />
-              <p>No active worktree sessions.</p>
-              <p className="text-[11px] text-zinc-600">
-                Click "New Worktree Agent" or run{" "}
-                <code className="text-zinc-400">velo run</code> in terminal.
-              </p>
-            </div>
-          ) : (
-            sessions.map((s) => {
-              const isSelected = s.id === selectedId;
-              return (
-                <button
-                  key={s.id}
-                  onClick={() => setSelectedId(s.id)}
-                  className={`w-full text-left p-3.5 transition flex flex-col gap-1.5 cursor-pointer ${
-                    isSelected
-                      ? "bg-indigo-950/30 border-l-2 border-l-indigo-500"
-                      : "hover:bg-zinc-900/80"
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <StatusDot status={s.status} />
-                      <span className="font-medium text-xs text-zinc-100 truncate">
-                        {s.name}
-                      </span>
-                    </div>
-                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800/90 text-zinc-300 border border-zinc-700/50">
-                      {formatProvider(s.provider)}
-                    </span>
-                  </div>
-
-                  <p className="text-[11px] text-zinc-400 line-clamp-1">
-                    {s.prompt || "(Interactive PTY Session)"}
-                  </p>
-
-                  <div className="flex items-center justify-between text-[10px] font-mono text-zinc-500 pt-0.5">
-                    <span className="flex items-center gap-1 truncate max-w-[150px]">
-                      <GitBranch className="w-3 h-3 text-zinc-500 shrink-0" />
-                      {s.branch}
-                    </span>
-                    <span className="flex items-center gap-1.5">
-                      <span className="text-zinc-400">
-                        {s.diff_stats.files_changed}f
-                      </span>
-                      <span className="text-emerald-400">
-                        +{s.diff_stats.insertions}
-                      </span>
-                      <span className="text-rose-400">
-                        -{s.diff_stats.deletions}
-                      </span>
-                    </span>
-                  </div>
-                </button>
-              );
-            })
-          )}
+        {/* Center: Multi-Pane Layout Switcher (1x / 2x / 4x) */}
+        <div className="flex items-center gap-1 bg-zinc-900/80 p-1 rounded-lg border border-zinc-800/90">
+          <button
+            onClick={() => setPaneLayout(1)}
+            className={`px-2.5 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+              paneLayout === 1
+                ? "bg-zinc-800 text-zinc-100 shadow-2xs"
+                : "text-zinc-400 hover:text-zinc-200"
+            }`}
+            title="Single Focus (⌘1)"
+          >
+            <Maximize2 className="w-3.5 h-3.5" />
+            <span>1x Focus</span>
+          </button>
+          <button
+            onClick={() => setPaneLayout(2)}
+            className={`px-2.5 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+              paneLayout === 2
+                ? "bg-zinc-800 text-zinc-100 shadow-2xs"
+                : "text-zinc-400 hover:text-zinc-200"
+            }`}
+            title="Side-by-Side Split (⌘2)"
+          >
+            <Columns2 className="w-3.5 h-3.5" />
+            <span>2x Split</span>
+          </button>
+          <button
+            onClick={() => setPaneLayout(4)}
+            className={`px-2.5 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+              paneLayout === 4
+                ? "bg-zinc-800 text-zinc-100 shadow-2xs"
+                : "text-zinc-400 hover:text-zinc-200"
+            }`}
+            title="2x2 Fleet Grid (⌘4)"
+          >
+            <Grid2x2 className="w-3.5 h-3.5" />
+            <span>4x Grid</span>
+          </button>
         </div>
 
-        {/* Footer Info */}
-        <div className="p-2.5 border-t border-zinc-800/80 text-[11px] text-zinc-500 flex items-center justify-between font-mono">
-          <span>Daemon: 127.0.0.1:6767</span>
-          <span>{sessions.length} worktrees</span>
-        </div>
-      </aside>
+        {/* Right: Quick Orchestration Actions & Diff Toggle */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setLaunchModalMode("committee")}
+            className="px-2.5 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition cursor-pointer"
+            title="Dispatch Multi-Agent Committee in parallel worktrees"
+          >
+            <Users className="w-3.5 h-3.5 text-amber-400" />
+            <span>Committee</span>
+          </button>
 
-      {/* Main Content Area */}
-      <main className="flex-1 flex flex-col min-w-0 bg-zinc-950">
-        {errorBanner && (
-          <div className="bg-rose-950/80 border-b border-rose-800 px-4 py-2 text-xs text-rose-200 flex items-center justify-between">
-            <span>{errorBanner}</span>
+          <button
+            onClick={() => setLaunchModalMode("loop")}
+            className="px-2.5 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition cursor-pointer"
+            title="Start Test-Driven Self-Healing Loop"
+          >
+            <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Loop</span>
+          </button>
+
+          <button
+            onClick={() => setShowPairingModal(true)}
+            className="px-2.5 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition cursor-pointer"
+            title="Mobile & Remote E2EE Pairing QR"
+          >
+            <QrCode className="w-3.5 h-3.5 text-indigo-400" />
+            <span>Pair</span>
+          </button>
+
+          <button
+            onClick={() => setShowDiffDrawer((v) => !v)}
+            className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+              showDiffDrawer
+                ? "bg-indigo-600/20 border-indigo-500/40 text-indigo-200"
+                : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200"
+            }`}
+            title="Toggle Git Worktree Diff Inspector (⌘D)"
+          >
+            <FileDiff className="w-3.5 h-3.5" />
+            <span>Diff Drawer</span>
+          </button>
+        </div>
+      </header>
+
+      {/* Error Toast */}
+      {errorBanner && (
+        <div className="bg-rose-950/90 border-b border-rose-800 px-4 py-2 text-xs text-rose-200 flex items-center justify-between shrink-0">
+          <span>{errorBanner}</span>
+          <button
+            onClick={() => setErrorBanner(null)}
+            className="text-rose-300 hover:text-white font-mono cursor-pointer"
+          >
+            DISMISS
+          </button>
+        </div>
+      )}
+
+      {/* Main 3-Column IDE Body */}
+      <div className="flex-1 flex min-h-0 min-w-0">
+        {/* Column 1: Project & Worktree Tree Explorer */}
+        <aside className="w-72 shrink-0 border-r border-zinc-800/80 bg-zinc-950/60 flex flex-col">
+          {/* Primary Launch Button */}
+          <div className="p-3 border-b border-zinc-800/60">
             <button
-              onClick={() => setErrorBanner(null)}
-              className="text-rose-400 hover:text-rose-200 font-mono"
+              onClick={() => setLaunchModalMode("single")}
+              className="w-full py-2 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-medium text-xs flex items-center justify-between shadow-sm transition cursor-pointer"
             >
-              DISMISS
+              <span className="flex items-center gap-2">
+                <Plus className="w-4 h-4" />
+                <span>New Worktree Agent</span>
+              </span>
+              <kbd className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-700/80 text-indigo-100">
+                ⌘N
+              </kbd>
             </button>
           </div>
-        )}
 
-        {!activeSession ? (
-          <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 p-8">
-            <Cpu className="w-10 h-10 text-zinc-700 mb-3" />
-            <h2 className="text-sm font-medium text-zinc-300">
-              Select or Launch a Parallel Agent Workspace
-            </h2>
-            <p className="text-xs text-zinc-500 mt-1 max-w-md text-center">
-              Every Velo task runs inside an isolated Git worktree so Claude
-              Code, Codex, and OpenCode can build features in parallel without
-              stepping on each other.
-            </p>
-          </div>
-        ) : (
-          <>
-            {/* Top Session Header */}
-            <header className="h-14 px-5 border-b border-zinc-800/80 flex items-center justify-between gap-4 bg-zinc-900/30">
-              <div className="flex items-center gap-3 min-w-0">
-                <StatusBadge status={activeSession.status} />
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <h1 className="text-sm font-semibold text-zinc-100 truncate">
-                      {activeSession.name}
-                    </h1>
-                    <span className="text-[11px] font-mono text-zinc-500">
-                      #{activeSession.id.slice(0, 8)}
-                    </span>
-                    {activeSession.pid && (
-                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-400">
-                        PID {activeSession.pid}
+          {/* Repository -> Worktree Tree */}
+          <div className="flex-1 overflow-y-auto p-2 space-y-4">
+            {Object.keys(sessionsByRepo).length === 0 ? (
+              <div className="p-6 text-center text-zinc-500 text-xs space-y-2">
+                <Cpu className="w-7 h-7 mx-auto text-zinc-700" />
+                <p className="font-medium text-zinc-400">No Active Worktrees</p>
+                <p className="text-[11px] text-zinc-600">
+                  Press <kbd className="text-zinc-400">⌘N</kbd> to spin up an
+                  isolated Git worktree agent.
+                </p>
+              </div>
+            ) : (
+              Object.entries(sessionsByRepo).map(([repoName, repoSessions]) => (
+                <div key={repoName} className="space-y-1">
+                  <div className="px-2 py-1 flex items-center justify-between text-[11px] font-mono uppercase tracking-wider text-zinc-500">
+                    <span className="flex items-center gap-1.5 truncate">
+                      <FolderGit2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                      <span className="font-semibold text-zinc-300">
+                        {repoName}
                       </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-3 text-[11px] text-zinc-400 font-mono truncate">
-                    <span className="flex items-center gap-1 text-indigo-400">
-                      <GitBranch className="w-3 h-3" />
-                      {activeSession.branch}
                     </span>
-                    <span className="flex items-center gap-1 truncate text-zinc-500">
-                      <FolderGit2 className="w-3 h-3 shrink-0" />
-                      {activeSession.worktree_path}
+                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-zinc-900 text-zinc-500">
+                      {repoSessions.length}
                     </span>
                   </div>
-                </div>
-              </div>
 
-              {/* Session Controls */}
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  onClick={() => setShowHandoffModal(true)}
-                  className="px-2.5 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium flex items-center gap-1.5 border border-zinc-700/60 transition cursor-pointer"
-                  title="Hand off this Git worktree & progress to another coding agent"
-                >
-                  <ArrowRightLeft className="w-3.5 h-3.5 text-indigo-400" />
-                  Handoff
-                </button>
-
-                {activeSession.status === "running" && (
-                  <button
-                    onClick={() => stopSession(activeSession.id)}
-                    className="px-2.5 py-1.5 rounded-md bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-800/60 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer"
-                  >
-                    <Square className="w-3.5 h-3.5 fill-current" />
-                    Stop
-                  </button>
-                )}
-              </div>
-            </header>
-
-            {/* View Switcher Tabs */}
-            <div className="px-5 border-b border-zinc-800/80 bg-zinc-900/20 flex items-center justify-between">
-              <div className="flex items-center gap-1">
-                <TabButton
-                  active={activeTab === "stream"}
-                  onClick={() => setActiveTab("stream")}
-                  icon={<Activity className="w-3.5 h-3.5" />}
-                  label="Structured Stream"
-                  badge={activeEvents.length}
-                />
-                <TabButton
-                  active={activeTab === "diff"}
-                  onClick={() => setActiveTab("diff")}
-                  icon={<FileDiff className="w-3.5 h-3.5" />}
-                  label="Worktree Diff"
-                  badge={`${activeSession.diff_stats.files_changed} files`}
-                />
-                <TabButton
-                  active={activeTab === "terminal"}
-                  onClick={() => setActiveTab("terminal")}
-                  icon={<Terminal className="w-3.5 h-3.5" />}
-                  label="Raw PTY / Logs"
-                />
-              </div>
-
-              {activeTab === "diff" && (
-                <button
-                  onClick={refreshDiff}
-                  className="text-xs text-zinc-400 hover:text-zinc-200 flex items-center gap-1 py-1 px-2 rounded hover:bg-zinc-800/60 cursor-pointer"
-                >
-                  <RefreshCw
-                    className={`w-3.5 h-3.5 ${loadingDiff ? "animate-spin" : ""}`}
-                  />
-                  Refresh Diff
-                </button>
-              )}
-            </div>
-
-            {/* Tab Content */}
-            <div className="flex-1 overflow-y-auto p-5">
-              {activeTab === "stream" && (
-                <div className="max-w-4xl mx-auto space-y-3">
-                  {/* Initial Task Card */}
-                  <div className="p-3.5 rounded-lg bg-zinc-900/90 border border-zinc-800">
-                    <div className="text-[11px] font-mono uppercase text-indigo-400 mb-1 flex items-center justify-between">
-                      <span>Task Prompt ({formatProvider(activeSession.provider)})</span>
-                      <span className="text-zinc-500">
-                        {new Date(activeSession.created_at).toLocaleTimeString()}
-                      </span>
-                    </div>
-                    <p className="text-xs text-zinc-200 whitespace-pre-wrap leading-relaxed">
-                      {activeSession.prompt}
-                    </p>
-                  </div>
-
-                  {/* Event Stream Cards */}
-                  {activeEvents.map((ev, idx) => (
-                    <EventCard key={idx} event={ev} />
-                  ))}
-                  <div ref={streamEndRef} />
-                </div>
-              )}
-
-              {activeTab === "diff" && (
-                <div className="max-w-5xl mx-auto space-y-4">
-                  {/* Modified Files Summary */}
-                  <div className="p-3.5 rounded-lg bg-zinc-900/70 border border-zinc-800 flex items-center justify-between">
-                    <div className="flex items-center gap-3 text-xs">
-                      <Code2 className="w-4 h-4 text-indigo-400" />
-                      <span className="font-medium text-zinc-200">
-                        {activeSession.diff_stats.files_changed} modified files in{" "}
-                        <code className="text-indigo-300 font-mono">
-                          {activeSession.branch}
-                        </code>
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-3 font-mono text-xs">
-                      <span className="text-emerald-400">
-                        +{activeSession.diff_stats.insertions} insertions
-                      </span>
-                      <span className="text-rose-400">
-                        -{activeSession.diff_stats.deletions} deletions
-                      </span>
-                    </div>
-                  </div>
-
-                  {activeSession.diff_stats.modified_files.length > 0 && (
-                    <div className="flex flex-wrap gap-1.5">
-                      {activeSession.diff_stats.modified_files.map((file) => (
-                        <span
-                          key={file}
-                          className="text-[11px] font-mono px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-300"
+                  <div className="space-y-1">
+                    {repoSessions.map((s) => {
+                      const isFocused = s.id === focusedSession?.id;
+                      const isInSplit = visibleSessions.some(
+                        (v) => v.id === s.id
+                      );
+                      return (
+                        <button
+                          key={s.id}
+                          onClick={() => setFocusedId(s.id)}
+                          className={`w-full text-left px-2.5 py-2.5 rounded-xl border transition flex flex-col gap-1.5 cursor-pointer ${
+                            isFocused
+                              ? "bg-indigo-950/35 border-indigo-500/45 shadow-2xs"
+                              : isInSplit
+                              ? "bg-zinc-900/70 border-zinc-800"
+                              : "bg-transparent border-transparent hover:bg-zinc-900/50"
+                          }`}
                         >
-                          {file}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Unified Diff Renderer */}
-                  <div className="rounded-lg border border-zinc-800 bg-zinc-950 overflow-hidden font-mono text-xs">
-                    {!diffData?.diff?.trim() ? (
-                      <div className="p-8 text-center text-zinc-500">
-                        No uncommitted changes detected against HEAD in this worktree.
-                      </div>
-                    ) : (
-                      <div className="overflow-x-auto p-3 space-y-0.5">
-                        {diffData.diff.split("\n").map((line, i) => {
-                          let cls = "text-zinc-400";
-                          if (line.startsWith("+") && !line.startsWith("+++")) {
-                            cls = "bg-emerald-950/40 text-emerald-300";
-                          } else if (
-                            line.startsWith("-") &&
-                            !line.startsWith("---")
-                          ) {
-                            cls = "bg-rose-950/40 text-rose-300";
-                          } else if (line.startsWith("@@")) {
-                            cls = "text-indigo-400 bg-indigo-950/20";
-                          } else if (line.startsWith("diff --git")) {
-                            cls =
-                              "text-zinc-200 font-semibold border-t border-zinc-800 pt-2 mt-2";
-                          }
-                          return (
-                            <div key={i} className={`px-2 py-0.5 whitespace-pre ${cls}`}>
-                              {line || " "}
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <StatusPulse status={s.status} />
+                              <span className="font-medium text-xs text-zinc-100 truncate">
+                                {s.name}
+                              </span>
                             </div>
-                          );
-                        })}
-                      </div>
-                    )}
+                            <span
+                              className={`text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0 ${providerBadgeColor(
+                                s.provider
+                              )}`}
+                            >
+                              {formatProvider(s.provider)}
+                            </span>
+                          </div>
+
+                          <div className="text-[11px] text-zinc-400 truncate pl-4">
+                            {s.prompt || "(Interactive PTY)"}
+                          </div>
+
+                          <div className="flex items-center justify-between text-[10px] font-mono text-zinc-500 pl-4 pt-0.5">
+                            <span className="flex items-center gap-1 truncate max-w-[125px] text-zinc-400">
+                              <GitBranch className="w-2.5 h-2.5 text-indigo-400 shrink-0" />
+                              {s.branch}
+                            </span>
+                            <span className="flex items-center gap-1.5">
+                              <span className="text-emerald-400">
+                                +{s.diff_stats.insertions}
+                              </span>
+                              <span className="text-rose-400">
+                                -{s.diff_stats.deletions}
+                              </span>
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Left Column Bottom Telemetry Bar */}
+          <div className="h-9 px-3 border-t border-zinc-800/80 bg-zinc-950 flex items-center justify-between text-[11px] font-mono text-zinc-500">
+            <div className="flex items-center gap-1.5">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  connected
+                    ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]"
+                    : "bg-rose-500"
+                }`}
+              />
+              <span>{connected ? "DAEMON READY" : "OFFLINE"}</span>
+            </div>
+            <span>
+              {runningCount} running / {sessions.length} total
+            </span>
+          </div>
+        </aside>
+
+        {/* Column 2: Multi-Pane Agent Canvas (1x / 2x / 4x) */}
+        <main className="flex-1 min-w-0 min-h-0 bg-[#0c0c0f] p-3 flex flex-col">
+          {visibleSessions.length === 0 ? (
+            <div className="flex-1 rounded-2xl border border-dashed border-zinc-800/80 flex flex-col items-center justify-center p-8 text-center">
+              <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 mb-4">
+                <Sparkles className="w-6 h-6" />
+              </div>
+              <h2 className="text-base font-semibold text-zinc-100">
+                Velo Parallel Agent Control Plane
+              </h2>
+              <p className="text-xs text-zinc-400 max-w-md mt-1.5 leading-relaxed">
+                Orchestrate Claude Code, OpenAI Codex, and OpenCode side-by-side
+                in isolated Git worktrees with real-time diff inspection and
+                cross-agent handoffs.
+              </p>
+              <div className="flex items-center gap-3 mt-5">
+                <button
+                  onClick={() => setLaunchModalMode("single")}
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium flex items-center gap-2 cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  Launch Worktree Agent
+                </button>
+                <button
+                  onClick={() => setLaunchModalMode("committee")}
+                  className="px-4 py-2 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-200 text-xs font-medium flex items-center gap-2 cursor-pointer"
+                >
+                  <Users className="w-4 h-4 text-amber-400" />
+                  Dispatch Committee
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div
+              className={`flex-1 min-h-0 grid gap-3 ${
+                visibleSessions.length === 1
+                  ? "grid-cols-1 grid-rows-1"
+                  : visibleSessions.length === 2
+                  ? "grid-cols-1 lg:grid-cols-2 grid-rows-1"
+                  : "grid-cols-1 lg:grid-cols-2 grid-rows-2"
+              }`}
+            >
+              {visibleSessions.map((session) => (
+                <SessionPane
+                  key={session.id}
+                  session={session}
+                  events={eventsBySession[session.id] || []}
+                  isFocused={session.id === focusedSession?.id}
+                  compact={visibleSessions.length >= 4}
+                  onFocus={() => setFocusedId(session.id)}
+                  onOpenDiff={() => setShowDiffDrawer(true)}
+                  onHandoff={(s) => setHandoffTargetSession(s)}
+                  onAdvisor={handleQuickAdvisor}
+                  onStop={stopSession}
+                  onSendInput={sendInput}
+                />
+              ))}
+            </div>
+          )}
+        </main>
+
+        {/* Column 3: Collapsible Git Diff & File Tree Inspector Drawer */}
+        {showDiffDrawer && focusedSession && (
+          <DiffDrawer
+            session={focusedSession}
+            diffData={diffData}
+            loading={loadingDiff}
+            onRefresh={refreshDiff}
+            onClose={() => setShowDiffDrawer(false)}
+          />
+        )}
+      </div>
+
+      {/* Unified Launch Modal (Single Agent / Multi-Agent Committee / Self-Healing Loop) */}
+      {launchModalMode && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-zinc-900 border border-zinc-800 shadow-2xl overflow-hidden">
+            {/* Mode Switcher Header */}
+            <div className="px-5 pt-4 pb-3 border-b border-zinc-800 flex items-center justify-between">
+              <div className="flex items-center gap-1 bg-zinc-950 p-1 rounded-xl border border-zinc-800">
+                <button
+                  type="button"
+                  onClick={() => setLaunchModalMode("single")}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+                    launchModalMode === "single"
+                      ? "bg-indigo-600 text-white"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  <span>Single Agent</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLaunchModalMode("committee")}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+                    launchModalMode === "committee"
+                      ? "bg-indigo-600 text-white"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  <Users className="w-3.5 h-3.5" />
+                  <span>Committee</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLaunchModalMode("loop")}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer ${
+                    launchModalMode === "loop"
+                      ? "bg-indigo-600 text-white"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Test Loop</span>
+                </button>
+              </div>
+
+              <button
+                onClick={() => setLaunchModalMode(null)}
+                className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleLaunchSubmit} className="p-5 space-y-4 text-xs">
+              {launchModalMode === "committee" ? (
+                <div>
+                  <label className="block text-zinc-400 mb-2">
+                    Select Committee Agents (each runs in its own isolated Git worktree)
+                  </label>
+                  <div className="grid grid-cols-3 gap-2.5">
+                    {(["claude", "codex", "opencode"] as const).map((ag) => (
+                      <label
+                        key={ag}
+                        className={`p-3 rounded-xl border flex items-center gap-2 cursor-pointer transition ${
+                          committeeChecks[ag]
+                            ? "bg-indigo-950/40 border-indigo-500/50 text-zinc-100"
+                            : "bg-zinc-950 border-zinc-800 text-zinc-400"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={committeeChecks[ag]}
+                          onChange={(e) =>
+                            setCommitteeChecks((prev) => ({
+                              ...prev,
+                              [ag]: e.target.checked,
+                            }))
+                          }
+                        />
+                        <span className="font-mono uppercase">{ag}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-zinc-400 mb-1">
+                      Agent Provider
+                    </label>
+                    <select
+                      value={providerInput}
+                      onChange={(e) => setProviderInput(e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="claude">Claude Code (stream-json)</option>
+                      <option value="codex">OpenAI Codex</option>
+                      <option value="opencode">OpenCode</option>
+                      <option value="custom">Custom CLI Command</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-zinc-400 mb-1">
+                      Git Branch (isolated worktree)
+                    </label>
+                    <input
+                      type="text"
+                      value={branchInput}
+                      onChange={(e) => setBranchInput(e.target.value)}
+                      placeholder="e.g. feat/auth-middleware"
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 font-mono focus:outline-none focus:border-indigo-500"
+                    />
                   </div>
                 </div>
               )}
 
-              {activeTab === "terminal" && (
-                <div className="max-w-5xl mx-auto rounded-lg bg-black border border-zinc-800 p-4 font-mono text-xs space-y-1 min-h-[420px]">
-                  {activeEvents.map((ev, i) => {
-                    if (ev.type === "pty_output") {
-                      return (
-                        <div key={i} className="text-zinc-200 whitespace-pre-wrap">
-                          {ev.line}
-                        </div>
-                      );
-                    }
-                    if (ev.type === "message_delta") {
-                      return (
-                        <div key={i} className="text-emerald-300 whitespace-pre-wrap">
-                          {ev.text}
-                        </div>
-                      );
-                    }
-                    if (ev.type === "error") {
-                      return (
-                        <div key={i} className="text-rose-400 whitespace-pre-wrap">
-                          [ERROR] {ev.error}
-                        </div>
-                      );
-                    }
-                    return null;
-                  })}
-                </div>
-              )}
-            </div>
-
-            {/* Bottom Interactive Input Bar */}
-            <form
-              onSubmit={handleSendStdin}
-              className="p-3 border-t border-zinc-800/80 bg-zinc-900/40 flex items-center gap-2"
-            >
-              <input
-                type="text"
-                value={stdinText}
-                onChange={(e) => setStdinText(e.target.value)}
-                placeholder={
-                  activeSession.status === "running"
-                    ? "Send stdin / follow-up input to running agent..."
-                    : "Session is not currently running"
-                }
-                disabled={activeSession.status !== "running"}
-                className="flex-1 bg-zinc-900 border border-zinc-800 rounded-lg px-3.5 py-2 text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-indigo-500 disabled:opacity-50 font-mono"
-              />
-              <button
-                type="submit"
-                disabled={activeSession.status !== "running" || !stdinText.trim()}
-                className="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-medium flex items-center gap-1.5 transition cursor-pointer"
-              >
-                <Send className="w-3.5 h-3.5" />
-                Send
-              </button>
-            </form>
-          </>
-        )}
-      </main>
-
-      {/* Modal: Create New Parallel Worktree Session */}
-      {showNewModal && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-lg rounded-xl bg-zinc-900 border border-zinc-800 shadow-2xl overflow-hidden">
-            <div className="px-5 py-3.5 border-b border-zinc-800 flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
-                <Play className="w-4 h-4 text-indigo-400" />
-                Launch Parallel Worktree Agent
-              </h3>
-              <button
-                onClick={() => setShowNewModal(false)}
-                className="text-xs text-zinc-400 hover:text-zinc-200"
-              >
-                ESC
-              </button>
-            </div>
-
-            <form onSubmit={handleCreateSession} className="p-5 space-y-4 text-xs">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-zinc-400 mb-1">Agent Provider</label>
-                  <select
-                    value={providerInput}
-                    onChange={(e) => setProviderInput(e.target.value)}
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 focus:outline-none focus:border-indigo-500"
-                  >
-                    <option value="claude">Claude Code (stream-json)</option>
-                    <option value="codex">OpenAI Codex</option>
-                    <option value="opencode">OpenCode</option>
-                    <option value="custom">Custom CLI Command</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-zinc-400 mb-1">
-                    Git Branch (auto-created)
-                  </label>
-                  <input
-                    type="text"
-                    value={branchInput}
-                    onChange={(e) => setBranchInput(e.target.value)}
-                    placeholder="e.g. feat/jwt-auth"
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 font-mono focus:outline-none focus:border-indigo-500"
-                  />
-                </div>
-              </div>
-
-              {providerInput === "custom" && (
+              {providerInput === "custom" && launchModalMode !== "committee" && (
                 <div>
                   <label className="block text-zinc-400 mb-1">
                     Custom CLI Command
@@ -634,15 +744,48 @@ export default function App() {
                     type="text"
                     value={customCmdInput}
                     onChange={(e) => setCustomCmdInput(e.target.value)}
-                    placeholder="e.g. aider --yes-always"
+                    placeholder="e.g. /tmp/velo_demo_agent.sh #"
                     className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 font-mono focus:outline-none focus:border-indigo-500"
                   />
                 </div>
               )}
 
+              {launchModalMode === "loop" && (
+                <div className="grid grid-cols-3 gap-3 p-3 rounded-xl bg-emerald-950/15 border border-emerald-500/25">
+                  <div className="col-span-2">
+                    <label className="block text-emerald-300 mb-1">
+                      Acceptance Check Command
+                    </label>
+                    <input
+                      type="text"
+                      value={checkCommandInput}
+                      onChange={(e) => setCheckCommandInput(e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-1.5 text-zinc-100 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-emerald-300 mb-1">
+                      Max Iterations
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={10}
+                      value={maxIterationsInput}
+                      onChange={(e) =>
+                        setMaxIterationsInput(Number(e.target.value))
+                      }
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-1.5 text-zinc-100 font-mono"
+                    />
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-zinc-400 mb-1">Repository Path</label>
+                  <label className="block text-zinc-400 mb-1">
+                    Repository Root
+                  </label>
                   <input
                     type="text"
                     value={repoPathInput}
@@ -652,55 +795,65 @@ export default function App() {
                 </div>
                 <div>
                   <label className="block text-zinc-400 mb-1">
-                    Session Name (optional)
+                    Session / Group Name
                   </label>
                   <input
                     type="text"
                     value={sessionNameInput}
                     onChange={(e) => setSessionNameInput(e.target.value)}
-                    placeholder="e.g. auth-refactor"
+                    placeholder="Optional label"
                     className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 focus:outline-none focus:border-indigo-500"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-zinc-400 mb-1">Task Prompt</label>
+                <label className="block text-zinc-400 mb-1">
+                  Task Instructions / Prompt
+                </label>
                 <textarea
                   rows={4}
+                  required={!usePtyInput}
                   value={promptInput}
                   onChange={(e) => setPromptInput(e.target.value)}
-                  placeholder="Describe the feature, bugfix, or refactor to execute inside this isolated Git worktree..."
+                  placeholder="Describe what the agent(s) should build, fix, or analyze inside the isolated Git worktree..."
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-zinc-100 focus:outline-none focus:border-indigo-500"
                 />
               </div>
 
-              <label className="flex items-center gap-2 text-zinc-300 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={usePtyInput}
-                  onChange={(e) => setUsePtyInput(e.target.checked)}
-                  className="rounded border-zinc-700"
-                />
-                <span>
-                  Spawn inside interactive pseudo-terminal (<code>portable-pty</code>)
-                </span>
-              </label>
+              {launchModalMode === "single" && (
+                <label className="flex items-center gap-2 text-zinc-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={usePtyInput}
+                    onChange={(e) => setUsePtyInput(e.target.checked)}
+                  />
+                  <span>
+                    Run in interactive pseudo-terminal (<code>portable-pty</code>)
+                  </span>
+                </label>
+              )}
 
               <div className="flex items-center justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setShowNewModal(false)}
-                  className="px-3.5 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                  onClick={() => setLaunchModalMode(null)}
+                  className="px-3.5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={submitting}
-                  className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium cursor-pointer"
                 >
-                  {submitting ? "Provisioning Worktree..." : "Launch Agent"}
+                  {submitting
+                    ? "Provisioning Worktree..."
+                    : launchModalMode === "committee"
+                    ? "Dispatch Committee"
+                    : launchModalMode === "loop"
+                    ? "Start Self-Healing Loop"
+                    : "Launch Worktree Agent"}
                 </button>
               </div>
             </form>
@@ -708,35 +861,35 @@ export default function App() {
         </div>
       )}
 
-      {/* Modal: Cross-Agent Handoff */}
-      {showHandoffModal && activeSession && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-md rounded-xl bg-zinc-900 border border-zinc-800 shadow-2xl overflow-hidden">
+      {/* Cross-Agent Handoff Modal */}
+      {handoffTargetSession && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl bg-zinc-900 border border-zinc-800 shadow-2xl overflow-hidden">
             <div className="px-5 py-3.5 border-b border-zinc-800 flex items-center justify-between">
               <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
                 <ArrowRightLeft className="w-4 h-4 text-indigo-400" />
-                Handoff Worktree to Another Agent
+                Handoff Worktree to Peer Agent
               </h3>
               <button
-                onClick={() => setShowHandoffModal(false)}
-                className="text-xs text-zinc-400 hover:text-zinc-200"
+                onClick={() => setHandoffTargetSession(null)}
+                className="text-zinc-400 hover:text-zinc-200 cursor-pointer"
               >
-                ESC
+                <X className="w-4 h-4" />
               </button>
             </div>
 
-            <form onSubmit={handleHandoff} className="p-5 space-y-4 text-xs">
-              <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800 font-mono text-[11px] text-zinc-400 space-y-1">
-                <div>Source: {activeSession.name}</div>
-                <div>Branch: {activeSession.branch}</div>
-                <div>Worktree: {activeSession.worktree_path}</div>
+            <form onSubmit={handleExecuteHandoff} className="p-5 space-y-4 text-xs">
+              <div className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 font-mono text-[11px] text-zinc-400 space-y-1">
+                <div>From Session: {handoffTargetSession.name}</div>
+                <div>Shared Branch: {handoffTargetSession.branch}</div>
+                <div>Worktree: {handoffTargetSession.worktree_path}</div>
               </div>
 
               <div>
                 <label className="block text-zinc-400 mb-1">Target Agent</label>
                 <select
-                  value={handoffTarget}
-                  onChange={(e) => setHandoffTarget(e.target.value)}
+                  value={handoffProvider}
+                  onChange={(e) => setHandoffProvider(e.target.value)}
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100"
                 >
                   <option value="codex">OpenAI Codex</option>
@@ -760,15 +913,15 @@ export default function App() {
               <div className="flex items-center justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setShowHandoffModal(false)}
-                  className="px-3.5 py-2 rounded-lg bg-zinc-800 text-zinc-300"
+                  onClick={() => setHandoffTargetSession(null)}
+                  className="px-3.5 py-2 rounded-xl bg-zinc-800 text-zinc-300 cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={submitting}
-                  className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium cursor-pointer"
                 >
                   {submitting ? "Handing Off..." : "Execute Handoff"}
                 </button>
@@ -777,169 +930,27 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Global Command Palette (⌘K) */}
+      {showCommandPalette && (
+        <CommandPalette
+          sessions={sessions}
+          onClose={() => setShowCommandPalette(false)}
+          onSelectSession={(id) => setFocusedId(id)}
+          onOpenLaunchModal={(mode) => setLaunchModalMode(mode)}
+          onSetLayout={(l) => setPaneLayout(l)}
+          onToggleDiffDrawer={() => setShowDiffDrawer((v) => !v)}
+          onOpenPairing={() => setShowPairingModal(true)}
+        />
+      )}
+
+      {/* Mobile & Remote E2EE Pairing QR Modal */}
+      {showPairingModal && (
+        <PairingModal
+          daemonUrl="http://127.0.0.1:6767"
+          onClose={() => setShowPairingModal(false)}
+        />
+      )}
     </div>
   );
-}
-
-function StatusDot({ status }: { status: SessionStatus }) {
-  switch (status) {
-    case "running":
-    case "starting":
-      return (
-        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-      );
-    case "waiting_for_permission":
-      return <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" />;
-    case "completed":
-      return <span className="w-2 h-2 rounded-full bg-sky-400 shrink-0" />;
-    case "failed":
-      return <span className="w-2 h-2 rounded-full bg-rose-500 shrink-0" />;
-    default:
-      return <span className="w-2 h-2 rounded-full bg-zinc-500 shrink-0" />;
-  }
-}
-
-function StatusBadge({ status }: { status: SessionStatus }) {
-  const styles: Record<SessionStatus, string> = {
-    starting: "bg-emerald-950/60 text-emerald-300 border-emerald-800/60",
-    running: "bg-emerald-950/60 text-emerald-300 border-emerald-800/60",
-    waiting_for_permission: "bg-amber-950/60 text-amber-300 border-amber-800/60",
-    completed: "bg-sky-950/60 text-sky-300 border-sky-800/60",
-    failed: "bg-rose-950/60 text-rose-300 border-rose-800/60",
-    stopped: "bg-zinc-800 text-zinc-400 border-zinc-700",
-  };
-  return (
-    <span
-      className={`text-[10px] font-mono uppercase px-2 py-0.5 rounded border ${styles[status]}`}
-    >
-      {status}
-    </span>
-  );
-}
-
-function TabButton({
-  active,
-  onClick,
-  icon,
-  label,
-  badge,
-}: {
-  active: boolean;
-  onClick: () => void;
-  icon: React.ReactNode;
-  label: string;
-  badge?: string | number;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`px-3.5 py-2.5 text-xs font-medium flex items-center gap-2 border-b-2 transition cursor-pointer ${
-        active
-          ? "border-indigo-500 text-indigo-300"
-          : "border-transparent text-zinc-400 hover:text-zinc-200"
-      }`}
-    >
-      {icon}
-      <span>{label}</span>
-      {badge !== undefined && (
-        <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-zinc-800 text-zinc-400">
-          {badge}
-        </span>
-      )}
-    </button>
-  );
-}
-
-function EventCard({ event }: { event: AgentEvent }) {
-  switch (event.type) {
-    case "thinking_delta":
-      return (
-        <div className="p-3 rounded-lg bg-zinc-900/40 border border-zinc-800/70 text-xs text-zinc-400 flex items-start gap-2.5">
-          <Brain className="w-4 h-4 text-amber-400/80 shrink-0 mt-0.5" />
-          <div className="min-w-0 flex-1">
-            <div className="text-[10px] font-mono uppercase text-amber-400/80 mb-0.5">
-              Reasoning Trace
-            </div>
-            <p className="whitespace-pre-wrap leading-relaxed">{event.text}</p>
-          </div>
-        </div>
-      );
-
-    case "message_delta":
-      return (
-        <div className="p-3.5 rounded-lg bg-zinc-900/80 border border-zinc-800 text-xs text-zinc-100 whitespace-pre-wrap leading-relaxed">
-          {event.text}
-        </div>
-      );
-
-    case "tool_call_requested":
-      return (
-        <div className="p-3 rounded-lg bg-indigo-950/20 border border-indigo-900/50 text-xs flex items-start gap-2.5">
-          <Wrench className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
-          <div className="min-w-0 flex-1 font-mono">
-            <div className="text-[11px] text-indigo-300 font-semibold">
-              Tool Call: {event.tool_name}{" "}
-              <span className="text-zinc-500 font-normal">({event.tool_id})</span>
-            </div>
-            <pre className="mt-1 text-[11px] text-zinc-400 overflow-x-auto bg-zinc-950/70 p-2 rounded border border-zinc-800/80">
-              {JSON.stringify(event.arguments, null, 2)}
-            </pre>
-          </div>
-        </div>
-      );
-
-    case "tool_call_completed":
-      return (
-        <div
-          className={`p-3 rounded-lg border text-xs flex items-start gap-2.5 font-mono ${
-            event.is_error
-              ? "bg-rose-950/20 border-rose-900/50 text-rose-200"
-              : "bg-emerald-950/15 border-emerald-900/40 text-zinc-300"
-          }`}
-        >
-          {event.is_error ? (
-            <XCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-          ) : (
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-          )}
-          <div className="min-w-0 flex-1">
-            <div className="text-[11px] text-zinc-400 mb-1">
-              Tool Output ({event.tool_id})
-            </div>
-            <pre className="text-[11px] whitespace-pre-wrap max-h-48 overflow-y-auto bg-zinc-950/70 p-2 rounded">
-              {event.output}
-            </pre>
-          </div>
-        </div>
-      );
-
-    case "status_changed":
-      return (
-        <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-500 py-1">
-          <span className="h-px flex-1 bg-zinc-800/80" />
-          <span>
-            Status → <strong className="text-zinc-300">{event.status}</strong>{" "}
-            {event.message ? `(${event.message})` : ""}
-          </span>
-          <span className="h-px flex-1 bg-zinc-800/80" />
-        </div>
-      );
-
-    case "error":
-      return (
-        <div className="p-3 rounded-lg bg-rose-950/40 border border-rose-800 text-xs text-rose-200 font-mono">
-          ❗ {event.error}
-        </div>
-      );
-
-    case "pty_output":
-      return (
-        <div className="px-3 py-1 rounded bg-black/60 border border-zinc-900 font-mono text-[11px] text-zinc-300 whitespace-pre-wrap">
-          {event.line}
-        </div>
-      );
-
-    default:
-      return null;
-  }
 }
