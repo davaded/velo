@@ -16,11 +16,15 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  CircleGauge,
   Command,
   Copy,
   FileCode2,
   FolderGit2,
+  FolderPlus,
   GitBranch,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   QrCode,
   Search,
@@ -31,8 +35,16 @@ import {
 } from "lucide-react";
 
 type VariantId = "a" | "b" | "c";
+type GroupMode = "project" | "status";
 type DrawerTab = "diff" | "terminal";
-type ModalKind = null | "new-worktree" | "new-repo" | "command" | "skills" | "qr" | "advisor";
+type ModalKind =
+  | null
+  | "new-worktree"
+  | "new-repo"
+  | "command"
+  | "skills"
+  | "qr"
+  | "advisor";
 
 export function App() {
   const [daemonUrl] = useState<string>(() => {
@@ -44,9 +56,13 @@ export function App() {
   // Visual Material Variant (A / B / C live switcher)
   const [variant, setVariant] = useState<VariantId>("a");
 
-  // L3 Left Navigation State: 48px Repo Rail + 220px Worktree Column
+  // Unified Sidebar State (Claude Code / OpenAI Codex / Paseo style)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
+  const [groupMode, setGroupMode] = useState<GroupMode>("project");
+  const [sidebarSearch, setSidebarSearch] = useState<string>("");
+  const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
   const [repos, setRepos] = useState<VeloRepo[]>(DEMO_REPOS);
-  const [activeRepoId, setActiveRepoId] = useState<string>(DEMO_REPOS[0].id);
+  const [targetRepoIdForNewWt, setTargetRepoIdForNewWt] = useState<string>(DEMO_REPOS[0].id);
 
   // Core Sessions & Events
   const [sessions, setSessions] = useState<VeloSession[]>(DEMO_SESSIONS);
@@ -54,7 +70,7 @@ export function App() {
   const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(DEMO_EVENTS);
   const [connected, setConnected] = useState<boolean>(false);
 
-  // On-Demand Right Drawer State (Closed by default per User's 1+4 Layout)
+  // On-Demand Right Drawer State (Closed by default)
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("diff");
   const [selectedDiffPath, setSelectedDiffPath] = useState<string>(DEMO_DIFF_FILES[0].path);
@@ -94,23 +110,14 @@ export function App() {
 
   const streamEndRef = useRef<HTMLDivElement | null>(null);
 
-  const activeRepo = useMemo(
-    () => repos.find((r) => r.id === activeRepoId) || repos[0],
-    [repos, activeRepoId]
-  );
-
-  const repoSessions = useMemo(
-    () => sessions.filter((s) => s.repo_id === activeRepo.id),
-    [sessions, activeRepo.id]
-  );
-
   const activeSession = useMemo(
-    () =>
-      sessions.find((s) => s.id === activeId) ||
-      repoSessions[0] ||
-      sessions[0] ||
-      DEMO_SESSIONS[0],
-    [sessions, repoSessions, activeId]
+    () => sessions.find((s) => s.id === activeId) || sessions[0] || DEMO_SESSIONS[0],
+    [sessions, activeId]
+  );
+
+  const activeRepo = useMemo(
+    () => repos.find((r) => r.id === activeSession.repo_id) || repos[0],
+    [repos, activeSession.repo_id]
   );
 
   const activeEvents = useMemo(
@@ -118,14 +125,17 @@ export function App() {
     [eventsBySession, activeSession.id]
   );
 
-  // Switch repo and automatically select its first worktree
-  const handleSelectRepo = (repoId: string) => {
-    setActiveRepoId(repoId);
-    const firstInRepo = sessions.find((s) => s.repo_id === repoId);
-    if (firstInRepo) {
-      setActiveId(firstInRepo.id);
-    }
-  };
+  const filteredSessions = useMemo(() => {
+    const q = sidebarSearch.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter(
+      (s) =>
+        s.title.toLowerCase().includes(q) ||
+        s.branch_name.toLowerCase().includes(q) ||
+        s.model.toLowerCase().includes(q) ||
+        s.project_path.toLowerCase().includes(q)
+    );
+  }, [sessions, sidebarSearch]);
 
   // Connect to live Rust Velo Daemon
   useEffect(() => {
@@ -186,12 +196,15 @@ export function App() {
     };
   }, [daemonUrl, activeId]);
 
-  // Keyboard shortcuts: Cmd+K (Command), Cmd+J (Toggle Right Drawer), Esc (Close)
+  // Keyboard shortcuts: Cmd+K (Command), Cmd+B (Toggle Left Sidebar), Cmd+J (Toggle Right Drawer), Esc
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setActiveModal((m) => (m === "command" ? null : "command"));
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        setSidebarCollapsed((c) => !c);
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "j") {
         e.preventDefault();
         setDrawerOpen((o) => !o);
@@ -303,15 +316,17 @@ export function App() {
   };
 
   const handleCreateWorktree = async () => {
+    const targetRepo = repos.find((r) => r.id === targetRepoIdForNewWt) || activeRepo;
     const clean = newTaskName.trim() || `feat/task-${sessions.length + 1}`;
-    const branch = clean.startsWith("feat/") || clean.startsWith("fix/") || clean.startsWith("chore/")
-      ? clean
-      : `feat/${clean}`;
+    const branch =
+      clean.startsWith("feat/") || clean.startsWith("fix/") || clean.startsWith("chore/")
+        ? clean
+        : `feat/${clean}`;
     const slug = branch.replace(/\//g, "-");
     const newId = `sess-${Date.now().toString().slice(-4)}`;
     const created: VeloSession = {
       id: newId,
-      repo_id: activeRepo.id,
+      repo_id: targetRepo.id,
       title: newTaskDesc.trim() || branch,
       agent_kind: newAgentKind,
       model:
@@ -322,14 +337,14 @@ export function App() {
           : "gemini-2.5-pro",
       model_short:
         newAgentKind === "claude"
-          ? "claude-4.5"
+          ? "Claude 4.5"
           : newAgentKind === "codex"
-          ? "codex-o3"
-          : "gemini-2.5",
+          ? "Codex o3"
+          : "Gemini 2.5",
       status: "running",
       branch_name: branch,
-      worktree_path: `${activeRepo.path}/.velo/worktrees/${slug}`,
-      project_path: activeRepo.path,
+      worktree_path: `${targetRepo.path}/.velo/worktrees/${slug}`,
+      project_path: targetRepo.path,
       approval_mode: newApproval,
       tokens_used: 2400,
       tokens_limit: 200000,
@@ -337,10 +352,11 @@ export function App() {
       files_changed: 1,
       insertions: 14,
       deletions: 2,
-      updated_at: "just now",
+      updated_at: "now",
     };
 
     setSessions((prev) => [created, ...prev]);
+    setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
     setEventsBySession((prev) => ({
       ...prev,
       [newId]: [
@@ -359,7 +375,7 @@ export function App() {
           session_id: newId,
           timestamp: new Date().toLocaleTimeString([], { hour12: false }),
           kind: "assistant",
-          content: `已在仓库 **${activeRepo.name}** 下创建隔离 Git Worktree \`${branch}\`（模型：**${created.model}**）。点击流中的修改胶囊即可滑出右侧 Diff 抽屉。`,
+          content: `已在项目 **${targetRepo.name}** 下创建隔离 Git Worktree 会话 \`${branch}\`（模型：**${created.model}**）。点击流中的修改胶囊即可滑出右侧 Diff 抽屉。`,
         },
       ],
     }));
@@ -386,7 +402,7 @@ export function App() {
       title: "初始化 Worktree 架构索引",
       agent_kind: "claude",
       model: "claude-sonnet-4.5",
-      model_short: "claude-4.5",
+      model_short: "Claude 4.5",
       status: "running",
       branch_name: "feat/init-worktree",
       worktree_path: `${cleanPath}/.velo/worktrees/init`,
@@ -398,11 +414,10 @@ export function App() {
       files_changed: 1,
       insertions: 18,
       deletions: 0,
-      updated_at: "just now",
+      updated_at: "now",
     };
     setRepos((prev) => [...prev, newRepo]);
     setSessions((prev) => [defaultSession, ...prev]);
-    setActiveRepoId(id);
     setActiveId(defaultSessId);
     setActiveModal(null);
   };
@@ -439,204 +454,319 @@ export function App() {
     )
   );
 
+  // Render a single Thread / Worktree row (Claude Code / Codex / Paseo style)
+  const renderThreadRow = (w: VeloSession, showRepoPrefix = false) => {
+    const isSelected = w.id === activeSession.id;
+    const repoObj = repos.find((r) => r.id === w.repo_id);
+    const dotColor =
+      w.status === "running"
+        ? "#34d399"
+        : w.status === "waiting_approval"
+        ? "#fbbf24"
+        : "#52525b";
+
+    return (
+      <button
+        key={w.id}
+        onClick={() => setActiveId(w.id)}
+        className={`group flex w-full flex-col gap-0.5 rounded-[6px] border px-2.5 py-1.5 text-left transition-all ${
+          isSelected
+            ? "border-[#383842] bg-[#18181e]"
+            : "border-transparent bg-transparent hover:bg-[#131318]"
+        }`}
+      >
+        {/* Line 1: Status Dot + Thread Task Title + Diff Stat (+48 -14) */}
+        <div className="flex w-full items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <span
+              className="v-dot shrink-0"
+              style={{
+                background: dotColor,
+                boxShadow:
+                  w.status === "running" ? "0 0 6px rgba(52,211,153,0.55)" : "none",
+              }}
+            />
+            <span
+              className={`truncate text-[12px] ${
+                isSelected
+                  ? "font-semibold text-[#fafafa]"
+                  : "font-medium text-[#d4d4d8] group-hover:text-[#fafafa]"
+              }`}
+            >
+              {w.title}
+            </span>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1 font-mono text-[10.5px]">
+            <span className="text-[#34d399]">+{w.insertions}</span>
+            <span className="text-[#f87171]">−{w.deletions}</span>
+          </div>
+        </div>
+
+        {/* Line 2 (Indented): Git Branch + Agent Provider + Relative Time */}
+        <div className="flex w-full items-center justify-between gap-2 pl-[14px] font-mono text-[10.5px] text-[#71717a]">
+          <div className="flex min-w-0 items-center gap-1.5 truncate">
+            {showRepoPrefix && repoObj && (
+              <>
+                <span className="text-[#a1a1aa]">{repoObj.name}</span>
+                <span>·</span>
+              </>
+            )}
+            <GitBranch className="h-2.5 w-2.5 shrink-0 text-[#71717a]" />
+            <span className="truncate">{w.branch_name}</span>
+            <span className="text-[#3f3f46]">·</span>
+            <span className="shrink-0 text-[#a1a1aa]">{w.model_short}</span>
+          </div>
+          <span className="shrink-0 text-[10px] text-[#52525b]">{w.updated_at}</span>
+        </div>
+      </button>
+    );
+  };
+
   return (
     <div
       className={`velo-variant-${variant} flex h-screen w-screen overflow-hidden select-none bg-[#09090b] text-[#fafafa]`}
     >
       {/* =====================================================================
-          1A. LEFTMOST 48PX REPOSITORY RAIL (方案 L3 第一栏：切换不同项目仓库)
+          1. UNIFIED LEFT SIDEBAR (Claude Code / OpenAI Codex / Paseo Style)
+             - Top Header: Collapse (⌘B) + Velo Daemon Status + ⌘K + New Thread
+             - Top Nav Block: "+ New Worktree Thread" + Search Filter
+             - Section Switcher: Workspaces (N) | [Project | Status]
+             - Hierarchical Tree: Collapsible Project Folders -> Indented Threads
+             - Bottom Footer: + Add Project, Usage, Mobile Pairing QR
          ===================================================================== */}
-      <aside className="v-rail z-30 flex w-[48px] shrink-0 flex-col items-center justify-between py-3">
-        <div className="flex flex-col items-center gap-2.5">
-          {/* Velo Monochrome Brand Mark */}
-          <button
-            onClick={() => setActiveModal("command")}
-            title="Velo Orchestrator (⌘K)"
-            className="v-card group relative flex h-8 w-8 items-center justify-center font-mono text-[13px] font-bold tracking-tighter text-[#fafafa] transition-transform active:scale-95"
-          >
-            V
-            <span
-              className="v-dot absolute -right-0.5 -top-0.5"
-              style={{ background: connected ? "#34d399" : "#fbbf24" }}
-            />
-          </button>
-
-          <div className="my-0.5 h-[1px] w-5 bg-[#27272a]" />
-
-          {/* Repository Icons (VL, NX, UI...) */}
-          {repos.map((repo) => {
-            const isSelected = repo.id === activeRepo.id;
-            const repoWorktrees = sessions.filter((s) => s.repo_id === repo.id);
-            const hasRunning = repoWorktrees.some((s) => s.status === "running");
-            const hasWaiting = repoWorktrees.some((s) => s.status === "waiting_approval");
-            const dotColor = hasRunning
-              ? "#34d399"
-              : hasWaiting
-              ? "#fbbf24"
-              : "#71717a";
-
-            return (
-              <button
-                key={repo.id}
-                onClick={() => handleSelectRepo(repo.id)}
-                title={`仓库: ${repo.name} (${repo.path}) · ${repoWorktrees.length} Worktrees`}
-                className={`group relative flex h-8 w-8 items-center justify-center rounded-md font-mono text-[11px] font-semibold transition-all ${
-                  isSelected
-                    ? "bg-[#fafafa] text-[#09090b] shadow-sm"
-                    : "bg-[#141417] text-[#a1a1aa] hover:bg-[#1f1f24] hover:text-[#fafafa]"
-                }`}
-              >
-                {isSelected && (
-                  <span className="absolute -left-[8px] h-4 w-[3px] rounded-r bg-[#fafafa]" />
-                )}
-                {repo.code}
-                <span
-                  className="v-dot absolute -bottom-0.5 -right-0.5 border border-[#09090b]"
-                  style={{ background: dotColor }}
-                />
-              </button>
-            );
-          })}
-
-          {/* Add Repository Button */}
-          <button
-            onClick={() => setActiveModal("new-repo")}
-            title="导入/添加 Git 仓库 (Add Repository)"
-            className="flex h-8 w-8 items-center justify-center rounded-md border border-dashed border-[#27272a] text-[#71717a] transition-colors hover:border-[#52525b] hover:text-[#fafafa]"
-          >
-            <Plus className="h-3.5 w-3.5" />
-          </button>
-        </div>
-
-        {/* Bottom Global Utility Triggers */}
-        <div className="flex flex-col items-center gap-2">
-          <button
-            onClick={() => setActiveModal("skills")}
-            title="Slash Skills (/handoff, /advisor)"
-            className="flex h-8 w-8 items-center justify-center rounded-md text-[#71717a] transition-colors hover:bg-[#18181c] hover:text-[#fafafa]"
-          >
-            <Wand2 className="h-3.5 w-3.5" />
-          </button>
-          <button
-            onClick={() => setActiveModal("qr")}
-            title="Mobile E2EE Relay Pairing"
-            className="flex h-8 w-8 items-center justify-center rounded-md text-[#71717a] transition-colors hover:bg-[#18181c] hover:text-[#fafafa]"
-          >
-            <QrCode className="h-3.5 w-3.5" />
-          </button>
-          <button
-            onClick={() => setActiveModal("command")}
-            title="Command Palette (⌘K)"
-            className="flex h-8 w-8 items-center justify-center rounded-md text-[#71717a] transition-colors hover:bg-[#18181c] hover:text-[#fafafa]"
-          >
-            <Command className="h-3.5 w-3.5" />
-          </button>
-        </div>
-      </aside>
-
-      {/* =====================================================================
-          1B. SECONDARY 216PX WORKTREE COLUMN (方案 L3 第二栏：双行高密度 Worktree 胶囊列)
-         ===================================================================== */}
-      <aside className="v-rail z-20 flex w-[220px] shrink-0 flex-col justify-between bg-[#0c0c0f]">
-        <div className="flex flex-1 flex-col overflow-hidden">
-          {/* Repo Header inside Worktree Column */}
-          <div className="flex h-[44px] shrink-0 items-center justify-between border-b border-[#222226] px-3">
-            <div className="flex items-center gap-1.5 overflow-hidden">
-              <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-[#a1a1aa]" />
-              <span className="truncate font-mono text-[12px] font-semibold text-[#fafafa]">
-                {activeRepo.name}
+      <aside
+        className={`v-rail z-20 flex shrink-0 flex-col justify-between overflow-hidden bg-[#0c0c0f] transition-all duration-200 ${
+          sidebarCollapsed ? "w-0 border-r-0 opacity-0" : "w-[264px] opacity-100"
+        }`}
+      >
+        {/* Top Sidebar Header (44px) */}
+        <div className="flex h-[44px] shrink-0 items-center justify-between border-b border-[#222226] px-3">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSidebarCollapsed(true)}
+              title="Collapse Sidebar (⌘B)"
+              className="flex h-6 w-6 items-center justify-center rounded text-[#71717a] transition-colors hover:bg-[#18181d] hover:text-[#fafafa]"
+            >
+              <PanelLeftClose className="h-3.5 w-3.5" />
+            </button>
+            <div className="flex items-center gap-1.5">
+              <span
+                className="v-dot"
+                style={{ background: connected ? "#34d399" : "#fbbf24" }}
+              />
+              <span className="text-[13px] font-semibold tracking-tight text-[#fafafa]">
+                Velo
+              </span>
+              <span className="rounded border border-[#27272d] bg-[#141418] px-1.5 py-0.2 font-mono text-[9.5px] text-[#a1a1aa]">
+                daemon
               </span>
             </div>
+          </div>
+
+          <div className="flex items-center gap-1">
             <button
-              onClick={() => setActiveModal("new-worktree")}
-              title="在当前仓库新建隔离 Git Worktree"
-              className="v-chip flex items-center gap-1 px-2 py-0.5 font-mono text-[10.5px] text-[#a1a1aa] hover:text-[#fafafa]"
+              onClick={() => setActiveModal("command")}
+              title="Command Palette (⌘K)"
+              className="flex h-6 w-6 items-center justify-center rounded text-[#71717a] hover:bg-[#18181d] hover:text-[#fafafa]"
             >
-              <Plus className="h-3 w-3" />
-              <span>Worktree</span>
+              <Command className="h-3.5 w-3.5" />
             </button>
-          </div>
-
-          {/* Section Subheader */}
-          <div className="flex items-center justify-between px-3 pb-1.5 pt-3 font-mono text-[10px] uppercase tracking-wider text-[#71717a]">
-            <span>Worktrees ({repoSessions.length})</span>
-            <span>Diff / Model</span>
-          </div>
-
-          {/* 2-Line High-Density Worktree Capsule List */}
-          <div className="flex-1 space-y-1.5 overflow-y-auto px-2.5 py-1">
-            {repoSessions.map((w) => {
-              const isSelected = w.id === activeSession.id;
-              const dotColor =
-                w.status === "running"
-                  ? "#34d399"
-                  : w.status === "waiting_approval"
-                  ? "#fbbf24"
-                  : "#71717a";
-
-              return (
-                <button
-                  key={w.id}
-                  onClick={() => setActiveId(w.id)}
-                  className={`v-card group flex w-full flex-col gap-1 px-2.5 py-2 text-left transition-all ${
-                    isSelected
-                      ? "border-[#71717a] bg-[#18181d]"
-                      : "border-transparent bg-transparent hover:border-[#27272a] hover:bg-[#131317]"
-                  }`}
-                >
-                  {/* Row 1: Semantic Status Dot + Git Branch Name + Diff (+48 -14) */}
-                  <div className="flex w-full items-center justify-between gap-1.5">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      <span
-                        className="v-dot shrink-0"
-                        style={{
-                          background: dotColor,
-                          boxShadow:
-                            w.status === "running"
-                              ? "0 0 6px rgba(52,211,153,0.55)"
-                              : "none",
-                        }}
-                      />
-                      <span
-                        className={`truncate font-mono text-[11.5px] ${
-                          isSelected
-                            ? "font-semibold text-[#fafafa]"
-                            : "font-medium text-[#d4d4d8] group-hover:text-[#fafafa]"
-                        }`}
-                      >
-                        {w.branch_name}
-                      </span>
-                    </div>
-
-                    <div className="flex shrink-0 items-center gap-1 font-mono text-[10.5px]">
-                      <span className="text-[#34d399]">+{w.insertions}</span>
-                      <span className="text-[#f87171]">−{w.deletions}</span>
-                    </div>
-                  </div>
-
-                  {/* Row 2: Task Summary + Compact Model Badge */}
-                  <div className="flex w-full items-center justify-between gap-2 text-[11px]">
-                    <span className="truncate text-[#71717a] group-hover:text-[#a1a1aa]">
-                      {w.title}
-                    </span>
-                    <span className="shrink-0 rounded bg-[#141418] px-1.5 py-0.2 font-mono text-[10px] text-[#a1a1aa]">
-                      {w.model_short}
-                    </span>
-                  </div>
-                </button>
-              );
-            })}
+            <button
+              onClick={() => {
+                setTargetRepoIdForNewWt(activeRepo.id);
+                setActiveModal("new-worktree");
+              }}
+              title="New Worktree Thread (⌘N)"
+              className="flex h-6 w-6 items-center justify-center rounded text-[#a1a1aa] hover:bg-[#18181d] hover:text-[#fafafa]"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
           </div>
         </div>
 
-        {/* Worktree Column Footer */}
-        <div className="flex items-center justify-between border-t border-[#1f1f24] px-3 py-2.5 font-mono text-[10.5px] text-[#71717a]">
-          <span className="truncate" title={activeRepo.path}>
-            {activeRepo.path.replace("/Users/daiyudai/", "~/")}
+        {/* Top Action & Search Filter Block (Codex / Claude Code style) */}
+        <div className="flex shrink-0 flex-col gap-2 border-b border-[#19191f] px-2.5 py-2.5">
+          <button
+            onClick={() => {
+              setTargetRepoIdForNewWt(activeRepo.id);
+              setActiveModal("new-worktree");
+            }}
+            className="v-card flex w-full items-center justify-between px-2.5 py-1.5 text-[12px] font-medium text-[#fafafa] transition-colors hover:border-[#3f3f46] hover:bg-[#16161b]"
+          >
+            <span className="flex items-center gap-2">
+              <Plus className="h-3.5 w-3.5 text-[#a1a1aa]" />
+              <span>New Worktree Thread</span>
+            </span>
+            <kbd className="font-mono text-[10px] text-[#71717a]">⌘N</kbd>
+          </button>
+
+          <div className="flex h-[28px] items-center gap-1.5 rounded-[6px] border border-[#1f1f26] bg-[#09090b] px-2.5">
+            <Search className="h-3 w-3 shrink-0 text-[#71717a]" />
+            <input
+              type="text"
+              value={sidebarSearch}
+              onChange={(e) => setSidebarSearch(e.target.value)}
+              placeholder="Filter threads or branches..."
+              className="w-full bg-transparent text-[11.5px] text-[#fafafa] placeholder-[#52525b] focus:outline-none"
+            />
+          </div>
+        </div>
+
+        {/* Section Header + Segmented Group Switcher (Project | Status) */}
+        <div className="flex shrink-0 items-center justify-between px-3 pb-1 pt-2.5">
+          <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#71717a]">
+            Workspaces ({filteredSessions.length})
           </span>
-          <span className="text-[#34d399]">
-            ● {repoSessions.filter((s) => s.status === "running").length} active
-          </span>
+          <div className="flex items-center gap-0.5 rounded-[5px] border border-[#222228] bg-[#09090b] p-0.5">
+            <button
+              onClick={() => setGroupMode("project")}
+              className={`rounded-[3.5px] px-2 py-0.5 text-[10px] font-medium transition-all ${
+                groupMode === "project"
+                  ? "bg-[#1f1f26] text-[#fafafa]"
+                  : "text-[#71717a] hover:text-[#a1a1aa]"
+              }`}
+            >
+              Project
+            </button>
+            <button
+              onClick={() => setGroupMode("status")}
+              className={`rounded-[3.5px] px-2 py-0.5 text-[10px] font-medium transition-all ${
+                groupMode === "status"
+                  ? "bg-[#1f1f26] text-[#fafafa]"
+                  : "text-[#71717a] hover:text-[#a1a1aa]"
+              }`}
+            >
+              Status
+            </button>
+          </div>
+        </div>
+
+        {/* Scrollable Hierarchical Project -> Worktree Thread Tree */}
+        <div className="flex-1 space-y-2.5 overflow-y-auto px-2 py-1.5">
+          {groupMode === "project" ? (
+            repos.map((repo) => {
+              const items = filteredSessions.filter((s) => s.repo_id === repo.id);
+              const isCollapsed = !!collapsedRepos[repo.id];
+              return (
+                <div key={repo.id} className="space-y-0.5">
+                  {/* Project Folder Header Row */}
+                  <div className="group flex items-center justify-between rounded-[5px] px-1.5 py-1 hover:bg-[#141419]">
+                    <button
+                      onClick={() =>
+                        setCollapsedRepos((prev) => ({
+                          ...prev,
+                          [repo.id]: !prev[repo.id],
+                        }))
+                      }
+                      className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                    >
+                      {isCollapsed ? (
+                        <ChevronRight className="h-3 w-3 shrink-0 text-[#71717a]" />
+                      ) : (
+                        <ChevronDown className="h-3 w-3 shrink-0 text-[#71717a]" />
+                      )}
+                      <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-[#a1a1aa]" />
+                      <span className="truncate text-[12px] font-semibold text-[#e4e4e7] group-hover:text-[#fafafa]">
+                        {repo.name}
+                      </span>
+                      <span className="font-mono text-[10px] text-[#52525b]">
+                        {items.length}
+                      </span>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setTargetRepoIdForNewWt(repo.id);
+                        setActiveModal("new-worktree");
+                      }}
+                      title={`在 ${repo.name} 下新建隔离 Worktree 会话`}
+                      className="flex h-5 w-5 items-center justify-center rounded text-[#71717a] opacity-0 transition-opacity hover:bg-[#1f1f26] hover:text-[#fafafa] group-hover:opacity-100"
+                    >
+                      <Plus className="h-3 w-3" />
+                    </button>
+                  </div>
+
+                  {/* Indented Thread Children with Vertical Tree Guide Rail */}
+                  {!isCollapsed && (
+                    <div className="ml-[11px] space-y-0.5 border-l border-[#1f1f26] pl-2">
+                      {items.map((w) => renderThreadRow(w, false))}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          ) : (
+            /* Status Grouping Mode (In Progress / Waiting / Idle) */
+            [
+              {
+                key: "running",
+                label: "In Progress",
+                items: filteredSessions.filter((s) => s.status === "running"),
+              },
+              {
+                key: "waiting",
+                label: "Waiting for Review",
+                items: filteredSessions.filter((s) => s.status === "waiting_approval"),
+              },
+              {
+                key: "idle",
+                label: "Completed / Idle",
+                items: filteredSessions.filter((s) => s.status === "idle"),
+              },
+            ]
+              .filter((g) => g.items.length > 0)
+              .map((group) => (
+                <div key={group.key} className="space-y-1">
+                  <div className="flex items-center justify-between px-2 py-0.5 font-mono text-[10.5px] font-medium text-[#71717a]">
+                    <span>{group.label}</span>
+                    <span>{group.items.length}</span>
+                  </div>
+                  <div className="space-y-0.5">
+                    {group.items.map((w) => renderThreadRow(w, true))}
+                  </div>
+                </div>
+              ))
+          )}
+        </div>
+
+        {/* Bottom Single-Row Footer (Paseo / Codex / Claude Code style) */}
+        <div className="flex h-[38px] shrink-0 items-center justify-between border-t border-[#222226] px-2.5 text-[11px] text-[#71717a]">
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => setActiveModal("new-repo")}
+              title="Add Local Git Project"
+              className="flex items-center gap-1 rounded px-1.5 py-1 text-[#a1a1aa] transition-colors hover:bg-[#18181d] hover:text-[#fafafa]"
+            >
+              <FolderPlus className="h-3.5 w-3.5" />
+              <span className="text-[11px]">Add Project</span>
+            </button>
+            <span className="text-[#3f3f46]">·</span>
+            <span
+              className="flex items-center gap-1 font-mono text-[10px] text-[#71717a]"
+              title="Active Context & Token Usage"
+            >
+              <CircleGauge className="h-3 w-3 text-[#a1a1aa]" />
+              {tokenPercent}%
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setActiveModal("skills")}
+              title="Agent Orchestration Skills (/handoff, /advisor)"
+              className="flex h-6 w-6 items-center justify-center rounded text-[#71717a] hover:bg-[#18181d] hover:text-[#fafafa]"
+            >
+              <Wand2 className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={() => setActiveModal("qr")}
+              title="Mobile E2EE Relay Pairing"
+              className="flex h-6 w-6 items-center justify-center rounded text-[#71717a] hover:bg-[#18181d] hover:text-[#fafafa]"
+            >
+              <QrCode className="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -646,8 +776,17 @@ export function App() {
       <div className="flex flex-1 flex-col overflow-hidden">
         {/* Minimal Monochrome Top Header (44px) */}
         <header className="v-topbar z-20 flex h-[44px] shrink-0 items-center justify-between px-4">
-          {/* Left: Active Repo & Branch Breadcrumb */}
+          {/* Left: Expand Sidebar Button (when collapsed) + Active Repo & Branch Breadcrumb */}
           <div className="flex items-center gap-2 text-[12px]">
+            {sidebarCollapsed && (
+              <button
+                onClick={() => setSidebarCollapsed(false)}
+                title="Expand Sidebar (⌘B)"
+                className="mr-1 flex h-6 w-6 items-center justify-center rounded text-[#a1a1aa] hover:bg-[#18181d] hover:text-[#fafafa]"
+              >
+                <PanelLeftOpen className="h-3.5 w-3.5" />
+              </button>
+            )}
             <span className="font-mono text-[11.5px] text-[#71717a]">
               {activeRepo.name}
             </span>
@@ -660,6 +799,9 @@ export function App() {
               <span>{activeSession.branch_name}</span>
               <ChevronDown className="h-3 w-3 text-[#71717a]" />
             </button>
+            <span className="hidden truncate text-[11.5px] text-[#71717a] lg:inline">
+              · {activeSession.title}
+            </span>
           </div>
 
           {/* Center: LIVE MATERIAL VARIANT SWITCHER (A / B / C for User Comparison!) */}
@@ -1165,7 +1307,7 @@ export function App() {
               <div>
                 <div className="mb-3 flex items-center justify-between">
                   <h3 className="text-[14px] font-semibold text-[#fafafa]">
-                    在仓库 {activeRepo.name} 下新建隔离 Git Worktree
+                    New Isolated Worktree Thread
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
@@ -1177,22 +1319,42 @@ export function App() {
                 <div className="space-y-3 text-[12px]">
                   <div>
                     <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
-                      Git Branch Name (第 1 行展示)
+                      所属项目 (Project Repository)
                     </label>
-                    <input
-                      value={newTaskName}
-                      onChange={(e) => setNewTaskName(e.target.value)}
-                      className="v-card w-full px-3 py-2 font-mono text-[12px] text-[#fafafa] focus:outline-none"
-                    />
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {repos.map((r) => (
+                        <button
+                          key={r.id}
+                          onClick={() => setTargetRepoIdForNewWt(r.id)}
+                          className={`v-chip truncate px-2 py-1.5 font-mono text-[11px] ${
+                            targetRepoIdForNewWt === r.id
+                              ? "border-[#fafafa] text-[#fafafa]"
+                              : "text-[#71717a]"
+                          }`}
+                        >
+                          {r.name}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                   <div>
                     <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
-                      任务简述 (第 2 行展示)
+                      任务标题 (Thread Title — 第 1 行主标题)
                     </label>
                     <input
                       value={newTaskDesc}
                       onChange={(e) => setNewTaskDesc(e.target.value)}
                       className="v-card w-full px-3 py-2 text-[12px] text-[#fafafa] focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
+                      隔离 Git 分支名 (Worktree Branch — 第 2 行展示)
+                    </label>
+                    <input
+                      value={newTaskName}
+                      onChange={(e) => setNewTaskName(e.target.value)}
+                      className="v-card w-full px-3 py-2 font-mono text-[12px] text-[#fafafa] focus:outline-none"
                     />
                   </div>
                   <div className="grid grid-cols-3 gap-2">
@@ -1219,7 +1381,7 @@ export function App() {
                       onClick={handleCreateWorktree}
                       className="v-primary-btn px-4 py-1.5 text-[12px]"
                     >
-                      Create Worktree
+                      Create Thread
                     </button>
                   </div>
                 </div>
@@ -1230,7 +1392,7 @@ export function App() {
               <div>
                 <div className="mb-3 flex items-center justify-between">
                   <h3 className="text-[14px] font-semibold text-[#fafafa]">
-                    添加本地 Git 仓库到左轨
+                    Add Local Git Project
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
@@ -1261,7 +1423,7 @@ export function App() {
                       onClick={handleCreateRepo}
                       className="v-primary-btn px-4 py-1.5 text-[12px]"
                     >
-                      Add Repository
+                      Add Project
                     </button>
                   </div>
                 </div>
@@ -1276,7 +1438,7 @@ export function App() {
                     autoFocus
                     value={cmdQuery}
                     onChange={(e) => setCmdQuery(e.target.value)}
-                    placeholder="Switch repo, worktree, toggle material A/B/C, open Diff drawer..."
+                    placeholder="Switch thread, toggle sidebar (⌘B), toggle material A/B/C..."
                     className="w-full bg-transparent text-[13px] text-[#fafafa] focus:outline-none"
                   />
                 </div>
@@ -1310,6 +1472,16 @@ export function App() {
                   >
                     <span>Switch Material → Version C (硬件立体 3D Rare UI)</span>
                     <span className="font-mono text-[10px] text-[#71717a]">Variant C</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSidebarCollapsed((c) => !c);
+                      setActiveModal(null);
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2.5 py-2 hover:bg-[#18181c]"
+                  >
+                    <span>Toggle Left Project/Thread Sidebar</span>
+                    <span className="font-mono text-[10px] text-[#71717a]">⌘B</span>
                   </button>
                   <button
                     onClick={() => {
