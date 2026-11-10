@@ -10,6 +10,7 @@ import {
   DiffFileItem,
   EffortLevel,
   MODEL_CATALOG,
+  ModelOption,
   SLASH_SKILLS,
   VeloRepo,
   VeloSession,
@@ -157,13 +158,27 @@ export function App() {
   });
   const [targetRepoIdForNewWt, setTargetRepoIdForNewWt] = useState<string>(DEMO_REPOS[0].id);
 
-  // Core Sessions & Events (Persisted across restarts)
+  // Core Sessions & Events (Persisted across restarts; auto-migrate outdated model IDs)
   const [sessions, setSessions] = useState<VeloSession[]>(() => {
     try {
       const saved = localStorage.getItem("velo.sessions.v2");
       if (saved) {
         const parsed = JSON.parse(saved) as VeloSession[];
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed.map((s) => {
+            const valid = MODEL_CATALOG.find((m) => m.id === s.model);
+            if (valid) return s;
+            const fallback =
+              s.agent_kind === "codex"
+                ? MODEL_CATALOG.find((m) => m.id === "gpt-6.1-sol")!
+                : MODEL_CATALOG.find((m) => m.id === "claude-fable-5-2")!;
+            return {
+              ...s,
+              model: fallback.id,
+              model_short: fallback.shortLabel,
+            };
+          });
+        }
       }
     } catch {
       // ignore
@@ -216,9 +231,10 @@ export function App() {
 
   const [connected, setConnected] = useState<boolean>(false);
   const [runtimes, setRuntimes] = useState<LocalRuntimeDto[]>([
-    { id: "claude", name: "Claude Code", available: true, version: "2.1.233 (Claude Code)" },
+    { id: "claude", name: "Claude Code", available: true, version: "2.1.317 (Claude Code)" },
     { id: "codex", name: "OpenAI Codex", available: true, version: "codex-cli 0.154.0" },
   ]);
+  const [modelCatalog, setModelCatalog] = useState<ModelOption[]>(MODEL_CATALOG);
   const [modelPickerOpen, setModelPickerOpen] = useState<boolean>(false);
   const [effortPickerOpen, setEffortPickerOpen] = useState<boolean>(false);
 
@@ -272,7 +288,7 @@ export function App() {
   const [cmdQuery, setCmdQuery] = useState<string>("");
   const [newTaskName, setNewTaskName] = useState<string>("feat/new-thread");
   const [newTaskDesc, setNewTaskDesc] = useState<string>("");
-  const [newModelId, setNewModelId] = useState<string>("claude-sonnet-4.5");
+  const [newModelId, setNewModelId] = useState<string>("claude-fable-5-2");
   const [newApproval] = useState<ApprovalMode>("auto_edit");
   const [newRepoPath, setNewRepoPath] = useState<string>("/Users/daiyudai/code/velo");
 
@@ -352,6 +368,15 @@ export function App() {
       .then((data: { runtimes?: LocalRuntimeDto[] }) => {
         if (Array.isArray(data.runtimes) && data.runtimes.length > 0) {
           setRuntimes(data.runtimes);
+        }
+      })
+      .catch(() => {});
+
+    fetch(`${daemonUrl}/api/models`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data: { models?: ModelOption[] }) => {
+        if (Array.isArray(data.models) && data.models.length > 0) {
+          setModelCatalog(data.models);
         }
       })
       .catch(() => {});
@@ -1113,7 +1138,7 @@ export function App() {
         ? clean
         : `feat/${clean}`;
     const title = newTaskDesc.trim() || branch;
-    const chosenModel = MODEL_CATALOG.find((m) => m.id === newModelId) || MODEL_CATALOG[0];
+    const chosenModel = modelCatalog.find((m) => m.id === newModelId) || modelCatalog[0];
     const providerName = chosenModel.runtimeId === "codex" ? "codex" : "claude";
 
     try {
@@ -1972,7 +1997,7 @@ export function App() {
                       <span className="h-2.5 w-2.5 rounded-full border-[1.5px] border-[#34d399] border-t-transparent animate-spin" />
                       <span>
                         <strong className="font-medium text-[var(--v-fg-primary)]">
-                          {MODEL_CATALOG.find((m) => m.id === activeSession.model)?.label ||
+                          {modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                             activeSession.model_short}
                         </strong>{" "}
                         is working in{" "}
@@ -2004,7 +2029,7 @@ export function App() {
                       }
                     }}
                     placeholder={`Ask ${
-                      MODEL_CATALOG.find((m) => m.id === activeSession.model)?.label ||
+                      modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                       activeSession.model_short
                     } anything... (/ for commands)`}
                     className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
@@ -2012,67 +2037,82 @@ export function App() {
 
                   {/* Composer Bottom Toolbar: Concrete Model Picker + Effort + Permission Mode */}
                   <div className="relative mt-1.5 flex items-center justify-between">
-                    {/* 1. Concrete Model Picker Popover (Grouped by Model Family) */}
+                    {/* 1. Concrete Model Picker Popover (Grouped by Model Family, dynamically synced from ~/.claude.json & ~/.codex/codex-models.json) */}
                     {modelPickerOpen && (
-                      <div className="absolute bottom-9 left-0 z-30 w-[310px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
-                        {(["Anthropic", "OpenAI", "Google"] as const).map((family) => {
-                          const familyModels = MODEL_CATALOG.filter((m) => m.family === family);
-                          if (familyModels.length === 0) return null;
-                          const runtimeId = familyModels[0].runtimeId;
-                          const rt = runtimes.find((r) => r.id === runtimeId);
-                          const isConnected = rt ? rt.available : runtimeId !== "gemini";
-                          return (
-                            <div key={family} className="mb-1 last:mb-0">
-                              <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
-                                <span>{family}</span>
-                                <span className="font-mono text-[10px]">
-                                  {isConnected ? "Connected" : "Not configured"}
-                                </span>
-                              </div>
-                              {familyModels.map((m) => {
-                                const isCurrent = activeSession.model === m.id;
-                                return (
-                                  <button
-                                    key={m.id}
-                                    disabled={!isConnected}
-                                    onClick={() => {
-                                      setSessions((prev) =>
-                                        prev.map((s) =>
-                                          s.id === activeSession.id
-                                            ? {
-                                                ...s,
-                                                agent_kind: m.agentKind,
-                                                model: m.id,
-                                                model_short: m.shortLabel,
-                                              }
-                                            : s
-                                        )
-                                      );
-                                      setModelPickerOpen(false);
-                                    }}
-                                    className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
-                                      isCurrent
-                                        ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                                        : isConnected
-                                        ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
-                                        : "cursor-not-allowed text-[var(--v-fg-muted)] opacity-40"
-                                    }`}
-                                  >
-                                    <div className="min-w-0 pr-2">
-                                      <div className="font-medium">{m.label}</div>
-                                      <div className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
-                                        {m.desc}
+                      <div className="absolute bottom-9 left-0 z-30 w-[340px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                        <div className="max-h-[340px] overflow-y-auto pr-0.5">
+                          {(["Anthropic", "OpenAI", "Google"] as const).map((family) => {
+                            const familyModels = modelCatalog.filter((m) => m.family === family);
+                            if (familyModels.length === 0) return null;
+                            const runtimeId = familyModels[0].runtimeId;
+                            const rt = runtimes.find((r) => r.id === runtimeId);
+                            const isConnected = rt ? rt.available : runtimeId !== "gemini";
+                            return (
+                              <div key={family} className="mb-1.5 last:mb-0">
+                                <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
+                                  <span>
+                                    {family === "Anthropic"
+                                      ? "Anthropic (Claude Code)"
+                                      : family === "OpenAI"
+                                      ? "OpenAI / Codex (~/.codex)"
+                                      : family}
+                                  </span>
+                                  <span className="font-mono text-[10px]">
+                                    {isConnected ? "Connected" : "Not configured"}
+                                  </span>
+                                </div>
+                                {familyModels.map((m) => {
+                                  const isCurrent = activeSession.model === m.id;
+                                  return (
+                                    <button
+                                      key={m.id}
+                                      disabled={!isConnected}
+                                      onClick={() => {
+                                        setSessions((prev) =>
+                                          prev.map((s) =>
+                                            s.id === activeSession.id
+                                              ? {
+                                                  ...s,
+                                                  agent_kind: m.agentKind,
+                                                  model: m.id,
+                                                  model_short: m.shortLabel,
+                                                }
+                                              : s
+                                          )
+                                        );
+                                        setModelPickerOpen(false);
+                                      }}
+                                      className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
+                                        isCurrent
+                                          ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                          : isConnected
+                                          ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
+                                          : "cursor-not-allowed text-[var(--v-fg-muted)] opacity-40"
+                                      }`}
+                                    >
+                                      <div className="min-w-0 pr-2">
+                                        <div className="flex items-center gap-1.5 font-medium">
+                                          <span>{m.label}</span>
+                                          {m.isDefault && (
+                                            <span className="rounded bg-[var(--v-bg-active)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
+                                              default
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
+                                          {m.desc}
+                                        </div>
                                       </div>
-                                    </div>
-                                    {isCurrent && (
-                                      <Check className="h-3.5 w-3.5 shrink-0 text-[#34d399]" />
-                                    )}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          );
-                        })}
+                                      {isCurrent && (
+                                        <Check className="h-3.5 w-3.5 shrink-0 text-[#34d399]" />
+                                      )}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            );
+                          })}
+                        </div>
 
                         <div className="mt-1 border-t border-[var(--v-border-subtle)] pt-1">
                           <button
@@ -2095,15 +2135,23 @@ export function App() {
                         <div className="px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
                           Reasoning Effort
                         </div>
-                        {(
-                          [
-                            { id: "low", label: "Low" },
-                            { id: "medium", label: "Medium" },
-                            { id: "high", label: "High" },
-                            { id: "max", label: "Max" },
-                          ] as { id: EffortLevel; label: string }[]
+                        {(activeSession.agent_kind === "codex"
+                          ? ([
+                              { id: "low", label: "Low" },
+                              { id: "medium", label: "Medium" },
+                              { id: "high", label: "High" },
+                              { id: "xhigh", label: "xHigh" },
+                              { id: "ultra", label: "Ultra" },
+                              { id: "max", label: "Max" },
+                            ] as { id: EffortLevel; label: string }[])
+                          : ([
+                              { id: "low", label: "Low" },
+                              { id: "medium", label: "Medium" },
+                              { id: "high", label: "High" },
+                              { id: "max", label: "Max" },
+                            ] as { id: EffortLevel; label: string }[])
                         ).map((eff) => {
-                          const currentEff = activeSession.effort || "medium";
+                          const currentEff = activeSession.effort || "high";
                           const active = currentEff === eff.id;
                           return (
                             <button
@@ -2141,7 +2189,7 @@ export function App() {
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-[#34d399]" />
                         <span>
-                          {MODEL_CATALOG.find((m) => m.id === activeSession.model)?.label ||
+                          {modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                             activeSession.model_short ||
                             activeSession.model}
                         </span>
@@ -2565,8 +2613,8 @@ export function App() {
                       <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
                         Model
                       </label>
-                      <div className="grid grid-cols-2 gap-1.5">
-                        {MODEL_CATALOG.filter((m) => m.family !== "Google").map((m) => (
+                      <div className="max-h-[180px] overflow-y-auto grid grid-cols-2 gap-1.5 pr-1">
+                        {modelCatalog.filter((m) => m.family !== "Google").map((m) => (
                           <button
                             key={m.id}
                             onClick={() => setNewModelId(m.id)}
@@ -2749,9 +2797,9 @@ export function App() {
 
                     <div className="space-y-2">
                       {runtimes.map((rt) => {
-                        const unlockedModels = MODEL_CATALOG.filter(
-                          (m) => m.runtimeId === rt.id
-                        ).map((m) => m.label);
+                        const unlockedModels = modelCatalog
+                          .filter((m) => m.runtimeId === rt.id)
+                          .map((m) => m.label);
                         return (
                           <div
                             key={rt.id}

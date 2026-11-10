@@ -279,6 +279,7 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/assets/{file}", get(ui_asset_handler))
         .route("/api/health", get(health_handler))
         .route("/api/runtimes", get(list_runtimes_handler))
+        .route("/api/models", get(list_models_handler))
         .route("/api/pair", get(pair_ticket_handler))
         .route("/api/pick-folder", post(pick_folder_handler))
         .route("/api/open-editor", post(open_editor_handler))
@@ -324,6 +325,183 @@ async fn health_handler() -> impl IntoResponse {
 async fn list_runtimes_handler() -> impl IntoResponse {
     let runtimes = velo_agent::detect_local_runtimes().await;
     Json(json!({ "runtimes": runtimes }))
+}
+
+async fn list_models_handler() -> impl IntoResponse {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/daiyudai".to_string());
+    let home_path = PathBuf::from(&home);
+    let mut models: Vec<Value> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Discover Anthropic / Claude Code models from local ~/.claude.json & Claude Desktop config
+    let mut push_claude = |id: &str, label: &str, short_label: &str, desc: &str, is_default: bool| {
+        if seen_ids.insert(id.to_string()) {
+            models.push(json!({
+                "id": id,
+                "label": label,
+                "shortLabel": short_label,
+                "family": "Anthropic",
+                "agentKind": "claude",
+                "runtimeId": "claude",
+                "desc": desc,
+                "isDefault": is_default,
+            }));
+        }
+    };
+
+    // Primary Claude 5 / Fable 5 models active in the user's Claude Code v2.1.317 environment
+    push_claude(
+        "claude-fable-5-2",
+        "Claude Fable 5.2",
+        "Fable 5.2",
+        "Fable 5.2 · Most capable for your hardest and longest-running coding tasks",
+        true,
+    );
+
+    // Also read any dynamic entries from ~/.claude.json -> additionalModelOptionsCache
+    let claude_json_path = home_path.join(".claude.json");
+    if let Ok(raw) = tokio::fs::read_to_string(&claude_json_path).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+            if let Some(arr) = val.get("additionalModelOptionsCache").and_then(|v| v.as_array()) {
+                for item in arr {
+                    let value = item.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    let label = item.get("label").and_then(|v| v.as_str()).unwrap_or(value);
+                    let desc = item
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Claude Code model");
+                    if !value.is_empty() {
+                        let display = if value.contains("fable-5-1") {
+                            "Claude Fable 5.1 (1M)".to_string()
+                        } else if label == "Fable" {
+                            format!("Claude {}", desc.split('·').next().unwrap_or(label).trim())
+                        } else {
+                            label.to_string()
+                        };
+                        push_claude(value, &display, label, desc, false);
+                    }
+                }
+            }
+        }
+    }
+
+    push_claude(
+        "claude-opus-5-5",
+        "Claude Opus 5.5",
+        "Opus 5.5",
+        "Deep architectural reasoning & multi-file autonomous coding (Ultrathink)",
+        false,
+    );
+    push_claude(
+        "claude-sonnet-5",
+        "Claude Sonnet 5",
+        "Sonnet 5",
+        "Fast, balanced everyday coding and agentic tool execution",
+        false,
+    );
+    push_claude(
+        "claude-opus-4-8",
+        "Claude Opus 4.8",
+        "Opus 4.8",
+        "Previous-gen flagship Opus with Fast Mode support",
+        false,
+    );
+    push_claude(
+        "claude-sonnet-4-6",
+        "Claude Sonnet 4.6",
+        "Sonnet 4.6",
+        "High-efficiency coding with adaptive effort",
+        false,
+    );
+    push_claude(
+        "claude-haiku-4-5",
+        "Claude Haiku 4.5",
+        "Haiku 4.5",
+        "Ultra-low latency for quick edits and lightweight lookups",
+        false,
+    );
+
+    // 2. Discover OpenAI / Codex models from ~/.codex/config.toml, ~/.codex/codex-models.json & ~/.codex/models_cache.json
+    let codex_dir = home_path.join(".codex");
+    let mut default_codex_model = "gpt-6.1-sol".to_string();
+    let mut default_codex_effort = "max".to_string();
+
+    if let Ok(cfg_str) = tokio::fs::read_to_string(codex_dir.join("config.toml")).await {
+        for line in cfg_str.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("model =") {
+                let m = rest.trim().trim_matches('"').trim_matches('\'');
+                if !m.is_empty() {
+                    default_codex_model = m.to_string();
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("model_reasoning_effort =") {
+                let eff = rest.trim().trim_matches('"').trim_matches('\'');
+                if !eff.is_empty() {
+                    default_codex_effort = eff.to_string();
+                }
+            }
+        }
+    }
+
+    let mut codex_entries: Vec<(String, String, String, bool)> = Vec::new();
+    for file_name in ["codex-models.json", "models_cache.json"] {
+        let p = codex_dir.join(file_name);
+        if let Ok(raw) = tokio::fs::read_to_string(&p).await {
+            if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                if let Some(arr) = val.get("models").and_then(|v| v.as_array()) {
+                    for item in arr {
+                        let slug = item.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                        let vis = item.get("visibility").and_then(|v| v.as_str()).unwrap_or("list");
+                        if slug.is_empty() || vis != "list" || slug == "codex-auto-review" || slug == "gpt-reserve" {
+                            continue;
+                        }
+                        let display = item
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(slug);
+                        let desc = item
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("Codex CLI model");
+                        let is_def = slug == default_codex_model;
+                        codex_entries.push((
+                            slug.to_string(),
+                            display.to_string(),
+                            desc.to_string(),
+                            is_def,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort so default_codex_model (e.g. gpt-6.1-sol) is first among Codex models
+    codex_entries.sort_by(|a, b| b.3.cmp(&a.3));
+
+    for (slug, display, desc, is_def) in codex_entries {
+        if seen_ids.insert(slug.clone()) {
+            models.push(json!({
+                "id": slug,
+                "label": display,
+                "shortLabel": display,
+                "family": "OpenAI",
+                "agentKind": "codex",
+                "runtimeId": "codex",
+                "desc": if is_def { format!("Default in ~/.codex/config.toml · {}", desc) } else { desc },
+                "isDefault": is_def,
+            }));
+        }
+    }
+
+    Json(json!({
+        "models": models,
+        "defaultCodexModel": default_codex_model,
+        "defaultCodexEffort": default_codex_effort,
+        "defaultClaudeModel": "claude-fable-5-2",
+    }))
 }
 
 async fn pick_folder_handler() -> impl IntoResponse {

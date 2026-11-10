@@ -547,16 +547,7 @@ impl AgentSpawner {
                     "acceptEdits",
                 ]);
                 if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-                    let cli_model = if m.contains("opus") {
-                        "opus"
-                    } else if m.contains("haiku") {
-                        "haiku"
-                    } else if m.contains("sonnet") {
-                        "sonnet"
-                    } else {
-                        m
-                    };
-                    c.args(["--model", cli_model]);
+                    c.args(["--model", m]);
                 }
                 if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
                     c.args(["--effort", eff]);
@@ -574,11 +565,10 @@ impl AgentSpawner {
                     "--skip-git-repo-check",
                 ]);
                 if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-                    let cli_model = match m {
-                        "codex-o3" => "o3",
-                        other => other,
-                    };
-                    c.args(["-m", cli_model]);
+                    c.args(["-m", m]);
+                }
+                if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
+                    c.args(["-c", &format!("model_reasoning_effort=\"{}\"", eff)]);
                 }
                 c.arg(prompt);
                 c

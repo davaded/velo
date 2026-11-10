@@ -1,6 +1,6 @@
 export type AgentKind = "claude" | "codex" | "gemini";
 export type ApprovalMode = "auto_edit" | "ask_before_edit" | "full_auto";
-export type EffortLevel = "low" | "medium" | "high" | "max";
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "ultra" | "max";
 
 export interface ModelOption {
   id: string;
@@ -10,71 +10,175 @@ export interface ModelOption {
   runtimeId: "claude" | "codex" | "gemini";
   agentKind: AgentKind;
   desc: string;
+  isDefault?: boolean;
 }
 
 export const MODEL_CATALOG: ModelOption[] = [
+  // Anthropic / Claude Code (v2.1.317 local models)
   {
-    id: "claude-sonnet-4.5",
-    label: "Claude Sonnet 4.5",
-    shortLabel: "Claude Sonnet 4.5",
+    id: "claude-fable-5-2",
+    label: "Claude Fable 5.2",
+    shortLabel: "Fable 5.2",
     family: "Anthropic",
     runtimeId: "claude",
     agentKind: "claude",
-    desc: "主力编码模型，兼顾速度与代码质量",
+    desc: "Fable 5.2 · Most capable for your hardest and longest-running coding tasks",
+    isDefault: true,
   },
   {
-    id: "claude-opus-4.5",
-    label: "Claude Opus 4.5",
-    shortLabel: "Claude Opus 4.5",
+    id: "claude-fable-5-1[1m]",
+    label: "Claude Fable 5.1 (1M)",
+    shortLabel: "Fable 5.1",
     family: "Anthropic",
     runtimeId: "claude",
     agentKind: "claude",
-    desc: "深度架构设计与复杂跨模块重构",
+    desc: "Fable 5.1 · 1M context window for large codebase tasks",
   },
   {
-    id: "claude-haiku-4.5",
+    id: "claude-opus-5-5",
+    label: "Claude Opus 5.5",
+    shortLabel: "Opus 5.5",
+    family: "Anthropic",
+    runtimeId: "claude",
+    agentKind: "claude",
+    desc: "Deep architectural reasoning & multi-file autonomous coding (Ultrathink)",
+  },
+  {
+    id: "claude-sonnet-5",
+    label: "Claude Sonnet 5",
+    shortLabel: "Sonnet 5",
+    family: "Anthropic",
+    runtimeId: "claude",
+    agentKind: "claude",
+    desc: "Fast, balanced everyday coding and agentic tool execution",
+  },
+  {
+    id: "claude-opus-4-8",
+    label: "Claude Opus 4.8",
+    shortLabel: "Opus 4.8",
+    family: "Anthropic",
+    runtimeId: "claude",
+    agentKind: "claude",
+    desc: "Previous-gen flagship Opus with Fast Mode support",
+  },
+  {
+    id: "claude-sonnet-4-6",
+    label: "Claude Sonnet 4.6",
+    shortLabel: "Sonnet 4.6",
+    family: "Anthropic",
+    runtimeId: "claude",
+    agentKind: "claude",
+    desc: "High-efficiency coding with adaptive effort",
+  },
+  {
+    id: "claude-haiku-4-5",
     label: "Claude Haiku 4.5",
-    shortLabel: "Claude Haiku 4.5",
+    shortLabel: "Haiku 4.5",
     family: "Anthropic",
     runtimeId: "claude",
     agentKind: "claude",
-    desc: "超快响应，适合轻量修改与快速问答",
+    desc: "Ultra-low latency for quick edits and lightweight lookups",
   },
+  // OpenAI / Codex CLI (~/.codex/config.toml & ~/.codex/codex-models.json)
   {
-    id: "o3",
-    label: "o3",
-    shortLabel: "o3",
+    id: "gpt-6.1-sol",
+    label: "GPT-6.1-Sol",
+    shortLabel: "GPT-6.1-Sol",
     family: "OpenAI",
     runtimeId: "codex",
     agentKind: "codex",
-    desc: "高强推理模型，适合疑难 Bug 与算法攻坚",
+    desc: "Default in ~/.codex/config.toml · Latest workhorse model for coding and everyday work.",
+    isDefault: true,
   },
   {
-    id: "o4-mini",
-    label: "o4-mini",
-    shortLabel: "o4-mini",
+    id: "gpt-6-sol",
+    label: "GPT-6 Sol",
+    shortLabel: "GPT-6 Sol",
     family: "OpenAI",
     runtimeId: "codex",
     agentKind: "codex",
-    desc: "极速高性价比编码与自动化测试生成",
+    desc: "OpenAI GPT-6 Sol coding model",
   },
   {
-    id: "gpt-4.1",
-    label: "GPT-4.1",
-    shortLabel: "GPT-4.1",
+    id: "gpt-6-luna",
+    label: "GPT-6 Luna",
+    shortLabel: "GPT-6 Luna",
     family: "OpenAI",
     runtimeId: "codex",
     agentKind: "codex",
-    desc: "通用全栈开发与稳健指令遵循",
+    desc: "OpenAI GPT-6 Luna coding model",
   },
   {
-    id: "gemini-2.5-pro",
-    label: "Gemini 2.5 Pro",
-    shortLabel: "Gemini 2.5 Pro",
-    family: "Google",
-    runtimeId: "gemini",
-    agentKind: "gemini",
-    desc: "百万长上下文全库分析",
+    id: "gpt-6-astra",
+    label: "GPT-6 Astra",
+    shortLabel: "GPT-6 Astra",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "OpenAI GPT-6 Astra coding model",
+  },
+  {
+    id: "gpt-5.6-sol",
+    label: "GPT-5.6 Sol",
+    shortLabel: "GPT-5.6 Sol",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "OpenAI GPT-5.6 Sol coding model",
+  },
+  {
+    id: "gpt-5.6-luna",
+    label: "GPT-5.6 Luna",
+    shortLabel: "GPT-5.6 Luna",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "OpenAI GPT-5.6 Luna coding model",
+  },
+  {
+    id: "gpt-5.6-terra",
+    label: "GPT-5.6 Terra",
+    shortLabel: "GPT-5.6 Terra",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "OpenAI GPT-5.6 Terra coding model",
+  },
+  {
+    id: "gpt-5.5",
+    label: "GPT-5.5",
+    shortLabel: "GPT-5.5",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "OpenAI GPT-5.5 coding model",
+  },
+  {
+    id: "gpt-5.4-mini",
+    label: "GPT-5.4 Mini",
+    shortLabel: "GPT-5.4 Mini",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "Fast, lightweight GPT-5.4 Mini coding model",
+  },
+  {
+    id: "gpt-5.3-codex-spark",
+    label: "GPT-5.3 Codex Spark",
+    shortLabel: "Codex Spark",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "Specialized ultra-fast Codex Spark model",
+  },
+  {
+    id: "grok-4.6",
+    label: "Grok 4.6",
+    shortLabel: "Grok 4.6",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "Grok 4.6 coding and reasoning model via Codex CLI",
   },
 ];
 
@@ -155,9 +259,9 @@ export const DEMO_SESSIONS: VeloSession[] = [
     repo_id: "repo-velo",
     title: "New thread",
     agent_kind: "claude",
-    model: "claude-sonnet-4.5",
-    model_short: "Claude Sonnet 4.5",
-    effort: "medium",
+    model: "claude-fable-5-2",
+    model_short: "Claude Fable 5.2",
+    effort: "high",
     status: "idle",
     branch_name: "main",
     worktree_path: "/Users/daiyudai/code/velo",
@@ -186,7 +290,7 @@ export const SLASH_SKILLS: SlashSkillItem[] = [
   {
     cmd: "/advisor",
     label: "Architect Advisor",
-    desc: "调用高阶推理模型 (Claude Opus 4.5 / o3) 审计当前 Worktree Diff",
+    desc: "调用高阶推理模型 (Claude Fable 5.2 / GPT-6.1-Sol) 审计当前 Worktree Diff",
   },
   {
     cmd: "/committee",
@@ -219,7 +323,7 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
       ? "gemini"
       : "claude";
   const modelId = String(
-    r.model ?? (agentKind === "codex" ? "o3" : agentKind === "gemini" ? "gemini-2.5-pro" : "claude-sonnet-4.5")
+    r.model ?? (agentKind === "codex" ? "gpt-6.1-sol" : "claude-fable-5-2")
   );
   const foundModel = MODEL_CATALOG.find((m) => m.id === modelId);
   const rawStatus = String(r.status ?? "idle");
