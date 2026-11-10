@@ -13,6 +13,7 @@ import {
   normalizeToVeloSession,
 } from "./mockData";
 import {
+  ArrowUp,
   Check,
   ChevronDown,
   ChevronRight,
@@ -20,22 +21,23 @@ import {
   Command,
   Copy,
   FileCode2,
-  FolderGit2,
+  Folder,
   FolderPlus,
   GitBranch,
-  PanelLeftClose,
-  PanelLeftOpen,
+  Layers,
+  PanelLeft,
   Plus,
   QrCode,
   Search,
+  Server,
+  Settings,
   Sparkles,
+  SquarePen,
   Terminal,
-  Wand2,
   X,
 } from "lucide-react";
 
 type VariantId = "a" | "b" | "c";
-type GroupMode = "project" | "status";
 type DrawerTab = "diff" | "terminal";
 type ModalKind =
   | null
@@ -43,8 +45,7 @@ type ModalKind =
   | "new-repo"
   | "command"
   | "skills"
-  | "qr"
-  | "advisor";
+  | "qr";
 
 export function App() {
   const [daemonUrl] = useState<string>(() => {
@@ -53,13 +54,8 @@ export function App() {
     return "http://127.0.0.1:6767";
   });
 
-  // Visual Material Variant (A / B / C live switcher)
   const [variant, setVariant] = useState<VariantId>("a");
-
-  // Unified Sidebar State (Claude Code / OpenAI Codex / Paseo style)
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
-  const [groupMode, setGroupMode] = useState<GroupMode>("project");
-  const [sidebarSearch, setSidebarSearch] = useState<string>("");
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(true);
   const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
   const [repos, setRepos] = useState<VeloRepo[]>(DEMO_REPOS);
   const [targetRepoIdForNewWt, setTargetRepoIdForNewWt] = useState<string>(DEMO_REPOS[0].id);
@@ -70,21 +66,17 @@ export function App() {
   const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(DEMO_EVENTS);
   const [connected, setConnected] = useState<boolean>(false);
 
-  // On-Demand Right Drawer State (Closed by default)
+  // On-Demand Right Drawer State
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("diff");
   const [selectedDiffPath, setSelectedDiffPath] = useState<string>(DEMO_DIFF_FILES[0].path);
 
-  // Collapsible states in stream
+  // Stream disclosure states
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
 
   // Composer State
   const [prompt, setPrompt] = useState<string>("");
-  const [attachedFiles, setAttachedFiles] = useState<string[]>([
-    "crates/velo-protocol/src/lib.rs",
-    "crates/velo-daemon/src/main.rs",
-  ]);
   const [slashFilter, setSlashFilter] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
@@ -124,18 +116,6 @@ export function App() {
     () => eventsBySession[activeSession.id] || DEMO_EVENTS["sess-1"] || [],
     [eventsBySession, activeSession.id]
   );
-
-  const filteredSessions = useMemo(() => {
-    const q = sidebarSearch.trim().toLowerCase();
-    if (!q) return sessions;
-    return sessions.filter(
-      (s) =>
-        s.title.toLowerCase().includes(q) ||
-        s.branch_name.toLowerCase().includes(q) ||
-        s.model.toLowerCase().includes(q) ||
-        s.project_path.toLowerCase().includes(q)
-    );
-  }, [sessions, sidebarSearch]);
 
   // Connect to live Rust Velo Daemon
   useEffect(() => {
@@ -196,7 +176,6 @@ export function App() {
     };
   }, [daemonUrl, activeId]);
 
-  // Keyboard shortcuts: Cmd+K (Command), Cmd+B (Toggle Left Sidebar), Cmd+J (Toggle Right Drawer), Esc
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -204,7 +183,7 @@ export function App() {
         setActiveModal((m) => (m === "command" ? null : "command"));
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
         e.preventDefault();
-        setSidebarCollapsed((c) => !c);
+        setSidebarOpen((c) => !c);
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "j") {
         e.preventDefault();
         setDrawerOpen((o) => !o);
@@ -225,11 +204,6 @@ export function App() {
       if (matched) setSelectedDiffPath(matched.path);
     }
     setDrawerTab("diff");
-    setDrawerOpen(true);
-  };
-
-  const openTerminalDrawer = () => {
-    setDrawerTab("terminal");
     setDrawerOpen(true);
   };
 
@@ -257,22 +231,20 @@ export function App() {
       content: text,
     };
 
-    const thinkId = `th-${Date.now() + 1}`;
     const thinkEv: AgentEvent = {
-      id: thinkId,
+      id: `th-${Date.now() + 1}`,
       session_id: activeSession.id,
       timestamp: now,
       kind: "thinking",
       content: text.startsWith("/handoff")
-        ? "Compacting context window into structured architectural handoff summary while preserving modified Rust symbols and active worktree diff..."
+        ? "Compacting context window into structured handoff state..."
         : text.startsWith("/advisor")
-        ? "Escalating architecture plan to Senior Reviewer Model (Claude Opus 4.6) to audit race-condition & lock safety..."
-        : `Analyzing prompt across ${attachedFiles.length} context files in isolated Git worktree (${activeSession.branch_name})...`,
+        ? "Consulting Claude Opus 4.6 for concurrency & lock hierarchy review..."
+        : `Analyzing workspace changes in ${activeSession.branch_name}...`,
     };
 
-    const toolId = `tl-${Date.now() + 2}`;
     const toolEv: AgentEvent = {
-      id: toolId,
+      id: `tl-${Date.now() + 2}`,
       session_id: activeSession.id,
       timestamp: now,
       kind: "tool_call",
@@ -289,10 +261,10 @@ export function App() {
       timestamp: now,
       kind: "assistant",
       content: text.startsWith("/handoff")
-        ? "Context compacted (`64k → 9.2k tokens`). Ready to continue seamlessly in a fresh worktree stream without losing architectural state."
+        ? "Context compacted (`64k → 9.2k tokens`). Ready to continue seamlessly."
         : text.startsWith("/advisor")
-        ? "**Opus 4.6 Architect Audit**:\n- Lock hierarchy in `velo-worktree` is deadlock-free.\n- Recommendation: bound `WsFrame` replay ring buffer to `1024` events per worktree session."
-        : `Updated \`crates/velo-protocol/src/lib.rs\` in branch \`${activeSession.branch_name}\` and verified workspace compilation. Click the file chip above to inspect the live Diff in the slide-over drawer.`,
+        ? "Opus 4.6 review complete: lock acquisition order in `velo-worktree` is deadlock-free."
+        : `Updated \`crates/velo-protocol/src/lib.rs\` on branch \`${activeSession.branch_name}\` and verified workspace build.`,
     };
 
     setEventsBySession((prev) => ({
@@ -307,7 +279,7 @@ export function App() {
         body: JSON.stringify({ data: text + "\n" }),
       });
     } catch {
-      // local optimistic simulation already updated
+      // optimistic UI already updated
     }
 
     setTimeout(() => {
@@ -337,10 +309,10 @@ export function App() {
           : "gemini-2.5-pro",
       model_short:
         newAgentKind === "claude"
-          ? "Claude 4.5"
+          ? "Claude"
           : newAgentKind === "codex"
-          ? "Codex o3"
-          : "Gemini 2.5",
+          ? "Codex"
+          : "Gemini",
       status: "running",
       branch_name: branch,
       worktree_path: `${targetRepo.path}/.velo/worktrees/${slug}`,
@@ -375,7 +347,7 @@ export function App() {
           session_id: newId,
           timestamp: new Date().toLocaleTimeString([], { hour12: false }),
           kind: "assistant",
-          content: `已在项目 **${targetRepo.name}** 下创建隔离 Git Worktree 会话 \`${branch}\`（模型：**${created.model}**）。点击流中的修改胶囊即可滑出右侧 Diff 抽屉。`,
+          content: `Checked out isolated worktree \`${branch}\` in **${targetRepo.name}**.`,
         },
       ],
     }));
@@ -395,30 +367,7 @@ export function App() {
       path: cleanPath,
       default_branch: "main",
     };
-    const defaultSessId = `sess-${Date.now().toString().slice(-3)}`;
-    const defaultSession: VeloSession = {
-      id: defaultSessId,
-      repo_id: id,
-      title: "初始化 Worktree 架构索引",
-      agent_kind: "claude",
-      model: "claude-sonnet-4.5",
-      model_short: "Claude 4.5",
-      status: "running",
-      branch_name: "feat/init-worktree",
-      worktree_path: `${cleanPath}/.velo/worktrees/init`,
-      project_path: cleanPath,
-      approval_mode: "auto_edit",
-      tokens_used: 4200,
-      tokens_limit: 200000,
-      cost_usd: 0.02,
-      files_changed: 1,
-      insertions: 18,
-      deletions: 0,
-      updated_at: "now",
-    };
     setRepos((prev) => [...prev, newRepo]);
-    setSessions((prev) => [defaultSession, ...prev]);
-    setActiveId(defaultSessId);
     setActiveModal(null);
   };
 
@@ -454,204 +403,97 @@ export function App() {
     )
   );
 
-  // Render a single Thread / Worktree row (Claude Code / Codex / Paseo style)
-  const renderThreadRow = (w: VeloSession, showRepoPrefix = false) => {
-    const isSelected = w.id === activeSession.id;
-    const repoObj = repos.find((r) => r.id === w.repo_id);
-    const dotColor =
-      w.status === "running"
-        ? "#34d399"
-        : w.status === "waiting_approval"
-        ? "#fbbf24"
-        : "#52525b";
-
-    return (
-      <button
-        key={w.id}
-        onClick={() => setActiveId(w.id)}
-        className={`group flex w-full flex-col gap-0.5 rounded-[6px] border px-2.5 py-1.5 text-left transition-all ${
-          isSelected
-            ? "border-[#383842] bg-[#18181e]"
-            : "border-transparent bg-transparent hover:bg-[#131318]"
-        }`}
-      >
-        {/* Line 1: Status Dot + Thread Task Title + Diff Stat (+48 -14) */}
-        <div className="flex w-full items-center justify-between gap-2">
-          <div className="flex min-w-0 items-center gap-2">
-            <span
-              className="v-dot shrink-0"
-              style={{
-                background: dotColor,
-                boxShadow:
-                  w.status === "running" ? "0 0 6px rgba(52,211,153,0.55)" : "none",
-              }}
-            />
-            <span
-              className={`truncate text-[12px] ${
-                isSelected
-                  ? "font-semibold text-[#fafafa]"
-                  : "font-medium text-[#d4d4d8] group-hover:text-[#fafafa]"
-              }`}
-            >
-              {w.title}
-            </span>
-          </div>
-
-          <div className="flex shrink-0 items-center gap-1 font-mono text-[10.5px]">
-            <span className="text-[#34d399]">+{w.insertions}</span>
-            <span className="text-[#f87171]">−{w.deletions}</span>
-          </div>
-        </div>
-
-        {/* Line 2 (Indented): Git Branch + Agent Provider + Relative Time */}
-        <div className="flex w-full items-center justify-between gap-2 pl-[14px] font-mono text-[10.5px] text-[#71717a]">
-          <div className="flex min-w-0 items-center gap-1.5 truncate">
-            {showRepoPrefix && repoObj && (
-              <>
-                <span className="text-[#a1a1aa]">{repoObj.name}</span>
-                <span>·</span>
-              </>
-            )}
-            <GitBranch className="h-2.5 w-2.5 shrink-0 text-[#71717a]" />
-            <span className="truncate">{w.branch_name}</span>
-            <span className="text-[#3f3f46]">·</span>
-            <span className="shrink-0 text-[#a1a1aa]">{w.model_short}</span>
-          </div>
-          <span className="shrink-0 text-[10px] text-[#52525b]">{w.updated_at}</span>
-        </div>
-      </button>
-    );
-  };
-
   return (
     <div
-      className={`velo-variant-${variant} flex h-screen w-screen overflow-hidden select-none bg-[#09090b] text-[#fafafa]`}
+      className={`velo-variant-${variant} flex h-screen w-screen overflow-hidden select-none bg-[#111113] text-[#f4f4f5]`}
     >
       {/* =====================================================================
-          1. UNIFIED LEFT SIDEBAR (Claude Code / OpenAI Codex / Paseo Style)
-             - Top Header: Collapse (⌘B) + Velo Daemon Status + ⌘K + New Thread
-             - Top Nav Block: "+ New Worktree Thread" + Search Filter
-             - Section Switcher: Workspaces (N) | [Project | Status]
-             - Hierarchical Tree: Collapsible Project Folders -> Indented Threads
-             - Bottom Footer: + Add Project, Usage, Mobile Pairing QR
+          1. AUTHENTIC CODEX / CLAUDE CODE / PASEO LEFT SIDEBAR
+             - Seamless matte surface (#0c0c0e), ZERO boxed cards or heavy lines
+             - Top: quiet nav rows (New thread, Automations, Search)
+             - Body: Workspaces section -> clean Project rows -> borderless Thread rows
+             - Idle rows keep empty leading slot; only active/waiting rows show indicator
+             - Bottom: single icon-only footer bar
          ===================================================================== */}
       <aside
-        className={`v-rail z-20 flex shrink-0 flex-col justify-between overflow-hidden bg-[#0c0c0f] transition-all duration-200 ${
-          sidebarCollapsed ? "w-0 border-r-0 opacity-0" : "w-[264px] opacity-100"
+        className={`flex shrink-0 flex-col justify-between bg-[#0c0c0e] border-r border-[#1f1f23] transition-all duration-200 overflow-hidden ${
+          sidebarOpen ? "w-[252px]" : "w-0 border-r-0"
         }`}
       >
-        {/* Top Sidebar Header (44px) */}
-        <div className="flex h-[44px] shrink-0 items-center justify-between border-b border-[#222226] px-3">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setSidebarCollapsed(true)}
-              title="Collapse Sidebar (⌘B)"
-              className="flex h-6 w-6 items-center justify-center rounded text-[#71717a] transition-colors hover:bg-[#18181d] hover:text-[#fafafa]"
-            >
-              <PanelLeftClose className="h-3.5 w-3.5" />
-            </button>
-            <div className="flex items-center gap-1.5">
-              <span
-                className="v-dot"
-                style={{ background: connected ? "#34d399" : "#fbbf24" }}
-              />
-              <span className="text-[13px] font-semibold tracking-tight text-[#fafafa]">
+        <div className="flex flex-1 flex-col overflow-hidden">
+          {/* Top Window Bar + Sidebar Toggle */}
+          <div className="flex h-[42px] shrink-0 items-center justify-between px-3">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setSidebarOpen(false)}
+                title="Hide sidebar (⌘B)"
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[#71717a] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+              >
+                <PanelLeft className="h-4 w-4" />
+              </button>
+              <span className="text-[13px] font-semibold tracking-tight text-[#f4f4f5]">
                 Velo
               </span>
-              <span className="rounded border border-[#27272d] bg-[#141418] px-1.5 py-0.2 font-mono text-[9.5px] text-[#a1a1aa]">
-                daemon
-              </span>
             </div>
-          </div>
 
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => setActiveModal("command")}
-              title="Command Palette (⌘K)"
-              className="flex h-6 w-6 items-center justify-center rounded text-[#71717a] hover:bg-[#18181d] hover:text-[#fafafa]"
-            >
-              <Command className="h-3.5 w-3.5" />
-            </button>
             <button
               onClick={() => {
                 setTargetRepoIdForNewWt(activeRepo.id);
                 setActiveModal("new-worktree");
               }}
-              title="New Worktree Thread (⌘N)"
-              className="flex h-6 w-6 items-center justify-center rounded text-[#a1a1aa] hover:bg-[#18181d] hover:text-[#fafafa]"
+              title="New thread (⌘N)"
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[#a1a1aa] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
             >
-              <Plus className="h-3.5 w-3.5" />
+              <SquarePen className="h-4 w-4" />
             </button>
           </div>
-        </div>
 
-        {/* Top Action & Search Filter Block (Codex / Claude Code style) */}
-        <div className="flex shrink-0 flex-col gap-2 border-b border-[#19191f] px-2.5 py-2.5">
-          <button
-            onClick={() => {
-              setTargetRepoIdForNewWt(activeRepo.id);
-              setActiveModal("new-worktree");
-            }}
-            className="v-card flex w-full items-center justify-between px-2.5 py-1.5 text-[12px] font-medium text-[#fafafa] transition-colors hover:border-[#3f3f46] hover:bg-[#16161b]"
-          >
-            <span className="flex items-center gap-2">
-              <Plus className="h-3.5 w-3.5 text-[#a1a1aa]" />
-              <span>New Worktree Thread</span>
-            </span>
-            <kbd className="font-mono text-[10px] text-[#71717a]">⌘N</kbd>
-          </button>
-
-          <div className="flex h-[28px] items-center gap-1.5 rounded-[6px] border border-[#1f1f26] bg-[#09090b] px-2.5">
-            <Search className="h-3 w-3 shrink-0 text-[#71717a]" />
-            <input
-              type="text"
-              value={sidebarSearch}
-              onChange={(e) => setSidebarSearch(e.target.value)}
-              placeholder="Filter threads or branches..."
-              className="w-full bg-transparent text-[11.5px] text-[#fafafa] placeholder-[#52525b] focus:outline-none"
-            />
-          </div>
-        </div>
-
-        {/* Section Header + Segmented Group Switcher (Project | Status) */}
-        <div className="flex shrink-0 items-center justify-between px-3 pb-1 pt-2.5">
-          <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#71717a]">
-            Workspaces ({filteredSessions.length})
-          </span>
-          <div className="flex items-center gap-0.5 rounded-[5px] border border-[#222228] bg-[#09090b] p-0.5">
+          {/* Top Navigation Rows (Codex / Claude Code / Paseo SidebarNavRows) */}
+          <div className="space-y-0.5 px-2 pb-3">
             <button
-              onClick={() => setGroupMode("project")}
-              className={`rounded-[3.5px] px-2 py-0.5 text-[10px] font-medium transition-all ${
-                groupMode === "project"
-                  ? "bg-[#1f1f26] text-[#fafafa]"
-                  : "text-[#71717a] hover:text-[#a1a1aa]"
-              }`}
+              onClick={() => {
+                setTargetRepoIdForNewWt(activeRepo.id);
+                setActiveModal("new-worktree");
+              }}
+              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[#a1a1aa] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
             >
-              Project
+              <Plus className="h-4 w-4 text-[#71717a]" />
+              <span>New thread</span>
             </button>
             <button
-              onClick={() => setGroupMode("status")}
-              className={`rounded-[3.5px] px-2 py-0.5 text-[10px] font-medium transition-all ${
-                groupMode === "status"
-                  ? "bg-[#1f1f26] text-[#fafafa]"
-                  : "text-[#71717a] hover:text-[#a1a1aa]"
-              }`}
+              onClick={() => setActiveModal("command")}
+              className="flex h-[30px] w-full items-center justify-between rounded-md px-2.5 text-[13px] text-[#a1a1aa] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
             >
-              Status
+              <span className="flex items-center gap-2.5">
+                <Search className="h-3.5 w-3.5 text-[#71717a]" />
+                <span>Search</span>
+              </span>
+              <span className="font-mono text-[11px] text-[#52525b]">⌘K</span>
+            </button>
+            <button
+              onClick={() => setActiveModal("skills")}
+              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[#a1a1aa] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+            >
+              <Layers className="h-3.5 w-3.5 text-[#71717a]" />
+              <span>Automations & Skills</span>
             </button>
           </div>
-        </div>
 
-        {/* Scrollable Hierarchical Project -> Worktree Thread Tree */}
-        <div className="flex-1 space-y-2.5 overflow-y-auto px-2 py-1.5">
-          {groupMode === "project" ? (
-            repos.map((repo) => {
-              const items = filteredSessions.filter((s) => s.repo_id === repo.id);
+          {/* Section Header: Workspaces */}
+          <div className="flex items-center justify-between px-4 pb-1.5 pt-1">
+            <span className="text-[11px] font-medium text-[#71717a]">Workspaces</span>
+          </div>
+
+          {/* Scrollable Project -> Thread Hierarchy (Borderless, Clean Rows) */}
+          <div className="flex-1 space-y-3 overflow-y-auto px-2 py-1">
+            {repos.map((repo) => {
+              const repoItems = sessions.filter((s) => s.repo_id === repo.id);
               const isCollapsed = !!collapsedRepos[repo.id];
+
               return (
                 <div key={repo.id} className="space-y-0.5">
-                  {/* Project Folder Header Row */}
-                  <div className="group flex items-center justify-between rounded-[5px] px-1.5 py-1 hover:bg-[#141419]">
+                  {/* Project Row */}
+                  <div className="group flex h-[28px] items-center justify-between rounded-md px-2 text-[#a1a1aa] transition-colors hover:bg-[#16161a] hover:text-[#f4f4f5]">
                     <button
                       onClick={() =>
                         setCollapsedRepos((prev) => ({
@@ -659,19 +501,16 @@ export function App() {
                           [repo.id]: !prev[repo.id],
                         }))
                       }
-                      className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left"
                     >
+                      <Folder className="h-3.5 w-3.5 shrink-0 text-[#71717a] group-hover:hidden" />
                       {isCollapsed ? (
-                        <ChevronRight className="h-3 w-3 shrink-0 text-[#71717a]" />
+                        <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 text-[#71717a] group-hover:block" />
                       ) : (
-                        <ChevronDown className="h-3 w-3 shrink-0 text-[#71717a]" />
+                        <ChevronDown className="hidden h-3.5 w-3.5 shrink-0 text-[#71717a] group-hover:block" />
                       )}
-                      <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-[#a1a1aa]" />
-                      <span className="truncate text-[12px] font-semibold text-[#e4e4e7] group-hover:text-[#fafafa]">
+                      <span className="truncate text-[13px] font-medium text-[#d4d4d8] group-hover:text-[#f4f4f5]">
                         {repo.name}
-                      </span>
-                      <span className="font-mono text-[10px] text-[#52525b]">
-                        {items.length}
                       </span>
                     </button>
 
@@ -680,280 +519,244 @@ export function App() {
                         setTargetRepoIdForNewWt(repo.id);
                         setActiveModal("new-worktree");
                       }}
-                      title={`在 ${repo.name} 下新建隔离 Worktree 会话`}
-                      className="flex h-5 w-5 items-center justify-center rounded text-[#71717a] opacity-0 transition-opacity hover:bg-[#1f1f26] hover:text-[#fafafa] group-hover:opacity-100"
+                      title={`New thread in ${repo.name}`}
+                      className="flex h-5 w-5 items-center justify-center rounded text-[#71717a] opacity-0 transition-opacity hover:bg-[#222228] hover:text-[#f4f4f5] group-hover:opacity-100"
                     >
-                      <Plus className="h-3 w-3" />
+                      <Plus className="h-3.5 w-3.5" />
                     </button>
                   </div>
 
-                  {/* Indented Thread Children with Vertical Tree Guide Rail */}
+                  {/* Thread Rows under Project */}
                   {!isCollapsed && (
-                    <div className="ml-[11px] space-y-0.5 border-l border-[#1f1f26] pl-2">
-                      {items.map((w) => renderThreadRow(w, false))}
+                    <div className="space-y-0.5">
+                      {repoItems.map((w) => {
+                        const isSelected = w.id === activeSession.id;
+                        return (
+                          <button
+                            key={w.id}
+                            onClick={() => setActiveId(w.id)}
+                            className={`group flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
+                              isSelected
+                                ? "bg-[#1f1f25] text-[#f4f4f5]"
+                                : "text-[#a1a1aa] hover:bg-[#16161a] hover:text-[#e4e4e7]"
+                            }`}
+                          >
+                            {/* Leading Status Slot (16px wide, reserves space when idle just like Paseo/Codex) */}
+                            <div className="mt-[4px] flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+                              {w.status === "running" ? (
+                                <span
+                                  className="h-2.5 w-2.5 rounded-full border-[1.5px] border-[#34d399] border-t-transparent animate-spin"
+                                  title="Running"
+                                />
+                              ) : w.status === "waiting_approval" ? (
+                                <span
+                                  className="h-2 w-2 rounded-full bg-[#fbbf24]"
+                                  title="Waiting for review"
+                                />
+                              ) : null}
+                            </div>
+
+                            {/* Thread Content Column */}
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-baseline justify-between gap-2">
+                                <span
+                                  className={`truncate text-[13px] leading-snug ${
+                                    isSelected ? "font-medium text-[#f4f4f5]" : "font-normal"
+                                  }`}
+                                >
+                                  {w.title}
+                                </span>
+                                <span className="shrink-0 font-mono text-[11px] text-[#52525b]">
+                                  {w.updated_at}
+                                </span>
+                              </div>
+
+                              {/* Subtle Meta Line: Branch + Diff Stats */}
+                              <div className="mt-0.5 flex items-center justify-between gap-2 font-mono text-[11px] text-[#71717a]">
+                                <span className="truncate">{w.branch_name}</span>
+                                {(w.insertions > 0 || w.deletions > 0) && (
+                                  <span className="flex shrink-0 items-center gap-1 text-[10.5px]">
+                                    <span className="text-[#34d399]/80">+{w.insertions}</span>
+                                    <span className="text-[#f87171]/80">−{w.deletions}</span>
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
               );
-            })
-          ) : (
-            /* Status Grouping Mode (In Progress / Waiting / Idle) */
-            [
-              {
-                key: "running",
-                label: "In Progress",
-                items: filteredSessions.filter((s) => s.status === "running"),
-              },
-              {
-                key: "waiting",
-                label: "Waiting for Review",
-                items: filteredSessions.filter((s) => s.status === "waiting_approval"),
-              },
-              {
-                key: "idle",
-                label: "Completed / Idle",
-                items: filteredSessions.filter((s) => s.status === "idle"),
-              },
-            ]
-              .filter((g) => g.items.length > 0)
-              .map((group) => (
-                <div key={group.key} className="space-y-1">
-                  <div className="flex items-center justify-between px-2 py-0.5 font-mono text-[10.5px] font-medium text-[#71717a]">
-                    <span>{group.label}</span>
-                    <span>{group.items.length}</span>
-                  </div>
-                  <div className="space-y-0.5">
-                    {group.items.map((w) => renderThreadRow(w, true))}
-                  </div>
-                </div>
-              ))
-          )}
+            })}
+          </div>
         </div>
 
-        {/* Bottom Single-Row Footer (Paseo / Codex / Claude Code style) */}
-        <div className="flex h-[38px] shrink-0 items-center justify-between border-t border-[#222226] px-2.5 text-[11px] text-[#71717a]">
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={() => setActiveModal("new-repo")}
-              title="Add Local Git Project"
-              className="flex items-center gap-1 rounded px-1.5 py-1 text-[#a1a1aa] transition-colors hover:bg-[#18181d] hover:text-[#fafafa]"
-            >
-              <FolderPlus className="h-3.5 w-3.5" />
-              <span className="text-[11px]">Add Project</span>
-            </button>
-            <span className="text-[#3f3f46]">·</span>
-            <span
-              className="flex items-center gap-1 font-mono text-[10px] text-[#71717a]"
-              title="Active Context & Token Usage"
-            >
-              <CircleGauge className="h-3 w-3 text-[#a1a1aa]" />
-              {tokenPercent}%
-            </span>
-          </div>
-
+        {/* Bottom Icon-Only Footer (Paseo / Codex SidebarFooter) */}
+        <div className="flex h-[40px] shrink-0 items-center justify-between border-t border-[#18181c] px-2.5 text-[#71717a]">
           <div className="flex items-center gap-1">
             <button
-              onClick={() => setActiveModal("skills")}
-              title="Agent Orchestration Skills (/handoff, /advisor)"
-              className="flex h-6 w-6 items-center justify-center rounded text-[#71717a] hover:bg-[#18181d] hover:text-[#fafafa]"
+              onClick={() => setActiveModal("new-repo")}
+              title="Add project"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
             >
-              <Wand2 className="h-3.5 w-3.5" />
+              <FolderPlus className="h-4 w-4" />
+            </button>
+            <button
+              onClick={() => setActiveModal("skills")}
+              title={`Usage: ${tokenPercent}% context window`}
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+            >
+              <CircleGauge className="h-4 w-4" />
             </button>
             <button
               onClick={() => setActiveModal("qr")}
-              title="Mobile E2EE Relay Pairing"
-              className="flex h-6 w-6 items-center justify-center rounded text-[#71717a] hover:bg-[#18181d] hover:text-[#fafafa]"
+              title={`Local Daemon (${connected ? "Connected" : "Offline"}) & Mobile Pairing`}
+              className="relative flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
             >
-              <QrCode className="h-3.5 w-3.5" />
+              <Server className="h-4 w-4" />
+              <span
+                className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full"
+                style={{ background: connected ? "#34d399" : "#fbbf24" }}
+              />
+            </button>
+          </div>
+
+          {/* Discrete Style Switcher (A/B/C) + Settings */}
+          <div className="flex items-center gap-1">
+            <div
+              className="flex items-center rounded-md bg-[#141418] p-0.5 text-[10px] font-mono"
+              title="Switch Material Variant (A / B / C)"
+            >
+              {(["a", "b", "c"] as VariantId[]).map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setVariant(v)}
+                  className={`rounded px-1.5 py-0.5 uppercase transition-colors ${
+                    variant === v
+                      ? "bg-[#27272e] text-[#f4f4f5] font-semibold"
+                      : "text-[#71717a] hover:text-[#a1a1aa]"
+                  }`}
+                >
+                  {v}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setActiveModal("command")}
+              title="Settings & Command Palette (⌘K)"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+            >
+              <Settings className="h-4 w-4" />
             </button>
           </div>
         </div>
       </aside>
 
       {/* =====================================================================
-          2. MAIN WORKSPACE AREA (Top Header + Single-Column Center + Slide-Over Drawer)
+          2. MAIN WORKSPACE AREA (Clean Header + Natural Conversation + Docked Composer)
          ===================================================================== */}
-      <div className="flex flex-1 flex-col overflow-hidden">
-        {/* Minimal Monochrome Top Header (44px) */}
-        <header className="v-topbar z-20 flex h-[44px] shrink-0 items-center justify-between px-4">
-          {/* Left: Expand Sidebar Button (when collapsed) + Active Repo & Branch Breadcrumb */}
-          <div className="flex items-center gap-2 text-[12px]">
-            {sidebarCollapsed && (
+      <div className="flex flex-1 flex-col overflow-hidden bg-[#111113]">
+        {/* Clean Minimal Workspace Header (42px) */}
+        <header className="flex h-[42px] shrink-0 items-center justify-between border-b border-[#1f1f23] px-4">
+          <div className="flex items-center gap-2.5 min-w-0">
+            {!sidebarOpen && (
               <button
-                onClick={() => setSidebarCollapsed(false)}
-                title="Expand Sidebar (⌘B)"
-                className="mr-1 flex h-6 w-6 items-center justify-center rounded text-[#a1a1aa] hover:bg-[#18181d] hover:text-[#fafafa]"
+                onClick={() => setSidebarOpen(true)}
+                title="Show sidebar (⌘B)"
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[#71717a] hover:bg-[#1c1c21] hover:text-[#f4f4f5]"
               >
-                <PanelLeftOpen className="h-3.5 w-3.5" />
+                <PanelLeft className="h-4 w-4" />
               </button>
             )}
-            <span className="font-mono text-[11.5px] text-[#71717a]">
-              {activeRepo.name}
+            <span className="truncate text-[13px] font-medium text-[#f4f4f5]">
+              {activeSession.title}
             </span>
-            <span className="text-[#3f3f46]">/</span>
-            <button
-              onClick={() => setActiveModal("command")}
-              className="v-chip flex items-center gap-1.5 px-2 py-0.5 font-mono text-[11px] text-[#fafafa]"
-            >
-              <GitBranch className="h-3 w-3 text-[#a1a1aa]" />
-              <span>{activeSession.branch_name}</span>
-              <ChevronDown className="h-3 w-3 text-[#71717a]" />
-            </button>
-            <span className="hidden truncate text-[11.5px] text-[#71717a] lg:inline">
-              · {activeSession.title}
+            <span className="inline-flex items-center gap-1 rounded-md bg-[#18181c] px-2 py-0.5 font-mono text-[11px] text-[#a1a1aa]">
+              <GitBranch className="h-3 w-3 text-[#71717a]" />
+              {activeSession.branch_name}
             </span>
           </div>
 
-          {/* Center: LIVE MATERIAL VARIANT SWITCHER (A / B / C for User Comparison!) */}
-          <div className="flex items-center gap-1 rounded-lg border border-[#27272a] bg-[#0f0f12] p-0.5">
-            <button
-              onClick={() => setVariant("a")}
-              className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-all ${
-                variant === "a"
-                  ? "bg-[#fafafa] text-[#09090b] font-semibold"
-                  : "text-[#a1a1aa] hover:text-[#fafafa]"
-              }`}
-            >
-              A · 极简锐利 (shadcn/Linear)
-            </button>
-            <button
-              onClick={() => setVariant("b")}
-              className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-all ${
-                variant === "b"
-                  ? "bg-[#fafafa] text-[#09090b] font-semibold"
-                  : "text-[#a1a1aa] hover:text-[#fafafa]"
-              }`}
-            >
-              B · 微光毛玻璃 (Beautiful/beUI)
-            </button>
-            <button
-              onClick={() => setVariant("c")}
-              className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-all ${
-                variant === "c"
-                  ? "bg-[#fafafa] text-[#09090b] font-semibold"
-                  : "text-[#a1a1aa] hover:text-[#fafafa]"
-              }`}
-            >
-              C · 硬件立体 3D (Rare UI)
-            </button>
-          </div>
-
-          {/* Right: On-Demand Slide-Over Drawer Triggers */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => handleSendPrompt("/advisor Audit current worktree changes")}
-              className="v-chip hidden items-center gap-1 px-2.5 py-1 font-mono text-[11px] text-[#a1a1aa] hover:text-[#fafafa] xl:inline-flex"
-            >
-              <Sparkles className="h-3 w-3" />
-              <span>/advisor</span>
-            </button>
-
+          {/* Right Header Controls: Diff Stat Trigger & Terminal Toggle */}
+          <div className="flex items-center gap-1.5">
             <button
               onClick={() => {
-                if (drawerOpen && drawerTab === "diff") {
-                  setDrawerOpen(false);
-                } else {
+                if (drawerOpen && drawerTab === "diff") setDrawerOpen(false);
+                else {
                   setDrawerTab("diff");
                   setDrawerOpen(true);
                 }
               }}
-              className={`v-chip flex items-center gap-1.5 px-2.5 py-1 font-mono text-[11px] ${
+              className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11.5px] transition-colors ${
                 drawerOpen && drawerTab === "diff"
-                  ? "border-[#fafafa] text-[#fafafa]"
-                  : "text-[#a1a1aa]"
+                  ? "bg-[#222228] text-[#f4f4f5]"
+                  : "text-[#a1a1aa] hover:bg-[#1a1a1f] hover:text-[#f4f4f5]"
               }`}
             >
-              <FileCode2 className="h-3 w-3" />
-              <span>Diff</span>
               <span className="text-[#34d399]">+{activeSession.insertions}</span>
               <span className="text-[#f87171]">−{activeSession.deletions}</span>
             </button>
 
             <button
               onClick={() => {
-                if (drawerOpen && drawerTab === "terminal") {
-                  setDrawerOpen(false);
-                } else {
-                  openTerminalDrawer();
+                if (drawerOpen && drawerTab === "terminal") setDrawerOpen(false);
+                else {
+                  setDrawerTab("terminal");
+                  setDrawerOpen(true);
                 }
               }}
-              className={`v-chip flex items-center gap-1.5 px-2.5 py-1 font-mono text-[11px] ${
+              title="Toggle Worktree Terminal (⌘J)"
+              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
                 drawerOpen && drawerTab === "terminal"
-                  ? "border-[#fafafa] text-[#fafafa]"
-                  : "text-[#a1a1aa]"
+                  ? "bg-[#222228] text-[#f4f4f5]"
+                  : "text-[#71717a] hover:bg-[#1a1a1f] hover:text-[#f4f4f5]"
               }`}
             >
-              <Terminal className="h-3 w-3" />
-              <span>PTY</span>
+              <Terminal className="h-4 w-4" />
             </button>
           </div>
         </header>
 
-        {/* Body Area: Centered Single-Column Stream + On-Demand Slide-Over Drawer */}
+        {/* Body Area: Centered Conversation Stream + On-Demand Right Drawer */}
         <div className="relative flex flex-1 overflow-hidden">
-          {/* =================================================================
-              3. SINGLE-COLUMN MONOCHROME FOCUS STREAM
-             ================================================================= */}
           <main className="flex flex-1 flex-col items-center overflow-hidden">
-            {/* Scrollable Conversation Stream */}
+            {/* Scrollable Stream (Claude Code / Codex / Paseo Natural Proportions) */}
             <div className="w-full flex-1 overflow-y-auto px-6 py-6">
-              <div className="mx-auto flex max-w-[720px] flex-col gap-4">
-                {/* Compact Worktree Isolation Banner */}
-                <div className="v-card flex items-center justify-between px-3.5 py-2 text-[11px] text-[#a1a1aa]">
-                  <div className="flex items-center gap-2 font-mono">
-                    <span className="v-dot" style={{ background: "#34d399" }} />
-                    <span className="text-[#fafafa]">{activeSession.worktree_path}</span>
-                  </div>
-                  <div className="flex items-center gap-3 font-mono text-[11px] text-[#71717a]">
-                    <span>{activeSession.approval_mode}</span>
-                    <span>·</span>
-                    <button
-                      onClick={() => openDiffForFile()}
-                      className="text-[#fafafa] underline decoration-[#3f3f46] underline-offset-4 hover:decoration-[#fafafa]"
-                    >
-                      {activeSession.files_changed} files changed (点击滑出 Diff 抽屉)
-                    </button>
-                  </div>
-                </div>
-
-                {/* Stream Events */}
+              <div className="mx-auto flex max-w-[680px] flex-col gap-5">
                 {activeEvents.map((ev) => {
+                  // 1. User Message: Right-aligned soft bubble, no robotic header
                   if (ev.kind === "user") {
                     return (
-                      <div key={ev.id} className="v-card px-4 py-3">
-                        <div className="mb-1 flex items-center justify-between text-[10px] font-mono uppercase tracking-wider text-[#71717a]">
-                          <span>YOU</span>
-                          <span>{ev.timestamp}</span>
-                        </div>
-                        <div className="text-[13.5px] leading-relaxed text-[#fafafa]">
+                      <div key={ev.id} className="flex justify-end">
+                        <div className="max-w-[82%] rounded-[18px] bg-[#1f1f24] px-4 py-2.5 text-[13.5px] leading-relaxed text-[#f4f4f5]">
                           {ev.content}
                         </div>
                       </div>
                     );
                   }
 
+                  // 2. Thinking Trace: Quiet 1-line disclosure
                   if (ev.kind === "thinking") {
                     const isOpen = !!expandedThinking[ev.id];
                     return (
-                      <div key={ev.id} className="px-1">
+                      <div key={ev.id}>
                         <button
                           onClick={() =>
                             setExpandedThinking((p) => ({ ...p, [ev.id]: !isOpen }))
                           }
-                          className="flex items-center gap-2 text-left font-mono text-[11.5px] text-[#a1a1aa] hover:text-[#fafafa]"
+                          className="flex items-center gap-1.5 text-left text-[12.5px] text-[#71717a] transition-colors hover:text-[#a1a1aa]"
                         >
                           {isOpen ? (
-                            <ChevronDown className="h-3.5 w-3.5 text-[#71717a]" />
+                            <ChevronDown className="h-3.5 w-3.5" />
                           ) : (
-                            <ChevronRight className="h-3.5 w-3.5 text-[#71717a]" />
+                            <ChevronRight className="h-3.5 w-3.5" />
                           )}
-                          <span className="v-shimmer">
-                            Thinking · {ev.content.slice(0, 76)}
-                            {ev.content.length > 76 ? "..." : ""}
-                          </span>
+                          <span>Thought for a moment</span>
                         </button>
                         {isOpen && (
-                          <div className="mt-2 border-l border-[#27272a] pl-4 font-mono text-[11.5px] leading-relaxed text-[#71717a]">
+                          <div className="mt-2 border-l-2 border-[#232329] pl-3.5 text-[12.5px] leading-relaxed text-[#71717a]">
                             {ev.content}
                           </div>
                         )}
@@ -961,40 +764,35 @@ export function App() {
                     );
                   }
 
+                  // 3. Tool Call: Clean inline row with IndentRail
                   if (ev.kind === "tool_call") {
                     const isExpanded = !!expandedTools[ev.id];
                     return (
                       <div key={ev.id} className="flex flex-col gap-1.5">
-                        <div className="flex flex-wrap items-center gap-2">
-                          {/* Clicking the file/tool chip opens the Slide-Over Diff Drawer! */}
+                        <div className="flex items-center gap-2">
                           <button
                             onClick={() => openDiffForFile(ev.tool_args)}
-                            className="v-chip group flex items-center gap-2 px-3 py-1.5 font-mono text-[11.5px]"
+                            className="group inline-flex items-center gap-2 rounded-lg border border-[#222228] bg-[#16161a] px-3 py-1.5 font-mono text-[12px] text-[#d4d4d8] transition-colors hover:border-[#34343d] hover:bg-[#1b1b20]"
                           >
-                            <span className="v-dot" style={{ background: "#34d399" }} />
-                            <span className="font-semibold text-[#fafafa]">
-                              {ev.tool_name || "Tool"}
-                            </span>
-                            <span className="text-[#a1a1aa]">{ev.tool_args}</span>
+                            <FileCode2 className="h-3.5 w-3.5 text-[#71717a]" />
+                            <span className="text-[#71717a]">{ev.tool_name}</span>
+                            <span className="text-[#f4f4f5]">{ev.tool_args}</span>
                             <span className="text-[#34d399]">+24</span>
                             <span className="text-[#f87171]">−3</span>
-                            <span className="ml-1 text-[10px] text-[#71717a] group-hover:text-[#fafafa]">
-                              [滑出 Diff 抽屉 →]
-                            </span>
                           </button>
 
                           <button
                             onClick={() =>
                               setExpandedTools((p) => ({ ...p, [ev.id]: !isExpanded }))
                             }
-                            className="font-mono text-[10.5px] text-[#71717a] hover:text-[#fafafa]"
+                            className="text-[11.5px] text-[#52525b] hover:text-[#a1a1aa]"
                           >
-                            {isExpanded ? "收起输出" : `${ev.duration_ms || 42}ms · 展开内联`}
+                            {isExpanded ? "Hide" : "Preview"}
                           </button>
                         </div>
 
                         {isExpanded && (
-                          <pre className="v-card overflow-x-auto p-3 font-mono text-[11px] leading-relaxed text-[#a1a1aa]">
+                          <pre className="overflow-x-auto rounded-lg border border-[#1f1f24] bg-[#0c0c0e] p-3 font-mono text-[11.5px] leading-relaxed text-[#a1a1aa]">
                             {ev.content}
                           </pre>
                         )}
@@ -1002,19 +800,13 @@ export function App() {
                     );
                   }
 
-                  // Assistant response
+                  // 4. Assistant Response: Clean left-aligned prose
                   return (
-                    <div key={ev.id} className="px-1 py-1">
-                      <div className="mb-1.5 flex items-center gap-2 font-mono text-[11px] text-[#71717a]">
-                        <span className="font-semibold text-[#fafafa]">
-                          {activeSession.model}
-                        </span>
-                        <span>·</span>
-                        <span>{ev.timestamp}</span>
-                      </div>
-                      <div className="whitespace-pre-line text-[13.5px] leading-relaxed text-[#e4e4e7]">
-                        {ev.content}
-                      </div>
+                    <div
+                      key={ev.id}
+                      className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[#e4e4e7]"
+                    >
+                      {ev.content}
                     </div>
                   );
                 })}
@@ -1023,74 +815,30 @@ export function App() {
             </div>
 
             {/* ===============================================================
-                4. CENTERED MONOCHROME COMPOSER DOCK
+                4. AUTHENTIC COMPOSER DOCK (Rounded Surface + Circular Submit Disc)
                =============================================================== */}
-            <div className="w-full px-6 pb-5 pt-2">
-              <div className="mx-auto max-w-[720px]">
-                {/* Slash command popup if typing '/' */}
+            <div className="w-full px-6 pb-5 pt-1">
+              <div className="mx-auto max-w-[680px]">
                 {slashFilter !== null && (
-                  <div className="v-card mb-2 overflow-hidden p-1.5">
-                    <div className="px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-[#71717a]">
-                      Velo Native Skills
-                    </div>
+                  <div className="mb-2 overflow-hidden rounded-xl border border-[#27272e] bg-[#16161a] p-1.5 shadow-xl">
                     {SLASH_SKILLS.filter((s) =>
                       s.cmd.toLowerCase().includes(slashFilter)
                     ).map((skill) => (
                       <button
                         key={skill.cmd}
                         onClick={() => handleSendPrompt(`${skill.cmd} `)}
-                        className="flex w-full items-center justify-between rounded px-2.5 py-1.5 text-left text-[12px] hover:bg-[#18181c]"
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left text-[12.5px] hover:bg-[#222228]"
                       >
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono font-semibold text-[#fafafa]">
-                            {skill.cmd}
-                          </span>
-                          <span className="text-[#a1a1aa]">{skill.label}</span>
-                        </div>
-                        <span className="font-mono text-[11px] text-[#71717a]">
-                          {skill.desc}
+                        <span className="font-mono font-medium text-[#f4f4f5]">
+                          {skill.cmd}
                         </span>
+                        <span className="text-[12px] text-[#71717a]">{skill.desc}</span>
                       </button>
                     ))}
                   </div>
                 )}
 
-                <div className="v-composer p-3 transition-all">
-                  {/* Context File Chips */}
-                  <div className="mb-2 flex flex-wrap items-center gap-1.5">
-                    {attachedFiles.map((file) => (
-                      <span
-                        key={file}
-                        onClick={() => openDiffForFile(file)}
-                        className="v-chip flex cursor-pointer items-center gap-1.5 px-2 py-0.5 font-mono text-[11px] text-[#a1a1aa] hover:text-[#fafafa]"
-                      >
-                        <span>@{file.split("/").slice(-2).join("/")}</span>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setAttachedFiles((prev) => prev.filter((f) => f !== file));
-                          }}
-                          className="text-[#71717a] hover:text-[#fafafa]"
-                        >
-                          ×
-                        </button>
-                      </span>
-                    ))}
-                    <button
-                      onClick={() => handleSendPrompt("/handoff")}
-                      className="v-chip px-2 py-0.5 font-mono text-[11px] text-[#71717a] hover:text-[#fafafa]"
-                    >
-                      /handoff
-                    </button>
-                    <button
-                      onClick={() => handleSendPrompt("/advisor")}
-                      className="v-chip px-2 py-0.5 font-mono text-[11px] text-[#71717a] hover:text-[#fafafa]"
-                    >
-                      /advisor
-                    </button>
-                  </div>
-
-                  {/* Textarea */}
+                <div className="rounded-[18px] border border-[#27272e] bg-[#16161a] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[#3f3f46]">
                   <textarea
                     rows={2}
                     value={prompt}
@@ -1101,34 +849,47 @@ export function App() {
                         handleSendPrompt();
                       }
                     }}
-                    placeholder={`向 ${activeSession.model} (${activeSession.branch_name}) 发送指令，输入 / 调用技能...`}
-                    className="w-full resize-none bg-transparent text-[13px] leading-relaxed text-[#fafafa] placeholder-[#52525b] focus:outline-none"
+                    placeholder={`Prompt ${activeSession.model_short}... (type / for commands)`}
+                    className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[#f4f4f5] placeholder-[#52525b] focus:outline-none"
                   />
 
-                  {/* Bottom Composer Bar */}
-                  <div className="mt-2 flex items-center justify-between border-t border-[#1f1f24] pt-2">
-                    <div className="flex items-center gap-3 font-mono text-[11px] text-[#71717a]">
-                      <span className="flex items-center gap-1.5 text-[#a1a1aa]">
-                        <span className="v-dot" style={{ background: "#34d399" }} />
-                        {activeSession.model}
-                      </span>
-                      <span>·</span>
-                      <span>{activeSession.approval_mode}</span>
-                      <span>·</span>
-                      <span title="Context window usage">
-                        {tokenPercent}% ({Math.round(activeSession.tokens_used / 1000)}k / 200k)
-                      </span>
-                    </div>
-
-                    <div className="flex items-center gap-2">
+                  {/* Composer Bottom Toolbar */}
+                  <div className="mt-1.5 flex items-center justify-between">
+                    <div className="flex items-center gap-1.5">
                       <button
-                        onClick={() => handleSendPrompt()}
-                        className="v-primary-btn flex items-center gap-1.5 px-3 py-1 text-[11.5px]"
+                        onClick={() => setActiveModal("command")}
+                        className="flex items-center gap-1 rounded-full bg-[#202026] px-2.5 py-1 text-[11.5px] font-medium text-[#d4d4d8] transition-colors hover:bg-[#27272f]"
                       >
-                        <span>Send</span>
-                        <span className="font-mono text-[10px] opacity-70">↵</span>
+                        <span>{activeSession.model}</span>
+                        <ChevronDown className="h-3 w-3 text-[#71717a]" />
+                      </button>
+
+                      <span className="rounded-full px-2.5 py-1 text-[11.5px] text-[#71717a]">
+                        {activeSession.approval_mode === "auto_edit"
+                          ? "Auto-edit"
+                          : "Ask permissions"}
+                      </span>
+
+                      <button
+                        onClick={() => handleSendPrompt("/handoff")}
+                        className="rounded-full px-2 py-1 font-mono text-[11px] text-[#71717a] hover:bg-[#202026] hover:text-[#d4d4d8]"
+                      >
+                        /handoff
                       </button>
                     </div>
+
+                    {/* Signature Circular Submit Disc (Paseo / Claude Code / Codex) */}
+                    <button
+                      onClick={() => handleSendPrompt()}
+                      disabled={!prompt.trim()}
+                      className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
+                        prompt.trim()
+                          ? "bg-[#f4f4f5] text-[#09090b] hover:opacity-90 cursor-pointer"
+                          : "bg-[#27272e] text-[#52525b] cursor-default"
+                      }`}
+                    >
+                      <ArrowUp className="h-4 w-4 stroke-[2.25]" />
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1139,62 +900,59 @@ export function App() {
               5. ON-DEMAND SLIDE-OVER DIFF & TERMINAL DRAWER (Right Side)
              ================================================================= */}
           <aside
-            className={`v-drawer z-20 flex flex-col overflow-hidden transition-all duration-200 ease-out ${
-              drawerOpen ? "w-[460px] opacity-100" : "w-0 border-l-0 opacity-0"
+            className={`flex flex-col overflow-hidden bg-[#0c0c0e] border-l border-[#1f1f23] transition-all duration-200 ease-out ${
+              drawerOpen ? "w-[440px] opacity-100" : "w-0 border-l-0 opacity-0"
             }`}
           >
-            {/* Drawer Header */}
-            <div className="flex h-[42px] shrink-0 items-center justify-between border-b border-[#222226] px-3.5">
-              <div className="flex items-center gap-1.5">
+            <div className="flex h-[42px] shrink-0 items-center justify-between border-b border-[#1f1f23] px-3.5">
+              <div className="flex items-center gap-1">
                 <button
                   onClick={() => setDrawerTab("diff")}
-                  className={`v-chip px-2.5 py-1 font-mono text-[11px] ${
+                  className={`rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
                     drawerTab === "diff"
-                      ? "border-[#fafafa] text-[#fafafa]"
-                      : "border-transparent text-[#71717a]"
+                      ? "bg-[#1f1f25] text-[#f4f4f5]"
+                      : "text-[#71717a] hover:text-[#a1a1aa]"
                   }`}
                 >
-                  Git Diff ({DEMO_DIFF_FILES.length})
+                  Changes ({DEMO_DIFF_FILES.length})
                 </button>
                 <button
                   onClick={() => setDrawerTab("terminal")}
-                  className={`v-chip px-2.5 py-1 font-mono text-[11px] ${
+                  className={`rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
                     drawerTab === "terminal"
-                      ? "border-[#fafafa] text-[#fafafa]"
-                      : "border-transparent text-[#71717a]"
+                      ? "bg-[#1f1f25] text-[#f4f4f5]"
+                      : "text-[#71717a] hover:text-[#a1a1aa]"
                   }`}
                 >
-                  Worktree PTY
+                  Terminal
                 </button>
               </div>
 
               <button
                 onClick={() => setDrawerOpen(false)}
-                title="Close Drawer (Esc)"
-                className="v-chip flex items-center gap-1 px-2 py-1 font-mono text-[11px] text-[#a1a1aa] hover:text-[#fafafa]"
+                title="Close (Esc)"
+                className="flex h-6 w-6 items-center justify-center rounded-md text-[#71717a] hover:bg-[#18181c] hover:text-[#f4f4f5]"
               >
-                <span>收起</span>
-                <X className="h-3 w-3" />
+                <X className="h-3.5 w-3.5" />
               </button>
             </div>
 
             {drawerTab === "diff" ? (
               <div className="flex flex-1 flex-col overflow-hidden">
-                {/* Modified File Selector Pills */}
-                <div className="flex flex-wrap gap-1.5 border-b border-[#1f1f24] p-2.5">
+                <div className="flex flex-wrap gap-1 border-b border-[#18181c] p-2.5">
                   {DEMO_DIFF_FILES.map((file) => {
                     const active = file.path === currentDiffFile.path;
                     return (
                       <button
                         key={file.path}
                         onClick={() => setSelectedDiffPath(file.path)}
-                        className={`v-chip flex items-center gap-1.5 px-2.5 py-1 font-mono text-[11px] ${
+                        className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11px] transition-colors ${
                           active
-                            ? "border-[#fafafa] text-[#fafafa]"
-                            : "text-[#71717a] hover:text-[#a1a1aa]"
+                            ? "bg-[#1f1f25] text-[#f4f4f5]"
+                            : "text-[#71717a] hover:bg-[#16161a] hover:text-[#a1a1aa]"
                         }`}
                       >
-                        <span>{file.path.split("/").slice(-2).join("/")}</span>
+                        <span>{file.path.split("/").pop()}</span>
                         <span className="text-[#34d399]">+{file.additions}</span>
                         <span className="text-[#f87171]">−{file.deletions}</span>
                       </button>
@@ -1202,9 +960,8 @@ export function App() {
                   })}
                 </div>
 
-                {/* Selected File Diff Header */}
-                <div className="flex items-center justify-between border-b border-[#18181c] bg-[#0c0c0e] px-3.5 py-2 font-mono text-[11px]">
-                  <span className="truncate text-[#e4e4e7]">{currentDiffFile.path}</span>
+                <div className="flex items-center justify-between border-b border-[#18181c] px-3.5 py-2 font-mono text-[11px] text-[#71717a]">
+                  <span className="truncate">{currentDiffFile.path}</span>
                   <button
                     onClick={() =>
                       copyText(
@@ -1212,23 +969,16 @@ export function App() {
                         currentDiffFile.hunks.map((h) => h.content).join("\n")
                       )
                     }
-                    className="flex items-center gap-1 text-[#71717a] hover:text-[#fafafa]"
+                    className="flex items-center gap-1 hover:text-[#f4f4f5]"
                   >
                     {copiedKey === currentDiffFile.path ? (
-                      <>
-                        <Check className="h-3 w-3 text-[#34d399]" />
-                        <span>Copied</span>
-                      </>
+                      <Check className="h-3 w-3 text-[#34d399]" />
                     ) : (
-                      <>
-                        <Copy className="h-3 w-3" />
-                        <span>Copy Patch</span>
-                      </>
+                      <Copy className="h-3 w-3" />
                     )}
                   </button>
                 </div>
 
-                {/* Diff Hunks (Pure Monochrome + Semantic Green/Red Lines Only) */}
                 <div className="flex-1 overflow-y-auto py-2 font-mono text-[11.5px] leading-[1.65]">
                   {currentDiffFile.hunks.map((line, idx) => {
                     const rowClass =
@@ -1240,11 +990,8 @@ export function App() {
                     const sign =
                       line.type === "add" ? "+" : line.type === "del" ? "-" : " ";
                     return (
-                      <div
-                        key={idx}
-                        className={`flex px-3.5 py-0.5 ${rowClass}`}
-                      >
-                        <span className="w-8 shrink-0 select-none text-right pr-3 opacity-40">
+                      <div key={idx} className={`flex px-3.5 py-0.5 ${rowClass}`}>
+                        <span className="w-8 shrink-0 select-none pr-3 text-right opacity-40">
                           {line.newLine ?? line.oldLine ?? ""}
                         </span>
                         <span className="w-4 shrink-0 select-none">{sign}</span>
@@ -1255,18 +1002,13 @@ export function App() {
                 </div>
               </div>
             ) : (
-              /* Worktree Native PTY Terminal Tab */
-              <div className="flex flex-1 flex-col overflow-hidden bg-[#09090b] p-3.5 font-mono text-[11.5px]">
-                <div className="mb-2 flex items-center justify-between border-b border-[#18181c] pb-2 text-[11px] text-[#71717a]">
-                  <span>zsh · {activeSession.worktree_path}</span>
-                  <span className="text-[#34d399]">● PTY Active</span>
-                </div>
+              <div className="flex flex-1 flex-col overflow-hidden p-3.5 font-mono text-[11.5px]">
                 <div className="flex-1 space-y-1.5 overflow-y-auto text-[#d4d4d8]">
                   {termLines.map((line, i) => (
                     <div
                       key={i}
                       className={
-                        line.startsWith("$") ? "font-semibold text-[#fafafa]" : "text-[#a1a1aa]"
+                        line.startsWith("$") ? "font-medium text-[#f4f4f5]" : "text-[#71717a]"
                       }
                     >
                       {line}
@@ -1275,14 +1017,14 @@ export function App() {
                 </div>
                 <form
                   onSubmit={handleRunTermCommand}
-                  className="mt-2 flex items-center gap-2 border-t border-[#222226] pt-2.5"
+                  className="mt-2 flex items-center gap-2 border-t border-[#1f1f23] pt-2.5"
                 >
                   <span className="text-[#71717a]">$</span>
                   <input
                     value={termInput}
                     onChange={(e) => setTermInput(e.target.value)}
-                    placeholder="cargo test / git status..."
-                    className="flex-1 bg-transparent text-[#fafafa] placeholder-[#52525b] focus:outline-none"
+                    placeholder="Run command in worktree..."
+                    className="flex-1 bg-transparent text-[#f4f4f5] placeholder-[#52525b] focus:outline-none"
                   />
                 </form>
               </div>
@@ -1292,44 +1034,44 @@ export function App() {
       </div>
 
       {/* =====================================================================
-          6. MODALS (New Isolated Worktree / New Repo / Command Palette / Mobile Relay QR)
+          6. MODALS
          ===================================================================== */}
       {activeModal && (
         <div
           onClick={() => setActiveModal(null)}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs"
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="v-card w-full max-w-[460px] p-5"
+            className="w-full max-w-[420px] rounded-xl border border-[#27272e] bg-[#141417] p-5 shadow-2xl"
           >
             {activeModal === "new-worktree" && (
               <div>
-                <div className="mb-3 flex items-center justify-between">
-                  <h3 className="text-[14px] font-semibold text-[#fafafa]">
-                    New Isolated Worktree Thread
+                <div className="mb-4 flex items-center justify-between">
+                  <h3 className="text-[14px] font-semibold text-[#f4f4f5]">
+                    New thread
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
-                    className="text-[#71717a] hover:text-[#fafafa]"
+                    className="text-[#71717a] hover:text-[#f4f4f5]"
                   >
                     <X className="h-4 w-4" />
                   </button>
                 </div>
-                <div className="space-y-3 text-[12px]">
+                <div className="space-y-3 text-[12.5px]">
                   <div>
-                    <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
-                      所属项目 (Project Repository)
+                    <label className="mb-1 block text-[11.5px] text-[#a1a1aa]">
+                      Project
                     </label>
                     <div className="grid grid-cols-3 gap-1.5">
                       {repos.map((r) => (
                         <button
                           key={r.id}
                           onClick={() => setTargetRepoIdForNewWt(r.id)}
-                          className={`v-chip truncate px-2 py-1.5 font-mono text-[11px] ${
+                          className={`truncate rounded-lg border px-2.5 py-1.5 text-[12px] ${
                             targetRepoIdForNewWt === r.id
-                              ? "border-[#fafafa] text-[#fafafa]"
-                              : "text-[#71717a]"
+                              ? "border-[#f4f4f5] bg-[#1f1f25] text-[#f4f4f5]"
+                              : "border-[#27272e] text-[#71717a]"
                           }`}
                         >
                           {r.name}
@@ -1338,50 +1080,37 @@ export function App() {
                     </div>
                   </div>
                   <div>
-                    <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
-                      任务标题 (Thread Title — 第 1 行主标题)
+                    <label className="mb-1 block text-[11.5px] text-[#a1a1aa]">
+                      Task title
                     </label>
                     <input
                       value={newTaskDesc}
                       onChange={(e) => setNewTaskDesc(e.target.value)}
-                      className="v-card w-full px-3 py-2 text-[12px] text-[#fafafa] focus:outline-none"
+                      className="w-full rounded-lg border border-[#27272e] bg-[#0c0c0e] px-3 py-2 text-[12.5px] text-[#f4f4f5] focus:border-[#52525b] focus:outline-none"
                     />
                   </div>
                   <div>
-                    <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
-                      隔离 Git 分支名 (Worktree Branch — 第 2 行展示)
+                    <label className="mb-1 block text-[11.5px] text-[#a1a1aa]">
+                      Worktree branch
                     </label>
                     <input
                       value={newTaskName}
                       onChange={(e) => setNewTaskName(e.target.value)}
-                      className="v-card w-full px-3 py-2 font-mono text-[12px] text-[#fafafa] focus:outline-none"
+                      className="w-full rounded-lg border border-[#27272e] bg-[#0c0c0e] px-3 py-2 font-mono text-[12px] text-[#f4f4f5] focus:border-[#52525b] focus:outline-none"
                     />
-                  </div>
-                  <div className="grid grid-cols-3 gap-2">
-                    {(["claude", "codex", "gemini"] as AgentKind[]).map((k) => (
-                      <button
-                        key={k}
-                        onClick={() => setNewAgentKind(k)}
-                        className={`v-chip py-2 font-mono text-[11.5px] uppercase ${
-                          newAgentKind === k ? "border-[#fafafa] text-[#fafafa]" : "text-[#71717a]"
-                        }`}
-                      >
-                        {k}
-                      </button>
-                    ))}
                   </div>
                   <div className="flex justify-end gap-2 pt-2">
                     <button
                       onClick={() => setActiveModal(null)}
-                      className="v-chip px-3 py-1.5 text-[12px] text-[#a1a1aa]"
+                      className="rounded-lg px-3 py-1.5 text-[12.5px] text-[#a1a1aa] hover:bg-[#1f1f25]"
                     >
                       Cancel
                     </button>
                     <button
                       onClick={handleCreateWorktree}
-                      className="v-primary-btn px-4 py-1.5 text-[12px]"
+                      className="rounded-lg bg-[#f4f4f5] px-4 py-1.5 text-[12.5px] font-medium text-[#09090b] hover:opacity-90"
                     >
-                      Create Thread
+                      Start thread
                     </button>
                   </div>
                 </div>
@@ -1390,40 +1119,36 @@ export function App() {
 
             {activeModal === "new-repo" && (
               <div>
-                <div className="mb-3 flex items-center justify-between">
-                  <h3 className="text-[14px] font-semibold text-[#fafafa]">
-                    Add Local Git Project
+                <div className="mb-4 flex items-center justify-between">
+                  <h3 className="text-[14px] font-semibold text-[#f4f4f5]">
+                    Add project
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
-                    className="text-[#71717a] hover:text-[#fafafa]"
+                    className="text-[#71717a] hover:text-[#f4f4f5]"
                   >
                     <X className="h-4 w-4" />
                   </button>
                 </div>
-                <div className="space-y-3 text-[12px]">
-                  <div>
-                    <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
-                      Repository Local Path
-                    </label>
-                    <input
-                      value={newRepoPath}
-                      onChange={(e) => setNewRepoPath(e.target.value)}
-                      className="v-card w-full px-3 py-2 font-mono text-[12px] text-[#fafafa] focus:outline-none"
-                    />
-                  </div>
+                <div className="space-y-3 text-[12.5px]">
+                  <input
+                    value={newRepoPath}
+                    onChange={(e) => setNewRepoPath(e.target.value)}
+                    placeholder="/path/to/git/repo"
+                    className="w-full rounded-lg border border-[#27272e] bg-[#0c0c0e] px-3 py-2 font-mono text-[12px] text-[#f4f4f5] focus:outline-none"
+                  />
                   <div className="flex justify-end gap-2 pt-2">
                     <button
                       onClick={() => setActiveModal(null)}
-                      className="v-chip px-3 py-1.5 text-[12px] text-[#a1a1aa]"
+                      className="rounded-lg px-3 py-1.5 text-[12.5px] text-[#a1a1aa]"
                     >
                       Cancel
                     </button>
                     <button
                       onClick={handleCreateRepo}
-                      className="v-primary-btn px-4 py-1.5 text-[12px]"
+                      className="rounded-lg bg-[#f4f4f5] px-4 py-1.5 text-[12.5px] font-medium text-[#09090b]"
                     >
-                      Add Project
+                      Add
                     </button>
                   </div>
                 </div>
@@ -1432,93 +1157,58 @@ export function App() {
 
             {activeModal === "command" && (
               <div>
-                <div className="mb-3 flex items-center gap-2 border-b border-[#27272a] pb-2.5">
+                <div className="mb-3 flex items-center gap-2 border-b border-[#222228] pb-2.5">
                   <Search className="h-4 w-4 text-[#71717a]" />
                   <input
                     autoFocus
                     value={cmdQuery}
                     onChange={(e) => setCmdQuery(e.target.value)}
-                    placeholder="Switch thread, toggle sidebar (⌘B), toggle material A/B/C..."
-                    className="w-full bg-transparent text-[13px] text-[#fafafa] focus:outline-none"
+                    placeholder="Type a command or search threads..."
+                    className="w-full bg-transparent text-[13px] text-[#f4f4f5] focus:outline-none"
                   />
                 </div>
-                <div className="space-y-1 text-[12px]">
-                  <button
-                    onClick={() => {
-                      setVariant("a");
-                      setActiveModal(null);
-                    }}
-                    className="flex w-full items-center justify-between rounded px-2.5 py-2 hover:bg-[#18181c]"
-                  >
-                    <span>Switch Material → Version A (极简锐利 shadcn/Linear)</span>
-                    <span className="font-mono text-[10px] text-[#71717a]">Variant A</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setVariant("b");
-                      setActiveModal(null);
-                    }}
-                    className="flex w-full items-center justify-between rounded px-2.5 py-2 hover:bg-[#18181c]"
-                  >
-                    <span>Switch Material → Version B (微光毛玻璃 Beautiful/beUI)</span>
-                    <span className="font-mono text-[10px] text-[#71717a]">Variant B</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setVariant("c");
-                      setActiveModal(null);
-                    }}
-                    className="flex w-full items-center justify-between rounded px-2.5 py-2 hover:bg-[#18181c]"
-                  >
-                    <span>Switch Material → Version C (硬件立体 3D Rare UI)</span>
-                    <span className="font-mono text-[10px] text-[#71717a]">Variant C</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setSidebarCollapsed((c) => !c);
-                      setActiveModal(null);
-                    }}
-                    className="flex w-full items-center justify-between rounded px-2.5 py-2 hover:bg-[#18181c]"
-                  >
-                    <span>Toggle Left Project/Thread Sidebar</span>
-                    <span className="font-mono text-[10px] text-[#71717a]">⌘B</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setDrawerOpen((o) => !o);
-                      setActiveModal(null);
-                    }}
-                    className="flex w-full items-center justify-between rounded px-2.5 py-2 hover:bg-[#18181c]"
-                  >
-                    <span>Toggle On-Demand Diff / PTY Drawer</span>
-                    <span className="font-mono text-[10px] text-[#71717a]">⌘J</span>
-                  </button>
+                <div className="space-y-1 text-[12.5px]">
+                  {sessions.map((s) => (
+                    <button
+                      key={s.id}
+                      onClick={() => {
+                        setActiveId(s.id);
+                        setActiveModal(null);
+                      }}
+                      className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left hover:bg-[#1f1f25]"
+                    >
+                      <span className="truncate text-[#f4f4f5]">{s.title}</span>
+                      <span className="font-mono text-[11px] text-[#71717a]">
+                        {s.branch_name}
+                      </span>
+                    </button>
+                  ))}
                 </div>
               </div>
             )}
 
-            {(activeModal === "skills" || activeModal === "qr" || activeModal === "advisor") && (
+            {(activeModal === "skills" || activeModal === "qr") && (
               <div>
                 <div className="mb-3 flex items-center justify-between">
-                  <h3 className="font-mono text-[13px] font-semibold uppercase text-[#fafafa]">
-                    {activeModal === "qr" ? "Mobile E2EE Relay Pairing" : "Velo Slash Skills"}
+                  <h3 className="text-[13.5px] font-semibold text-[#f4f4f5]">
+                    {activeModal === "qr" ? "Mobile E2EE Pairing" : "Automations & Skills"}
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
-                    className="text-[#71717a] hover:text-[#fafafa]"
+                    className="text-[#71717a] hover:text-[#f4f4f5]"
                   >
                     <X className="h-4 w-4" />
                   </button>
                 </div>
                 {activeModal === "qr" ? (
                   <div className="space-y-2 font-mono text-[11.5px] text-[#a1a1aa]">
-                    <p>End-to-End Encrypted X25519 + ChaCha20-Poly1305 Tunnel:</p>
-                    <div className="v-card p-3 text-[#fafafa]">
+                    <p>X25519 + ChaCha20-Poly1305 E2EE Relay:</p>
+                    <div className="rounded-lg border border-[#27272e] bg-[#0c0c0e] p-3 text-[#f4f4f5]">
                       velo://pair?daemon=127.0.0.1:6767&fp=9F8B-441A-E2EE
                     </div>
                   </div>
                 ) : (
-                  <div className="space-y-1.5">
+                  <div className="space-y-1">
                     {SLASH_SKILLS.map((s) => (
                       <button
                         key={s.cmd}
@@ -1526,12 +1216,12 @@ export function App() {
                           setActiveModal(null);
                           handleSendPrompt(s.cmd);
                         }}
-                        className="flex w-full items-center justify-between rounded px-3 py-2 text-left hover:bg-[#18181c]"
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-[#1f1f25]"
                       >
-                        <span className="font-mono text-[12px] font-semibold text-[#fafafa]">
+                        <span className="font-mono text-[12px] font-medium text-[#f4f4f5]">
                           {s.cmd}
                         </span>
-                        <span className="text-[11.5px] text-[#a1a1aa]">{s.desc}</span>
+                        <span className="text-[12px] text-[#71717a]">{s.desc}</span>
                       </button>
                     ))}
                   </div>
