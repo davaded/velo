@@ -1,15 +1,17 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   Check,
   CheckCircle2,
   ChevronRight,
   Clock,
   FileCode2,
+  Loader2,
   ShieldAlert,
   Sparkles,
   Terminal,
   Wrench,
   X,
+  XCircle,
 } from "lucide-react";
 
 /**
@@ -21,60 +23,94 @@ export const BeautifulThinkingBlock: React.FC<{
   isStreaming?: boolean;
   defaultExpanded?: boolean;
 }> = ({ text, isStreaming = false, defaultExpanded = false }) => {
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [expanded, setExpanded] = useState(defaultExpanded || isStreaming);
+  const [elapsedSec, setElapsedSec] = useState<number>(0.4);
+
+  useEffect(() => {
+    if (isStreaming) {
+      setExpanded(true);
+    }
+  }, [isStreaming]);
+
+  useEffect(() => {
+    if (!isStreaming) return;
+    const started = Date.now();
+    const timer = setInterval(() => {
+      setElapsedSec(Number(((Date.now() - started) / 1000 + 0.4).toFixed(1)));
+    }, 100);
+    return () => clearInterval(timer);
+  }, [isStreaming]);
+
   const estimatedTokens = Math.max(24, Math.round(text.length * 1.3));
+  const previewLine =
+    text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop() || text;
 
   return (
     <div className="t-blur-swap my-1">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="group inline-flex items-center gap-2 px-2.5 py-1 rounded-[7px] text-[12px] border transition-all cursor-pointer rare-specular-pill"
+        className="group inline-flex items-center gap-2 px-2.5 py-1 rounded-[7px] text-[12px] border transition-all cursor-pointer rare-specular-pill max-w-full"
         style={{
           backgroundColor: expanded ? "var(--surface-2)" : "var(--surface-1)",
-          borderColor: expanded ? "var(--border-accent)" : "var(--border-subtle)",
+          borderColor: isStreaming
+            ? "var(--accent)"
+            : expanded
+            ? "var(--border-accent)"
+            : "var(--border-subtle)",
           color: "var(--fg-muted)",
         }}
       >
         <ChevronRight
-          className="w-3.5 h-3.5 transition-transform duration-200"
+          className="w-3.5 h-3.5 shrink-0 transition-transform duration-200"
           style={{
             transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
             color: "var(--fg-extra-muted)",
           }}
         />
-        <Sparkles
-          className="w-3.5 h-3.5 shrink-0"
-          style={{ color: "var(--accent-bright)" }}
-        />
+        {isStreaming ? (
+          <Loader2
+            className="w-3.5 h-3.5 shrink-0 animate-spin"
+            style={{ color: "var(--accent-bright)" }}
+          />
+        ) : (
+          <Sparkles
+            className="w-3.5 h-3.5 shrink-0"
+            style={{ color: "var(--accent-bright)" }}
+          />
+        )}
         <span
-          className={`font-medium ${isStreaming ? "beautiful-shimmer-text" : ""}`}
+          className={`font-medium shrink-0 ${isStreaming ? "beautiful-shimmer-text" : ""}`}
           style={!isStreaming ? { color: "var(--fg)" } : undefined}
         >
-          {isStreaming ? "Reasoning..." : "Thought process"}
+          {isStreaming ? "Thinking..." : `Thought for ${elapsedSec.toFixed(1)}s`}
         </span>
         <span
-          className="truncate max-w-[340px] text-[11.5px]"
+          className="truncate max-w-[320px] text-[11.5px]"
           style={{ color: "var(--fg-extra-muted)" }}
         >
-          {text}
+          {previewLine}
         </span>
         <span
           className="font-mono-code text-[10px] px-1.5 py-0.2 rounded-full ml-1 shrink-0 flex items-center gap-1"
           style={{
             backgroundColor: "var(--surface-0)",
-            color: "var(--fg-extra-muted)",
+            color: isStreaming ? "var(--accent-bright)" : "var(--fg-extra-muted)",
           }}
         >
           <Clock className="w-2.5 h-2.5" />
-          1.4s · {estimatedTokens} tok
+          {elapsedSec.toFixed(1)}s · {estimatedTokens} tok
         </span>
       </button>
 
       <div className={`t-grid-collapse ${expanded ? "t-expanded" : ""}`}>
         <div className="t-grid-collapse-inner">
           <div
-            className="paseo-indent-rail ml-3 mt-1.5 py-1.5 px-3 rounded-r-[7px] text-[12.5px] leading-relaxed"
+            className="paseo-indent-rail ml-3 mt-1.5 py-1.5 px-3 rounded-r-[7px] text-[12.5px] leading-relaxed whitespace-pre-wrap"
             style={{
               backgroundColor: "rgba(255,255,255,0.015)",
               color: "var(--fg-muted)",
@@ -105,9 +141,12 @@ export const BeautifulToolCallCard: React.FC<{
       ? (input as Record<string, unknown>)
       : {};
   const targetFile =
+    (inputObj.file_path as string) ||
+    (inputObj.target as string) ||
     (inputObj.file as string) ||
     (inputObj.path as string) ||
     (inputObj.command as string) ||
+    (inputObj.pattern as string) ||
     null;
 
   const isEdit =
@@ -183,9 +222,9 @@ export const BeautifulToolCallCard: React.FC<{
             </button>
           )}
 
-          {output && (
+          {output !== undefined ? (
             <span
-              className="ml-1 flex items-center gap-1 text-[10.5px] font-mono-code px-1.5 py-0.5 rounded-full"
+              className="ml-1 flex items-center gap-1 text-[10.5px] font-mono-code px-1.5 py-0.5 rounded-full shrink-0"
               style={{
                 backgroundColor: isError
                   ? "rgba(216, 132, 123, 0.14)"
@@ -193,8 +232,23 @@ export const BeautifulToolCallCard: React.FC<{
                 color: isError ? "var(--status-danger)" : "var(--status-success)",
               }}
             >
-              <CheckCircle2 className="w-3 h-3" />
+              {isError ? (
+                <XCircle className="w-3 h-3" />
+              ) : (
+                <CheckCircle2 className="w-3 h-3" />
+              )}
               {isError ? "failed" : "ok"}
+            </span>
+          ) : (
+            <span
+              className="ml-1 flex items-center gap-1 text-[10.5px] font-mono-code px-1.5 py-0.5 rounded-full shrink-0"
+              style={{
+                backgroundColor: "rgba(139, 92, 246, 0.14)",
+                color: "var(--accent-bright)",
+              }}
+            >
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span className="beautiful-shimmer-text">running...</span>
             </span>
           )}
         </div>

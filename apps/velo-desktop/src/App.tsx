@@ -1085,6 +1085,16 @@ export function App() {
         s.id === activeSession.id ? { ...s, status: "idle", updated_at: "now" } : s
       )
     );
+    // Finalize any in-flight tool_call spinner so it doesn't stay spinning after stopping
+    setEventsBySession((prev) => {
+      const list = prev[activeSession.id] || [];
+      const updated = list.map((item) =>
+        item.kind === "tool_call" && item.tool_output === undefined
+          ? { ...item, tool_output: "(interrupted by user)", content: "(interrupted by user)" }
+          : item
+      );
+      return { ...prev, [activeSession.id]: updated };
+    });
     try {
       await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/stop`, {
         method: "POST",
@@ -1095,7 +1105,7 @@ export function App() {
     }
   };
 
-  // User Message Actions: Edit & Resend, Retry/Rerun, Delete Turn (Works whether running or stopped)
+  // User Message Actions: Click-to-edit & Resend, Retry from turn (Cursor / Claude Desktop / Codex standard)
   const handleStartEditMessage = (ev: AgentEvent) => {
     setEditingEventId(ev.id);
     setEditingText(ev.content);
@@ -1135,20 +1145,6 @@ export function App() {
       [activeSession.id]: truncated,
     }));
     await handleSendPrompt(ev.content, truncated);
-  };
-
-  const handleDeleteUserMessage = (ev: AgentEvent) => {
-    setEventsBySession((prev) => {
-      const list = prev[activeSession.id] || [];
-      const idx = list.findIndex((item) => item.id === ev.id);
-      if (idx === -1) return prev;
-      let endIdx = idx + 1;
-      while (endIdx < list.length && list[endIdx].kind !== "user") {
-        endIdx++;
-      }
-      const next = [...list.slice(0, idx), ...list.slice(endIdx)];
-      return { ...prev, [activeSession.id]: next };
-    });
   };
 
   // Delete / archive a thread from sidebar and daemon
@@ -2038,181 +2034,238 @@ export function App() {
                       break;
                     }
                   }
+                  const lastUserEv = lastUserIdx >= 0 ? activeEvents[lastUserIdx] : null;
 
-                  return activeEvents.map((ev, idx) => {
-                    const isLastEvent = idx === activeEvents.length - 1;
+                  return (
+                    <>
+                      {activeEvents.map((ev, idx) => {
+                        const isLastEvent = idx === activeEvents.length - 1;
 
-                    // 1. User Message: Right-aligned soft bubble + Inline Edit / Retry / Copy / Delete controls
-                    if (ev.kind === "user") {
-                      const isEditing = editingEventId === ev.id;
-                      const isLatestUser = idx === lastUserIdx;
+                        // 1. User Message: Cursor / Claude Desktop style (click bubble to edit, minimal hover icons only when idle, zero delete button)
+                        if (ev.kind === "user") {
+                          const isEditing = editingEventId === ev.id;
 
-                      if (isEditing) {
-                        return (
-                          <div key={ev.id} className="flex justify-end">
-                            <div className="w-full max-w-[86%] rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-3.5 shadow-lg">
-                              <textarea
-                                rows={3}
-                                autoFocus
-                                value={editingText}
-                                onChange={(e) => setEditingText(e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" && !e.shiftKey) {
-                                    e.preventDefault();
-                                    handleSaveAndResendEdit(ev);
-                                  } else if (e.key === "Escape") {
-                                    setEditingEventId(null);
-                                    setEditingText("");
+                          if (isEditing) {
+                            return (
+                              <div key={ev.id} className="flex justify-end">
+                                <div className="w-full max-w-[86%] rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-3.5 shadow-lg">
+                                  <textarea
+                                    rows={3}
+                                    autoFocus
+                                    value={editingText}
+                                    onChange={(e) => setEditingText(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter" && !e.shiftKey) {
+                                        e.preventDefault();
+                                        handleSaveAndResendEdit(ev);
+                                      } else if (e.key === "Escape") {
+                                        setEditingEventId(null);
+                                        setEditingText("");
+                                      }
+                                    }}
+                                    className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] focus:outline-none"
+                                  />
+                                  <div className="mt-2 flex items-center justify-between border-t border-[var(--v-border-subtle)] pt-2">
+                                    <span className="text-[11px] text-[var(--v-fg-muted)]">
+                                      Enter 重新发送 · Esc 取消
+                                    </span>
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        onClick={() => {
+                                          setEditingEventId(null);
+                                          setEditingText("");
+                                        }}
+                                        className="rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                      >
+                                        取消
+                                      </button>
+                                      <button
+                                        onClick={() => handleSaveAndResendEdit(ev)}
+                                        disabled={!editingText.trim()}
+                                        className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] transition-opacity hover:opacity-90 disabled:opacity-40"
+                                      >
+                                        重新发送
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          return (
+                            <div key={ev.id} className="group flex flex-col items-end gap-1">
+                              <div
+                                onClick={() => {
+                                  if (activeSession.status !== "running") {
+                                    handleStartEditMessage(ev);
                                   }
                                 }}
-                                className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] focus:outline-none"
-                              />
-                              <div className="mt-2 flex items-center justify-end gap-2 border-t border-[var(--v-border-subtle)] pt-2">
+                                title={
+                                  activeSession.status !== "running"
+                                    ? "点击可直接编辑并重新发送"
+                                    : undefined
+                                }
+                                className={`max-w-[82%] whitespace-pre-wrap rounded-[18px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] transition-colors ${
+                                  activeSession.status !== "running"
+                                    ? "cursor-pointer hover:ring-1 hover:ring-[var(--v-border-strong)]"
+                                    : ""
+                                }`}
+                              >
+                                {ev.content}
+                              </div>
+                              {/* Minimal Hover-Only Icon Actions (Hidden during running) */}
+                              {activeSession.status !== "running" && (
+                                <div className="flex items-center gap-1 pr-1 text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100">
+                                  <button
+                                    onClick={() => copyText(ev.id, ev.content)}
+                                    title="复制"
+                                    className="rounded-md p-1 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                  >
+                                    {copiedKey === ev.id ? (
+                                      <Check className="h-3.5 w-3.5 text-[#34d399]" />
+                                    ) : (
+                                      <Copy className="h-3.5 w-3.5" />
+                                    )}
+                                  </button>
+                                  <button
+                                    onClick={() => handleStartEditMessage(ev)}
+                                    title="编辑消息"
+                                    className="rounded-md p-1 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                  >
+                                    <SquarePen className="h-3.5 w-3.5" />
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        }
+
+                        // 2. Thinking Trace: Using BeautifulThinkingBlock component
+                        if (ev.kind === "thinking") {
+                          const isStreamingThinking =
+                            activeSession.status === "running" && isLastEvent;
+                          return (
+                            <BeautifulThinkingBlock
+                              key={ev.id}
+                              text={ev.content}
+                              isStreaming={isStreamingThinking}
+                              defaultExpanded={isStreamingThinking}
+                            />
+                          );
+                        }
+
+                        // 3. Tool Call: Using BeautifulToolCallCard component (with live running spinner -> ok badge)
+                        if (ev.kind === "tool_call") {
+                          const toolInput =
+                            ev.tool_input ??
+                            (ev.tool_args ? { target: ev.tool_args } : ev.content);
+                          const toolOutput =
+                            ev.tool_output ??
+                            (ev.tool_input === undefined ? ev.content : undefined);
+                          return (
+                            <BeautifulToolCallCard
+                              key={ev.id}
+                              toolName={ev.tool_name || "Tool"}
+                              input={toolInput}
+                              output={toolOutput}
+                              isError={ev.tool_is_error}
+                              onOpenDiffTab={() => openDiffForFile(ev.tool_args)}
+                            />
+                          );
+                        }
+
+                        // 4. Assistant Response: Clean left-aligned prose + hover Copy & Retry + Worktree Diff Summary Card
+                        return (
+                          <div key={ev.id} className="group flex flex-col items-start gap-2">
+                            <div className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[var(--v-fg-body)]">
+                              {ev.content}
+                            </div>
+
+                            {/* Worktree Verification & Diff Card when files were modified */}
+                            {isLastEvent && activeDiffFiles.length > 0 && (
+                              <div className="mt-1 flex w-full items-center justify-between gap-3 rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-3.5 py-2.5">
+                                <div className="flex min-w-0 items-center gap-2.5">
+                                  <FileCode2 className="h-4 w-4 shrink-0 text-[#34d399]" />
+                                  <div className="min-w-0">
+                                    <div className="truncate text-[12px] font-medium text-[var(--v-fg-primary)]">
+                                      Worktree Changes Ready ({activeDiffFiles.length} files modified)
+                                    </div>
+                                    <div className="truncate font-mono text-[11px] text-[var(--v-fg-muted)]">
+                                      {activeDiffFiles.map((f) => f.path.split("/").pop()).join(", ")}
+                                    </div>
+                                  </div>
+                                </div>
                                 <button
-                                  onClick={() => {
-                                    setEditingEventId(null);
-                                    setEditingText("");
-                                  }}
-                                  className="rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                  onClick={() => openDiffForFile()}
+                                  className="shrink-0 rounded-lg bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
                                 >
-                                  取消
-                                </button>
-                                <button
-                                  onClick={() => handleSaveAndResendEdit(ev)}
-                                  disabled={!editingText.trim()}
-                                  className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] transition-opacity hover:opacity-90 disabled:opacity-40"
-                                >
-                                  保存并重新发送
+                                  Review Diff →
                                 </button>
                               </div>
-                            </div>
+                            )}
+
+                            {/* Hover-only Copy & Regenerate on Assistant Reply */}
+                            {activeSession.status !== "running" && (
+                              <div className="flex items-center gap-1 text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100">
+                                <button
+                                  onClick={() => copyText(ev.id, ev.content)}
+                                  title="复制回复"
+                                  className="rounded-md p-1 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                >
+                                  {copiedKey === ev.id ? (
+                                    <Check className="h-3.5 w-3.5 text-[#34d399]" />
+                                  ) : (
+                                    <Copy className="h-3.5 w-3.5" />
+                                  )}
+                                </button>
+                                {lastUserEv && (
+                                  <button
+                                    onClick={() => handleRetryUserMessage(lastUserEv)}
+                                    title="重新生成回复"
+                                    className="rounded-md p-1 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                  >
+                                    <RefreshCw className="h-3.5 w-3.5" />
+                                  </button>
+                                )}
+                              </div>
+                            )}
                           </div>
                         );
-                      }
+                      })}
 
-                      return (
-                        <div key={ev.id} className="group flex flex-col items-end gap-1">
-                          <div className="max-w-[82%] whitespace-pre-wrap rounded-[18px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-relaxed text-[var(--v-fg-primary)]">
-                            {ev.content}
-                          </div>
-                          <div
-                            className={`flex items-center gap-1 pr-1 text-[11px] text-[var(--v-fg-muted)] transition-opacity ${
-                              isLatestUser
-                                ? "opacity-90 group-hover:opacity-100"
-                                : "opacity-0 group-hover:opacity-100"
-                            }`}
-                          >
+                      {/* Live Inline Reasoning Indicator when running after a user message or completed tool call */}
+                      {activeSession.status === "running" &&
+                        activeEvents[activeEvents.length - 1]?.kind !== "thinking" && (
+                          <BeautifulThinkingBlock
+                            text={`正在使用 ${
+                              modelCatalog.find((m) => m.id === activeSession.model)?.label ||
+                              activeSession.model_short
+                            } 思考并规划下一步操作...`}
+                            isStreaming={true}
+                            defaultExpanded={false}
+                          />
+                        )}
+
+                      {/* Interrupted / Stopped Inline Bar (Only shown when stopped before final assistant reply) */}
+                      {activeSession.status !== "running" &&
+                        activeEvents.length > 0 &&
+                        activeEvents[activeEvents.length - 1]?.kind !== "assistant" &&
+                        lastUserEv && (
+                          <div className="flex items-center justify-between rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3.5 py-2 text-[12px] text-[var(--v-fg-muted)]">
+                            <span>已手动停止当前执行 · 点击上方消息可直接修改重发</span>
                             <button
-                              onClick={() => handleStartEditMessage(ev)}
-                              title="编辑并重新发送"
-                              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                            >
-                              <SquarePen className="h-3 w-3" />
-                              <span>编辑</span>
-                            </button>
-                            <button
-                              onClick={() => handleRetryUserMessage(ev)}
-                              title="基于此消息重新运行"
-                              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                              onClick={() => handleRetryUserMessage(lastUserEv)}
+                              className="flex items-center gap-1.5 rounded-lg bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
                             >
                               <RefreshCw className="h-3 w-3" />
                               <span>重试</span>
                             </button>
-                            <button
-                              onClick={() => copyText(ev.id, ev.content)}
-                              title="复制消息内容"
-                              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                            >
-                              {copiedKey === ev.id ? (
-                                <Check className="h-3 w-3 text-[#34d399]" />
-                              ) : (
-                                <Copy className="h-3 w-3" />
-                              )}
-                              <span>{copiedKey === ev.id ? "已复制" : "复制"}</span>
-                            </button>
-                            <button
-                              onClick={() => handleDeleteUserMessage(ev)}
-                              title="删除此轮对话"
-                              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[#f87171]"
-                            >
-                              <X className="h-3 w-3" />
-                              <span>删除</span>
-                            </button>
                           </div>
-                        </div>
-                      );
-                    }
-
-                    // 2. Thinking Trace: Using our designed BeautifulThinkingBlock component
-                    if (ev.kind === "thinking") {
-                      const isStreamingThinking =
-                        activeSession.status === "running" && isLastEvent;
-                      return (
-                        <BeautifulThinkingBlock
-                          key={ev.id}
-                          text={ev.content}
-                          isStreaming={isStreamingThinking}
-                          defaultExpanded={isStreamingThinking}
-                        />
-                      );
-                    }
-
-                    // 3. Tool Call: Using our designed BeautifulToolCallCard component
-                    if (ev.kind === "tool_call") {
-                      const toolInput =
-                        ev.tool_input ??
-                        (ev.tool_args ? { target: ev.tool_args } : ev.content);
-                      const toolOutput =
-                        ev.tool_output ??
-                        (ev.tool_input === undefined ? ev.content : undefined);
-                      return (
-                        <BeautifulToolCallCard
-                          key={ev.id}
-                          toolName={ev.tool_name || "Tool"}
-                          input={toolInput}
-                          output={toolOutput}
-                          isError={ev.tool_is_error}
-                          onOpenDiffTab={() => openDiffForFile(ev.tool_args)}
-                        />
-                      );
-                    }
-
-                    // 4. Assistant Response: Clean left-aligned prose + copy action
-                    return (
-                      <div key={ev.id} className="group flex flex-col items-start gap-1">
-                        <div className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[var(--v-fg-body)]">
-                          {ev.content}
-                        </div>
-                        <div className="flex items-center gap-1 text-[11px] text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100">
-                          <button
-                            onClick={() => copyText(ev.id, ev.content)}
-                            className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                          >
-                            {copiedKey === ev.id ? (
-                              <Check className="h-3 w-3 text-[#34d399]" />
-                            ) : (
-                              <Copy className="h-3 w-3" />
-                            )}
-                            <span>{copiedKey === ev.id ? "已复制" : "复制"}</span>
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  });
+                        )}
+                    </>
+                  );
                 })()}
-
-                {/* Live Inline Reasoning Indicator when running after a user message or completed tool call */}
-                {activeSession.status === "running" &&
-                  activeEvents[activeEvents.length - 1]?.kind !== "thinking" && (
-                    <BeautifulThinkingBlock
-                      text={`正在使用 ${
-                        modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-                        activeSession.model_short
-                      } 思考并规划下一步操作...`}
-                      isStreaming={true}
-                      defaultExpanded={false}
-                    />
-                  )}
                 <div ref={streamEndRef} />
               </div>
             </div>
