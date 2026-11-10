@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info};
@@ -99,6 +99,29 @@ pub fn discover_augmented_path() -> String {
 }
 
 pub fn resolve_cli_binary(name: &str) -> Option<PathBuf> {
+    if name == "claude" {
+        if let Some(home) = dirs::home_dir() {
+            let cc_base = home.join("Library/Application Support/Claude/claude-code");
+            if let Ok(versions) = std::fs::read_dir(&cc_base) {
+                let mut ver_dirs: Vec<PathBuf> = versions
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .collect();
+                ver_dirs.sort();
+                ver_dirs.reverse();
+                for vdir in ver_dirs {
+                    if let Ok(hashes) = std::fs::read_dir(&vdir) {
+                        for h in hashes.flatten() {
+                            let bin = h.path().join("claude.app/Contents/MacOS/claude");
+                            if bin.is_file() {
+                                return Some(bin);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let path_str = discover_augmented_path();
     for dir in path_str.split(':') {
         if dir.is_empty() {
@@ -110,6 +133,29 @@ pub fn resolve_cli_binary(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Discovers active `CLAUDE_CODE_OAUTH_TOKEN` from the user's running Claude Desktop / Claude Code session
+/// when `claude` is invoked outside the Claude Desktop process tree.
+fn discover_claude_oauth_token() -> Option<String> {
+    if let Ok(tok) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        if !tok.trim().is_empty() {
+            return Some(tok);
+        }
+    }
+    let out = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "for p in $(pgrep -f 'claude.app/Contents/MacOS/claude' 2>/dev/null); do ps eww -p $p 2>/dev/null | tr ' ' '\\n' | grep '^CLAUDE_CODE_OAUTH_TOKEN=' | head -n 1 | cut -d= -f2-; done | head -n 1",
+        ])
+        .output()
+        .ok()?;
+    let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !tok.is_empty() {
+        Some(tok)
+    } else {
+        None
+    }
 }
 
 pub async fn detect_local_runtimes() -> Vec<LocalRuntimeInfo> {
@@ -250,7 +296,7 @@ impl AgentSpawner {
             effort.as_deref(),
         );
         cmd.current_dir(&worktree_path)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -295,25 +341,11 @@ impl AgentSpawner {
 
         let stdout = child.stdout.take().context("Failed to capture stdout")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
-        let mut stdin = child.stdin.take().context("Failed to capture stdin")?;
 
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
+        let (input_tx, _input_rx) = mpsc::unbounded_channel::<String>();
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
 
-        // Forward stdin writer
-        tokio::spawn(async move {
-            while let Some(line) = input_rx.recv().await {
-                if stdin.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-                if !line.ends_with('\n') {
-                    let _ = stdin.write_all(b"\n").await;
-                }
-                let _ = stdin.flush().await;
-            }
-        });
-
-        // Parse stdout lines (Claude stream-json or plain text fallback)
+        // Parse stdout lines (Claude stream-json or Codex --json)
         let tx_out = event_tx.clone();
         let provider_clone = provider.clone();
         tokio::spawn(async move {
@@ -325,12 +357,13 @@ impl AgentSpawner {
             }
         });
 
-        // Parse stderr lines
+        // Parse stderr lines (ignore benign stdin notice from codex)
         let tx_err = event_tx.clone();
         tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                if !line.trim().is_empty() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.contains("Reading additional input from stdin") {
                     let _ = tx_err.send(AgentEvent::PtyOutput {
                         session_id,
                         line: format!("[stderr] {}", line),
@@ -537,6 +570,9 @@ impl AgentSpawner {
             AgentProvider::Claude => {
                 let bin = resolve_cli_binary("claude").unwrap_or_else(|| PathBuf::from("claude"));
                 let mut c = Command::new(bin);
+                if let Some(tok) = discover_claude_oauth_token() {
+                    c.env("CLAUDE_CODE_OAUTH_TOKEN", tok);
+                }
                 c.args([
                     "-p",
                     prompt,
@@ -547,7 +583,12 @@ impl AgentSpawner {
                     "acceptEdits",
                 ]);
                 if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-                    c.args(["--model", m]);
+                    let cli_model = if m.starts_with("claude-fable") {
+                        "fable"
+                    } else {
+                        m
+                    };
+                    c.args(["--model", cli_model]);
                 }
                 if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
                     c.args(["--effort", eff]);

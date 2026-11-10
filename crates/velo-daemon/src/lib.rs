@@ -171,6 +171,8 @@ impl DaemonState {
             provision.branch,
             req.use_pty,
             req.parent_session_id,
+            req.model,
+            req.effort,
         )
         .await
     }
@@ -187,6 +189,8 @@ impl DaemonState {
         branch: String,
         use_pty: bool,
         parent_session_id: Option<Uuid>,
+        model: Option<String>,
+        effort: Option<String>,
     ) -> Result<SessionInfo> {
         let short_id = &session_id.to_string()[..8];
         let name = custom_name
@@ -219,12 +223,14 @@ impl DaemonState {
             guard.sessions.insert(session_id, session.clone());
         }
 
-        let handle = AgentSpawner::spawn_agent(
+        let handle = AgentSpawner::spawn_agent_with_options(
             session_id,
             provider,
             prompt,
             worktree_path,
             use_pty,
+            model,
+            effort,
             self.event_tx.clone(),
         )
         .await?;
@@ -886,6 +892,8 @@ async fn handoff_session_handler(
             source_session.branch,
             false,
             Some(source_session.id),
+            None,
+            None,
         )
         .await
     {
@@ -954,6 +962,8 @@ async fn advisor_session_handler(
             source_session.branch,
             false,
             Some(source_session.id),
+            None,
+            None,
         )
         .await
     {
@@ -1165,6 +1175,8 @@ async fn loop_handler(
                             branch.clone(),
                             false,
                             Some(current_session_id),
+                            None,
+                            None,
                         )
                         .await
                     {

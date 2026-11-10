@@ -455,7 +455,8 @@ export function App() {
               : raw;
 
           const evType = String(evObj.type ?? "");
-          const sid = String(evObj.session_id ?? activeId);
+          const sid = String(evObj.session_id ?? "");
+          if (!sid) return;
 
           if (evType === "status_changed") {
             const st = String(evObj.status ?? "");
@@ -477,6 +478,38 @@ export function App() {
             );
             if (st === "completed") {
               refreshSessionDiffAndFiles(sid);
+              fetch(`${daemonUrl}/api/sessions/${sid}/events`)
+                .then((r) => (r.ok ? r.json() : Promise.reject()))
+                .then((evList: Array<Record<string, unknown>>) => {
+                  if (!Array.isArray(evList)) return;
+                  const texts = evList
+                    .filter((e) => e.type === "message_delta" && typeof e.text === "string")
+                    .map((e) => String(e.text).trim())
+                    .filter(Boolean);
+                  if (texts.length === 0) return;
+                  const combined = texts.join("\n");
+                  setEventsBySession((prev) => {
+                    const list = prev[sid] || [];
+                    const hasReply = list.some(
+                      (item) => item.kind === "assistant" && item.content.includes(texts[texts.length - 1])
+                    );
+                    if (hasReply) return prev;
+                    return {
+                      ...prev,
+                      [sid]: [
+                        ...list,
+                        {
+                          id: `as-sync-${Date.now()}`,
+                          session_id: sid,
+                          timestamp: now,
+                          kind: "assistant",
+                          content: combined,
+                        },
+                      ],
+                    };
+                  });
+                })
+                .catch(() => {});
             }
             return;
           }
@@ -634,7 +667,7 @@ export function App() {
     return () => {
       if (ws) ws.close();
     };
-  }, [daemonUrl, activeId, refreshSessionDiffAndFiles]);
+  }, [daemonUrl, refreshSessionDiffAndFiles]);
 
   // Global Shortcuts
   useEffect(() => {
@@ -919,10 +952,13 @@ export function App() {
         setSessions((prev) => prev.map((s) => (s.id === oldId ? realSess : s)));
         setEventsBySession((prev) => ({
           ...prev,
-          [realSess.id]: (prev[oldId] || []).map((ev) => ({
-            ...ev,
-            session_id: realSess.id,
-          })),
+          [realSess.id]: [
+            ...(prev[oldId] || []).map((ev) => ({
+              ...ev,
+              session_id: realSess.id,
+            })),
+            ...(prev[realSess.id] || []),
+          ],
         }));
         setActiveId(realSess.id);
         return;
