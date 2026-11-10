@@ -5,18 +5,20 @@
   "identifier": "dev.velo.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
-    "devUrl": "http://127.0.0.1:5173",
+    "devUrl": "http://127.0.0.1:6767",
     "beforeBuildCommand": "pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "Velo — Parallel Agent Control Plane",
+        "title": "Velo",
         "width": 1360,
         "height": 860,
         "minWidth": 960,
-        "minHeight": 640
+        "minHeight": 640,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

@@ -285,6 +285,8 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/sessions/{id}", get(get_session_handler))
         .route("/api/sessions/{id}/events", get(get_session_events_handler))
         .route("/api/sessions/{id}/diff", get(get_session_diff_handler))
+        .route("/api/sessions/{id}/files", get(list_worktree_files_handler))
+        .route("/api/sessions/{id}/exec", post(exec_in_worktree_handler))
         .route("/api/sessions/{id}/input", post(send_input_handler))
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
         .route("/api/sessions/{id}/handoff", post(handoff_session_handler))
@@ -397,6 +399,95 @@ async fn get_session_diff_handler(
         })),
     )
         .into_response()
+}
+
+async fn list_worktree_files_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> impl IntoResponse {
+    let wt_path = {
+        let guard = state.inner.read().await;
+        match guard.sessions.get(&id) {
+            Some(s) => PathBuf::from(&s.worktree_path),
+            None => PathBuf::from("/Users/daiyudai/code/velo"),
+        }
+    };
+
+    let output = Command::new("git")
+        .args(["ls-files"])
+        .current_dir(&wt_path)
+        .output()
+        .await;
+
+    let files: Vec<String> = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .take(150)
+            .map(|s| s.to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    (StatusCode::OK, Json(json!({ "files": files }))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ExecCommandRequest {
+    command: String,
+}
+
+async fn exec_in_worktree_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<ExecCommandRequest>,
+) -> impl IntoResponse {
+    let wt_path = {
+        let guard = state.inner.read().await;
+        match guard.sessions.get(&id) {
+            Some(s) => PathBuf::from(&s.worktree_path),
+            None => PathBuf::from("/Users/daiyudai/code/velo"),
+        }
+    };
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&req.command)
+        .current_dir(&wt_path)
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let code = out.status.code().unwrap_or(0);
+
+            if let Ok(stats) = WorktreeManager::compute_diff_stats(&wt_path).await {
+                let mut guard = state.inner.write().await;
+                if let Some(s) = guard.sessions.get_mut(&id) {
+                    s.diff_stats = stats.clone();
+                    s.updated_at = Utc::now();
+                }
+            }
+            let _ = state.persist_sessions().await;
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": code,
+                    "worktree_path": wt_path,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn send_input_handler(

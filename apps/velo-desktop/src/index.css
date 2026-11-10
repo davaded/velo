@@ -261,3 +261,41 @@ body,
 .t-grid-collapse-inner {
   overflow: hidden;
 }
+
+/* Diff line highlight utilities */
+.v-diff-add {
+  background-color: rgba(52, 211, 153, 0.1);
+  color: #6ee7b7;
+}
+.v-diff-del {
+  background-color: rgba(248, 113, 113, 0.1);
+  color: #fca5a5;
+}
+.v-diff-hunk {
+  background-color: rgba(56, 189, 248, 0.07);
+  color: #7dd3fc;
+}
+
+/* Curated Theme Palettes */
+.velo-theme-claude {
+  --canvas-bg: #141311;
+  --surface-rail: #100f0d;
+  --surface-0: #171613;
+  --surface-1: #1f1d19;
+  --surface-2: #292621;
+  --border-hairline: #292621;
+}
+
+.velo-theme-paseo {
+  --canvas-bg: #0f1312;
+  --surface-rail: #0b0e0d;
+  --surface-0: #121716;
+  --surface-1: #181f1d;
+  --surface-2: #212a27;
+  --border-hairline: #1f2825;
+}
+
+.velo-theme-daylight {
+  filter: invert(0.94) hue-rotate(180deg);
+}
+
