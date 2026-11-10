@@ -119,6 +119,22 @@ impl WorktreeManager {
             });
         }
 
+        // If the requested branch is the primary workspace branch ("main" or "master"),
+        // run directly inside repo_root so the user works against their live workspace without git worktree lock conflicts.
+        if matches!(branch.as_str(), "main" | "master") {
+            info!(
+                "Session targets primary branch '{}'; running directly in repo root {}",
+                branch,
+                repo_root.display()
+            );
+            return Ok(WorktreeProvision {
+                repo_root: repo_root.clone(),
+                worktree_path: repo_root,
+                branch,
+                is_isolated_worktree: false,
+            });
+        }
+
         // Try creating worktree with a new branch `-b <branch>`, or attach to existing branch if it exists
         let create_new = Command::new("git")
             .arg("-C")
@@ -144,7 +160,18 @@ impl WorktreeManager {
 
             if !attach_existing.status.success() {
                 let stderr = String::from_utf8_lossy(&attach_existing.stderr);
-                bail!("Failed to create git worktree: {}", stderr.trim());
+                warn!(
+                    "Could not create isolated worktree for branch '{}' ({}); falling back to repo root {}",
+                    branch,
+                    stderr.trim(),
+                    repo_root.display()
+                );
+                return Ok(WorktreeProvision {
+                    repo_root: repo_root.clone(),
+                    worktree_path: repo_root,
+                    branch,
+                    is_isolated_worktree: false,
+                });
             }
         }
 

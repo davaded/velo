@@ -711,6 +711,32 @@ pub fn parse_agent_stdout_line(
             let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             match msg_type {
+                // 0. Session / Turn Initialization -> Immediate Thinking feedback
+                "system" => {
+                    if json.get("subtype").and_then(|v| v.as_str()) == Some("init") {
+                        let model_label = json
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Claude");
+                        events.push(AgentEvent::ThinkingDelta {
+                            session_id,
+                            text: format!(
+                                "Initialized {} runtime • Inspecting workspace context...\n",
+                                model_label
+                            ),
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    return events;
+                }
+                "turn.started" => {
+                    events.push(AgentEvent::ThinkingDelta {
+                        session_id,
+                        text: "Analyzing prompt and workspace context...\n".to_string(),
+                        timestamp: Utc::now(),
+                    });
+                    return events;
+                }
                 // 1. Claude Code stream-json events
                 "assistant" => {
                     if let Some(content_arr) = json
@@ -820,7 +846,7 @@ pub fn parse_agent_stdout_line(
                     return events;
                 }
                 // 2. OpenAI Codex `--json` JSONL events
-                "item.completed" | "item.started" => {
+                "item.completed" | "item.started" | "item.updated" => {
                     if let Some(item) = json.get("item") {
                         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         match item_type {
@@ -829,7 +855,26 @@ pub fn parse_agent_stdout_line(
                                     if !text.trim().is_empty() {
                                         events.push(AgentEvent::ThinkingDelta {
                                             session_id,
-                                            text: text.to_string(),
+                                            text: format!("{}\n", text.trim()),
+                                            timestamp: Utc::now(),
+                                        });
+                                    }
+                                } else if let Some(summary_arr) =
+                                    item.get("summary").and_then(|v| v.as_array())
+                                {
+                                    let mut combined = String::new();
+                                    for s in summary_arr {
+                                        if let Some(t) = s.get("text").and_then(|v| v.as_str()) {
+                                            if !t.trim().is_empty() {
+                                                combined.push_str(t.trim());
+                                                combined.push('\n');
+                                            }
+                                        }
+                                    }
+                                    if !combined.is_empty() {
+                                        events.push(AgentEvent::ThinkingDelta {
+                                            session_id,
+                                            text: combined,
                                             timestamp: Utc::now(),
                                         });
                                     }
@@ -865,13 +910,53 @@ pub fn parse_agent_stdout_line(
                                         arguments: serde_json::json!({ "command": cmd_str }),
                                         timestamp: Utc::now(),
                                     });
-                                } else if let Some(out) =
-                                    item.get("aggregated_output").and_then(|v| v.as_str())
-                                {
+                                } else if msg_type == "item.completed" {
+                                    let out = item
+                                        .get("aggregated_output")
+                                        .or_else(|| item.get("output"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let exit_code = item
+                                        .get("exit_code")
+                                        .and_then(|v| v.as_i64())
+                                        .unwrap_or(0);
                                     events.push(AgentEvent::ToolCallCompleted {
                                         session_id,
                                         tool_id,
-                                        output: out.to_string(),
+                                        output: if out.is_empty() {
+                                            format!("(exit code {})", exit_code)
+                                        } else {
+                                            out
+                                        },
+                                        is_error: exit_code != 0,
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                            }
+                            "file_change" => {
+                                let tool_id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("edit")
+                                    .to_string();
+                                let changes = item
+                                    .get("changes")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                if msg_type == "item.started" {
+                                    events.push(AgentEvent::ToolCallRequested {
+                                        session_id,
+                                        tool_id,
+                                        tool_name: "Edit".to_string(),
+                                        arguments: changes,
+                                        timestamp: Utc::now(),
+                                    });
+                                } else if msg_type == "item.completed" {
+                                    events.push(AgentEvent::ToolCallCompleted {
+                                        session_id,
+                                        tool_id,
+                                        output: "Applied file changes".to_string(),
                                         is_error: false,
                                         timestamp: Utc::now(),
                                     });
@@ -892,7 +977,7 @@ pub fn parse_agent_stdout_line(
                     }
                     return events;
                 }
-                "system" | "thread.started" | "turn.started" | "turn.completed" => {
+                "thread.started" | "turn.completed" => {
                     return vec![];
                 }
                 _ => {

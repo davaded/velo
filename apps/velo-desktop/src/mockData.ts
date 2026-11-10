@@ -220,6 +220,9 @@ export interface AgentEvent {
   content: string;
   tool_name?: string;
   tool_args?: string;
+  tool_input?: unknown;
+  tool_output?: string;
+  tool_is_error?: boolean;
   duration_ms?: number;
 }
 

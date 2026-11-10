@@ -27,6 +27,22 @@
   --sem-warning: #fbbf24;
   --sem-running: #38bdf8;
 
+  /* BeautifulAgentPrimitives adaptive token bridges */
+  --surface-0: var(--v-bg-code);
+  --surface-1: var(--v-bg-surface);
+  --surface-2: var(--v-bg-hover);
+  --surface-3: var(--v-bg-active);
+  --border-subtle: var(--v-border-subtle);
+  --border-accent: var(--v-border-strong);
+  --fg: var(--v-fg-primary);
+  --fg-muted: var(--v-fg-secondary);
+  --fg-extra-muted: var(--v-fg-muted);
+  --accent: #8b5cf6;
+  --accent-bright: #a78bfa;
+  --status-success: var(--sem-success);
+  --status-danger: var(--sem-danger);
+  --status-warning: var(--sem-warning);
+
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", "Geist Mono", Menlo, monospace;
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
@@ -58,6 +74,8 @@
   --sem-danger: #dc2626;
   --sem-warning: #d97706;
   --sem-running: #0284c7;
+  --accent: #7c3aed;
+  --accent-bright: #6d28d9;
   color-scheme: light;
 }
 
@@ -235,4 +253,51 @@ body,
 .v-row-selected {
   background-color: var(--v-bg-active);
   color: var(--v-fg-primary);
+}
+
+/* BeautifulAgentPrimitives Animations & Layout Helpers */
+.t-grid-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 220ms var(--ease-spring),
+    opacity 180ms ease;
+}
+
+.t-grid-collapse.t-expanded {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.t-grid-collapse-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
+.paseo-indent-rail {
+  border-left: 2px solid var(--v-border-strong);
+}
+
+@keyframes veloShimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.beautiful-shimmer-text {
+  background: linear-gradient(
+    90deg,
+    var(--v-fg-secondary) 0%,
+    var(--v-fg-primary) 50%,
+    var(--v-fg-secondary) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: veloShimmer 2.2s linear infinite;
 }

@@ -18,6 +18,12 @@ import {
 } from "./mockData";
 import { parseUnifiedDiff } from "./utils/diffParser";
 import {
+  BeautifulApprovalCard,
+  BeautifulContextMeter,
+  BeautifulThinkingBlock,
+  BeautifulToolCallCard,
+} from "./components/ui/BeautifulAgentPrimitives";
+import {
   ArrowUp,
   Check,
   ChevronDown,
@@ -268,9 +274,11 @@ export function App() {
     window.location.search.includes("mobile=1")
   );
 
-  // Stream disclosure states
+  // Stream disclosure states & Inline User Message Editing state
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
+  const [editingEventId, setEditingEventId] = useState<string | null>(null);
+  const [editingText, setEditingText] = useState<string>("");
 
   // Human-in-the-Loop Pending Approvals per Session
   const [pendingApprovals, setPendingApprovals] = useState<Record<string, PendingApprovalItem>>(
@@ -338,27 +346,36 @@ export function App() {
             }
             return true;
           });
-          if (realItems.length > 0) {
-            const normalized = realItems.map((item, idx) => normalizeToVeloSession(item, idx));
-            setSessions((prev) => {
-              const prevById = new Map(prev.map((s) => [s.id, s]));
-              const merged = normalized.map((n) => {
-                const existing = prevById.get(n.id);
-                if (!existing) return n;
-                return {
-                  ...n,
-                  title: existing.title || n.title,
-                  repo_id: existing.repo_id || n.repo_id,
-                  agent_kind: existing.agent_kind || n.agent_kind,
-                  model: existing.model || n.model,
-                  model_short: existing.model_short || n.model_short,
-                  effort: existing.effort || n.effort,
-                };
-              });
-              const mergedIds = new Set(merged.map((s) => s.id));
-              return [...merged, ...prev.filter((d) => !mergedIds.has(d.id))];
+          const normalized = realItems.map((item, idx) => normalizeToVeloSession(item, idx));
+          const runningDaemonIds = new Set(
+            normalized.filter((n) => n.status === "running").map((n) => n.id)
+          );
+          setSessions((prev) => {
+            const prevById = new Map(prev.map((s) => [s.id, s]));
+            const merged = normalized.map((n) => {
+              const existing = prevById.get(n.id);
+              if (!existing) return n;
+              return {
+                ...n,
+                title: existing.title || n.title,
+                repo_id: existing.repo_id || n.repo_id,
+                agent_kind: existing.agent_kind || n.agent_kind,
+                model: existing.model || n.model,
+                model_short: existing.model_short || n.model_short,
+                effort: existing.effort || n.effort,
+              };
             });
-          }
+            const mergedIds = new Set(merged.map((s) => s.id));
+            const remainingLocal = prev
+              .filter((d) => !mergedIds.has(d.id))
+              .map((d) =>
+                d.status === "running" && !runningDaemonIds.has(d.id)
+                  ? { ...d, status: "idle" as const, updated_at: "now" }
+                  : d
+              );
+            const combined = [...merged, ...remainingLocal];
+            return combined.length > 0 ? combined : prev;
+          });
         }
       })
       .catch(() => setConnected(false));
@@ -578,6 +595,9 @@ export function App() {
               kind: "tool_call",
               tool_name: toolName,
               tool_args: argSummary,
+              tool_input: argsObj,
+              tool_output: undefined,
+              tool_is_error: false,
               content: JSON.stringify(argsObj, null, 2),
             };
             setEventsBySession((prev) => ({
@@ -589,14 +609,28 @@ export function App() {
 
           if (evType === "tool_call_completed") {
             const toolId = String(evObj.tool_id ?? "");
-            const output = String(evObj.output ?? "");
-            if (!output) return;
+            const output = String(evObj.output ?? "(completed)");
+            const isError = Boolean(evObj.is_error);
             setEventsBySession((prev) => {
               const list = prev[sid] || [];
-              const idx = list.findIndex((item) => item.id === toolId);
+              let idx = list.findIndex((item) => item.id === toolId);
+              if (idx === -1) {
+                // Fallback to the latest pending tool_call in this session
+                for (let i = list.length - 1; i >= 0; i--) {
+                  if (list[i].kind === "tool_call" && list[i].tool_output === undefined) {
+                    idx = i;
+                    break;
+                  }
+                }
+              }
               if (idx !== -1) {
                 const next = [...list];
-                next[idx] = { ...next[idx], content: output };
+                next[idx] = {
+                  ...next[idx],
+                  content: output,
+                  tool_output: output,
+                  tool_is_error: isError,
+                };
                 return { ...prev, [sid]: next };
               }
               return prev;
@@ -717,7 +751,7 @@ export function App() {
     setSlashFilter(null);
   };
 
-  const handleSendPrompt = async (customText?: string) => {
+  const handleSendPrompt = async (customText?: string, overridePriorEvents?: AgentEvent[]) => {
     const rawText = (customText ?? prompt).trim();
     if (!rawText) return;
 
@@ -727,6 +761,7 @@ export function App() {
     setSlashFilter(null);
 
     const now = new Date().toLocaleTimeString([], { hour12: false });
+    const baseEvents = overridePriorEvents ?? (eventsBySession[activeSession.id] || []);
     const userEv: AgentEvent = {
       id: `u-${Date.now()}`,
       session_id: activeSession.id,
@@ -735,9 +770,30 @@ export function App() {
       content: text,
     };
 
+    const isSlashSpecial =
+      rawText.startsWith("/handoff") ||
+      rawText.startsWith("/advisor") ||
+      rawText.startsWith("/committee") ||
+      rawText.startsWith("/loop");
+
+    const modelLabel =
+      modelCatalog.find((m) => m.id === activeSession.model)?.label ||
+      activeSession.model_short ||
+      activeSession.model;
+
+    const initThinkingEv: AgentEvent = {
+      id: `th-init-${Date.now()}`,
+      session_id: activeSession.id,
+      timestamp: now,
+      kind: "thinking",
+      content: `Routing prompt to ${modelLabel} (${activeSession.effort || "medium"} effort) in ${activeSession.branch_name}...`,
+    };
+
     setEventsBySession((prev) => ({
       ...prev,
-      [activeSession.id]: [...(prev[activeSession.id] || []), userEv],
+      [activeSession.id]: isSlashSpecial
+        ? [...baseEvents, userEv]
+        : [...baseEvents, userEv, initThinkingEv],
     }));
 
     // Real Daemon /handoff endpoint
@@ -881,7 +937,7 @@ export function App() {
         : activeSession.title;
 
     // Build multi-turn context if there are prior messages in this thread
-    const priorHistory = (eventsBySession[activeSession.id] || [])
+    const priorHistory = baseEvents
       .filter((ev) => ev.kind === "user" || ev.kind === "assistant")
       .slice(-6);
     const promptWithContext =
@@ -950,21 +1006,71 @@ export function App() {
 
         const oldId = activeSession.id;
         setSessions((prev) => prev.map((s) => (s.id === oldId ? realSess : s)));
-        setEventsBySession((prev) => ({
-          ...prev,
-          [realSess.id]: [
-            ...(prev[oldId] || []).map((ev) => ({
-              ...ev,
-              session_id: realSess.id,
-            })),
-            ...(prev[realSess.id] || []),
-          ],
-        }));
+        setEventsBySession((prev) => {
+          const fromOld = (prev[oldId] || []).map((ev) => ({
+            ...ev,
+            session_id: realSess.id,
+          }));
+          const fromNew = prev[realSess.id] || [];
+          const mergedList: AgentEvent[] = [];
+          for (const item of [...fromOld, ...fromNew]) {
+            const last = mergedList[mergedList.length - 1];
+            if (last && last.kind === "thinking" && item.kind === "thinking") {
+              mergedList[mergedList.length - 1] = {
+                ...last,
+                content: `${last.content}\n${item.content}`,
+              };
+            } else {
+              mergedList.push(item);
+            }
+          }
+          return {
+            ...prev,
+            [realSess.id]: mergedList,
+          };
+        });
         setActiveId(realSess.id);
         return;
+      } else {
+        const errData = (await createRes.json().catch(() => ({}))) as { error?: string };
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === activeSession.id ? { ...s, status: "idle", updated_at: "now" } : s
+          )
+        );
+        setEventsBySession((prev) => ({
+          ...prev,
+          [activeSession.id]: [
+            ...(prev[activeSession.id] || []),
+            {
+              id: `err-${Date.now()}`,
+              session_id: activeSession.id,
+              timestamp: now,
+              kind: "assistant",
+              content: `⚠️ Failed to start session: ${errData.error || createRes.statusText}`,
+            },
+          ],
+        }));
       }
     } catch {
-      // fallback if daemon unreachable
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === activeSession.id ? { ...s, status: "idle", updated_at: "now" } : s
+        )
+      );
+      setEventsBySession((prev) => ({
+        ...prev,
+        [activeSession.id]: [
+          ...(prev[activeSession.id] || []),
+          {
+            id: `err-${Date.now()}`,
+            session_id: activeSession.id,
+            timestamp: now,
+            kind: "assistant",
+            content: "⚠️ Daemon unreachable on 127.0.0.1:6767. Please check Velo daemon status.",
+          },
+        ],
+      }));
     }
 
     setTimeout(() => {
@@ -987,6 +1093,62 @@ export function App() {
     } catch {
       // ignore if local-only
     }
+  };
+
+  // User Message Actions: Edit & Resend, Retry/Rerun, Delete Turn (Works whether running or stopped)
+  const handleStartEditMessage = (ev: AgentEvent) => {
+    setEditingEventId(ev.id);
+    setEditingText(ev.content);
+  };
+
+  const handleSaveAndResendEdit = async (ev: AgentEvent) => {
+    const trimmed = editingText.trim();
+    if (!trimmed) return;
+    setEditingEventId(null);
+    setEditingText("");
+    if (activeSession.status === "running") {
+      await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/stop`, {
+        method: "POST",
+      }).catch(() => {});
+    }
+    const currentList = eventsBySession[activeSession.id] || [];
+    const idx = currentList.findIndex((item) => item.id === ev.id);
+    const truncated = idx >= 0 ? currentList.slice(0, idx) : currentList;
+    setEventsBySession((prev) => ({
+      ...prev,
+      [activeSession.id]: truncated,
+    }));
+    await handleSendPrompt(trimmed, truncated);
+  };
+
+  const handleRetryUserMessage = async (ev: AgentEvent) => {
+    if (activeSession.status === "running") {
+      await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/stop`, {
+        method: "POST",
+      }).catch(() => {});
+    }
+    const currentList = eventsBySession[activeSession.id] || [];
+    const idx = currentList.findIndex((item) => item.id === ev.id);
+    const truncated = idx >= 0 ? currentList.slice(0, idx) : currentList;
+    setEventsBySession((prev) => ({
+      ...prev,
+      [activeSession.id]: truncated,
+    }));
+    await handleSendPrompt(ev.content, truncated);
+  };
+
+  const handleDeleteUserMessage = (ev: AgentEvent) => {
+    setEventsBySession((prev) => {
+      const list = prev[activeSession.id] || [];
+      const idx = list.findIndex((item) => item.id === ev.id);
+      if (idx === -1) return prev;
+      let endIdx = idx + 1;
+      while (endIdx < list.length && list[endIdx].kind !== "user") {
+        endIdx++;
+      }
+      const next = [...list.slice(0, idx), ...list.slice(endIdx)];
+      return { ...prev, [activeSession.id]: next };
+    });
   };
 
   // Delete / archive a thread from sidebar and daemon
@@ -1868,89 +2030,189 @@ export function App() {
                   </div>
                 )}
 
-                {activeEvents.map((ev) => {
-                  // 1. User Message: Right-aligned soft bubble, no robotic header
-                  if (ev.kind === "user") {
-                    return (
-                      <div key={ev.id} className="flex justify-end">
-                        <div className="max-w-[82%] whitespace-pre-wrap rounded-[18px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-relaxed text-[var(--v-fg-primary)]">
-                          {ev.content}
-                        </div>
-                      </div>
-                    );
+                {(() => {
+                  let lastUserIdx = -1;
+                  for (let i = activeEvents.length - 1; i >= 0; i--) {
+                    if (activeEvents[i].kind === "user") {
+                      lastUserIdx = i;
+                      break;
+                    }
                   }
 
-                  // 2. Thinking Trace: Quiet 1-line disclosure
-                  if (ev.kind === "thinking") {
-                    const isOpen = !!expandedThinking[ev.id];
-                    return (
-                      <div key={ev.id}>
-                        <button
-                          onClick={() =>
-                            setExpandedThinking((p) => ({ ...p, [ev.id]: !isOpen }))
-                          }
-                          className="flex items-center gap-1.5 text-left text-[12.5px] text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-secondary)]"
-                        >
-                          {isOpen ? (
-                            <ChevronDown className="h-3.5 w-3.5" />
-                          ) : (
-                            <ChevronRight className="h-3.5 w-3.5" />
-                          )}
-                          <span>Thought for a moment</span>
-                        </button>
-                        {isOpen && (
-                          <div className="mt-2 border-l-2 border-[var(--v-border-subtle)] pl-3.5 text-[12.5px] leading-relaxed text-[var(--v-fg-muted)]">
+                  return activeEvents.map((ev, idx) => {
+                    const isLastEvent = idx === activeEvents.length - 1;
+
+                    // 1. User Message: Right-aligned soft bubble + Inline Edit / Retry / Copy / Delete controls
+                    if (ev.kind === "user") {
+                      const isEditing = editingEventId === ev.id;
+                      const isLatestUser = idx === lastUserIdx;
+
+                      if (isEditing) {
+                        return (
+                          <div key={ev.id} className="flex justify-end">
+                            <div className="w-full max-w-[86%] rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-3.5 shadow-lg">
+                              <textarea
+                                rows={3}
+                                autoFocus
+                                value={editingText}
+                                onChange={(e) => setEditingText(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && !e.shiftKey) {
+                                    e.preventDefault();
+                                    handleSaveAndResendEdit(ev);
+                                  } else if (e.key === "Escape") {
+                                    setEditingEventId(null);
+                                    setEditingText("");
+                                  }
+                                }}
+                                className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] focus:outline-none"
+                              />
+                              <div className="mt-2 flex items-center justify-end gap-2 border-t border-[var(--v-border-subtle)] pt-2">
+                                <button
+                                  onClick={() => {
+                                    setEditingEventId(null);
+                                    setEditingText("");
+                                  }}
+                                  className="rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                >
+                                  取消
+                                </button>
+                                <button
+                                  onClick={() => handleSaveAndResendEdit(ev)}
+                                  disabled={!editingText.trim()}
+                                  className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] transition-opacity hover:opacity-90 disabled:opacity-40"
+                                >
+                                  保存并重新发送
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div key={ev.id} className="group flex flex-col items-end gap-1">
+                          <div className="max-w-[82%] whitespace-pre-wrap rounded-[18px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-relaxed text-[var(--v-fg-primary)]">
                             {ev.content}
                           </div>
-                        )}
-                      </div>
-                    );
-                  }
+                          <div
+                            className={`flex items-center gap-1 pr-1 text-[11px] text-[var(--v-fg-muted)] transition-opacity ${
+                              isLatestUser
+                                ? "opacity-90 group-hover:opacity-100"
+                                : "opacity-0 group-hover:opacity-100"
+                            }`}
+                          >
+                            <button
+                              onClick={() => handleStartEditMessage(ev)}
+                              title="编辑并重新发送"
+                              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                            >
+                              <SquarePen className="h-3 w-3" />
+                              <span>编辑</span>
+                            </button>
+                            <button
+                              onClick={() => handleRetryUserMessage(ev)}
+                              title="基于此消息重新运行"
+                              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                            >
+                              <RefreshCw className="h-3 w-3" />
+                              <span>重试</span>
+                            </button>
+                            <button
+                              onClick={() => copyText(ev.id, ev.content)}
+                              title="复制消息内容"
+                              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                            >
+                              {copiedKey === ev.id ? (
+                                <Check className="h-3 w-3 text-[#34d399]" />
+                              ) : (
+                                <Copy className="h-3 w-3" />
+                              )}
+                              <span>{copiedKey === ev.id ? "已复制" : "复制"}</span>
+                            </button>
+                            <button
+                              onClick={() => handleDeleteUserMessage(ev)}
+                              title="删除此轮对话"
+                              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[#f87171]"
+                            >
+                              <X className="h-3 w-3" />
+                              <span>删除</span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
 
-                  // 3. Tool Call: Clean inline row
-                  if (ev.kind === "tool_call") {
-                    const isExpanded = !!expandedTools[ev.id];
+                    // 2. Thinking Trace: Using our designed BeautifulThinkingBlock component
+                    if (ev.kind === "thinking") {
+                      const isStreamingThinking =
+                        activeSession.status === "running" && isLastEvent;
+                      return (
+                        <BeautifulThinkingBlock
+                          key={ev.id}
+                          text={ev.content}
+                          isStreaming={isStreamingThinking}
+                          defaultExpanded={isStreamingThinking}
+                        />
+                      );
+                    }
+
+                    // 3. Tool Call: Using our designed BeautifulToolCallCard component
+                    if (ev.kind === "tool_call") {
+                      const toolInput =
+                        ev.tool_input ??
+                        (ev.tool_args ? { target: ev.tool_args } : ev.content);
+                      const toolOutput =
+                        ev.tool_output ??
+                        (ev.tool_input === undefined ? ev.content : undefined);
+                      return (
+                        <BeautifulToolCallCard
+                          key={ev.id}
+                          toolName={ev.tool_name || "Tool"}
+                          input={toolInput}
+                          output={toolOutput}
+                          isError={ev.tool_is_error}
+                          onOpenDiffTab={() => openDiffForFile(ev.tool_args)}
+                        />
+                      );
+                    }
+
+                    // 4. Assistant Response: Clean left-aligned prose + copy action
                     return (
-                      <div key={ev.id} className="flex flex-col gap-1.5">
-                        <div className="flex items-center gap-2">
+                      <div key={ev.id} className="group flex flex-col items-start gap-1">
+                        <div className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[var(--v-fg-body)]">
+                          {ev.content}
+                        </div>
+                        <div className="flex items-center gap-1 text-[11px] text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100">
                           <button
-                            onClick={() => openDiffForFile(ev.tool_args)}
-                            className="group inline-flex items-center gap-2 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3 py-1.5 font-mono text-[12px] text-[var(--v-fg-body)] transition-colors hover:border-[var(--v-border-strong)] hover:bg-[var(--v-bg-hover)]"
+                            onClick={() => copyText(ev.id, ev.content)}
+                            className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
                           >
-                            <FileCode2 className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
-                            <span className="text-[var(--v-fg-muted)]">{ev.tool_name}</span>
-                            <span className="text-[var(--v-fg-primary)]">{ev.tool_args}</span>
-                          </button>
-
-                          <button
-                            onClick={() =>
-                              setExpandedTools((p) => ({ ...p, [ev.id]: !isExpanded }))
-                            }
-                            className="text-[11.5px] text-[var(--v-fg-faint)] hover:text-[var(--v-fg-secondary)]"
-                          >
-                            {isExpanded ? "Hide" : "Output"}
+                            {copiedKey === ev.id ? (
+                              <Check className="h-3 w-3 text-[#34d399]" />
+                            ) : (
+                              <Copy className="h-3 w-3" />
+                            )}
+                            <span>{copiedKey === ev.id ? "已复制" : "复制"}</span>
                           </button>
                         </div>
-
-                        {isExpanded && (
-                          <pre className="overflow-x-auto rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] p-3 font-mono text-[11.5px] leading-relaxed text-[var(--v-fg-secondary)]">
-                            {ev.content}
-                          </pre>
-                        )}
                       </div>
                     );
-                  }
+                  });
+                })()}
 
-                  // 4. Assistant Response: Clean left-aligned prose
-                  return (
-                    <div
-                      key={ev.id}
-                      className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[var(--v-fg-body)]"
-                    >
-                      {ev.content}
-                    </div>
-                  );
-                })}
+                {/* Live Inline Reasoning Indicator when running after a user message or completed tool call */}
+                {activeSession.status === "running" &&
+                  activeEvents[activeEvents.length - 1]?.kind !== "thinking" && (
+                    <BeautifulThinkingBlock
+                      text={`正在使用 ${
+                        modelCatalog.find((m) => m.id === activeSession.model)?.label ||
+                        activeSession.model_short
+                      } 思考并规划下一步操作...`}
+                      isStreaming={true}
+                      defaultExpanded={false}
+                    />
+                  )}
                 <div ref={streamEndRef} />
               </div>
             </div>
@@ -1958,52 +2220,19 @@ export function App() {
             {/* ===============================================================
                 4. AUTHENTIC PASEO / CODEX / CLAUDE CODE COMPOSER DOCK
                    - Pure natural language input (zero manual @file clutter)
-                   - Direct Model Picker (Claude Sonnet 4.5, Opus 4.5, o3, o4-mini...)
+                   - Direct Model Picker (Claude Fable 5.2, Opus 5.5, GPT-6.1-Sol...)
                    - Effort Picker (Low / Medium / High / Max) + Permission Mode
                =============================================================== */}
             <div className="w-full px-6 pb-5 pt-1">
               <div className="mx-auto max-w-[680px]">
-                {/* Human-in-the-Loop Permission Approval Card */}
+                {/* Human-in-the-Loop Permission Approval Card using BeautifulApprovalCard */}
                 {activePendingApproval && (
-                  <div className="mb-2.5 flex items-center justify-between gap-3 rounded-xl border border-[#fbbf24]/30 bg-[#181612] px-3.5 py-2.5 text-[12.5px]">
-                    <div className="flex min-w-0 items-start gap-2.5">
-                      <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[#fbbf24]" />
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium text-[var(--v-fg-primary)]">
-                            Permission required in worktree
-                          </span>
-                          <span className="truncate font-mono text-[11px] text-[var(--v-fg-secondary)]">
-                            {activeSession.branch_name}
-                          </span>
-                        </div>
-                        <div className="mt-0.5 truncate font-mono text-[11.5px] text-[#fbbf24]">
-                          $ {activePendingApproval.command}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="flex shrink-0 items-center gap-1.5">
-                      <button
-                        onClick={() => handleResolveApproval("deny")}
-                        className="rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[#26262c] hover:text-[var(--v-fg-primary)]"
-                      >
-                        Deny
-                      </button>
-                      <button
-                        onClick={() => handleResolveApproval("always")}
-                        className="rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] text-[var(--v-fg-body)] hover:bg-[#292932]"
-                      >
-                        Always allow
-                      </button>
-                      <button
-                        onClick={() => handleResolveApproval("approve")}
-                        className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90"
-                      >
-                        Approve & Run
-                      </button>
-                    </div>
-                  </div>
+                  <BeautifulApprovalCard
+                    toolName="Bash"
+                    commandPreview={activePendingApproval.command}
+                    onApprove={() => handleResolveApproval("approve")}
+                    onDeny={() => handleResolveApproval("deny")}
+                  />
                 )}
 
                 {/* Slash Command Popover */}
@@ -2023,33 +2252,6 @@ export function App() {
                         <span className="text-[12px] text-[var(--v-fg-muted)]">{skill.desc}</span>
                       </button>
                     ))}
-                  </div>
-                )}
-
-                {/* Live Running Status Bar */}
-                {activeSession.status === "running" && (
-                  <div className="mb-2 flex items-center justify-between rounded-xl border border-[#34d399]/25 bg-[#34d399]/10 px-3.5 py-2">
-                    <div className="flex items-center gap-2 text-[12px] text-[var(--v-fg-body)]">
-                      <span className="h-2.5 w-2.5 rounded-full border-[1.5px] border-[#34d399] border-t-transparent animate-spin" />
-                      <span>
-                        <strong className="font-medium text-[var(--v-fg-primary)]">
-                          {modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-                            activeSession.model_short}
-                        </strong>{" "}
-                        is working in{" "}
-                        <code className="font-mono text-[11px] text-[var(--v-fg-secondary)]">
-                          {activeSession.branch_name}
-                        </code>
-                        ...
-                      </span>
-                    </div>
-                    <button
-                      onClick={handleStopSession}
-                      className="flex items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
-                    >
-                      <span className="h-2 w-2 rounded-[2px] bg-[#f87171]" />
-                      <span>Stop</span>
-                    </button>
                   </div>
                 )}
 
@@ -2257,28 +2459,34 @@ export function App() {
                       </button>
                     </div>
 
-                    {/* Signature Circular Submit / Stop Disc (Paseo / Claude Code / Codex) */}
-                    {activeSession.status === "running" && !prompt.trim() ? (
-                      <button
-                        onClick={handleStopSession}
-                        title="Stop generation"
-                        className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] transition-all hover:opacity-90"
-                      >
-                        <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => handleSendPrompt()}
-                        disabled={!prompt.trim()}
-                        className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
-                          prompt.trim()
-                            ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
-                            : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
-                        }`}
-                      >
-                        <ArrowUp className="h-4 w-4 stroke-[2.25]" />
-                      </button>
-                    )}
+                    {/* Right Controls: BeautifulContextMeter + Signature Circular Submit / Stop Disc */}
+                    <div className="flex items-center gap-2">
+                      <BeautifulContextMeter
+                        usedTokens={activeSession.tokens_used || 14200}
+                        maxTokens={activeSession.tokens_limit || 200000}
+                      />
+                      {activeSession.status === "running" ? (
+                        <button
+                          onClick={handleStopSession}
+                          title="停止当前执行 (Stop)"
+                          className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] transition-all hover:opacity-90"
+                        >
+                          <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleSendPrompt()}
+                          disabled={!prompt.trim()}
+                          className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
+                            prompt.trim()
+                              ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
+                              : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
+                          }`}
+                        >
+                          <ArrowUp className="h-4 w-4 stroke-[2.25]" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
