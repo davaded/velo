@@ -177,6 +177,22 @@ export function App() {
   const [commitMsg, setCommitMsg] = useState<string>("feat: checkpoint isolated worktree changes");
   const [gitActionNotice, setGitActionNotice] = useState<string | null>(null);
 
+  // Inline Diff Line Review Comment State
+  const [diffCommentIdx, setDiffCommentIdx] = useState<number | null>(null);
+  const [diffCommentText, setDiffCommentText] = useState<string>("");
+
+  // Open in External IDE Menu State
+  const [openInMenuOpen, setOpenInMenuOpen] = useState<boolean>(false);
+
+  // Phase 3 Dispatch Mode (Single / Committee Race / TDD Loop)
+  const [dispatchMode, setDispatchMode] = useState<"single" | "committee" | "loop">("single");
+  const [loopCheckCmd, setLoopCheckCmd] = useState<string>("cargo test --workspace --offline");
+
+  // Phase 4 Mobile Remote Controller Mode (?mobile=1 or preview toggle)
+  const [mobileMode, setMobileMode] = useState<boolean>(() =>
+    window.location.search.includes("mobile=1")
+  );
+
   // Stream disclosure states
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
@@ -663,25 +679,92 @@ export function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            question: rawText.replace("/advisor", "").trim() || null,
+            focus_question: rawText.replace("/advisor", "").trim() || null,
             advisor_provider: "claude",
           }),
         });
         if (res.ok) {
-          const data = (await res.json()) as { advice_markdown?: string };
+          refreshSessions();
+          return;
+        }
+      } catch {
+        // fallback below
+      }
+    }
+
+    // Real Daemon /committee endpoint (Claude Code + Codex parallel race in 2 isolated worktrees)
+    if (rawText.startsWith("/committee")) {
+      const taskGoal =
+        rawText.replace("/committee", "").trim() ||
+        activeSession.title ||
+        "Implement and verify feature in isolated worktree";
+      try {
+        const res = await fetch(`${daemonUrl}/api/committee`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name_prefix: "race",
+            providers: ["claude", "codex"],
+            prompt: taskGoal,
+            repo_path: activeRepo.path,
+          }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { sessions?: unknown[] };
           const replyEv: AgentEvent = {
-            id: `adv-${Date.now()}`,
+            id: `cm-${Date.now()}`,
             session_id: activeSession.id,
             timestamp: now,
             kind: "assistant",
-            content:
-              data.advice_markdown ||
-              "Architectural review complete: worktree lock ordering is deadlock-free.",
+            content: `Dispatched **Committee Race** (\`Claude Code\` + \`OpenAI Codex\`) in ${
+              data.sessions?.length || 2
+            } parallel isolated Git worktrees for: "${taskGoal}". Check the sidebar to compare their diffs side by side.`,
           };
           setEventsBySession((prev) => ({
             ...prev,
             [activeSession.id]: [...(prev[activeSession.id] || []), replyEv],
           }));
+          refreshSessions();
+          return;
+        }
+      } catch {
+        // fallback below
+      }
+    }
+
+    // Real Daemon /loop endpoint (Test-driven loop until check_command passes)
+    if (rawText.startsWith("/loop")) {
+      const taskGoal =
+        rawText.replace("/loop", "").trim() ||
+        activeSession.title ||
+        "Fix failing tests and verify build";
+      try {
+        const res = await fetch(`${daemonUrl}/api/loop`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: `loop-${activeSession.branch_name.split("/").pop()}`,
+            provider: activeSession.agent_kind === "codex" ? "codex" : "claude",
+            prompt: taskGoal,
+            check_command: loopCheckCmd,
+            max_iterations: 3,
+            repo_path: activeRepo.path,
+            branch: `${activeSession.branch_name}-loop`,
+          }),
+        });
+        if (res.ok) {
+          const replyEv: AgentEvent = {
+            id: `lp-${Date.now()}`,
+            session_id: activeSession.id,
+            timestamp: now,
+            kind: "assistant",
+            content: `Started **TDD Verification Loop** (acceptance check: \`${loopCheckCmd}\`, up to 3 iterations).`,
+          };
+          setEventsBySession((prev) => ({
+            ...prev,
+            [activeSession.id]: [...(prev[activeSession.id] || []), replyEv],
+          }));
+          refreshSessions();
           return;
         }
       } catch {
@@ -883,7 +966,7 @@ export function App() {
     }
   };
 
-  // Create real isolated Git worktree via POST /api/sessions
+  // Create real isolated Git worktree (Single / Committee Race / TDD Loop)
   const handleCreateWorktree = async () => {
     const targetRepo = repos.find((r) => r.id === targetRepoIdForNewWt) || activeRepo;
     const clean = newTaskName.trim() || `feat/task-${sessions.length + 1}`;
@@ -892,9 +975,63 @@ export function App() {
         ? clean
         : `feat/${clean}`;
     const title = newTaskDesc.trim() || branch;
-
     const providerName = newAgentKind === "codex" ? "codex" : "claude";
+
     try {
+      if (dispatchMode === "committee") {
+        const res = await fetch(`${daemonUrl}/api/committee`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name_prefix: clean.replace(/\//g, "-"),
+            providers: ["claude", "codex"],
+            prompt: title,
+            repo_path: targetRepo.path,
+          }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { sessions?: unknown[] };
+          if (Array.isArray(data.sessions) && data.sessions.length > 0) {
+            const createdList = data.sessions.map((raw, i) => {
+              const s = normalizeToVeloSession(raw, i);
+              s.repo_id = targetRepo.id;
+              return s;
+            });
+            setSessions((prev) => [...createdList, ...prev]);
+            setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+            setActiveId(createdList[0].id);
+            setActiveModal(null);
+            return;
+          }
+        }
+      } else if (dispatchMode === "loop") {
+        const res = await fetch(`${daemonUrl}/api/loop`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: title,
+            provider: providerName,
+            prompt: title,
+            check_command: loopCheckCmd,
+            max_iterations: 3,
+            repo_path: targetRepo.path,
+            branch,
+          }),
+        });
+        if (res.ok) {
+          const rawSession = await res.json();
+          const created = normalizeToVeloSession(rawSession, 0);
+          created.repo_id = targetRepo.id;
+          created.title = `[Loop] ${title}`;
+          created.agent_kind = newAgentKind;
+          setSessions((prev) => [created, ...prev]);
+          setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+          setActiveId(created.id);
+          setActiveModal(null);
+          return;
+        }
+      }
+
       const res = await fetch(`${daemonUrl}/api/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -994,6 +1131,36 @@ export function App() {
     };
     setRepos((prev) => [...prev, newRepo]);
     setActiveModal(null);
+  };
+
+  const handlePickRepoFolder = async () => {
+    try {
+      const res = await fetch(`${daemonUrl}/api/pick-folder`, { method: "POST" });
+      if (res.ok) {
+        const data = (await res.json()) as { path?: string };
+        if (data.path) setNewRepoPath(data.path);
+      }
+    } catch {
+      // ignore if cancelled
+    }
+  };
+
+  const handleOpenInEditor = async (
+    editor: "cursor" | "vscode" | "zed" | "finder" | "terminal"
+  ) => {
+    setOpenInMenuOpen(false);
+    try {
+      await fetch(`${daemonUrl}/api/open-editor`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: activeSession.worktree_path,
+          editor,
+        }),
+      });
+    } catch {
+      // ignore
+    }
   };
 
   // Terminal Drawer Command Execution (Real Worktree Shell)
@@ -1367,8 +1534,50 @@ export function App() {
             </span>
           </div>
 
-          {/* Right Header Controls: Diff Stat Trigger & Terminal Toggle */}
-          <div className="flex items-center gap-1.5">
+          {/* Right Header Controls: Open in IDE, Diff Stat Trigger & Terminal Toggle */}
+          <div className="relative flex items-center gap-1.5">
+            {mobileMode && (
+              <button
+                onClick={() => setMobileMode(false)}
+                className="rounded-md bg-[#34d399]/15 px-2 py-1 font-mono text-[11px] font-medium text-[#34d399]"
+              >
+                Mobile Remote Active · Exit
+              </button>
+            )}
+
+            <div className="relative">
+              <button
+                onClick={() => setOpenInMenuOpen((o) => !o)}
+                title="Open isolated worktree in external IDE or Finder"
+                className="flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
+              >
+                <span>Open in</span>
+                <ChevronDown className="h-3 w-3 text-[var(--v-fg-muted)]" />
+              </button>
+
+              {openInMenuOpen && (
+                <div className="absolute right-0 top-8 z-40 w-[168px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1 shadow-2xl">
+                  {(
+                    [
+                      { id: "cursor", label: "Cursor" },
+                      { id: "vscode", label: "VS Code" },
+                      { id: "zed", label: "Zed" },
+                      { id: "finder", label: "Reveal in Finder" },
+                      { id: "terminal", label: "macOS Terminal" },
+                    ] as const
+                  ).map((item) => (
+                    <button
+                      key={item.id}
+                      onClick={() => handleOpenInEditor(item.id)}
+                      className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
+                    >
+                      <span>{item.label}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
             <button
               onClick={() => {
                 if (drawerOpen && drawerTab === "diff") setDrawerOpen(false);
@@ -1406,6 +1615,35 @@ export function App() {
             </button>
           </div>
         </header>
+
+        {/* Mobile E2EE Remote Controller Worktree Strip */}
+        {mobileMode && (
+          <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-4 py-2">
+            {sessions.map((s) => {
+              const active = s.id === activeSession.id;
+              return (
+                <button
+                  key={s.id}
+                  onClick={() => setActiveId(s.id)}
+                  className={`flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1 text-[12px] transition-colors ${
+                    active
+                      ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                      : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)]"
+                  }`}
+                >
+                  {s.status === "running" && (
+                    <span className="h-2 w-2 rounded-full bg-[#34d399]" />
+                  )}
+                  {s.status === "waiting_approval" && (
+                    <span className="h-2 w-2 rounded-full bg-[#fbbf24]" />
+                  )}
+                  <span className="max-w-[140px] truncate">{s.title}</span>
+                  <span className="font-mono text-[10.5px] text-[#34d399]">+{s.insertions}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {/* Body Area: Centered Conversation Stream + On-Demand Right Drawer */}
         <div className="relative flex flex-1 overflow-hidden">
@@ -1896,7 +2134,7 @@ export function App() {
                   </button>
                 </div>
 
-                {/* Dual-Line-Number Unified Diff Viewer */}
+                {/* Dual-Line-Number Unified Diff Viewer (Click any line to add inline review comment for Agent) */}
                 <div className="flex-1 overflow-y-auto py-2 font-mono text-[11.5px] leading-[1.65]">
                   {currentDiffFile.hunks.map((line, idx) => {
                     const isHunkHeader = line.content.startsWith("@@");
@@ -1914,16 +2152,85 @@ export function App() {
                       : line.type === "del"
                       ? "-"
                       : " ";
+                    const lineNum = line.newLine ?? line.oldLine ?? idx + 1;
+                    const isCommenting = diffCommentIdx === idx;
                     return (
-                      <div key={idx} className={`flex px-3 py-0.5 ${rowClass}`}>
-                        <span className="w-7 shrink-0 select-none pr-1.5 text-right opacity-35">
-                          {line.oldLine ?? ""}
-                        </span>
-                        <span className="w-7 shrink-0 select-none pr-2 text-right opacity-35">
-                          {line.newLine ?? ""}
-                        </span>
-                        <span className="w-4 shrink-0 select-none">{sign}</span>
-                        <span className="whitespace-pre">{line.content}</span>
+                      <div key={idx}>
+                        <div
+                          onClick={() => {
+                            if (!isHunkHeader) {
+                              setDiffCommentIdx(isCommenting ? null : idx);
+                              setDiffCommentText("");
+                            }
+                          }}
+                          title={
+                            isHunkHeader ? undefined : "Click line to send inline review comment to Agent"
+                          }
+                          className={`group flex cursor-pointer items-center px-3 py-0.5 hover:brightness-110 ${rowClass}`}
+                        >
+                          <span className="w-7 shrink-0 select-none pr-1.5 text-right opacity-35">
+                            {line.oldLine ?? ""}
+                          </span>
+                          <span className="w-7 shrink-0 select-none pr-2 text-right opacity-35">
+                            {line.newLine ?? ""}
+                          </span>
+                          <span className="w-4 shrink-0 select-none">
+                            {!isHunkHeader ? (
+                              <span className="group-hover:hidden">{sign}</span>
+                            ) : (
+                              sign
+                            )}
+                            {!isHunkHeader && (
+                              <span className="hidden text-[#38bdf8] group-hover:inline">+</span>
+                            )}
+                          </span>
+                          <span className="whitespace-pre">{line.content}</span>
+                        </div>
+
+                        {isCommenting && (
+                          <div className="mx-3 my-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-2.5 font-sans shadow-lg">
+                            <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--v-fg-muted)]">
+                              <span className="font-mono">
+                                Review {currentDiffFile.path}:L{lineNum}
+                              </span>
+                              <button
+                                onClick={() => setDiffCommentIdx(null)}
+                                className="hover:text-[var(--v-fg-primary)]"
+                              >
+                                <X className="h-3 w-3" />
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                autoFocus
+                                value={diffCommentText}
+                                onChange={(e) => setDiffCommentText(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && diffCommentText.trim()) {
+                                    const reviewPrompt = `In \`${currentDiffFile.path}\` at line ${lineNum} (\`${line.content.trim()}\`), please make this change: ${diffCommentText.trim()}`;
+                                    setDiffCommentIdx(null);
+                                    setDiffCommentText("");
+                                    handleSendPrompt(reviewPrompt);
+                                  }
+                                }}
+                                placeholder="Ask Agent to change this line..."
+                                className="flex-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1 text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
+                              />
+                              <button
+                                onClick={() => {
+                                  if (!diffCommentText.trim()) return;
+                                  const reviewPrompt = `In \`${currentDiffFile.path}\` at line ${lineNum} (\`${line.content.trim()}\`), please make this change: ${diffCommentText.trim()}`;
+                                  setDiffCommentIdx(null);
+                                  setDiffCommentText("");
+                                  handleSendPrompt(reviewPrompt);
+                                }}
+                                className="rounded-md bg-[var(--v-btn-bg)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)]"
+                              >
+                                Ask Agent
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -2013,24 +2320,64 @@ export function App() {
                   </div>
                   <div>
                     <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                      Agent Runtime
+                      Orchestration Mode (Phase 3)
                     </label>
                     <div className="grid grid-cols-3 gap-1.5">
-                      {(["claude", "codex", "gemini"] as AgentKind[]).map((kind) => (
+                      {(
+                        [
+                          { id: "single", label: "Single Agent" },
+                          { id: "committee", label: "Committee Race" },
+                          { id: "loop", label: "TDD Auto-Loop" },
+                        ] as const
+                      ).map((m) => (
                         <button
-                          key={kind}
-                          onClick={() => setNewAgentKind(kind)}
-                          className={`rounded-lg border px-2.5 py-1.5 text-[12px] capitalize ${
-                            newAgentKind === kind
-                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                          key={m.id}
+                          onClick={() => setDispatchMode(m.id)}
+                          className={`rounded-lg border px-2 py-1.5 text-[11.5px] ${
+                            dispatchMode === m.id
+                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
                               : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)]"
                           }`}
                         >
-                          {kind}
+                          {m.label}
                         </button>
                       ))}
                     </div>
                   </div>
+                  {dispatchMode !== "committee" && (
+                    <div>
+                      <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                        Agent Runtime
+                      </label>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        {(["claude", "codex", "gemini"] as AgentKind[]).map((kind) => (
+                          <button
+                            key={kind}
+                            onClick={() => setNewAgentKind(kind)}
+                            className={`rounded-lg border px-2.5 py-1.5 text-[12px] capitalize ${
+                              newAgentKind === kind
+                                ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)]"
+                            }`}
+                          >
+                            {kind}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {dispatchMode === "loop" && (
+                    <div>
+                      <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                        Acceptance Test Command (Auto-reruns until exit 0)
+                      </label>
+                      <input
+                        value={loopCheckCmd}
+                        onChange={(e) => setLoopCheckCmd(e.target.value)}
+                        className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
+                      />
+                    </div>
+                  )}
                   <div>
                     <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
                       Task title
@@ -2083,12 +2430,20 @@ export function App() {
                   </button>
                 </div>
                 <div className="space-y-3 text-[12.5px]">
-                  <input
-                    value={newRepoPath}
-                    onChange={(e) => setNewRepoPath(e.target.value)}
-                    placeholder="/path/to/git/repo"
-                    className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
-                  />
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={newRepoPath}
+                      onChange={(e) => setNewRepoPath(e.target.value)}
+                      placeholder="/path/to/git/repo"
+                      className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
+                    />
+                    <button
+                      onClick={handlePickRepoFolder}
+                      className="shrink-0 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-3 py-2 text-[12px] text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
+                    >
+                      Browse Finder...
+                    </button>
+                  </div>
                   <div className="flex justify-end gap-2 pt-2">
                     <button
                       onClick={() => setActiveModal(null)}
@@ -2275,6 +2630,21 @@ export function App() {
                     <div className="break-all rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] p-3 text-[var(--v-fg-primary)]">
                       {pairTicket?.uri ||
                         "velo://pair?daemon=127.0.0.1:6767&fp=9F8B-441A-E2EE"}
+                    </div>
+                    <div className="flex items-center justify-between pt-1 font-sans">
+                      <span className="text-[11.5px] text-[var(--v-fg-muted)]">
+                        Scan on iOS/Android over LAN Wi-Fi
+                      </span>
+                      <button
+                        onClick={() => {
+                          setMobileMode(true);
+                          setSidebarOpen(false);
+                          setActiveModal(null);
+                        }}
+                        className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1.5 text-[12px] font-medium text-[var(--v-btn-fg)]"
+                      >
+                        Preview Mobile Remote UI
+                      </button>
                     </div>
                   </div>
                 ) : (

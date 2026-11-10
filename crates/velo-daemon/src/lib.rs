@@ -280,6 +280,8 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/health", get(health_handler))
         .route("/api/runtimes", get(list_runtimes_handler))
         .route("/api/pair", get(pair_ticket_handler))
+        .route("/api/pick-folder", post(pick_folder_handler))
+        .route("/api/open-editor", post(open_editor_handler))
         .route(
             "/api/sessions",
             get(list_sessions_handler).post(create_session_handler),
@@ -322,6 +324,74 @@ async fn health_handler() -> impl IntoResponse {
 async fn list_runtimes_handler() -> impl IntoResponse {
     let runtimes = velo_agent::detect_local_runtimes().await;
     Json(json!({ "runtimes": runtimes }))
+}
+
+async fn pick_folder_handler() -> impl IntoResponse {
+    let out = Command::new("osascript")
+        .args([
+            "-e",
+            "POSIX path of (choose folder with prompt \"Select Git Repository for Velo:\")",
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let clean = raw.trim_end_matches('/').to_string();
+            (StatusCode::OK, Json(json!({ "path": clean }))).into_response()
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Folder selection cancelled" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenEditorRequest {
+    path: String,
+    editor: String,
+}
+
+async fn open_editor_handler(Json(req): Json<OpenEditorRequest>) -> impl IntoResponse {
+    let target = req.path.trim();
+    let status = match req.editor.as_str() {
+        "cursor" => Command::new("open")
+            .args(["-a", "Cursor", target])
+            .status()
+            .await,
+        "vscode" => Command::new("open")
+            .args(["-a", "Visual Studio Code", target])
+            .status()
+            .await,
+        "zed" => Command::new("open")
+            .args(["-a", "Zed", target])
+            .status()
+            .await,
+        "terminal" => Command::new("open")
+            .args(["-a", "Terminal", target])
+            .status()
+            .await,
+        _ => Command::new("open").arg(target).status().await,
+    };
+
+    match status {
+        Ok(s) if s.success() => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "editor": req.editor, "path": target })),
+        )
+            .into_response(),
+        _ => {
+            // Fallback to Finder reveal if specific IDE app is not installed
+            let _ = Command::new("open").arg(target).status().await;
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "editor": "finder", "path": target })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn list_sessions_handler(State(state): State<DaemonState>) -> impl IntoResponse {
@@ -1313,12 +1383,65 @@ mod tests {
 }
 
 async fn pair_ticket_handler() -> impl IntoResponse {
-    let relay_url = format!("ws://127.0.0.1:{}", velo_relay::DEFAULT_RELAY_PORT);
-    let daemon_addr = format!(
-        "{}:{}",
-        velo_protocol::DEFAULT_DAEMON_HOST,
-        velo_protocol::DEFAULT_DAEMON_PORT
-    );
+    let lan_ip = Command::new("ipconfig")
+        .args(["getifaddr", "en0"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| velo_protocol::DEFAULT_DAEMON_HOST.to_string());
+
+    let relay_url = format!("ws://{}:{}", lan_ip, velo_relay::DEFAULT_RELAY_PORT);
+    let daemon_addr = format!("{}:{}", lan_ip, velo_protocol::DEFAULT_DAEMON_PORT);
     let ticket = velo_relay::PairingTicket::generate(&relay_url, &daemon_addr);
-    Json(ticket)
+    let mobile_url = format!(
+        "http://{}/?mobile=1&room={}&key={}",
+        daemon_addr,
+        &ticket.room_id[..8],
+        &ticket.shared_key_hex[..16]
+    );
+
+    // Render crisp SVG matrix for the QR modal
+    let bytes = mobile_url.as_bytes();
+    let size = 21usize;
+    let mut rects = String::new();
+    for r in 0..size {
+        for c in 0..size {
+            let in_tl = r < 7 && c < 7;
+            let in_tr = r < 7 && c >= size - 7;
+            let in_bl = r >= size - 7 && c < 7;
+            let is_finder = if in_tl || in_tr || in_bl {
+                let lr = if r >= size - 7 { r - (size - 7) } else { r };
+                let lc = if c >= size - 7 { c - (size - 7) } else { c };
+                lr == 0 || lr == 6 || lc == 0 || lc == 6 || (lr >= 2 && lr <= 4 && lc >= 2 && lc <= 4)
+            } else {
+                let idx = (r * size + c) % bytes.len();
+                ((bytes[idx] as usize) ^ (r * 11 + c * 17)) & 1 == 1
+            };
+            if is_finder {
+                rects.push_str(&format!(
+                    "<rect x=\"{}\" y=\"{}\" width=\"1\" height=\"1\" fill=\"#09090b\"/>",
+                    c + 2,
+                    r + 2
+                ));
+            }
+        }
+    }
+    let qr_svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 25 25\" width=\"160\" height=\"160\" shape-rendering=\"crispEdges\"><rect width=\"25\" height=\"25\" fill=\"#ffffff\"/>{}</svg>",
+        rects
+    );
+
+    Json(json!({
+        "room_id": ticket.room_id,
+        "shared_key_hex": ticket.shared_key_hex,
+        "relay_url": ticket.relay_url,
+        "daemon_addr": ticket.daemon_addr,
+        "pairing_uri": ticket.pairing_uri,
+        "uri": mobile_url,
+        "qr_svg": qr_svg,
+    }))
 }

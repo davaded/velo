@@ -334,6 +334,16 @@ export const SLASH_SKILLS: SlashSkillItem[] = [
     desc: "调用高阶推理模型 (Opus 4.6 / o3) 审计当前 Worktree Diff 与并发安全性",
   },
   {
+    cmd: "/committee",
+    label: "Dual-Agent Committee Race",
+    desc: "同时派发 Claude Code 与 Codex 在两个独立 Git Worktree 分支并发实现同一需求",
+  },
+  {
+    cmd: "/loop",
+    label: "TDD Verification Loop",
+    desc: "持续运行 Agent 并自动执行验收测试命令 (cargo test) 直到全部通过",
+  },
+  {
     cmd: "/worktree-GC",
     label: "Prune Worktrees",
     desc: "清理已合并的孤立 Git Worktree 目录与锁文件",
