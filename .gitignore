@@ -1,4 +1,6 @@
 /target
+**/target/
+/Velo.app/
 node_modules/
 dist/
 .DS_Store

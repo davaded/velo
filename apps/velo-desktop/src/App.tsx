@@ -83,6 +83,15 @@ export function App() {
     return "http://127.0.0.1:6767";
   });
 
+  const [isMacDesktop] = useState<boolean>(() => {
+    const w = window as unknown as Record<string, unknown>;
+    return (
+      Boolean(w.__TAURI_INTERNALS__) ||
+      Boolean(w.__VELO_MACOS_APP__) ||
+      window.location.search.includes("desktop=1")
+    );
+  });
+
   const [variant, setVariant] = useState<VariantId>("a");
   const [theme, setTheme] = useState<ThemeId>("zinc");
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(true);
@@ -844,7 +853,9 @@ export function App() {
           {/* Top Window Bar + Sidebar Toggle (Draggable for macOS Tauri Overlay Titlebar) */}
           <div
             data-tauri-drag-region
-            className="flex h-[42px] shrink-0 items-center justify-between px-3"
+            className={`flex h-[42px] shrink-0 items-center justify-between pr-3 ${
+              isMacDesktop ? "pl-[78px]" : "pl-3"
+            }`}
           >
             <div className="flex items-center gap-2">
               <button
@@ -1064,7 +1075,9 @@ export function App() {
         {/* Clean Minimal Workspace Header (42px) */}
         <header
           data-tauri-drag-region
-          className="flex h-[42px] shrink-0 items-center justify-between border-b border-[#1f1f23] px-4"
+          className={`flex h-[42px] shrink-0 items-center justify-between border-b border-[#1f1f23] pr-4 ${
+            isMacDesktop && !sidebarOpen ? "pl-[78px]" : "pl-4"
+          }`}
         >
           <div className="flex items-center gap-2.5 min-w-0">
             {!sidebarOpen && (
