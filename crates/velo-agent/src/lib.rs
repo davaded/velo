@@ -616,6 +616,8 @@ impl AgentSpawner {
                     "workspace-write",
                     "--skip-git-repo-check",
                     "-c",
+                    "mcp_servers={}",
+                    "-c",
                     "model_reasoning_summary=\"detailed\"",
                     "-c",
                     "hide_agent_reasoning=false",
@@ -726,45 +728,7 @@ pub fn parse_agent_stdout_line(
             let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             match msg_type {
-                "system" => {
-                    if json.get("subtype").and_then(|v| v.as_str()) == Some("init") {
-                        events.push(AgentEvent::ThinkingDelta {
-                            session_id,
-                            text: "正在分析工作区上下文与规划执行步骤...".to_string(),
-                            timestamp: Utc::now(),
-                        });
-                    }
-                    return events;
-                }
-                "turn.started" => {
-                    events.push(AgentEvent::ThinkingDelta {
-                        session_id,
-                        text: "正在分析工作区上下文与推理...".to_string(),
-                        timestamp: Utc::now(),
-                    });
-                    return events;
-                }
-                "turn.completed" => {
-                    if let Some(usage) = json.get("usage") {
-                        let r_tok = usage
-                            .get("reasoning_output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let in_tok = usage
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        if r_tok > 0 || in_tok > 0 {
-                            events.push(AgentEvent::ThinkingDelta {
-                                session_id,
-                                text: format!(
-                                    "推理完成（思考 {} tokens · 上下文 {} tokens）",
-                                    r_tok, in_tok
-                                ),
-                                timestamp: Utc::now(),
-                            });
-                        }
-                    }
+                "system" | "turn.started" | "turn.completed" => {
                     return events;
                 }
                 // 1. Claude Code stream-json events

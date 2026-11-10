@@ -22,6 +22,7 @@ import {
   BeautifulContextMeter,
   BeautifulThinkingBlock,
   BeautifulToolCallCard,
+  PaseoTurnFooter,
 } from "./components/ui/BeautifulAgentPrimitives";
 import {
   ArrowUp,
@@ -49,6 +50,7 @@ import {
   SquarePen,
   Sun,
   Terminal,
+  Undo2,
   X,
 } from "lucide-react";
 
@@ -306,8 +308,12 @@ export function App() {
     "  Ready to execute commands inside the active isolated Git worktree.",
   ]);
   const [termInput, setTermInput] = useState<string>("");
+  const [turnTimingBySession, setTurnTimingBySession] = useState<
+    Record<string, { startedAtMs: number; durationMs?: number; completedAtLabel?: string }>
+  >({});
 
   const streamEndRef = useRef<HTMLDivElement | null>(null);
+  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeId) || sessions[0] || DEMO_SESSIONS[0],
@@ -477,6 +483,26 @@ export function App() {
 
           if (evType === "status_changed") {
             const st = String(evObj.status ?? "");
+            if (st === "running") {
+              setTurnTimingBySession((prev) => ({
+                ...prev,
+                [sid]: {
+                  startedAtMs: prev[sid]?.startedAtMs || Date.now(),
+                },
+              }));
+            } else if (st === "completed" || st === "failed" || st === "stopped") {
+              setTurnTimingBySession((prev) => {
+                const startedAtMs = prev[sid]?.startedAtMs || Date.now() - 1000;
+                return {
+                  ...prev,
+                  [sid]: {
+                    startedAtMs,
+                    durationMs: Math.max(500, Date.now() - startedAtMs),
+                    completedAtLabel: now,
+                  },
+                };
+              });
+            }
             setSessions((prev) =>
               prev.map((s) =>
                 s.id === sid
@@ -848,25 +874,15 @@ export function App() {
       content: text,
     };
 
-    const initThinkingEv: AgentEvent = {
-      id: `th-${Date.now()}`,
-      session_id: activeSession.id,
-      timestamp: now,
-      kind: "thinking",
-      content: "正在分析工作区上下文与推理...",
-    };
-
-    const isSlashSpecial =
-      rawText.startsWith("/handoff") ||
-      rawText.startsWith("/advisor") ||
-      rawText.startsWith("/committee") ||
-      rawText.startsWith("/loop");
+    const startedAtMs = Date.now();
+    setTurnTimingBySession((prev) => ({
+      ...prev,
+      [activeSession.id]: { startedAtMs },
+    }));
 
     setEventsBySession((prev) => ({
       ...prev,
-      [activeSession.id]: isSlashSpecial
-        ? [...baseEvents, userEv]
-        : [...baseEvents, userEv, initThinkingEv],
+      [activeSession.id]: [...baseEvents, userEv],
     }));
 
     // Real Daemon /handoff endpoint
@@ -1079,6 +1095,13 @@ export function App() {
 
         const oldId = activeSession.id;
         setSessions((prev) => prev.map((s) => (s.id === oldId ? realSess : s)));
+        setTurnTimingBySession((prev) => {
+          const oldTiming = prev[oldId] || { startedAtMs };
+          return {
+            ...prev,
+            [realSess.id]: oldTiming,
+          };
+        });
         setEventsBySession((prev) => {
           const fromOld = (prev[oldId] || []).map((ev) => ({
             ...ev,
@@ -1218,6 +1241,25 @@ export function App() {
       [activeSession.id]: truncated,
     }));
     await handleSendPrompt(ev.content, truncated);
+  };
+
+  // Paseo Rewind Flow (packages/app/src/components/rewind/rewind-menu.tsx):
+  // Rewinds conversation to before this user message and restores its text into the bottom Composer input
+  const handleRewindUserMessage = async (ev: AgentEvent) => {
+    if (activeSession.status === "running") {
+      await handleStopSession();
+    }
+    const currentList = eventsBySession[activeSession.id] || [];
+    const idx = currentList.findIndex((item) => item.id === ev.id);
+    const truncated = idx >= 0 ? currentList.slice(0, idx) : currentList;
+    setEventsBySession((prev) => ({
+      ...prev,
+      [activeSession.id]: truncated,
+    }));
+    setPrompt(ev.content);
+    setTimeout(() => {
+      composerTextareaRef.current?.focus();
+    }, 30);
   };
 
   // Delete / archive a thread from sidebar and daemon
@@ -2071,9 +2113,9 @@ export function App() {
         {/* Body Area: Centered Conversation Stream + On-Demand Right Drawer */}
         <div className="relative flex flex-1 overflow-hidden">
           <main className="flex flex-1 flex-col items-center overflow-hidden">
-            {/* Scrollable Stream (Claude Code / Codex / Paseo Natural Proportions) */}
-            <div className="w-full flex-1 overflow-y-auto px-6 py-6">
-              <div className="mx-auto flex max-w-[680px] flex-col gap-5">
+            {/* Scrollable Stream (Authentic Paseo Stream Layout) */}
+            <div className="w-full flex-1 overflow-y-auto px-6 py-6" data-testid="agent-chat-scroll">
+              <div className="mx-auto flex max-w-[680px] flex-col gap-1.5">
                 {activeEvents.length === 0 && (
                   <div className="my-12 flex flex-col items-start gap-2.5 rounded-2xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] p-5">
                     <div className="flex items-center gap-2 text-[13.5px] font-medium text-[var(--v-fg-primary)]">
@@ -2108,20 +2150,25 @@ export function App() {
                     }
                   }
                   const lastUserEv = lastUserIdx >= 0 ? activeEvents[lastUserIdx] : null;
+                  const lastAssistantAfterUser = [...activeEvents.slice(Math.max(0, lastUserIdx))]
+                    .reverse()
+                    .find((e) => e.kind === "assistant");
+                  const activeTurnTiming = turnTimingBySession[activeSession.id];
+                  const lastEvent = activeEvents[activeEvents.length - 1];
 
                   return (
                     <>
                       {activeEvents.map((ev, idx) => {
                         const isLastEvent = idx === activeEvents.length - 1;
 
-                        // 1. User Message: Cursor / Claude Desktop style (click bubble to edit, minimal hover icons only when idle, zero delete button)
+                        // 1. User Message: Authentic Paseo UserMessage (asymmetric surface3 bubble + hover trailingRow with Timestamp, Rewind, Edit, Copy)
                         if (ev.kind === "user") {
                           const isEditing = editingEventId === ev.id;
 
                           if (isEditing) {
                             return (
-                              <div key={ev.id} className="flex justify-end">
-                                <div className="w-full max-w-[86%] rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-3.5 shadow-lg">
+                              <div key={ev.id} className="mt-3 mb-2 flex justify-end">
+                                <div className="w-full max-w-[86%] rounded-2xl rounded-tr-[4px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-3.5 shadow-lg">
                                   <textarea
                                     rows={3}
                                     autoFocus
@@ -2167,7 +2214,11 @@ export function App() {
                           }
 
                           return (
-                            <div key={ev.id} className="group flex flex-col items-end gap-1">
+                            <div
+                              key={ev.id}
+                              data-testid="user-message"
+                              className="group mt-3 mb-1 flex flex-col items-end"
+                            >
                               <div
                                 onClick={() => {
                                   if (activeSession.status !== "running") {
@@ -2176,45 +2227,61 @@ export function App() {
                                 }}
                                 title={
                                   activeSession.status !== "running"
-                                    ? "点击可直接编辑并重新发送"
+                                    ? "点击可编辑并重新发送"
                                     : undefined
                                 }
-                                className={`max-w-[82%] whitespace-pre-wrap rounded-[18px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] transition-colors ${
+                                className={`max-w-[82%] whitespace-pre-wrap rounded-2xl rounded-tr-[4px] bg-[var(--v-bg-bubble)] px-4 py-3 text-[13.5px] leading-[1.45] text-[var(--v-fg-primary)] transition-colors ${
                                   activeSession.status !== "running"
-                                    ? "cursor-pointer hover:ring-1 hover:ring-[var(--v-border-strong)]"
+                                    ? "cursor-pointer hover:brightness-105"
                                     : ""
                                 }`}
                               >
                                 {ev.content}
                               </div>
-                              {/* Minimal Hover-Only Icon Actions (Hidden during running) */}
-                              {activeSession.status !== "running" && (
-                                <div className="flex items-center gap-1 pr-1 text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100">
+                              {/* Paseo Trailing Row: Timestamp + Rewind (Undo2) + Inline Edit + Copy */}
+                              <div
+                                data-testid="user-message-trailing-row"
+                                className="mt-1.5 flex h-6 items-center justify-end gap-1.5 text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100"
+                              >
+                                <span className="mr-0.5 text-[12.5px] tabular-nums select-none">
+                                  {ev.timestamp}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRewindUserMessage(ev)}
+                                  title="回退到此消息并恢复到输入框 (Rewind conversation)"
+                                  className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                >
+                                  <Undo2 className="h-3.5 w-3.5" />
+                                </button>
+                                {activeSession.status !== "running" && (
                                   <button
-                                    onClick={() => copyText(ev.id, ev.content)}
-                                    title="复制"
-                                    className="rounded-md p-1 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                                  >
-                                    {copiedKey === ev.id ? (
-                                      <Check className="h-3.5 w-3.5 text-[#34d399]" />
-                                    ) : (
-                                      <Copy className="h-3.5 w-3.5" />
-                                    )}
-                                  </button>
-                                  <button
+                                    type="button"
                                     onClick={() => handleStartEditMessage(ev)}
-                                    title="编辑消息"
-                                    className="rounded-md p-1 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                    title="行内编辑并重发"
+                                    className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                                   >
                                     <SquarePen className="h-3.5 w-3.5" />
                                   </button>
-                                </div>
-                              )}
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => copyText(ev.id, ev.content)}
+                                  title="复制消息"
+                                  className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                >
+                                  {copiedKey === ev.id ? (
+                                    <Check className="h-3.5 w-3.5 text-[#34d399]" />
+                                  ) : (
+                                    <Copy className="h-3.5 w-3.5" />
+                                  )}
+                                </button>
+                              </div>
                             </div>
                           );
                         }
 
-                        // 2. Thinking Trace: Using BeautifulThinkingBlock component
+                        // 2. Thinking Trace: Paseo ExpandableBadge (Brain -> ChevronRight on hover + clean step summary)
                         if (ev.kind === "thinking") {
                           const isStreamingThinking =
                             activeSession.status === "running" && isLastEvent;
@@ -2223,12 +2290,12 @@ export function App() {
                               key={ev.id}
                               text={ev.content}
                               isStreaming={isStreamingThinking}
-                              defaultExpanded={true}
+                              defaultExpanded={false}
                             />
                           );
                         }
 
-                        // 3. Tool Call: Using BeautifulToolCallCard component (with live running spinner -> ok badge)
+                        // 3. Tool Call: Paseo ExpandableBadge (Shell / Read / Edit / Search + Paseo Web Shimmer when running)
                         if (ev.kind === "tool_call") {
                           const toolInput =
                             ev.tool_input ??
@@ -2248,9 +2315,13 @@ export function App() {
                           );
                         }
 
-                        // 4. Assistant Response: Clean left-aligned prose + hover Copy & Retry + Worktree Diff Summary Card
+                        // 4. Assistant Response: Clean left-aligned prose + Worktree Diff Summary Card
                         return (
-                          <div key={ev.id} className="group flex flex-col items-start gap-2">
+                          <div
+                            key={ev.id}
+                            data-testid="assistant-message"
+                            className="flex flex-col items-start gap-2.5 py-2"
+                          >
                             <div className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[var(--v-fg-body)]">
                               {ev.content}
                             </div>
@@ -2277,62 +2348,27 @@ export function App() {
                                 </button>
                               </div>
                             )}
-
-                            {/* Hover-only Copy & Regenerate on Assistant Reply */}
-                            {activeSession.status !== "running" && (
-                              <div className="flex items-center gap-1 text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100">
-                                <button
-                                  onClick={() => copyText(ev.id, ev.content)}
-                                  title="复制回复"
-                                  className="rounded-md p-1 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                                >
-                                  {copiedKey === ev.id ? (
-                                    <Check className="h-3.5 w-3.5 text-[#34d399]" />
-                                  ) : (
-                                    <Copy className="h-3.5 w-3.5" />
-                                  )}
-                                </button>
-                                {lastUserEv && (
-                                  <button
-                                    onClick={() => handleRetryUserMessage(lastUserEv)}
-                                    title="重新生成回复"
-                                    className="rounded-md p-1 hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                                  >
-                                    <RefreshCw className="h-3.5 w-3.5" />
-                                  </button>
-                                )}
-                              </div>
-                            )}
                           </div>
                         );
                       })}
 
-                      {/* Live Inline Reasoning Indicator when running after a user message or completed tool call */}
-                      {activeSession.status === "running" &&
-                        activeEvents[activeEvents.length - 1]?.kind !== "thinking" && (
-                          <BeautifulThinkingBlock
-                            text=""
-                            isStreaming={true}
-                            defaultExpanded={false}
-                          />
-                        )}
-
-                      {/* Interrupted / Stopped Inline Bar (Only shown when stopped before final assistant reply) */}
-                      {activeSession.status !== "running" &&
-                        activeEvents.length > 0 &&
-                        activeEvents[activeEvents.length - 1]?.kind !== "assistant" &&
-                        lastUserEv && (
-                          <div className="flex items-center justify-between rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3.5 py-2 text-[12px] text-[var(--v-fg-muted)]">
-                            <span>已手动停止当前执行 · 点击上方消息可直接修改重发</span>
-                            <button
-                              onClick={() => handleRetryUserMessage(lastUserEv)}
-                              className="flex items-center gap-1.5 rounded-lg bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
-                            >
-                              <RefreshCw className="h-3 w-3" />
-                              <span>重试</span>
-                            </button>
-                          </div>
-                        )}
+                      {/* 5. Authentic Paseo TurnFooter:
+                         - While running: 2x3 6-dot PaseoSyncedLoader + live elapsed timer (0s, 1s, 2s...)
+                         - When completed: swaps in-place in the same 24px slot to Copy + Retry + "Worked for Xs" */}
+                      {activeEvents.length > 0 && (
+                        <PaseoTurnFooter
+                          isRunning={activeSession.status === "running"}
+                          startedAtMs={activeTurnTiming?.startedAtMs}
+                          durationMs={activeTurnTiming?.durationMs}
+                          completedAtLabel={
+                            activeTurnTiming?.completedAtLabel || lastEvent?.timestamp
+                          }
+                          assistantContent={lastAssistantAfterUser?.content}
+                          onRetry={
+                            lastUserEv ? () => handleRetryUserMessage(lastUserEv) : undefined
+                          }
+                        />
+                      )}
                     </>
                   );
                 })()}
@@ -2380,6 +2416,7 @@ export function App() {
 
                 <div className="rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)]">
                   <textarea
+                    ref={composerTextareaRef}
                     rows={2}
                     value={prompt}
                     onChange={(e) => handlePromptChange(e.target.value)}
