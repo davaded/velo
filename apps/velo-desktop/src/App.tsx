@@ -5,8 +5,10 @@ import {
   ApprovalMode,
   DEMO_DIFF_FILES,
   DEMO_EVENTS,
+  DEMO_REPOS,
   DEMO_SESSIONS,
   SLASH_SKILLS,
+  VeloRepo,
   VeloSession,
   normalizeToVeloSession,
 } from "./mockData";
@@ -17,6 +19,7 @@ import {
   Command,
   Copy,
   FileCode2,
+  FolderGit2,
   GitBranch,
   Plus,
   QrCode,
@@ -29,7 +32,7 @@ import {
 
 type VariantId = "a" | "b" | "c";
 type DrawerTab = "diff" | "terminal";
-type ModalKind = null | "new-worktree" | "command" | "skills" | "qr" | "advisor";
+type ModalKind = null | "new-worktree" | "new-repo" | "command" | "skills" | "qr" | "advisor";
 
 export function App() {
   const [daemonUrl] = useState<string>(() => {
@@ -38,8 +41,12 @@ export function App() {
     return "http://127.0.0.1:6767";
   });
 
-  // Visual Material Variant (User asked for all 3 versions to compare!)
+  // Visual Material Variant (A / B / C live switcher)
   const [variant, setVariant] = useState<VariantId>("a");
+
+  // L3 Left Navigation State: 48px Repo Rail + 220px Worktree Column
+  const [repos, setRepos] = useState<VeloRepo[]>(DEMO_REPOS);
+  const [activeRepoId, setActiveRepoId] = useState<string>(DEMO_REPOS[0].id);
 
   // Core Sessions & Events
   const [sessions, setSessions] = useState<VeloSession[]>(DEMO_SESSIONS);
@@ -47,7 +54,7 @@ export function App() {
   const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(DEMO_EVENTS);
   const [connected, setConnected] = useState<boolean>(false);
 
-  // On-Demand Right Drawer State (Closed by default per User's 1+4 Layout!)
+  // On-Demand Right Drawer State (Closed by default per User's 1+4 Layout)
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("diff");
   const [selectedDiffPath, setSelectedDiffPath] = useState<string>(DEMO_DIFF_FILES[0].path);
@@ -68,15 +75,17 @@ export function App() {
   // Modals
   const [activeModal, setActiveModal] = useState<ModalKind>(null);
   const [cmdQuery, setCmdQuery] = useState<string>("");
-  const [newTaskName, setNewTaskName] = useState<string>("feat-worktree-orchestrator");
+  const [newTaskName, setNewTaskName] = useState<string>("feat/worktree-orchestrator");
+  const [newTaskDesc, setNewTaskDesc] = useState<string>("并行 Agent 调度与状态同步");
   const [newAgentKind, setNewAgentKind] = useState<AgentKind>("claude");
   const [newApproval] = useState<ApprovalMode>("auto_edit");
+  const [newRepoPath, setNewRepoPath] = useState<string>("/Users/daiyudai/code/my-service");
 
   // Terminal State inside Drawer
   const [termLines, setTermLines] = useState<string[]>([
     "$ velo status --worktrees",
     "  ● feat/ws-reconnection      [claude-sonnet-4.5]  +48 -14  RUNNING",
-    "  ● fix/worktree-gc-lock      [codex-o3]           +19 -5   RUNNING",
+    "  ● fix/worktree-gc-lock      [codex-o3]           +19 -5   WAITING",
     "  ✓ chore/mcp-bridge-tools    [gemini-2.5-pro]     +112 -8  IDLE",
     "$ cargo test --workspace --quiet",
     "  test result: ok. 18 passed; 0 failed; 0 ignored (0.41s)",
@@ -85,15 +94,38 @@ export function App() {
 
   const streamEndRef = useRef<HTMLDivElement | null>(null);
 
+  const activeRepo = useMemo(
+    () => repos.find((r) => r.id === activeRepoId) || repos[0],
+    [repos, activeRepoId]
+  );
+
+  const repoSessions = useMemo(
+    () => sessions.filter((s) => s.repo_id === activeRepo.id),
+    [sessions, activeRepo.id]
+  );
+
   const activeSession = useMemo(
-    () => sessions.find((s) => s.id === activeId) || sessions[0] || DEMO_SESSIONS[0],
-    [sessions, activeId]
+    () =>
+      sessions.find((s) => s.id === activeId) ||
+      repoSessions[0] ||
+      sessions[0] ||
+      DEMO_SESSIONS[0],
+    [sessions, repoSessions, activeId]
   );
 
   const activeEvents = useMemo(
     () => eventsBySession[activeSession.id] || DEMO_EVENTS["sess-1"] || [],
     [eventsBySession, activeSession.id]
   );
+
+  // Switch repo and automatically select its first worktree
+  const handleSelectRepo = (repoId: string) => {
+    setActiveRepoId(repoId);
+    const firstInRepo = sessions.find((s) => s.repo_id === repoId);
+    if (firstInRepo) {
+      setActiveId(firstInRepo.id);
+    }
+  };
 
   // Connect to live Rust Velo Daemon
   useEffect(() => {
@@ -154,16 +186,13 @@ export function App() {
     };
   }, [daemonUrl, activeId]);
 
-  // Keyboard shortcuts: Cmd+K (Command), Cmd+J / Cmd+B (Toggle Right Drawer), Esc (Close)
+  // Keyboard shortcuts: Cmd+K (Command), Cmd+J (Toggle Right Drawer), Esc (Close)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setActiveModal((m) => (m === "command" ? null : "command"));
-      } else if (
-        (e.metaKey || e.ctrlKey) &&
-        (e.key.toLowerCase() === "j" || e.key.toLowerCase() === "b")
-      ) {
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "j") {
         e.preventDefault();
         setDrawerOpen((o) => !o);
       } else if (e.key === "Escape") {
@@ -274,12 +303,16 @@ export function App() {
   };
 
   const handleCreateWorktree = async () => {
-    const clean = newTaskName.trim() || `task-${sessions.length + 1}`;
-    const branch = clean.startsWith("feat/") || clean.startsWith("fix/") ? clean : `feat/${clean}`;
+    const clean = newTaskName.trim() || `feat/task-${sessions.length + 1}`;
+    const branch = clean.startsWith("feat/") || clean.startsWith("fix/") || clean.startsWith("chore/")
+      ? clean
+      : `feat/${clean}`;
+    const slug = branch.replace(/\//g, "-");
     const newId = `sess-${Date.now().toString().slice(-4)}`;
     const created: VeloSession = {
       id: newId,
-      title: clean,
+      repo_id: activeRepo.id,
+      title: newTaskDesc.trim() || branch,
       agent_kind: newAgentKind,
       model:
         newAgentKind === "claude"
@@ -287,10 +320,16 @@ export function App() {
           : newAgentKind === "codex"
           ? "codex-o3"
           : "gemini-2.5-pro",
+      model_short:
+        newAgentKind === "claude"
+          ? "claude-4.5"
+          : newAgentKind === "codex"
+          ? "codex-o3"
+          : "gemini-2.5",
       status: "running",
       branch_name: branch,
-      worktree_path: `/Users/daiyudai/code/velo/.velo/worktrees/${clean}`,
-      project_path: "/Users/daiyudai/code/velo",
+      worktree_path: `${activeRepo.path}/.velo/worktrees/${slug}`,
+      project_path: activeRepo.path,
       approval_mode: newApproval,
       tokens_used: 2400,
       tokens_limit: 200000,
@@ -311,7 +350,7 @@ export function App() {
           timestamp: new Date().toLocaleTimeString([], { hour12: false }),
           kind: "tool_call",
           tool_name: "GitWorktree",
-          tool_args: `git worktree add .velo/worktrees/${clean} -b ${branch}`,
+          tool_args: `git worktree add .velo/worktrees/${slug} -b ${branch}`,
           content: `HEAD is now at 9ef8a30 Checked out isolated branch ${branch}`,
           duration_ms: 34,
         },
@@ -320,11 +359,51 @@ export function App() {
           session_id: newId,
           timestamp: new Date().toLocaleTimeString([], { hour12: false }),
           kind: "assistant",
-          content: `Isolated Git worktree \`${branch}\` is ready with **${created.model}**. Send a task or click any modified file chip to slide out the Diff & PTY drawer.`,
+          content: `已在仓库 **${activeRepo.name}** 下创建隔离 Git Worktree \`${branch}\`（模型：**${created.model}**）。点击流中的修改胶囊即可滑出右侧 Diff 抽屉。`,
         },
       ],
     }));
     setActiveId(newId);
+    setActiveModal(null);
+  };
+
+  const handleCreateRepo = () => {
+    const cleanPath = newRepoPath.trim() || "/Users/daiyudai/code/new-repo";
+    const name = cleanPath.split("/").filter(Boolean).pop() || "repo";
+    const code = name.slice(0, 2).toUpperCase();
+    const id = `repo-${Date.now().toString().slice(-4)}`;
+    const newRepo: VeloRepo = {
+      id,
+      code,
+      name,
+      path: cleanPath,
+      default_branch: "main",
+    };
+    const defaultSessId = `sess-${Date.now().toString().slice(-3)}`;
+    const defaultSession: VeloSession = {
+      id: defaultSessId,
+      repo_id: id,
+      title: "初始化 Worktree 架构索引",
+      agent_kind: "claude",
+      model: "claude-sonnet-4.5",
+      model_short: "claude-4.5",
+      status: "running",
+      branch_name: "feat/init-worktree",
+      worktree_path: `${cleanPath}/.velo/worktrees/init`,
+      project_path: cleanPath,
+      approval_mode: "auto_edit",
+      tokens_used: 4200,
+      tokens_limit: 200000,
+      cost_usd: 0.02,
+      files_changed: 1,
+      insertions: 18,
+      deletions: 0,
+      updated_at: "just now",
+    };
+    setRepos((prev) => [...prev, newRepo]);
+    setSessions((prev) => [defaultSession, ...prev]);
+    setActiveRepoId(id);
+    setActiveId(defaultSessId);
     setActiveModal(null);
   };
 
@@ -337,7 +416,7 @@ export function App() {
       ...prev,
       `$ ${cmd}`,
       cmd.includes("git status")
-        ? `On branch ${activeSession.branch_name} — 3 files modified (+${activeSession.insertions} -${activeSession.deletions})`
+        ? `On branch ${activeSession.branch_name} — ${activeSession.files_changed} files modified (+${activeSession.insertions} -${activeSession.deletions})`
         : `Executed '${cmd}' in worktree ${activeSession.worktree_path} (exit 0)`,
     ]);
   };
@@ -365,9 +444,9 @@ export function App() {
       className={`velo-variant-${variant} flex h-screen w-screen overflow-hidden select-none bg-[#09090b] text-[#fafafa]`}
     >
       {/* =====================================================================
-          1. ULTRA-SLIM 48PX LEFT ICON RAIL (Spatial Layout Option 1)
+          1A. LEFTMOST 48PX REPOSITORY RAIL (方案 L3 第一栏：切换不同项目仓库)
          ===================================================================== */}
-      <aside className="v-rail z-30 flex w-[50px] shrink-0 flex-col items-center justify-between py-3">
+      <aside className="v-rail z-30 flex w-[48px] shrink-0 flex-col items-center justify-between py-3">
         <div className="flex flex-col items-center gap-2.5">
           {/* Velo Monochrome Brand Mark */}
           <button
@@ -384,39 +463,33 @@ export function App() {
 
           <div className="my-0.5 h-[1px] w-5 bg-[#27272a]" />
 
-          {/* Worktree Agent Session Icons */}
-          {sessions.map((s, idx) => {
-            const isActive = s.id === activeSession.id;
-            const shortCode =
-              s.agent_kind === "claude"
-                ? `C${idx + 1}`
-                : s.agent_kind === "codex"
-                ? `CX`
-                : `GM`;
-            const dotColor =
-              s.status === "running"
-                ? "#34d399"
-                : s.status === "waiting_approval"
-                ? "#fbbf24"
-                : "#71717a";
+          {/* Repository Icons (VL, NX, UI...) */}
+          {repos.map((repo) => {
+            const isSelected = repo.id === activeRepo.id;
+            const repoWorktrees = sessions.filter((s) => s.repo_id === repo.id);
+            const hasRunning = repoWorktrees.some((s) => s.status === "running");
+            const hasWaiting = repoWorktrees.some((s) => s.status === "waiting_approval");
+            const dotColor = hasRunning
+              ? "#34d399"
+              : hasWaiting
+              ? "#fbbf24"
+              : "#71717a";
 
             return (
               <button
-                key={s.id}
-                onClick={() => setActiveId(s.id)}
-                title={`${s.branch_name} · ${s.model} (+${s.insertions} -${s.deletions})`}
+                key={repo.id}
+                onClick={() => handleSelectRepo(repo.id)}
+                title={`仓库: ${repo.name} (${repo.path}) · ${repoWorktrees.length} Worktrees`}
                 className={`group relative flex h-8 w-8 items-center justify-center rounded-md font-mono text-[11px] font-semibold transition-all ${
-                  isActive
+                  isSelected
                     ? "bg-[#fafafa] text-[#09090b] shadow-sm"
                     : "bg-[#141417] text-[#a1a1aa] hover:bg-[#1f1f24] hover:text-[#fafafa]"
                 }`}
               >
-                {/* Left active pill indicator */}
-                {isActive && (
-                  <span className="absolute -left-[9px] h-4 w-[3px] rounded-r bg-[#fafafa]" />
+                {isSelected && (
+                  <span className="absolute -left-[8px] h-4 w-[3px] rounded-r bg-[#fafafa]" />
                 )}
-                {shortCode}
-                {/* Semantic 6px status dot */}
+                {repo.code}
                 <span
                   className="v-dot absolute -bottom-0.5 -right-0.5 border border-[#09090b]"
                   style={{ background: dotColor }}
@@ -425,17 +498,17 @@ export function App() {
             );
           })}
 
-          {/* Create Isolated Worktree Session Button */}
+          {/* Add Repository Button */}
           <button
-            onClick={() => setActiveModal("new-worktree")}
-            title="New Isolated Git Worktree Session"
+            onClick={() => setActiveModal("new-repo")}
+            title="导入/添加 Git 仓库 (Add Repository)"
             className="flex h-8 w-8 items-center justify-center rounded-md border border-dashed border-[#27272a] text-[#71717a] transition-colors hover:border-[#52525b] hover:text-[#fafafa]"
           >
             <Plus className="h-3.5 w-3.5" />
           </button>
         </div>
 
-        {/* Bottom Utility Triggers */}
+        {/* Bottom Global Utility Triggers */}
         <div className="flex flex-col items-center gap-2">
           <button
             onClick={() => setActiveModal("skills")}
@@ -462,14 +535,122 @@ export function App() {
       </aside>
 
       {/* =====================================================================
+          1B. SECONDARY 216PX WORKTREE COLUMN (方案 L3 第二栏：双行高密度 Worktree 胶囊列)
+         ===================================================================== */}
+      <aside className="v-rail z-20 flex w-[220px] shrink-0 flex-col justify-between bg-[#0c0c0f]">
+        <div className="flex flex-1 flex-col overflow-hidden">
+          {/* Repo Header inside Worktree Column */}
+          <div className="flex h-[44px] shrink-0 items-center justify-between border-b border-[#222226] px-3">
+            <div className="flex items-center gap-1.5 overflow-hidden">
+              <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-[#a1a1aa]" />
+              <span className="truncate font-mono text-[12px] font-semibold text-[#fafafa]">
+                {activeRepo.name}
+              </span>
+            </div>
+            <button
+              onClick={() => setActiveModal("new-worktree")}
+              title="在当前仓库新建隔离 Git Worktree"
+              className="v-chip flex items-center gap-1 px-2 py-0.5 font-mono text-[10.5px] text-[#a1a1aa] hover:text-[#fafafa]"
+            >
+              <Plus className="h-3 w-3" />
+              <span>Worktree</span>
+            </button>
+          </div>
+
+          {/* Section Subheader */}
+          <div className="flex items-center justify-between px-3 pb-1.5 pt-3 font-mono text-[10px] uppercase tracking-wider text-[#71717a]">
+            <span>Worktrees ({repoSessions.length})</span>
+            <span>Diff / Model</span>
+          </div>
+
+          {/* 2-Line High-Density Worktree Capsule List */}
+          <div className="flex-1 space-y-1.5 overflow-y-auto px-2.5 py-1">
+            {repoSessions.map((w) => {
+              const isSelected = w.id === activeSession.id;
+              const dotColor =
+                w.status === "running"
+                  ? "#34d399"
+                  : w.status === "waiting_approval"
+                  ? "#fbbf24"
+                  : "#71717a";
+
+              return (
+                <button
+                  key={w.id}
+                  onClick={() => setActiveId(w.id)}
+                  className={`v-card group flex w-full flex-col gap-1 px-2.5 py-2 text-left transition-all ${
+                    isSelected
+                      ? "border-[#71717a] bg-[#18181d]"
+                      : "border-transparent bg-transparent hover:border-[#27272a] hover:bg-[#131317]"
+                  }`}
+                >
+                  {/* Row 1: Semantic Status Dot + Git Branch Name + Diff (+48 -14) */}
+                  <div className="flex w-full items-center justify-between gap-1.5">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span
+                        className="v-dot shrink-0"
+                        style={{
+                          background: dotColor,
+                          boxShadow:
+                            w.status === "running"
+                              ? "0 0 6px rgba(52,211,153,0.55)"
+                              : "none",
+                        }}
+                      />
+                      <span
+                        className={`truncate font-mono text-[11.5px] ${
+                          isSelected
+                            ? "font-semibold text-[#fafafa]"
+                            : "font-medium text-[#d4d4d8] group-hover:text-[#fafafa]"
+                        }`}
+                      >
+                        {w.branch_name}
+                      </span>
+                    </div>
+
+                    <div className="flex shrink-0 items-center gap-1 font-mono text-[10.5px]">
+                      <span className="text-[#34d399]">+{w.insertions}</span>
+                      <span className="text-[#f87171]">−{w.deletions}</span>
+                    </div>
+                  </div>
+
+                  {/* Row 2: Task Summary + Compact Model Badge */}
+                  <div className="flex w-full items-center justify-between gap-2 text-[11px]">
+                    <span className="truncate text-[#71717a] group-hover:text-[#a1a1aa]">
+                      {w.title}
+                    </span>
+                    <span className="shrink-0 rounded bg-[#141418] px-1.5 py-0.2 font-mono text-[10px] text-[#a1a1aa]">
+                      {w.model_short}
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Worktree Column Footer */}
+        <div className="flex items-center justify-between border-t border-[#1f1f24] px-3 py-2.5 font-mono text-[10.5px] text-[#71717a]">
+          <span className="truncate" title={activeRepo.path}>
+            {activeRepo.path.replace("/Users/daiyudai/", "~/")}
+          </span>
+          <span className="text-[#34d399]">
+            ● {repoSessions.filter((s) => s.status === "running").length} active
+          </span>
+        </div>
+      </aside>
+
+      {/* =====================================================================
           2. MAIN WORKSPACE AREA (Top Header + Single-Column Center + Slide-Over Drawer)
          ===================================================================== */}
       <div className="flex flex-1 flex-col overflow-hidden">
         {/* Minimal Monochrome Top Header (44px) */}
         <header className="v-topbar z-20 flex h-[44px] shrink-0 items-center justify-between px-4">
-          {/* Left: Worktree & Branch Breadcrumb */}
-          <div className="flex items-center gap-2.5 text-[12px]">
-            <span className="font-medium text-[#71717a]">velo</span>
+          {/* Left: Active Repo & Branch Breadcrumb */}
+          <div className="flex items-center gap-2 text-[12px]">
+            <span className="font-mono text-[11.5px] text-[#71717a]">
+              {activeRepo.name}
+            </span>
             <span className="text-[#3f3f46]">/</span>
             <button
               onClick={() => setActiveModal("command")}
@@ -479,15 +660,6 @@ export function App() {
               <span>{activeSession.branch_name}</span>
               <ChevronDown className="h-3 w-3 text-[#71717a]" />
             </button>
-            <span className="hidden items-center gap-1.5 font-mono text-[11px] text-[#71717a] md:inline-flex">
-              <span
-                className="v-dot"
-                style={{
-                  background: activeSession.status === "running" ? "#34d399" : "#38bdf8",
-                }}
-              />
-              {activeSession.model}
-            </span>
           </div>
 
           {/* Center: LIVE MATERIAL VARIANT SWITCHER (A / B / C for User Comparison!) */}
@@ -528,7 +700,7 @@ export function App() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => handleSendPrompt("/advisor Audit current worktree changes")}
-              className="v-chip hidden items-center gap-1 px-2.5 py-1 font-mono text-[11px] text-[#a1a1aa] hover:text-[#fafafa] lg:inline-flex"
+              className="v-chip hidden items-center gap-1 px-2.5 py-1 font-mono text-[11px] text-[#a1a1aa] hover:text-[#fafafa] xl:inline-flex"
             >
               <Sparkles className="h-3 w-3" />
               <span>/advisor</span>
@@ -578,7 +750,7 @@ export function App() {
         {/* Body Area: Centered Single-Column Stream + On-Demand Slide-Over Drawer */}
         <div className="relative flex flex-1 overflow-hidden">
           {/* =================================================================
-              3. SINGLE-COLUMN MONOCHROME FOCUS STREAM (Spatial Layout Option 4)
+              3. SINGLE-COLUMN MONOCHROME FOCUS STREAM
              ================================================================= */}
           <main className="flex flex-1 flex-col items-center overflow-hidden">
             {/* Scrollable Conversation Stream */}
@@ -787,7 +959,7 @@ export function App() {
                         handleSendPrompt();
                       }
                     }}
-                    placeholder={`向 ${activeSession.model} 发送指令，输入 / 调用技能，点击文件标签滑出右侧 Diff 抽屉...`}
+                    placeholder={`向 ${activeSession.model} (${activeSession.branch_name}) 发送指令，输入 / 调用技能...`}
                     className="w-full resize-none bg-transparent text-[13px] leading-relaxed text-[#fafafa] placeholder-[#52525b] focus:outline-none"
                   />
 
@@ -826,7 +998,7 @@ export function App() {
              ================================================================= */}
           <aside
             className={`v-drawer z-20 flex flex-col overflow-hidden transition-all duration-200 ease-out ${
-              drawerOpen ? "w-[480px] opacity-100" : "w-0 border-l-0 opacity-0"
+              drawerOpen ? "w-[460px] opacity-100" : "w-0 border-l-0 opacity-0"
             }`}
           >
             {/* Drawer Header */}
@@ -978,7 +1150,7 @@ export function App() {
       </div>
 
       {/* =====================================================================
-          6. MODALS (New Isolated Worktree / Command Palette / Mobile Relay QR)
+          6. MODALS (New Isolated Worktree / New Repo / Command Palette / Mobile Relay QR)
          ===================================================================== */}
       {activeModal && (
         <div
@@ -993,7 +1165,7 @@ export function App() {
               <div>
                 <div className="mb-3 flex items-center justify-between">
                   <h3 className="text-[14px] font-semibold text-[#fafafa]">
-                    New Isolated Git Worktree Session
+                    在仓库 {activeRepo.name} 下新建隔离 Git Worktree
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
@@ -1005,12 +1177,22 @@ export function App() {
                 <div className="space-y-3 text-[12px]">
                   <div>
                     <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
-                      Branch / Worktree Name
+                      Git Branch Name (第 1 行展示)
                     </label>
                     <input
                       value={newTaskName}
                       onChange={(e) => setNewTaskName(e.target.value)}
                       className="v-card w-full px-3 py-2 font-mono text-[12px] text-[#fafafa] focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
+                      任务简述 (第 2 行展示)
+                    </label>
+                    <input
+                      value={newTaskDesc}
+                      onChange={(e) => setNewTaskDesc(e.target.value)}
+                      className="v-card w-full px-3 py-2 text-[12px] text-[#fafafa] focus:outline-none"
                     />
                   </div>
                   <div className="grid grid-cols-3 gap-2">
@@ -1044,6 +1226,48 @@ export function App() {
               </div>
             )}
 
+            {activeModal === "new-repo" && (
+              <div>
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="text-[14px] font-semibold text-[#fafafa]">
+                    添加本地 Git 仓库到左轨
+                  </h3>
+                  <button
+                    onClick={() => setActiveModal(null)}
+                    className="text-[#71717a] hover:text-[#fafafa]"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                <div className="space-y-3 text-[12px]">
+                  <div>
+                    <label className="mb-1 block font-mono text-[11px] text-[#a1a1aa]">
+                      Repository Local Path
+                    </label>
+                    <input
+                      value={newRepoPath}
+                      onChange={(e) => setNewRepoPath(e.target.value)}
+                      className="v-card w-full px-3 py-2 font-mono text-[12px] text-[#fafafa] focus:outline-none"
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <button
+                      onClick={() => setActiveModal(null)}
+                      className="v-chip px-3 py-1.5 text-[12px] text-[#a1a1aa]"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleCreateRepo}
+                      className="v-primary-btn px-4 py-1.5 text-[12px]"
+                    >
+                      Add Repository
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {activeModal === "command" && (
               <div>
                 <div className="mb-3 flex items-center gap-2 border-b border-[#27272a] pb-2.5">
@@ -1052,7 +1276,7 @@ export function App() {
                     autoFocus
                     value={cmdQuery}
                     onChange={(e) => setCmdQuery(e.target.value)}
-                    placeholder="Switch worktree, toggle material A/B/C, open Diff drawer..."
+                    placeholder="Switch repo, worktree, toggle material A/B/C, open Diff drawer..."
                     className="w-full bg-transparent text-[13px] text-[#fafafa] focus:outline-none"
                   />
                 </div>

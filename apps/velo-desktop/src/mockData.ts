@@ -1,11 +1,21 @@
 export type AgentKind = "claude" | "codex" | "gemini";
 export type ApprovalMode = "auto_edit" | "ask_before_edit" | "full_auto";
 
+export interface VeloRepo {
+  id: string;
+  code: string;
+  name: string;
+  path: string;
+  default_branch: string;
+}
+
 export interface VeloSession {
   id: string;
+  repo_id: string;
   title: string;
   agent_kind: AgentKind;
   model: string;
+  model_short: string;
   status: "running" | "waiting_approval" | "idle";
   branch_name: string;
   worktree_path: string;
@@ -51,12 +61,38 @@ export interface SlashSkillItem {
   desc: string;
 }
 
+export const DEMO_REPOS: VeloRepo[] = [
+  {
+    id: "repo-velo",
+    code: "VL",
+    name: "velo",
+    path: "/Users/daiyudai/code/velo",
+    default_branch: "main",
+  },
+  {
+    id: "repo-nexus",
+    code: "NX",
+    name: "nexus-engine",
+    path: "/Users/daiyudai/code/nexus-engine",
+    default_branch: "main",
+  },
+  {
+    id: "repo-uikit",
+    code: "UI",
+    name: "design-tokens",
+    path: "/Users/daiyudai/code/design-tokens",
+    default_branch: "main",
+  },
+];
+
 export const DEMO_SESSIONS: VeloSession[] = [
   {
     id: "sess-1",
-    title: "ws-reconnect-backoff",
+    repo_id: "repo-velo",
+    title: "WebSocket 指数退避与环形缓冲",
     agent_kind: "claude",
     model: "claude-sonnet-4.5",
+    model_short: "claude-4.5",
     status: "running",
     branch_name: "feat/ws-reconnection",
     worktree_path: "/Users/daiyudai/code/velo/.velo/worktrees/ws-reconnect",
@@ -72,14 +108,16 @@ export const DEMO_SESSIONS: VeloSession[] = [
   },
   {
     id: "sess-2",
-    title: "worktree-gc-lock",
+    repo_id: "repo-velo",
+    title: "修复并发 Worktree 锁竞争",
     agent_kind: "codex",
     model: "codex-o3",
-    status: "running",
+    model_short: "codex-o3",
+    status: "waiting_approval",
     branch_name: "fix/worktree-gc-lock",
     worktree_path: "/Users/daiyudai/code/velo/.velo/worktrees/gc-lock",
     project_path: "/Users/daiyudai/code/velo",
-    approval_mode: "auto_edit",
+    approval_mode: "ask_before_edit",
     tokens_used: 21800,
     tokens_limit: 200000,
     cost_usd: 0.09,
@@ -90,14 +128,16 @@ export const DEMO_SESSIONS: VeloSession[] = [
   },
   {
     id: "sess-3",
-    title: "mcp-bridge-tools",
+    repo_id: "repo-velo",
+    title: "MCP JSON-RPC 工具桥接器",
     agent_kind: "gemini",
     model: "gemini-2.5-pro",
+    model_short: "gemini-2.5",
     status: "idle",
     branch_name: "chore/mcp-bridge-tools",
     worktree_path: "/Users/daiyudai/code/velo/.velo/worktrees/mcp-bridge",
     project_path: "/Users/daiyudai/code/velo",
-    approval_mode: "ask_before_edit",
+    approval_mode: "auto_edit",
     tokens_used: 52000,
     tokens_limit: 1000000,
     cost_usd: 0.11,
@@ -105,6 +145,46 @@ export const DEMO_SESSIONS: VeloSession[] = [
     insertions: 112,
     deletions: 8,
     updated_at: "6m ago",
+  },
+  {
+    id: "sess-4",
+    repo_id: "repo-nexus",
+    title: "零拷贝 Tokio IPC 帧调度",
+    agent_kind: "claude",
+    model: "claude-opus-4.6",
+    model_short: "opus-4.6",
+    status: "running",
+    branch_name: "perf/zero-copy-ipc",
+    worktree_path: "/Users/daiyudai/code/nexus-engine/.velo/worktrees/zero-copy",
+    project_path: "/Users/daiyudai/code/nexus-engine",
+    approval_mode: "auto_edit",
+    tokens_used: 41200,
+    tokens_limit: 200000,
+    cost_usd: 0.28,
+    files_changed: 5,
+    insertions: 86,
+    deletions: 21,
+    updated_at: "30s ago",
+  },
+  {
+    id: "sess-5",
+    repo_id: "repo-uikit",
+    title: "黑白灰 Zinc 变量与主题导出",
+    agent_kind: "codex",
+    model: "codex-o3",
+    model_short: "codex-o3",
+    status: "idle",
+    branch_name: "feat/monochrome-tokens",
+    worktree_path: "/Users/daiyudai/code/design-tokens/.velo/worktrees/mono",
+    project_path: "/Users/daiyudai/code/design-tokens",
+    approval_mode: "auto_edit",
+    tokens_used: 12900,
+    tokens_limit: 200000,
+    cost_usd: 0.04,
+    files_changed: 2,
+    insertions: 64,
+    deletions: 12,
+    updated_at: "14m ago",
   },
 ];
 
@@ -267,16 +347,19 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     unknown
   >;
   const branch = String(r.branch_name ?? r.branch ?? `feat/worktree-${idx + 1}`);
+  const agentKind: AgentKind =
+    r.agent_kind === "codex" || r.provider === "codex"
+      ? "codex"
+      : r.agent_kind === "gemini"
+      ? "gemini"
+      : "claude";
   return {
     id: String(r.id ?? `daemon-${idx}`),
-    title: String(r.title ?? r.name ?? branch),
-    agent_kind:
-      r.agent_kind === "codex" || r.provider === "codex"
-        ? "codex"
-        : r.agent_kind === "gemini"
-        ? "gemini"
-        : "claude",
-    model: String(r.model ?? (r.provider === "codex" ? "codex-o3" : "claude-sonnet-4.5")),
+    repo_id: String(r.repo_id ?? "repo-velo"),
+    title: String(r.title ?? r.prompt ?? r.name ?? branch),
+    agent_kind: agentKind,
+    model: String(r.model ?? (agentKind === "codex" ? "codex-o3" : "claude-sonnet-4.5")),
+    model_short: agentKind === "codex" ? "codex-o3" : agentKind === "gemini" ? "gemini-2.5" : "claude-4.5",
     status: r.status === "waiting_for_permission" ? "waiting_approval" : "running",
     branch_name: branch,
     worktree_path: String(r.worktree_path ?? `/Users/daiyudai/code/velo/.velo/worktrees/${branch}`),
