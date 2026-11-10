@@ -22,19 +22,16 @@ export const BeautifulThinkingBlock: React.FC<{
   text: string;
   isStreaming?: boolean;
   defaultExpanded?: boolean;
-}> = ({ text, isStreaming = false, defaultExpanded = false }) => {
+}> = ({ text, isStreaming = false, defaultExpanded = true }) => {
   const hasBody = text.trim().length > 0;
   const [expanded, setExpanded] = useState(defaultExpanded && hasBody);
-  const [elapsedSec, setElapsedSec] = useState<number>(0.4);
+  const [elapsedSec, setElapsedSec] = useState<number>(1.2);
 
   useEffect(() => {
-    if (isStreaming && hasBody) {
+    if (hasBody && defaultExpanded) {
       setExpanded(true);
-    } else if (!isStreaming) {
-      // Automatically fold into a clean 1-line summary once thinking completes
-      setExpanded(false);
     }
-  }, [isStreaming, hasBody]);
+  }, [hasBody, defaultExpanded]);
 
   useEffect(() => {
     if (!isStreaming) return;

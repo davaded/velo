@@ -508,30 +508,74 @@ export function App() {
                     }
                   }
                   const latestTurnEvents = evList.slice(lastRunStart);
+                  const thinkingTexts = latestTurnEvents
+                    .filter((e) => e.type === "thinking_delta" && typeof e.text === "string")
+                    .map((e) => String(e.text).trim())
+                    .filter(Boolean);
                   const texts = latestTurnEvents
                     .filter((e) => e.type === "message_delta" && typeof e.text === "string")
                     .map((e) => String(e.text).trim())
                     .filter(Boolean);
-                  if (texts.length === 0) return;
-                  const lastText = texts[texts.length - 1];
                   setEventsBySession((prev) => {
-                    const list = prev[sid] || [];
-                    const lastEv = list[list.length - 1];
-                    if (lastEv && lastEv.kind === "assistant" && lastEv.content.includes(lastText)) {
-                      return prev;
+                    let list = [...(prev[sid] || [])];
+                    // Ensure thinking trace from this turn is synced
+                    if (thinkingTexts.length > 0) {
+                      const combinedThinking = Array.from(new Set(thinkingTexts)).join("\n");
+                      let lastUserIdx = -1;
+                      for (let i = list.length - 1; i >= 0; i--) {
+                        if (list[i].kind === "user") {
+                          lastUserIdx = i;
+                          break;
+                        }
+                      }
+                      let thIdx = -1;
+                      for (let i = list.length - 1; i > lastUserIdx; i--) {
+                        if (list[i].kind === "thinking") {
+                          thIdx = i;
+                          break;
+                        }
+                      }
+                      if (thIdx !== -1) {
+                        list[thIdx] = { ...list[thIdx], content: combinedThinking };
+                      } else {
+                        const thEv: AgentEvent = {
+                          id: `th-sync-${Date.now()}`,
+                          session_id: sid,
+                          timestamp: now,
+                          kind: "thinking",
+                          content: combinedThinking,
+                        };
+                        if (lastUserIdx !== -1) {
+                          list = [
+                            ...list.slice(0, lastUserIdx + 1),
+                            thEv,
+                            ...list.slice(lastUserIdx + 1),
+                          ];
+                        } else {
+                          list = [thEv, ...list];
+                        }
+                      }
+                    }
+
+                    if (texts.length > 0) {
+                      const lastText = texts[texts.length - 1];
+                      const lastEv = list[list.length - 1];
+                      if (!lastEv || lastEv.kind !== "assistant" || !lastEv.content.includes(lastText)) {
+                        list = [
+                          ...list,
+                          {
+                            id: `as-sync-${Date.now()}`,
+                            session_id: sid,
+                            timestamp: now,
+                            kind: "assistant",
+                            content: lastText,
+                          },
+                        ];
+                      }
                     }
                     return {
                       ...prev,
-                      [sid]: [
-                        ...list,
-                        {
-                          id: `as-sync-${Date.now()}`,
-                          session_id: sid,
-                          timestamp: now,
-                          kind: "assistant",
-                          content: lastText,
-                        },
-                      ],
+                      [sid]: list,
                     };
                   });
                 })
@@ -562,24 +606,49 @@ export function App() {
             const text = String(evObj.text ?? "").trim();
             if (!text) return;
             setEventsBySession((prev) => {
-              const list = prev[sid] || [];
-              const last = list[list.length - 1];
-              if (last && last.kind === "thinking") {
-                const updatedLast = { ...last, content: `${last.content}\n${text}` };
-                return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
+              const list = [...(prev[sid] || [])];
+              let lastUserIdx = -1;
+              for (let i = list.length - 1; i >= 0; i--) {
+                if (list[i].kind === "user") {
+                  lastUserIdx = i;
+                  break;
+                }
+              }
+              let thIdx = -1;
+              for (let i = list.length - 1; i > lastUserIdx; i--) {
+                if (list[i].kind === "thinking") {
+                  thIdx = i;
+                  break;
+                }
+              }
+              if (thIdx !== -1) {
+                const existing = list[thIdx].content;
+                const nextContent = existing.includes(text)
+                  ? existing
+                  : `${existing}\n${text}`;
+                list[thIdx] = { ...list[thIdx], content: nextContent };
+                return { ...prev, [sid]: list };
+              }
+              const newTh: AgentEvent = {
+                id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                session_id: sid,
+                timestamp: now,
+                kind: "thinking",
+                content: text,
+              };
+              if (lastUserIdx !== -1) {
+                return {
+                  ...prev,
+                  [sid]: [
+                    ...list.slice(0, lastUserIdx + 1),
+                    newTh,
+                    ...list.slice(lastUserIdx + 1),
+                  ],
+                };
               }
               return {
                 ...prev,
-                [sid]: [
-                  ...list,
-                  {
-                    id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-                    session_id: sid,
-                    timestamp: now,
-                    kind: "thinking",
-                    content: text,
-                  },
-                ],
+                [sid]: [...list, newTh],
               };
             });
             return;
@@ -779,9 +848,25 @@ export function App() {
       content: text,
     };
 
+    const initThinkingEv: AgentEvent = {
+      id: `th-${Date.now()}`,
+      session_id: activeSession.id,
+      timestamp: now,
+      kind: "thinking",
+      content: "正在分析工作区上下文与推理...",
+    };
+
+    const isSlashSpecial =
+      rawText.startsWith("/handoff") ||
+      rawText.startsWith("/advisor") ||
+      rawText.startsWith("/committee") ||
+      rawText.startsWith("/loop");
+
     setEventsBySession((prev) => ({
       ...prev,
-      [activeSession.id]: [...baseEvents, userEv],
+      [activeSession.id]: isSlashSpecial
+        ? [...baseEvents, userEv]
+        : [...baseEvents, userEv, initThinkingEv],
     }));
 
     // Real Daemon /handoff endpoint
@@ -2138,7 +2223,7 @@ export function App() {
                               key={ev.id}
                               text={ev.content}
                               isStreaming={isStreamingThinking}
-                              defaultExpanded={isStreamingThinking}
+                              defaultExpanded={true}
                             />
                           );
                         }
