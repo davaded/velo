@@ -22,6 +22,9 @@ import {
   BeautifulContextMeter,
   BeautifulThinkingBlock,
   BeautifulToolCallCard,
+  PaseoMarkdown,
+  PaseoToolCallGroup,
+  PaseoToolGroupItem,
   PaseoTurnFooter,
 } from "./components/ui/BeautifulAgentPrimitives";
 import {
@@ -43,6 +46,7 @@ import {
   PanelLeft,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Server,
   Settings,
@@ -435,8 +439,14 @@ export function App() {
                 })),
               }));
               setDiffsBySession((prev) => ({ ...prev, [sessionId]: converted }));
-              setSelectedDiffPath(converted[0].path);
+              setSelectedDiffPath((prev) =>
+                converted.some((c) => c.path === prev) ? prev : converted[0].path
+              );
+            } else {
+              setDiffsBySession((prev) => ({ ...prev, [sessionId]: [] }));
             }
+          } else {
+            setDiffsBySession((prev) => ({ ...prev, [sessionId]: [] }));
           }
         }
       } finally {
@@ -449,6 +459,135 @@ export function App() {
   useEffect(() => {
     refreshSessionDiffAndFiles(activeSession.id);
   }, [activeSession.id, refreshSessionDiffAndFiles]);
+
+  // Load persisted event history from ~/.velo/events/<session-id>.json on startup or session switch
+  useEffect(() => {
+    const sid = activeSession.id;
+    if (!sid || sid.startsWith("sess-") || sid.startsWith("wt-")) return;
+    if (eventsBySession[sid] && eventsBySession[sid].length > 0) return;
+
+    fetch(`${daemonUrl}/api/sessions/${sid}/events`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((rawList: Array<Record<string, unknown>>) => {
+        if (!Array.isArray(rawList) || rawList.length === 0) return;
+        const reconstructed: AgentEvent[] = [];
+        for (let i = 0; i < rawList.length; i++) {
+          const ev = rawList[i];
+          const evType = String(ev.type ?? "");
+          const tsRaw = typeof ev.timestamp === "string" ? new Date(ev.timestamp) : new Date();
+          const ts = Number.isNaN(tsRaw.getTime())
+            ? new Date().toLocaleTimeString([], { hour12: false })
+            : tsRaw.toLocaleTimeString([], { hour12: false });
+
+          if (evType === "user_message") {
+            const text = String(ev.text ?? "").trim();
+            if (text) {
+              reconstructed.push({
+                id: `u-hist-${i}`,
+                session_id: sid,
+                timestamp: ts,
+                kind: "user",
+                content: text,
+              });
+            }
+          } else if (evType === "thinking_delta") {
+            const text = String(ev.text ?? "").trim();
+            if (!text) continue;
+            const last = reconstructed[reconstructed.length - 1];
+            if (last && last.kind === "thinking") {
+              if (!last.content.includes(text)) {
+                last.content = `${last.content}\n${text}`;
+              }
+            } else {
+              reconstructed.push({
+                id: `th-hist-${i}`,
+                session_id: sid,
+                timestamp: ts,
+                kind: "thinking",
+                content: text,
+              });
+            }
+          } else if (evType === "tool_call_requested") {
+            const toolId = String(ev.tool_id ?? `tl-hist-${i}`);
+            const toolName = String(ev.tool_name ?? "Tool");
+            const argsObj = (
+              ev.arguments && typeof ev.arguments === "object" ? ev.arguments : {}
+            ) as Record<string, unknown>;
+            const argSummary = String(
+              argsObj.file_path ??
+                argsObj.path ??
+                argsObj.command ??
+                argsObj.pattern ??
+                JSON.stringify(argsObj).slice(0, 80)
+            );
+            reconstructed.push({
+              id: toolId,
+              session_id: sid,
+              timestamp: ts,
+              kind: "tool_call",
+              tool_name: toolName,
+              tool_args: argSummary,
+              tool_input: argsObj,
+              tool_output: undefined,
+              tool_is_error: false,
+              content: JSON.stringify(argsObj, null, 2),
+            });
+          } else if (evType === "tool_call_completed") {
+            const toolId = String(ev.tool_id ?? "");
+            const output = String(ev.output ?? "(completed)");
+            const isError = Boolean(ev.is_error);
+            let idx = reconstructed.findIndex(
+              (item) => item.kind === "tool_call" && item.id === toolId
+            );
+            if (idx === -1) {
+              for (let j = reconstructed.length - 1; j >= 0; j--) {
+                if (
+                  reconstructed[j].kind === "tool_call" &&
+                  reconstructed[j].tool_output === undefined
+                ) {
+                  idx = j;
+                  break;
+                }
+              }
+            }
+            if (idx !== -1) {
+              reconstructed[idx] = {
+                ...reconstructed[idx],
+                tool_output: output,
+                tool_is_error: isError,
+                content: output,
+              };
+            }
+          } else if (evType === "message_delta") {
+            const text = String(ev.text ?? "");
+            if (!text.trim() || text.startsWith("[stderr]")) continue;
+            reconstructed.push({
+              id: `as-hist-${i}`,
+              session_id: sid,
+              timestamp: ts,
+              kind: "assistant",
+              content: text,
+            });
+          } else if (evType === "error") {
+            const errText = String(ev.error ?? "Agent execution error");
+            reconstructed.push({
+              id: `err-hist-${i}`,
+              session_id: sid,
+              timestamp: ts,
+              kind: "assistant",
+              content: `⚠️ ${errText}`,
+            });
+          }
+        }
+
+        if (reconstructed.length > 0) {
+          setEventsBySession((prev) =>
+            prev[sid] && prev[sid].length > 0 ? prev : { ...prev, [sid]: reconstructed }
+          );
+        }
+      })
+      .catch(() => {});
+  }, [activeSession.id, daemonUrl, eventsBySession]);
 
   // Fetch E2EE Pairing Ticket when QR modal opens
   useEffect(() => {
@@ -855,7 +994,11 @@ export function App() {
     setSlashFilter(null);
   };
 
-  const handleSendPrompt = async (customText?: string, overridePriorEvents?: AgentEvent[]) => {
+  const handleSendPrompt = async (
+    customText?: string,
+    overridePriorEvents?: AgentEvent[],
+    truncateToUserTurn?: number
+  ) => {
     const rawText = (customText ?? prompt).trim();
     if (!rawText) return;
 
@@ -1048,15 +1191,17 @@ export function App() {
     const providerName = activeSession.agent_kind === "codex" ? "codex" : "claude";
 
     try {
-      // 1. Try sending input to existing daemon session with selected concrete model & effort
+      // 1. Send clean user input to existing daemon session (uses native `codex exec resume` / `claude --resume` or daemon transcript fallback)
       const inputRes = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          input: promptWithContext,
+          input: text,
           model: activeSession.model,
           effort: activeSession.effort || "medium",
           provider: providerName,
+          truncate_to_user_turn: truncateToUserTurn,
+          reset_thread: truncateToUserTurn !== undefined,
         }),
       });
 
@@ -1220,11 +1365,12 @@ export function App() {
     const currentList = eventsBySession[activeSession.id] || [];
     const idx = currentList.findIndex((item) => item.id === ev.id);
     const truncated = idx >= 0 ? currentList.slice(0, idx) : currentList;
+    const userTurnIdx = truncated.filter((item) => item.kind === "user").length;
     setEventsBySession((prev) => ({
       ...prev,
       [activeSession.id]: truncated,
     }));
-    await handleSendPrompt(trimmed, truncated);
+    await handleSendPrompt(trimmed, truncated, userTurnIdx);
   };
 
   const handleRetryUserMessage = async (ev: AgentEvent) => {
@@ -1236,11 +1382,12 @@ export function App() {
     const currentList = eventsBySession[activeSession.id] || [];
     const idx = currentList.findIndex((item) => item.id === ev.id);
     const truncated = idx >= 0 ? currentList.slice(0, idx) : currentList;
+    const userTurnIdx = truncated.filter((item) => item.kind === "user").length;
     setEventsBySession((prev) => ({
       ...prev,
       [activeSession.id]: truncated,
     }));
-    await handleSendPrompt(ev.content, truncated);
+    await handleSendPrompt(ev.content, truncated, userTurnIdx);
   };
 
   // Paseo Rewind Flow (packages/app/src/components/rewind/rewind-menu.tsx):
@@ -1252,10 +1399,16 @@ export function App() {
     const currentList = eventsBySession[activeSession.id] || [];
     const idx = currentList.findIndex((item) => item.id === ev.id);
     const truncated = idx >= 0 ? currentList.slice(0, idx) : currentList;
+    const userTurnIdx = truncated.filter((item) => item.kind === "user").length;
     setEventsBySession((prev) => ({
       ...prev,
       [activeSession.id]: truncated,
     }));
+    fetch(`${daemonUrl}/api/sessions/${activeSession.id}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ truncate_to_user_turn: userTurnIdx }),
+    }).catch(() => {});
     setPrompt(ev.content);
     setTimeout(() => {
       composerTextareaRef.current?.focus();
@@ -1630,9 +1783,30 @@ export function App() {
     ]);
   };
 
-  // One-click Commit inside isolated worktree
+  // One-click Commit inside isolated worktree via POST /api/sessions/{id}/git/commit
   const handleCommitWorktree = async () => {
     const msg = commitMsg.trim() || "feat: update worktree";
+    try {
+      const res = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/git/commit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: msg, push: false }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { stdout?: string; stderr?: string };
+        const summary =
+          (data.stdout || data.stderr || `Committed: ${msg}`).trim().split("\n")[0] ||
+          `Committed: ${msg}`;
+        setGitActionNotice(summary);
+        setCommitBoxOpen(false);
+        await refreshSessionDiffAndFiles(activeSession.id);
+        refreshSessions();
+        setTimeout(() => setGitActionNotice(null), 4000);
+        return;
+      }
+    } catch {
+      // fallback below
+    }
     const safeMsg = msg.replace(/"/g, '\\"');
     const res = await executeInWorktree(`git add -A && git commit -m "${safeMsg}"`);
     const summary = (res.stdout || res.stderr || "Committed changes in worktree").split("\n")[0];
@@ -1641,8 +1815,54 @@ export function App() {
     setTimeout(() => setGitActionNotice(null), 4000);
   };
 
-  // One-click Merge Readiness Check
+  // One-click Discard single file or all changes in worktree via POST /api/sessions/{id}/git/discard
+  const handleDiscardFile = async (filePath?: string, discardAll = false) => {
+    try {
+      const res = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/git/discard`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_path: filePath, all: discardAll }),
+      });
+      if (res.ok) {
+        setGitActionNotice(
+          discardAll
+            ? "Discarded all uncommitted worktree changes"
+            : `Discarded changes in ${filePath?.split("/").pop() || "file"}`
+        );
+        await refreshSessionDiffAndFiles(activeSession.id);
+        refreshSessions();
+        setTimeout(() => setGitActionNotice(null), 3500);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  // One-click Merge Worktree Branch into Main Repo via POST /api/sessions/{id}/git/merge
   const handleMergeWorktree = async () => {
+    try {
+      const res = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/git/merge`, {
+        method: "POST",
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        branch?: string;
+        stdout?: string;
+        stderr?: string;
+      };
+      if (res.ok && data.ok) {
+        const summary =
+          (data.stdout || "").trim().split("\n")[0] ||
+          `Merged ${data.branch || activeSession.branch_name} into main`;
+        setGitActionNotice(`✅ ${summary}`);
+        await refreshSessionDiffAndFiles(activeSession.id);
+        refreshSessions();
+        setTimeout(() => setGitActionNotice(null), 4500);
+        return;
+      }
+    } catch {
+      // fallback below
+    }
     const res = await executeInWorktree("git status -sb && git log -1 --oneline");
     const summary =
       res.stdout.trim().split("\n").join(" · ") ||
@@ -2295,8 +2515,42 @@ export function App() {
                           );
                         }
 
-                        // 3. Tool Call: Paseo ExpandableBadge (Shell / Read / Edit / Search + Paseo Web Shimmer when running)
+                        // 3. Tool Call / Consecutive Tool Call Group: Paseo ExpandableBadge + OverviewToolCallGroupView
                         if (ev.kind === "tool_call") {
+                          if (idx > 0 && activeEvents[idx - 1].kind === "tool_call") {
+                            return null;
+                          }
+                          let endIdx = idx;
+                          while (
+                            endIdx + 1 < activeEvents.length &&
+                            activeEvents[endIdx + 1].kind === "tool_call"
+                          ) {
+                            endIdx++;
+                          }
+                          if (endIdx > idx) {
+                            const groupItems: PaseoToolGroupItem[] = activeEvents
+                              .slice(idx, endIdx + 1)
+                              .map((tev) => ({
+                                id: tev.id,
+                                toolName: tev.tool_name || "Tool",
+                                input:
+                                  tev.tool_input ??
+                                  (tev.tool_args ? { target: tev.tool_args } : tev.content),
+                                output:
+                                  tev.tool_output ??
+                                  (tev.tool_input === undefined ? tev.content : undefined),
+                                isError: tev.tool_is_error,
+                                fileArg: tev.tool_args,
+                              }));
+                            return (
+                              <PaseoToolCallGroup
+                                key={ev.id}
+                                items={groupItems}
+                                onOpenDiffForFile={openDiffForFile}
+                              />
+                            );
+                          }
+
                           const toolInput =
                             ev.tool_input ??
                             (ev.tool_args ? { target: ev.tool_args } : ev.content);
@@ -2315,16 +2569,14 @@ export function App() {
                           );
                         }
 
-                        // 4. Assistant Response: Clean left-aligned prose + Worktree Diff Summary Card
+                        // 4. Assistant Response: Rich Paseo Markdown & Code Block Renderer + Worktree Diff Summary Card
                         return (
                           <div
                             key={ev.id}
                             data-testid="assistant-message"
                             className="flex flex-col items-start gap-2.5 py-2"
                           >
-                            <div className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[var(--v-fg-body)]">
-                              {ev.content}
-                            </div>
+                            <PaseoMarkdown content={ev.content} />
 
                             {/* Worktree Verification & Diff Card when files were modified */}
                             {isLastEvent && activeDiffFiles.length > 0 && (
@@ -2782,21 +3034,32 @@ export function App() {
 
                   <div className="flex items-center justify-between border-b border-[var(--v-border-subtle)] px-3.5 py-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
                     <span className="truncate">{currentDiffFile.path}</span>
-                    <button
-                      onClick={() =>
-                        copyText(
-                          currentDiffFile.path,
-                          currentDiffFile.hunks.map((h) => h.content).join("\n")
-                        )
-                      }
-                      className="flex items-center gap-1 hover:text-[var(--v-fg-primary)]"
-                    >
-                      {copiedKey === currentDiffFile.path ? (
-                        <Check className="h-3 w-3 text-[#34d399]" />
-                      ) : (
-                        <Copy className="h-3 w-3" />
-                      )}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleDiscardFile(currentDiffFile.path, false)}
+                        title="Discard changes in this file (git checkout --)"
+                        className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171] cursor-pointer"
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        <span>Discard</span>
+                      </button>
+                      <button
+                        onClick={() =>
+                          copyText(
+                            currentDiffFile.path,
+                            currentDiffFile.hunks.map((h) => h.content).join("\n")
+                          )
+                        }
+                        title="Copy diff"
+                        className="flex items-center gap-1 hover:text-[var(--v-fg-primary)] cursor-pointer"
+                      >
+                        {copiedKey === currentDiffFile.path ? (
+                          <Check className="h-3 w-3 text-[#34d399]" />
+                        ) : (
+                          <Copy className="h-3 w-3" />
+                        )}
+                      </button>
+                    </div>
                   </div>
 
                   {/* Dual-Line-Number Unified Diff Viewer (Click any line to add inline review comment for Agent) */}

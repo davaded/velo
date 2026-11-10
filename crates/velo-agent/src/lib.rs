@@ -262,6 +262,32 @@ impl AgentSpawner {
         effort: Option<String>,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
+        Self::spawn_agent_turn(
+            session_id,
+            provider,
+            prompt,
+            worktree_path,
+            use_pty,
+            model,
+            effort,
+            None,
+            event_tx,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_agent_turn(
+        session_id: Uuid,
+        provider: AgentProvider,
+        prompt: String,
+        worktree_path: PathBuf,
+        use_pty: bool,
+        model: Option<String>,
+        effort: Option<String>,
+        resume_session_id: Option<String>,
+        event_tx: broadcast::Sender<AgentEvent>,
+    ) -> Result<AgentHandle> {
         if use_pty {
             Self::spawn_pty_agent(session_id, provider, prompt, worktree_path, event_tx).await
         } else {
@@ -272,6 +298,7 @@ impl AgentSpawner {
                 worktree_path,
                 model,
                 effort,
+                resume_session_id,
                 event_tx,
             )
             .await
@@ -279,6 +306,7 @@ impl AgentSpawner {
     }
 
     /// Channel A: Spawns agent subprocess with structured JSON stream parsing (e.g. Claude Code `stream-json`).
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_structured_agent(
         session_id: Uuid,
         provider: AgentProvider,
@@ -286,6 +314,7 @@ impl AgentSpawner {
         worktree_path: PathBuf,
         model: Option<String>,
         effort: Option<String>,
+        resume_session_id: Option<String>,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
         let mut cmd = Self::build_tokio_command(
@@ -294,6 +323,7 @@ impl AgentSpawner {
             &worktree_path,
             model.as_deref(),
             effort.as_deref(),
+            resume_session_id.as_deref(),
         );
         cmd.current_dir(&worktree_path)
             .stdin(Stdio::null())
@@ -575,6 +605,7 @@ impl AgentSpawner {
         _cwd: &Path,
         model: Option<&str>,
         effort: Option<&str>,
+        resume_session_id: Option<&str>,
     ) -> Command {
         let aug_path = discover_augmented_path();
         let mut cmd = match provider {
@@ -583,6 +614,9 @@ impl AgentSpawner {
                 let mut c = Command::new(bin);
                 if let Some(tok) = discover_claude_oauth_token() {
                     c.env("CLAUDE_CODE_OAUTH_TOKEN", tok);
+                }
+                if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
+                    c.args(["--resume", rid]);
                 }
                 c.args([
                     "-p",
@@ -609,26 +643,51 @@ impl AgentSpawner {
             AgentProvider::Codex => {
                 let bin = resolve_cli_binary("codex").unwrap_or_else(|| PathBuf::from("codex"));
                 let mut c = Command::new(bin);
-                c.args([
-                    "exec",
-                    "--json",
-                    "-s",
-                    "workspace-write",
-                    "--skip-git-repo-check",
-                    "-c",
-                    "mcp_servers={}",
-                    "-c",
-                    "model_reasoning_summary=\"detailed\"",
-                    "-c",
-                    "hide_agent_reasoning=false",
-                ]);
-                if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-                    c.args(["-m", m]);
+                if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
+                    c.args([
+                        "exec",
+                        "resume",
+                        "--json",
+                        "--skip-git-repo-check",
+                        "-c",
+                        "mcp_servers={}",
+                        "-c",
+                        "sandbox_mode=\"workspace-write\"",
+                        "-c",
+                        "model_reasoning_summary=\"detailed\"",
+                        "-c",
+                        "hide_agent_reasoning=false",
+                    ]);
+                    if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+                        c.args(["-m", m]);
+                    }
+                    if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
+                        c.args(["-c", &format!("model_reasoning_effort=\"{}\"", eff)]);
+                    }
+                    c.arg(rid);
+                    c.arg(prompt);
+                } else {
+                    c.args([
+                        "exec",
+                        "--json",
+                        "-s",
+                        "workspace-write",
+                        "--skip-git-repo-check",
+                        "-c",
+                        "mcp_servers={}",
+                        "-c",
+                        "model_reasoning_summary=\"detailed\"",
+                        "-c",
+                        "hide_agent_reasoning=false",
+                    ]);
+                    if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+                        c.args(["-m", m]);
+                    }
+                    if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
+                        c.args(["-c", &format!("model_reasoning_effort=\"{}\"", eff)]);
+                    }
+                    c.arg(prompt);
                 }
-                if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
-                    c.args(["-c", &format!("model_reasoning_effort=\"{}\"", eff)]);
-                }
-                c.arg(prompt);
                 c
             }
             AgentProvider::OpenCode => {
@@ -729,6 +788,15 @@ pub fn parse_agent_stdout_line(
 
             match msg_type {
                 "system" | "turn.started" | "turn.completed" => {
+                    if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+                        if !sid.trim().is_empty() {
+                            events.push(AgentEvent::ProviderSessionBound {
+                                session_id,
+                                provider_session_id: sid.trim().to_string(),
+                                timestamp: Utc::now(),
+                            });
+                        }
+                    }
                     return events;
                 }
                 // 1. Claude Code stream-json events
@@ -824,6 +892,15 @@ pub fn parse_agent_stdout_line(
                     return events;
                 }
                 "result" => {
+                    if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+                        if !sid.trim().is_empty() {
+                            events.push(AgentEvent::ProviderSessionBound {
+                                session_id,
+                                provider_session_id: sid.trim().to_string(),
+                                timestamp: Utc::now(),
+                            });
+                        }
+                    }
                     let is_err = json
                         .get("is_error")
                         .and_then(|v| v.as_bool())
@@ -972,7 +1049,16 @@ pub fn parse_agent_stdout_line(
                     return events;
                 }
                 "thread.started" => {
-                    return vec![];
+                    if let Some(tid) = json.get("thread_id").and_then(|v| v.as_str()) {
+                        if !tid.trim().is_empty() {
+                            events.push(AgentEvent::ProviderSessionBound {
+                                session_id,
+                                provider_session_id: tid.trim().to_string(),
+                                timestamp: Utc::now(),
+                            });
+                        }
+                    }
+                    return events;
                 }
                 _ => {
                     debug!("Unhandled JSON event from {}: {}", provider, msg_type);

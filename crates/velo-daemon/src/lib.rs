@@ -45,6 +45,7 @@ pub struct DaemonState {
     pub event_tx: broadcast::Sender<AgentEvent>,
     pub worktree_mgr: WorktreeManager,
     pub state_file: PathBuf,
+    pub events_dir: PathBuf,
 }
 
 impl DaemonState {
@@ -52,14 +53,23 @@ impl DaemonState {
         let velo_home = default_velo_home();
         tokio::fs::create_dir_all(&velo_home).await?;
         let state_file = velo_home.join("sessions.json");
+        let events_dir = velo_home.join("events");
+        tokio::fs::create_dir_all(&events_dir).await?;
 
         let mut sessions = HashMap::new();
+        let mut event_history = HashMap::new();
         if tokio::fs::try_exists(&state_file).await.unwrap_or(false) {
             if let Ok(raw) = tokio::fs::read_to_string(&state_file).await {
                 if let Ok(saved) = serde_json::from_str::<Vec<SessionInfo>>(&raw) {
                     for mut s in saved {
                         if matches!(s.status, SessionStatus::Starting | SessionStatus::Running) {
                             s.status = SessionStatus::Stopped;
+                        }
+                        let ev_path = events_dir.join(format!("{}.json", s.id));
+                        if let Ok(ev_raw) = tokio::fs::read_to_string(&ev_path).await {
+                            if let Ok(evs) = serde_json::from_str::<Vec<AgentEvent>>(&ev_raw) {
+                                event_history.insert(s.id, evs);
+                            }
                         }
                         sessions.insert(s.id, s);
                     }
@@ -71,12 +81,13 @@ impl DaemonState {
         let state = Self {
             inner: Arc::new(RwLock::new(DaemonInner {
                 sessions,
-                event_history: HashMap::new(),
+                event_history,
                 handles: HashMap::new(),
             })),
             event_tx,
             worktree_mgr: WorktreeManager::default(),
             state_file,
+            events_dir,
         };
 
         state.spawn_event_supervisor();
@@ -91,14 +102,19 @@ impl DaemonState {
             while let Ok(event) = rx.recv().await {
                 let session_id = event.session_id();
                 let mut should_refresh_diff = false;
+                let mut should_persist_events = false;
+                let mut should_persist_sessions = false;
 
                 {
                     let mut guard = state.inner.write().await;
-                    guard
-                        .event_history
-                        .entry(session_id)
-                        .or_default()
-                        .push(event.clone());
+                    if !matches!(event, AgentEvent::ProviderSessionBound { .. }) {
+                        guard
+                            .event_history
+                            .entry(session_id)
+                            .or_default()
+                            .push(event.clone());
+                        should_persist_events = true;
+                    }
 
                     if let Some(session) = guard.sessions.get_mut(&session_id) {
                         session.updated_at = Utc::now();
@@ -106,12 +122,21 @@ impl DaemonState {
                             AgentEvent::StatusChanged { status, .. } => {
                                 session.status = *status;
                                 should_refresh_diff = true;
+                                should_persist_sessions = true;
+                            }
+                            AgentEvent::ProviderSessionBound {
+                                provider_session_id,
+                                ..
+                            } => {
+                                session.provider_session_id = Some(provider_session_id.clone());
+                                should_persist_sessions = true;
                             }
                             AgentEvent::ToolCallCompleted { .. } => {
                                 should_refresh_diff = true;
                             }
                             AgentEvent::DiffUpdated { stats, .. } => {
                                 session.diff_stats = stats.clone();
+                                should_persist_sessions = true;
                             }
                             _ => {}
                         }
@@ -134,10 +159,31 @@ impl DaemonState {
                             }
                         }
                     }
+                    should_persist_sessions = true;
+                }
+
+                if should_persist_events {
+                    let _ = state.persist_session_events(session_id).await;
+                }
+                if should_persist_sessions {
                     let _ = state.persist_sessions().await;
                 }
             }
         });
+    }
+
+    pub async fn persist_session_events(&self, session_id: Uuid) -> Result<()> {
+        let evs = {
+            let guard = self.inner.read().await;
+            guard.event_history.get(&session_id).cloned()
+        };
+        if let Some(list) = evs {
+            let _ = tokio::fs::create_dir_all(&self.events_dir).await;
+            let ev_path = self.events_dir.join(format!("{}.json", session_id));
+            let json_str = serde_json::to_string_pretty(&list)?;
+            tokio::fs::write(&ev_path, json_str).await?;
+        }
+        Ok(())
     }
 
     pub async fn persist_sessions(&self) -> Result<()> {
@@ -216,14 +262,29 @@ impl DaemonState {
             created_at: now,
             updated_at: now,
             parent_session_id,
+            provider_session_id: None,
+            model: model.clone(),
+            effort: effort.clone(),
         };
 
         {
             let mut guard = self.inner.write().await;
             guard.sessions.insert(session_id, session.clone());
+            if !prompt.trim().is_empty() {
+                guard
+                    .event_history
+                    .entry(session_id)
+                    .or_default()
+                    .push(AgentEvent::UserMessage {
+                        session_id,
+                        text: prompt.clone(),
+                        timestamp: now,
+                    });
+            }
         }
+        let _ = self.persist_session_events(session_id).await;
 
-        let handle = AgentSpawner::spawn_agent_with_options(
+        let handle = AgentSpawner::spawn_agent_turn(
             session_id,
             provider,
             prompt,
@@ -231,6 +292,7 @@ impl DaemonState {
             use_pty,
             model,
             effort,
+            None,
             self.event_tx.clone(),
         )
         .await?;
@@ -299,7 +361,11 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/sessions/{id}/files", get(list_worktree_files_handler))
         .route("/api/sessions/{id}/exec", post(exec_in_worktree_handler))
         .route("/api/sessions/{id}/input", post(send_input_handler))
+        .route("/api/sessions/{id}/rewind", post(rewind_session_handler))
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
+        .route("/api/sessions/{id}/git/commit", post(git_commit_handler))
+        .route("/api/sessions/{id}/git/discard", post(git_discard_handler))
+        .route("/api/sessions/{id}/git/merge", post(git_merge_handler))
         .route("/api/sessions/{id}/handoff", post(handoff_session_handler))
         .route("/api/sessions/{id}/advisor", post(advisor_session_handler))
         .route("/api/committee", post(committee_handler))
@@ -751,21 +817,89 @@ async fn exec_in_worktree_handler(
     }
 }
 
+fn truncate_events_at_user_turn(events: &mut Vec<AgentEvent>, user_turn_idx: usize) {
+    let mut seen_users = 0usize;
+    let mut cut_index = None;
+    for (i, ev) in events.iter().enumerate() {
+        if matches!(ev, AgentEvent::UserMessage { .. }) {
+            if seen_users == user_turn_idx {
+                cut_index = Some(i);
+                break;
+            }
+            seen_users += 1;
+        }
+    }
+    if let Some(idx) = cut_index {
+        events.truncate(idx);
+    } else if user_turn_idx == 0 {
+        events.clear();
+    }
+}
+
+fn build_conversation_transcript_prefix(
+    events: &[AgentEvent],
+    fallback_initial_prompt: &str,
+) -> Option<String> {
+    let mut turns: Vec<String> = Vec::new();
+    let mut has_user_event = false;
+    for ev in events {
+        match ev {
+            AgentEvent::UserMessage { text, .. } => {
+                has_user_event = true;
+                if !text.trim().is_empty() {
+                    turns.push(format!("User: {}", text.trim()));
+                }
+            }
+            AgentEvent::MessageDelta { text, .. } => {
+                if !text.trim().is_empty() {
+                    turns.push(format!("Assistant: {}", text.trim()));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !has_user_event && !fallback_initial_prompt.trim().is_empty() && !turns.is_empty() {
+        turns.insert(0, format!("User: {}", fallback_initial_prompt.trim()));
+    }
+    if turns.is_empty() {
+        None
+    } else {
+        Some(turns.join("\n\n"))
+    }
+}
+
 async fn send_input_handler(
     State(state): State<DaemonState>,
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<SessionInputRequest>,
 ) -> impl IntoResponse {
     // 1. Stop any previous running process handle for this session before spawning the new turn
-    let existing_session = {
+    let (existing_session, prior_transcript) = {
         let mut guard = state.inner.write().await;
         if let Some(mut old_handle) = guard.handles.remove(&id) {
             old_handle.stop();
         }
-        guard.sessions.get(&id).cloned()
+        if let Some(turn_idx) = req.truncate_to_user_turn {
+            if let Some(ev_list) = guard.event_history.get_mut(&id) {
+                truncate_events_at_user_turn(ev_list, turn_idx);
+            }
+            if let Some(s) = guard.sessions.get_mut(&id) {
+                s.provider_session_id = None;
+            }
+        } else if req.reset_thread {
+            if let Some(s) = guard.sessions.get_mut(&id) {
+                s.provider_session_id = None;
+            }
+        }
+        let sess = guard.sessions.get(&id).cloned();
+        let transcript = sess.as_ref().and_then(|s| {
+            let evs = guard.event_history.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
+            build_conversation_transcript_prefix(evs, &s.prompt)
+        });
+        (sess, transcript)
     };
 
-    // 2. Otherwise, spawn a new real CLI turn (claude / codex) in the session's isolated worktree
+    // 2. Spawn a new real CLI turn (claude / codex) in the session's isolated worktree
     let Some(session) = existing_session else {
         return (
             StatusCode::NOT_FOUND,
@@ -775,15 +909,53 @@ async fn send_input_handler(
     };
 
     let target_provider = req.provider.clone().unwrap_or_else(|| session.provider.clone());
+    let can_resume_native = req.truncate_to_user_turn.is_none()
+        && !req.reset_thread
+        && target_provider == session.provider;
+    let resume_session_id = if can_resume_native {
+        session.provider_session_id.clone()
+    } else {
+        None
+    };
+
+    // Record the user message into event_history and persist
+    {
+        let mut guard = state.inner.write().await;
+        guard
+            .event_history
+            .entry(id)
+            .or_default()
+            .push(AgentEvent::UserMessage {
+                session_id: id,
+                text: req.input.clone(),
+                timestamp: Utc::now(),
+            });
+    }
+    let _ = state.persist_session_events(id).await;
+
+    // If native thread resume is unavailable (e.g. after Rewind/Edit or provider switch) and prior turns exist,
+    // prepend the surviving conversation history so multi-turn memory is still preserved.
+    let effective_prompt = if resume_session_id.is_some() {
+        req.input.clone()
+    } else if let Some(history) = prior_transcript {
+        format!(
+            "<conversation_history>\n{}\n</conversation_history>\n\nUser: {}",
+            history, req.input
+        )
+    } else {
+        req.input.clone()
+    };
+
     let wt_path = PathBuf::from(&session.worktree_path);
-    match AgentSpawner::spawn_agent_with_options(
+    match AgentSpawner::spawn_agent_turn(
         id,
         target_provider.clone(),
-        req.input.clone(),
+        effective_prompt,
         wt_path,
         false,
-        req.model.clone(),
-        req.effort.clone(),
+        req.model.clone().or_else(|| session.model.clone()),
+        req.effort.clone().or_else(|| session.effort.clone()),
+        resume_session_id.clone(),
         state.event_tx.clone(),
     )
     .await
@@ -793,7 +965,16 @@ async fn send_input_handler(
             {
                 let mut guard = state.inner.write().await;
                 if let Some(s) = guard.sessions.get_mut(&id) {
+                    if s.provider != target_provider {
+                        s.provider_session_id = None;
+                    }
                     s.provider = target_provider;
+                    if req.model.is_some() {
+                        s.model = req.model.clone();
+                    }
+                    if req.effort.is_some() {
+                        s.effort = req.effort.clone();
+                    }
                     s.status = SessionStatus::Running;
                     s.pid = pid;
                     s.updated_at = Utc::now();
@@ -803,13 +984,281 @@ async fn send_input_handler(
             let _ = state.persist_sessions().await;
             (
                 StatusCode::OK,
-                Json(json!({ "ok": true, "mode": "spawned_turn", "pid": pid })),
+                Json(json!({
+                    "ok": true,
+                    "mode": if resume_session_id.is_some() { "resumed_turn" } else { "spawned_turn" },
+                    "pid": pid,
+                    "resumed_thread_id": resume_session_id,
+                })),
             )
                 .into_response()
         }
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RewindSessionRequest {
+    truncate_to_user_turn: usize,
+}
+
+async fn rewind_session_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<RewindSessionRequest>,
+) -> impl IntoResponse {
+    {
+        let mut guard = state.inner.write().await;
+        if let Some(mut handle) = guard.handles.remove(&id) {
+            handle.stop();
+        }
+        if let Some(ev_list) = guard.event_history.get_mut(&id) {
+            truncate_events_at_user_turn(ev_list, req.truncate_to_user_turn);
+        }
+        if let Some(session) = guard.sessions.get_mut(&id) {
+            session.status = SessionStatus::Stopped;
+            session.provider_session_id = None;
+            session.updated_at = Utc::now();
+        }
+    }
+    let _ = state.persist_session_events(id).await;
+    let _ = state.persist_sessions().await;
+    Json(json!({ "ok": true, "session_id": id, "truncated_to": req.truncate_to_user_turn }))
+}
+
+#[derive(serde::Deserialize)]
+struct GitCommitRequest {
+    message: String,
+    #[serde(default)]
+    push: bool,
+}
+
+async fn git_commit_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<GitCommitRequest>,
+) -> impl IntoResponse {
+    let wt_path = {
+        let guard = state.inner.read().await;
+        match guard.sessions.get(&id) {
+            Some(s) => PathBuf::from(&s.worktree_path),
+            None => PathBuf::from("/Users/daiyudai/code/velo"),
+        }
+    };
+    let msg = if req.message.trim().is_empty() {
+        "chore: commit worktree changes via Velo".to_string()
+    } else {
+        req.message.trim().to_string()
+    };
+
+    let _ = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&wt_path)
+        .output()
+        .await;
+
+    let commit_out = Command::new("git")
+        .args(["commit", "-m", &msg])
+        .current_dir(&wt_path)
+        .output()
+        .await;
+
+    match commit_out {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let ok = out.status.success();
+            let mut push_out_str = String::new();
+            if ok && req.push {
+                if let Ok(p_out) = Command::new("git")
+                    .args(["push", "-u", "origin", "HEAD"])
+                    .current_dir(&wt_path)
+                    .output()
+                    .await
+                {
+                    push_out_str = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&p_out.stdout),
+                        String::from_utf8_lossy(&p_out.stderr)
+                    )
+                    .trim()
+                    .to_string();
+                }
+            }
+            let stats = WorktreeManager::compute_diff_stats(&wt_path)
+                .await
+                .unwrap_or_default();
+            {
+                let mut guard = state.inner.write().await;
+                if let Some(s) = guard.sessions.get_mut(&id) {
+                    s.diff_stats = stats.clone();
+                    s.updated_at = Utc::now();
+                }
+            }
+            let _ = state.event_tx.send(AgentEvent::DiffUpdated {
+                session_id: id,
+                stats: stats.clone(),
+                timestamp: Utc::now(),
+            });
+            let _ = state.persist_sessions().await;
+
+            (
+                if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST },
+                Json(json!({
+                    "ok": ok,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "push_output": push_out_str,
+                    "stats": stats,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GitDiscardRequest {
+    file_path: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+async fn git_discard_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<GitDiscardRequest>,
+) -> impl IntoResponse {
+    let wt_path = {
+        let guard = state.inner.read().await;
+        match guard.sessions.get(&id) {
+            Some(s) => PathBuf::from(&s.worktree_path),
+            None => PathBuf::from("/Users/daiyudai/code/velo"),
+        }
+    };
+
+    if req.all {
+        let _ = Command::new("git")
+            .args(["reset", "--hard", "HEAD"])
+            .current_dir(&wt_path)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["clean", "-fd"])
+            .current_dir(&wt_path)
+            .output()
+            .await;
+    } else if let Some(fp) = req.file_path.as_deref().filter(|s| !s.trim().is_empty()) {
+        let _ = Command::new("git")
+            .args(["checkout", "HEAD", "--", fp])
+            .current_dir(&wt_path)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["clean", "-fd", "--", fp])
+            .current_dir(&wt_path)
+            .output()
+            .await;
+    }
+
+    let stats = WorktreeManager::compute_diff_stats(&wt_path)
+        .await
+        .unwrap_or_default();
+    {
+        let mut guard = state.inner.write().await;
+        if let Some(s) = guard.sessions.get_mut(&id) {
+            s.diff_stats = stats.clone();
+            s.updated_at = Utc::now();
+        }
+    }
+    let _ = state.event_tx.send(AgentEvent::DiffUpdated {
+        session_id: id,
+        stats: stats.clone(),
+        timestamp: Utc::now(),
+    });
+    let _ = state.persist_sessions().await;
+
+    Json(json!({ "ok": true, "stats": stats }))
+}
+
+async fn git_merge_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> impl IntoResponse {
+    let session = {
+        let guard = state.inner.read().await;
+        guard.sessions.get(&id).cloned()
+    };
+    let Some(s) = session else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "Session not found" })),
+        )
+            .into_response();
+    };
+
+    let wt_path = PathBuf::from(&s.worktree_path);
+    let repo_root = PathBuf::from(&s.repo_root);
+
+    // Auto-commit any uncommitted work in the worktree before merging if needed
+    let status_out = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&wt_path)
+        .output()
+        .await;
+    if let Ok(st) = status_out {
+        if !String::from_utf8_lossy(&st.stdout).trim().is_empty() {
+            let _ = Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(&wt_path)
+                .output()
+                .await;
+            let _ = Command::new("git")
+                .args([
+                    "commit",
+                    "-m",
+                    &format!("feat({}): worktree changes from Velo session", s.branch),
+                ])
+                .current_dir(&wt_path)
+                .output()
+                .await;
+        }
+    }
+
+    let merge_out = Command::new("git")
+        .args(["merge", "--no-edit", &s.branch])
+        .current_dir(&repo_root)
+        .output()
+        .await;
+
+    match merge_out {
+        Ok(out) => {
+            let ok = out.status.success();
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            (
+                if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST },
+                Json(json!({
+                    "ok": ok,
+                    "branch": s.branch,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
         )
             .into_response(),
     }
@@ -1537,6 +1986,7 @@ mod tests {
             event_tx,
             worktree_mgr: WorktreeManager::new(wt_dir),
             state_file: temp_base.join("sessions.json"),
+            events_dir: temp_base.join("events"),
         };
         state.spawn_event_supervisor();
 
@@ -1550,6 +2000,8 @@ mod tests {
             branch: Some("feat/auto-edit".to_string()),
             use_pty: false,
             parent_session_id: None,
+            model: None,
+            effort: None,
         };
 
         let session = state.create_session(req).await?;

@@ -582,6 +582,15 @@ fn print_agent_event(ev: &AgentEvent) {
                 message.as_deref().unwrap_or("")
             );
         }
+        AgentEvent::UserMessage { text, .. } => {
+            println!("👤 {}", text);
+        }
+        AgentEvent::ProviderSessionBound {
+            provider_session_id,
+            ..
+        } => {
+            println!("🔗 [thread bound] {}", provider_session_id);
+        }
         AgentEvent::ThinkingDelta { text, .. } => {
             println!("💭 {}", text);
         }

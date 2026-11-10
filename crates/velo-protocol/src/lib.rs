@@ -98,6 +98,12 @@ pub struct SessionInfo {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub parent_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub provider_session_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// Unified event stream emitted by `velo-agent` drivers and broadcasted to connected clients.
@@ -108,6 +114,16 @@ pub enum AgentEvent {
         session_id: Uuid,
         status: SessionStatus,
         message: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
+    UserMessage {
+        session_id: Uuid,
+        text: String,
+        timestamp: DateTime<Utc>,
+    },
+    ProviderSessionBound {
+        session_id: Uuid,
+        provider_session_id: String,
         timestamp: DateTime<Utc>,
     },
     ThinkingDelta {
@@ -163,6 +179,8 @@ impl AgentEvent {
     pub fn session_id(&self) -> Uuid {
         match self {
             Self::StatusChanged { session_id, .. }
+            | Self::UserMessage { session_id, .. }
+            | Self::ProviderSessionBound { session_id, .. }
             | Self::ThinkingDelta { session_id, .. }
             | Self::MessageDelta { session_id, .. }
             | Self::ToolCallRequested { session_id, .. }
@@ -208,6 +226,10 @@ pub struct SessionInputRequest {
     pub effort: Option<String>,
     #[serde(default)]
     pub provider: Option<AgentProvider>,
+    #[serde(default)]
+    pub reset_thread: bool,
+    #[serde(default)]
+    pub truncate_to_user_turn: Option<usize>,
 }
 
 /// Client-to-daemon WebSocket command envelope.

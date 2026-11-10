@@ -710,6 +710,498 @@ export const BeautifulToolCallCard: React.FC<{
 };
 
 /**
+ * ============================================================================
+ * 7. PASEO TOOL CALL GROUP (packages/app/src/agent-stream/view.tsx -> OverviewToolCallGroupView)
+ *    Collapses 2+ consecutive completed tool calls into a single ExpandableBadge
+ *    with a human-readable summary ("Read 2 files, ran 1 command") and IndentRail.
+ * ============================================================================
+ */
+export interface PaseoToolGroupItem {
+  id: string;
+  toolName: string;
+  input: unknown;
+  output?: string;
+  isError?: boolean;
+  fileArg?: string;
+}
+
+function summarizeToolGroup(items: PaseoToolGroupItem[]): {
+  label: string;
+  secondaryLabel: string;
+  hasError: boolean;
+  isAnyRunning: boolean;
+} {
+  let shellCount = 0;
+  let readCount = 0;
+  let editCount = 0;
+  let searchCount = 0;
+  let otherCount = 0;
+  let hasError = false;
+  let isAnyRunning = false;
+
+  for (const item of items) {
+    if (item.isError) hasError = true;
+    if (item.output === undefined) isAnyRunning = true;
+    const pres = resolvePaseoToolPresentation(item.toolName, item.input);
+    if (pres.kind === "shell") shellCount++;
+    else if (pres.kind === "read") readCount++;
+    else if (pres.kind === "edit") editCount++;
+    else if (pres.kind === "search") searchCount++;
+    else otherCount++;
+  }
+
+  const parts: string[] = [];
+  if (readCount > 0) parts.push(`read ${readCount} ${readCount === 1 ? "file" : "files"}`);
+  if (searchCount > 0) parts.push(`searched ${searchCount} ${searchCount === 1 ? "pattern" : "patterns"}`);
+  if (shellCount > 0) parts.push(`ran ${shellCount} ${shellCount === 1 ? "command" : "commands"}`);
+  if (editCount > 0) parts.push(`edited ${editCount} ${editCount === 1 ? "file" : "files"}`);
+  if (otherCount > 0) parts.push(`${otherCount} other`);
+
+  const summaryText =
+    parts.length > 0
+      ? parts.join(", ").replace(/^./, (c) => c.toUpperCase())
+      : `${items.length} tool calls`;
+
+  return {
+    label: `${items.length} tool calls`,
+    secondaryLabel: summaryText,
+    hasError,
+    isAnyRunning,
+  };
+}
+
+export const PaseoToolCallGroup: React.FC<{
+  items: PaseoToolGroupItem[];
+  onOpenDiffForFile?: (fileArg?: string) => void;
+}> = ({ items, onOpenDiffForFile }) => {
+  const [expanded, setExpanded] = useState(false);
+  const { label, secondaryLabel, hasError, isAnyRunning } = useMemo(
+    () => summarizeToolGroup(items),
+    [items]
+  );
+
+  return (
+    <PaseoExpandableBadge
+      label={label}
+      secondaryLabel={secondaryLabel}
+      icon={Wrench}
+      isExpanded={expanded}
+      onToggle={() => setExpanded((v) => !v)}
+      isLoading={isAnyRunning}
+      isError={hasError}
+      borderlessWhenExpanded
+    >
+      <PaseoIndentRail className="space-y-0.5">
+        {items.map((item) => (
+          <BeautifulToolCallCard
+            key={item.id}
+            toolName={item.toolName}
+            input={item.input}
+            output={item.output}
+            isError={item.isError}
+            onOpenDiffTab={() => onOpenDiffForFile?.(item.fileArg)}
+          />
+        ))}
+      </PaseoIndentRail>
+    </PaseoExpandableBadge>
+  );
+};
+
+/**
+ * ============================================================================
+ * 8. PASEO MARKDOWN & CODE BLOCK RENDERER
+ *    Renders assistant prose with syntax-styled fenced code blocks (with 1-click Copy),
+ *    inline code badges, tables, headings, blockquotes, lists, and links.
+ * ============================================================================
+ */
+const PaseoCodeBlock: React.FC<{
+  language: string;
+  code: string;
+}> = ({ language, code }) => {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // ignore
+    }
+  };
+
+  return (
+    <div
+      className="my-2 overflow-hidden rounded-[8px] border"
+      style={{
+        borderColor: "var(--border-subtle)",
+        backgroundColor: "var(--surface-0)",
+      }}
+    >
+      <div
+        className="flex items-center justify-between border-b px-3 py-1.5 text-[11.5px]"
+        style={{
+          borderColor: "var(--border-subtle)",
+          backgroundColor: "var(--surface-1)",
+          color: "var(--fg-muted)",
+        }}
+      >
+        <span className="font-mono-code lowercase select-none">
+          {language || "code"}
+        </span>
+        <button
+          type="button"
+          onClick={handleCopyCode}
+          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
+          style={{ color: copied ? "var(--status-success)" : "var(--fg-muted)" }}
+        >
+          {copied ? (
+            <>
+              <Check className="h-3 w-3" />
+              <span>Copied</span>
+            </>
+          ) : (
+            <>
+              <Copy className="h-3 w-3" />
+              <span>Copy</span>
+            </>
+          )}
+        </button>
+      </div>
+      <pre
+        className="overflow-x-auto p-3 font-mono-code text-[12.5px] leading-[1.55]"
+        style={{ color: "var(--fg)" }}
+      >
+        <code>{code}</code>
+      </pre>
+    </div>
+  );
+};
+
+function renderInlineMarkdown(text: string): React.ReactNode[] {
+  // Tokenize inline `code`, **bold**, *italic*, ~~strike~~, and [label](url)
+  const tokenRegex =
+    /(`[^`\n]+`|\*\*[^*\n]+\*\*|~~[^~\n]+~~|\[[^\]]+\]\([^)]+\)|\*[^*\s][^*\n]*\*)/g;
+  const parts = text.split(tokenRegex);
+
+  return parts.map((part, idx) => {
+    if (!part) return null;
+
+    if (part.startsWith("`") && part.endsWith("`") && part.length >= 2) {
+      return (
+        <code
+          key={idx}
+          className="mx-[1px] rounded-[5px] border px-1.5 py-[1px] font-mono-code text-[12px]"
+          style={{
+            backgroundColor: "var(--surface-1)",
+            borderColor: "var(--border-subtle)",
+            color: "var(--fg)",
+          }}
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return (
+        <strong key={idx} className="font-semibold" style={{ color: "var(--fg)" }}>
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+
+    if (part.startsWith("~~") && part.endsWith("~~") && part.length > 4) {
+      return (
+        <del key={idx} style={{ color: "var(--fg-muted)" }}>
+          {part.slice(2, -2)}
+        </del>
+      );
+    }
+
+    if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
+      return (
+        <em key={idx} className="italic">
+          {part.slice(1, -1)}
+        </em>
+      );
+    }
+
+    const linkMatch = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+    if (linkMatch) {
+      return (
+        <a
+          key={idx}
+          href={linkMatch[2]}
+          target="_blank"
+          rel="noreferrer"
+          className="underline underline-offset-2 transition-opacity hover:opacity-80"
+          style={{ color: "var(--accent-bright)" }}
+        >
+          {linkMatch[1]}
+        </a>
+      );
+    }
+
+    return <React.Fragment key={idx}>{part}</React.Fragment>;
+  });
+}
+
+export const PaseoMarkdown: React.FC<{
+  content: string;
+  className?: string;
+}> = ({ content, className = "" }) => {
+  const blocks = useMemo(() => {
+    const result: Array<
+      | { type: "code"; lang: string; code: string }
+      | { type: "prose"; text: string }
+    > = [];
+
+    const fenceRegex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+
+    while ((match = fenceRegex.exec(content)) !== null) {
+      if (match.index > lastIndex) {
+        result.push({
+          type: "prose",
+          text: content.slice(lastIndex, match.index),
+        });
+      }
+      result.push({
+        type: "code",
+        lang: match[1] || "",
+        code: match[2].replace(/\n$/, ""),
+      });
+      lastIndex = match.index + match[0].length;
+    }
+
+    if (lastIndex < content.length) {
+      result.push({
+        type: "prose",
+        text: content.slice(lastIndex),
+      });
+    }
+
+    return result;
+  }, [content]);
+
+  const renderProseSegment = (text: string, blockIdx: number) => {
+    const lines = text.split("\n");
+    const elements: React.ReactNode[] = [];
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      const trimmed = line.trim();
+
+      if (!trimmed) {
+        i++;
+        continue;
+      }
+
+      // Horizontal Rule
+      if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+        elements.push(
+          <hr
+            key={`${blockIdx}-hr-${i}`}
+            className="my-3 border-t"
+            style={{ borderColor: "var(--border-subtle)" }}
+          />
+        );
+        i++;
+        continue;
+      }
+
+      // Headings
+      const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+      if (headingMatch) {
+        const level = headingMatch[1].length;
+        const sizeClass =
+          level === 1
+            ? "text-[16px] font-semibold mt-3 mb-1.5"
+            : level === 2
+            ? "text-[14.5px] font-semibold mt-2.5 mb-1"
+            : "text-[13.5px] font-semibold mt-2 mb-0.5";
+        elements.push(
+          <div
+            key={`${blockIdx}-h-${i}`}
+            className={sizeClass}
+            style={{ color: "var(--fg)" }}
+          >
+            {renderInlineMarkdown(headingMatch[2])}
+          </div>
+        );
+        i++;
+        continue;
+      }
+
+      // Markdown Table
+      if (
+        trimmed.startsWith("|") &&
+        trimmed.endsWith("|") &&
+        i + 1 < lines.length &&
+        /^\s*\|[\s:-]+\|/.test(lines[i + 1])
+      ) {
+        const headerCells = trimmed
+          .slice(1, -1)
+          .split("|")
+          .map((c) => c.trim());
+        i += 2; // skip header + separator
+        const rows: string[][] = [];
+        while (
+          i < lines.length &&
+          lines[i].trim().startsWith("|") &&
+          lines[i].trim().endsWith("|")
+        ) {
+          rows.push(
+            lines[i]
+              .trim()
+              .slice(1, -1)
+              .split("|")
+              .map((c) => c.trim())
+          );
+          i++;
+        }
+        elements.push(
+          <div
+            key={`${blockIdx}-tbl-${i}`}
+            className="my-2 overflow-x-auto rounded-[8px] border"
+            style={{ borderColor: "var(--border-subtle)" }}
+          >
+            <table className="w-full border-collapse text-left text-[12.5px]">
+              <thead>
+                <tr
+                  className="border-b"
+                  style={{
+                    borderColor: "var(--border-subtle)",
+                    backgroundColor: "var(--surface-1)",
+                  }}
+                >
+                  {headerCells.map((hc, cIdx) => (
+                    <th
+                      key={cIdx}
+                      className="px-3 py-1.5 font-semibold"
+                      style={{ color: "var(--fg)" }}
+                    >
+                      {renderInlineMarkdown(hc)}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y" style={{ borderColor: "var(--border-subtle)" }}>
+                {rows.map((row, rIdx) => (
+                  <tr key={rIdx}>
+                    {row.map((cell, cIdx) => (
+                      <td key={cIdx} className="px-3 py-1.5">
+                        {renderInlineMarkdown(cell)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+        continue;
+      }
+
+      // Unordered List
+      if (/^[-*+]\s+/.test(trimmed)) {
+        const items: string[] = [];
+        while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
+          items.push(lines[i].trim().replace(/^[-*+]\s+/, ""));
+          i++;
+        }
+        elements.push(
+          <ul
+            key={`${blockIdx}-ul-${i}`}
+            className="my-1.5 list-disc space-y-1 pl-5 text-[13.5px] leading-[1.65]"
+          >
+            {items.map((it, idx) => (
+              <li key={idx}>{renderInlineMarkdown(it)}</li>
+            ))}
+          </ul>
+        );
+        continue;
+      }
+
+      // Ordered List
+      if (/^\d+\.\s+/.test(trimmed)) {
+        const items: string[] = [];
+        while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+          items.push(lines[i].trim().replace(/^\d+\.\s+/, ""));
+          i++;
+        }
+        elements.push(
+          <ol
+            key={`${blockIdx}-ol-${i}`}
+            className="my-1.5 list-decimal space-y-1 pl-5 text-[13.5px] leading-[1.65]"
+          >
+            {items.map((it, idx) => (
+              <li key={idx}>{renderInlineMarkdown(it)}</li>
+            ))}
+          </ol>
+        );
+        continue;
+      }
+
+      // Blockquote
+      if (trimmed.startsWith(">")) {
+        const quoteLines: string[] = [];
+        while (i < lines.length && lines[i].trim().startsWith(">")) {
+          quoteLines.push(lines[i].trim().replace(/^>\s?/, ""));
+          i++;
+        }
+        elements.push(
+          <blockquote
+            key={`${blockIdx}-bq-${i}`}
+            className="my-2 border-l-2 pl-3 italic text-[13px]"
+            style={{
+              borderColor: "var(--border-accent)",
+              color: "var(--fg-muted)",
+            }}
+          >
+            {quoteLines.map((ql, idx) => (
+              <div key={idx}>{renderInlineMarkdown(ql)}</div>
+            ))}
+          </blockquote>
+        );
+        continue;
+      }
+
+      // Standard Paragraph
+      elements.push(
+        <p
+          key={`${blockIdx}-p-${i}`}
+          className="my-1 first:mt-0 last:mb-0 text-[13.5px] leading-[1.68]"
+        >
+          {renderInlineMarkdown(line)}
+        </p>
+      );
+      i++;
+    }
+
+    return elements;
+  };
+
+  return (
+    <div
+      className={`w-full space-y-1.5 text-[13.5px] leading-[1.68] ${className}`}
+      style={{ color: "var(--v-fg-body)" }}
+    >
+      {blocks.map((b, idx) =>
+        b.type === "code" ? (
+          <PaseoCodeBlock key={idx} language={b.lang} code={b.code} />
+        ) : (
+          <React.Fragment key={idx}>{renderProseSegment(b.text, idx)}</React.Fragment>
+        )
+      )}
+    </div>
+  );
+};
+
+/**
  * Beautiful UI (beautifului.dev) — Human-in-the-Loop Approval Card
  */
 export const BeautifulApprovalCard: React.FC<{
