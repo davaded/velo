@@ -1,20 +1,27 @@
 @import "tailwindcss";
 
-:root {
-  /* Pure Monochrome Zinc/Carbon Palette (A3) + Semantic Highlights Only */
-  --canvas-bg: #09090b;
-  --surface-rail: #0c0c0e;
-  --surface-0: #111114;
-  --surface-1: #16161a;
-  --surface-2: #1f1f24;
-  --surface-3: #2c2c33;
-  --fg: #fafafa;
-  --fg-muted: #a1a1aa;
-  --fg-subtle: #63636e;
-  --border-hairline: #232329;
-  --border-strong: #383842;
+:root,
+[data-theme="dark"] {
+  --v-bg-sidebar: #0c0c0e;
+  --v-bg-canvas: #111113;
+  --v-bg-surface: #16161a;
+  --v-bg-hover: #18181c;
+  --v-bg-active: #1f1f25;
+  --v-bg-bubble: #1f1f24;
+  --v-bg-code: #0c0c0e;
 
-  /* Strictly Semantic Status & Diff Highlights */
+  --v-fg-primary: #f4f4f5;
+  --v-fg-body: #e4e4e7;
+  --v-fg-secondary: #a1a1aa;
+  --v-fg-muted: #71717a;
+  --v-fg-faint: #52525b;
+
+  --v-border-subtle: #1f1f23;
+  --v-border-strong: #27272e;
+
+  --v-btn-bg: #f4f4f5;
+  --v-btn-fg: #09090b;
+
   --sem-success: #34d399;
   --sem-danger: #f87171;
   --sem-warning: #fbbf24;
@@ -23,11 +30,86 @@
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", "Geist Mono", Menlo, monospace;
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --v-bg-sidebar: #f3f4f6;
+  --v-bg-canvas: #ffffff;
+  --v-bg-surface: #ffffff;
+  --v-bg-hover: #e9eaee;
+  --v-bg-active: #dfe1e7;
+  --v-bg-bubble: #f1f2f5;
+  --v-bg-code: #f7f7f9;
+
+  --v-fg-primary: #111113;
+  --v-fg-body: #27272a;
+  --v-fg-secondary: #52525b;
+  --v-fg-muted: #71717a;
+  --v-fg-faint: #a1a1aa;
+
+  --v-border-subtle: #e4e4e7;
+  --v-border-strong: #d4d4d8;
+
+  --v-btn-bg: #18181b;
+  --v-btn-fg: #ffffff;
+
+  --sem-success: #059669;
+  --sem-danger: #dc2626;
+  --sem-warning: #d97706;
+  --sem-running: #0284c7;
+  color-scheme: light;
+}
+
+/* Tone Presets: Claude Warm */
+[data-theme="dark"][data-tone="claude"] {
+  --v-bg-sidebar: #12110e;
+  --v-bg-canvas: #171613;
+  --v-bg-surface: #1f1d19;
+  --v-bg-hover: #22201b;
+  --v-bg-active: #2a2721;
+  --v-bg-bubble: #26231e;
+  --v-border-subtle: #26231e;
+  --v-border-strong: #332f28;
+}
+
+[data-theme="light"][data-tone="claude"] {
+  --v-bg-sidebar: #f3efe6;
+  --v-bg-canvas: #faf8f5;
+  --v-bg-surface: #ffffff;
+  --v-bg-hover: #eae4d8;
+  --v-bg-active: #e2dacb;
+  --v-bg-bubble: #efeae0;
+  --v-border-subtle: #e5dfd3;
+  --v-border-strong: #d5cdbe;
+}
+
+/* Tone Presets: Paseo Forest */
+[data-theme="dark"][data-tone="paseo"] {
+  --v-bg-sidebar: #0b0e0d;
+  --v-bg-canvas: #0f1312;
+  --v-bg-surface: #151b19;
+  --v-bg-hover: #18201e;
+  --v-bg-active: #1f2926;
+  --v-bg-bubble: #1c2522;
+  --v-border-subtle: #1c2421;
+  --v-border-strong: #26312d;
+}
+
+[data-theme="light"][data-tone="paseo"] {
+  --v-bg-sidebar: #eef3f1;
+  --v-bg-canvas: #f8fbf9;
+  --v-bg-surface: #ffffff;
+  --v-bg-hover: #e3ebe8;
+  --v-bg-active: #d6e2dd;
+  --v-bg-bubble: #e9f0ed;
+  --v-border-subtle: #dce5e1;
+  --v-border-strong: #c8d6d0;
 }
 
 * {
   box-sizing: border-box;
-  border-color: var(--border-hairline);
+  border-color: var(--v-border-subtle);
 }
 
 html,
@@ -38,22 +120,16 @@ body,
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background-color: var(--canvas-bg);
-  color: var(--fg);
+  background-color: var(--v-bg-canvas);
+  color: var(--v-fg-primary);
   font-family: var(--font-sans);
   font-size: 13px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   user-select: none;
-}
-
-.selectable-text {
-  user-select: text;
-}
-
-.font-mono-code {
-  font-family: var(--font-mono);
-  font-feature-settings: "liga" 1, "calt" 1;
+  transition:
+    background-color 160ms ease,
+    color 160ms ease;
 }
 
 ::-webkit-scrollbar {
@@ -64,238 +140,99 @@ body,
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(161, 161, 170, 0.16);
+  background: rgba(161, 161, 170, 0.22);
   border-radius: 9999px;
-}
-
-/* ============================================================================
-   3 Switchable Material Variants (A2: 都出一个版本我看看)
-   ============================================================================ */
-
-/* Variant A: 极简锐利冷峻风 (shadcn/ui + Linear — 1px sharp hairline, flat matte, tight radius) */
-.velo-variant-a {
-  --card-radius: 6px;
-  --chip-radius: 4px;
-  --btn-radius: 5px;
-}
-.velo-variant-a .v-canvas {
-  background: #09090b;
-}
-.velo-variant-a .v-surface {
-  background: #111114;
-  border: 1px solid #242429;
-  border-radius: 6px;
-  box-shadow: none;
-}
-.velo-variant-a .v-composer {
-  background: #121215;
-  border: 1px solid #2a2a30;
-  border-radius: 8px;
-  box-shadow: none;
-}
-.velo-variant-a .v-chip {
-  background: #18181c;
-  border: 1px solid #27272d;
-  border-radius: 4px;
-}
-.velo-variant-a .v-primary-btn {
-  background: #fafafa;
-  color: #09090b;
-  border-radius: 5px;
-  font-weight: 600;
-}
-
-/* Variant B: AI 原生微光质感 (Beautiful UI + beUI — frosted glass, pill radius, silver shimmer) */
-.velo-variant-b {
-  --card-radius: 14px;
-  --chip-radius: 9999px;
-  --btn-radius: 9999px;
-}
-.velo-variant-b .v-canvas {
-  background: radial-gradient(75% 240px at 50% 0%, rgba(255, 255, 255, 0.055), #09090b 75%);
-}
-.velo-variant-b .v-surface {
-  background: rgba(22, 22, 26, 0.72);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-radius: 14px;
-  box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.65);
-}
-.velo-variant-b .v-composer {
-  background: rgba(26, 26, 31, 0.78);
-  backdrop-filter: blur(22px);
-  -webkit-backdrop-filter: blur(22px);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 18px;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.09),
-    0 20px 44px -12px rgba(0, 0, 0, 0.75);
-}
-.velo-variant-b .v-chip {
-  background: rgba(39, 39, 45, 0.65);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-radius: 9999px;
-}
-.velo-variant-b .v-primary-btn {
-  background: linear-gradient(180deg, #ffffff 0%, #d4d4d8 100%);
-  color: #09090b;
-  border-radius: 9999px;
-  font-weight: 600;
-  box-shadow: 0 0 18px rgba(255, 255, 255, 0.22);
-}
-
-/* Variant C: 硬件立体拟物风 (Rare UI — metallic top-edge specular light, 3D tactile keycaps & buttons) */
-.velo-variant-c {
-  --card-radius: 10px;
-  --chip-radius: 6px;
-  --btn-radius: 7px;
-}
-.velo-variant-c .v-canvas {
-  background: #0a0a0d;
-}
-.velo-variant-c .v-surface {
-  background: linear-gradient(180deg, #1b1b20 0%, #121216 100%);
-  border: 1px solid #2e2e36;
-  border-radius: 10px;
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
-    0 8px 20px -4px rgba(0, 0, 0, 0.75);
-}
-.velo-variant-c .v-composer {
-  background: linear-gradient(180deg, #1f1f25 0%, #141418 100%);
-  border: 1px solid #363640;
-  border-radius: 12px;
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
-    0 3px 0 0 #050507,
-    0 16px 32px -6px rgba(0, 0, 0, 0.8);
-}
-.velo-variant-c .v-chip {
-  background: linear-gradient(180deg, #27272e 0%, #1b1b20 100%);
-  border: 1px solid #383842;
-  border-radius: 6px;
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
-    0 2px 0 0 #08080a;
-}
-.velo-variant-c .v-primary-btn {
-  background: linear-gradient(180deg, #fafafa 0%, #a1a1aa 100%);
-  color: #09090b;
-  border-radius: 7px;
-  font-weight: 700;
-  box-shadow:
-    inset 0 1px 0 0 #ffffff,
-    0 2px 0 0 #3f3f46,
-    0 5px 12px rgba(0, 0, 0, 0.65);
-}
-.velo-variant-c .v-primary-btn:active {
-  transform: translateY(1.5px);
-}
-
-/* Monochrome Shimmer & Spring Animations */
-@keyframes mono-shimmer {
-  0% {
-    background-position: -200% 0;
-  }
-  100% {
-    background-position: 200% 0;
-  }
-}
-
-.beautiful-shimmer-text {
-  background: linear-gradient(90deg, #71717a 0%, #fafafa 50%, #71717a 100%);
-  background-size: 200% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: mono-shimmer 2.4s infinite linear;
-}
-
-@keyframes velo-spin {
-  0% {
-    transform: rotate(0deg);
-  }
-  100% {
-    transform: rotate(360deg);
-  }
-}
-
-.paseo-status-ring {
-  width: 10px;
-  height: 10px;
-  border-radius: 9999px;
-  border: 1.75px solid rgba(56, 189, 248, 0.25);
-  border-top-color: var(--sem-running);
-  animation: velo-spin 0.8s linear infinite;
-}
-
-.rare-keycap {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: 18px;
-  min-width: 18px;
-  padding: 0 5px;
-  border-radius: 4px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  background-color: #18181c;
-  color: #a1a1aa;
-  border: 1px solid #2e2e36;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 0 #050507;
-}
-
-.t-grid-collapse {
-  display: grid;
-  grid-template-rows: 0fr;
-  opacity: 0;
-  transition:
-    grid-template-rows 220ms var(--ease-spring),
-    opacity 180ms ease;
-}
-.t-grid-collapse.t-expanded {
-  grid-template-rows: 1fr;
-  opacity: 1;
-}
-.t-grid-collapse-inner {
-  overflow: hidden;
 }
 
 /* Diff line highlight utilities */
-.v-diff-add {
-  background-color: rgba(52, 211, 153, 0.1);
+[data-theme="dark"] .v-diff-add {
+  background-color: rgba(52, 211, 153, 0.12);
   color: #6ee7b7;
 }
-.v-diff-del {
-  background-color: rgba(248, 113, 113, 0.1);
+[data-theme="dark"] .v-diff-del {
+  background-color: rgba(248, 113, 113, 0.12);
   color: #fca5a5;
 }
-.v-diff-hunk {
-  background-color: rgba(56, 189, 248, 0.07);
+[data-theme="dark"] .v-diff-hunk {
+  background-color: rgba(56, 189, 248, 0.08);
   color: #7dd3fc;
 }
 
-/* Curated Theme Palettes */
-.velo-theme-claude {
-  --canvas-bg: #141311;
-  --surface-rail: #100f0d;
-  --surface-0: #171613;
-  --surface-1: #1f1d19;
-  --surface-2: #292621;
-  --border-hairline: #292621;
+[data-theme="light"] .v-diff-add {
+  background-color: rgba(16, 185, 129, 0.14);
+  color: #047857;
+}
+[data-theme="light"] .v-diff-del {
+  background-color: rgba(239, 68, 68, 0.13);
+  color: #b91c1c;
+}
+[data-theme="light"] .v-diff-hunk {
+  background-color: rgba(14, 165, 233, 0.11);
+  color: #0369a1;
 }
 
-.velo-theme-paseo {
-  --canvas-bg: #0f1312;
-  --surface-rail: #0b0e0d;
-  --surface-0: #121716;
-  --surface-1: #181f1d;
-  --surface-2: #212a27;
-  --border-hairline: #1f2825;
+/* Semantic Theme Utility Classes (auto-switching across Light & Dark + Tone Presets) */
+.v-bg-sidebar {
+  background-color: var(--v-bg-sidebar);
+}
+.v-bg-canvas {
+  background-color: var(--v-bg-canvas);
+}
+.v-bg-surface {
+  background-color: var(--v-bg-surface);
+}
+.v-bg-hover {
+  background-color: var(--v-bg-hover);
+}
+.v-bg-active {
+  background-color: var(--v-bg-active);
+}
+.v-bg-bubble {
+  background-color: var(--v-bg-bubble);
+}
+.v-bg-code {
+  background-color: var(--v-bg-code);
 }
 
-.velo-theme-daylight {
-  filter: invert(0.94) hue-rotate(180deg);
+.v-fg-primary {
+  color: var(--v-fg-primary);
+}
+.v-fg-body {
+  color: var(--v-fg-body);
+}
+.v-fg-secondary {
+  color: var(--v-fg-secondary);
+}
+.v-fg-muted {
+  color: var(--v-fg-muted);
+}
+.v-fg-faint {
+  color: var(--v-fg-faint);
 }
 
+.v-border-subtle {
+  border-color: var(--v-border-subtle);
+}
+.v-border-strong {
+  border-color: var(--v-border-strong);
+}
+
+.v-btn-primary {
+  background-color: var(--v-btn-bg);
+  color: var(--v-btn-fg);
+}
+
+.v-row-interactive {
+  color: var(--v-fg-secondary);
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+.v-row-interactive:hover {
+  background-color: var(--v-bg-hover);
+  color: var(--v-fg-primary);
+}
+.v-row-selected {
+  background-color: var(--v-bg-active);
+  color: var(--v-fg-primary);
+}

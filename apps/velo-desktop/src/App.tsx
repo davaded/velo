@@ -29,6 +29,8 @@ import {
   GitCommitHorizontal,
   GitMerge,
   Layers,
+  Monitor,
+  Moon,
   PanelLeft,
   Plus,
   RefreshCw,
@@ -37,12 +39,14 @@ import {
   Settings,
   ShieldAlert,
   SquarePen,
+  Sun,
   Terminal,
   X,
 } from "lucide-react";
 
 type VariantId = "a" | "b" | "c";
-type ThemeId = "zinc" | "claude" | "paseo" | "daylight";
+type ThemeMode = "system" | "light" | "dark";
+type ToneId = "zinc" | "claude" | "paseo";
 type DrawerTab = "diff" | "terminal";
 type ModalKind =
   | null
@@ -93,7 +97,47 @@ export function App() {
   });
 
   const [variant, setVariant] = useState<VariantId>("a");
-  const [theme, setTheme] = useState<ThemeId>("zinc");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    const saved = localStorage.getItem("velo.themeMode");
+    if (saved === "light" || saved === "dark" || saved === "system") return saved;
+    return "system";
+  });
+  const [tone, setTone] = useState<ToneId>(() => {
+    const saved = localStorage.getItem("velo.tone");
+    if (saved === "zinc" || saved === "claude" || saved === "paseo") return saved;
+    return "zinc";
+  });
+  const [systemDark, setSystemDark] = useState<boolean>(() =>
+    typeof window !== "undefined" && window.matchMedia
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : true
+  );
+
+  // Listen to macOS / OS system color-scheme changes in real time
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  const resolvedTheme: "light" | "dark" =
+    themeMode === "system" ? (systemDark ? "dark" : "light") : themeMode;
+
+  useEffect(() => {
+    localStorage.setItem("velo.themeMode", themeMode);
+    localStorage.setItem("velo.tone", tone);
+    document.documentElement.setAttribute("data-theme", resolvedTheme);
+    document.documentElement.setAttribute("data-tone", tone);
+
+    // Sync native macOS NSWindow appearance when running inside Velo.app
+    const w = window as unknown as {
+      webkit?: { messageHandlers?: { windowTheme?: { postMessage: (m: string) => void } } };
+    };
+    w.webkit?.messageHandlers?.windowTheme?.postMessage(themeMode);
+  }, [themeMode, tone, resolvedTheme]);
+
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(true);
   const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
   const [repos, setRepos] = useState<VeloRepo[]>(DEMO_REPOS);
@@ -834,7 +878,9 @@ export function App() {
 
   return (
     <div
-      className={`velo-variant-${variant} velo-theme-${theme} flex h-screen w-screen overflow-hidden select-none bg-[#111113] text-[#f4f4f5]`}
+      data-theme={resolvedTheme}
+      data-tone={tone}
+      className={`velo-variant-${variant} flex h-screen w-screen overflow-hidden select-none bg-[var(--v-bg-canvas)] text-[var(--v-fg-primary)]`}
     >
       {/* =====================================================================
           1. AUTHENTIC CODEX / CLAUDE CODE / PASEO LEFT SIDEBAR
@@ -845,7 +891,7 @@ export function App() {
              - Bottom: single icon-only footer bar
          ===================================================================== */}
       <aside
-        className={`flex shrink-0 flex-col justify-between bg-[#0c0c0e] border-r border-[#1f1f23] transition-all duration-200 overflow-hidden ${
+        className={`flex shrink-0 flex-col justify-between bg-[var(--v-bg-sidebar)] border-r border-[var(--v-border-subtle)] transition-all duration-200 overflow-hidden ${
           sidebarOpen ? "w-[252px]" : "w-0 border-r-0"
         }`}
       >
@@ -861,11 +907,11 @@ export function App() {
               <button
                 onClick={() => setSidebarOpen(false)}
                 title="Hide sidebar (⌘B)"
-                className="flex h-7 w-7 items-center justify-center rounded-md text-[#71717a] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
               >
                 <PanelLeft className="h-4 w-4" />
               </button>
-              <span className="text-[13px] font-semibold tracking-tight text-[#f4f4f5]">
+              <span className="text-[13px] font-semibold tracking-tight text-[var(--v-fg-primary)]">
                 Velo
               </span>
             </div>
@@ -876,7 +922,7 @@ export function App() {
                 setActiveModal("new-worktree");
               }}
               title="New thread (⌘N)"
-              className="flex h-7 w-7 items-center justify-center rounded-md text-[#a1a1aa] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
               <SquarePen className="h-4 w-4" />
             </button>
@@ -889,33 +935,33 @@ export function App() {
                 setTargetRepoIdForNewWt(activeRepo.id);
                 setActiveModal("new-worktree");
               }}
-              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[#a1a1aa] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
-              <Plus className="h-4 w-4 text-[#71717a]" />
+              <Plus className="h-4 w-4 text-[var(--v-fg-muted)]" />
               <span>New thread</span>
             </button>
             <button
               onClick={() => setActiveModal("command")}
-              className="flex h-[30px] w-full items-center justify-between rounded-md px-2.5 text-[13px] text-[#a1a1aa] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+              className="flex h-[30px] w-full items-center justify-between rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
               <span className="flex items-center gap-2.5">
-                <Search className="h-3.5 w-3.5 text-[#71717a]" />
+                <Search className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
                 <span>Search</span>
               </span>
-              <span className="font-mono text-[11px] text-[#52525b]">⌘K</span>
+              <span className="font-mono text-[11px] text-[var(--v-fg-faint)]">⌘K</span>
             </button>
             <button
               onClick={() => setActiveModal("skills")}
-              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[#a1a1aa] transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
-              <Layers className="h-3.5 w-3.5 text-[#71717a]" />
+              <Layers className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
               <span>Automations & Skills</span>
             </button>
           </div>
 
           {/* Section Header: Workspaces */}
           <div className="flex items-center justify-between px-4 pb-1.5 pt-1">
-            <span className="text-[11px] font-medium text-[#71717a]">Workspaces</span>
+            <span className="text-[11px] font-medium text-[var(--v-fg-muted)]">Workspaces</span>
           </div>
 
           {/* Scrollable Project -> Thread Hierarchy (Borderless, Clean Rows) */}
@@ -927,7 +973,7 @@ export function App() {
               return (
                 <div key={repo.id} className="space-y-0.5">
                   {/* Project Row */}
-                  <div className="group flex h-[28px] items-center justify-between rounded-md px-2 text-[#a1a1aa] transition-colors hover:bg-[#16161a] hover:text-[#f4f4f5]">
+                  <div className="group flex h-[28px] items-center justify-between rounded-md px-2 text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-primary)]">
                     <button
                       onClick={() =>
                         setCollapsedRepos((prev) => ({
@@ -937,13 +983,13 @@ export function App() {
                       }
                       className="flex min-w-0 flex-1 items-center gap-2 text-left"
                     >
-                      <Folder className="h-3.5 w-3.5 shrink-0 text-[#71717a] group-hover:hidden" />
+                      <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)] group-hover:hidden" />
                       {isCollapsed ? (
-                        <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 text-[#71717a] group-hover:block" />
+                        <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)] group-hover:block" />
                       ) : (
-                        <ChevronDown className="hidden h-3.5 w-3.5 shrink-0 text-[#71717a] group-hover:block" />
+                        <ChevronDown className="hidden h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)] group-hover:block" />
                       )}
-                      <span className="truncate text-[13px] font-medium text-[#d4d4d8] group-hover:text-[#f4f4f5]">
+                      <span className="truncate text-[13px] font-medium text-[var(--v-fg-body)] group-hover:text-[var(--v-fg-primary)]">
                         {repo.name}
                       </span>
                     </button>
@@ -954,7 +1000,7 @@ export function App() {
                         setActiveModal("new-worktree");
                       }}
                       title={`New thread in ${repo.name}`}
-                      className="flex h-5 w-5 items-center justify-center rounded text-[#71717a] opacity-0 transition-opacity hover:bg-[#222228] hover:text-[#f4f4f5] group-hover:opacity-100"
+                      className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] opacity-0 transition-opacity hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:opacity-100"
                     >
                       <Plus className="h-3.5 w-3.5" />
                     </button>
@@ -972,8 +1018,8 @@ export function App() {
                             onClick={() => setActiveId(w.id)}
                             className={`group flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
                               isSelected
-                                ? "bg-[#1f1f25] text-[#f4f4f5]"
-                                : "text-[#a1a1aa] hover:bg-[#16161a] hover:text-[#e4e4e7]"
+                                ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-body)]"
                             }`}
                           >
                             {/* Leading Status Slot (14px wide, reserves space when idle just like Paseo/Codex) */}
@@ -996,18 +1042,18 @@ export function App() {
                               <div className="flex items-baseline justify-between gap-2">
                                 <span
                                   className={`truncate text-[13px] leading-snug ${
-                                    isSelected ? "font-medium text-[#f4f4f5]" : "font-normal"
+                                    isSelected ? "font-medium text-[var(--v-fg-primary)]" : "font-normal"
                                   }`}
                                 >
                                   {w.title}
                                 </span>
-                                <span className="shrink-0 font-mono text-[11px] text-[#52525b]">
+                                <span className="shrink-0 font-mono text-[11px] text-[var(--v-fg-faint)]">
                                   {w.updated_at}
                                 </span>
                               </div>
 
                               {/* Subtle Meta Line: Branch + Diff Stats */}
-                              <div className="mt-0.5 flex items-center justify-between gap-2 font-mono text-[11px] text-[#71717a]">
+                              <div className="mt-0.5 flex items-center justify-between gap-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
                                 <span className="truncate">{w.branch_name}</span>
                                 {(w.insertions > 0 || w.deletions > 0) && (
                                   <span className="flex shrink-0 items-center gap-1 text-[10.5px]">
@@ -1029,26 +1075,26 @@ export function App() {
         </div>
 
         {/* Bottom Icon-Only Footer (Paseo / Codex SidebarFooter) */}
-        <div className="flex h-[40px] shrink-0 items-center justify-between border-t border-[#18181c] px-2.5 text-[#71717a]">
+        <div className="flex h-[40px] shrink-0 items-center justify-between border-t border-[var(--v-border-subtle)] px-2.5 text-[var(--v-fg-muted)]">
           <div className="flex items-center gap-1">
             <button
               onClick={() => setActiveModal("new-repo")}
               title="Add project"
-              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
               <FolderPlus className="h-4 w-4" />
             </button>
             <button
               onClick={() => setActiveModal("skills")}
               title={`Usage: ${tokenPercent}% context window`}
-              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
               <CircleGauge className="h-4 w-4" />
             </button>
             <button
               onClick={() => setActiveModal("qr")}
               title={`Local Daemon (${connected ? "Connected" : "Offline"}) & Mobile E2EE Pairing`}
-              className="relative flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
+              className="relative flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
               <Server className="h-4 w-4" />
               <span
@@ -1058,24 +1104,52 @@ export function App() {
             </button>
           </div>
 
-          <button
-            onClick={() => setActiveModal("settings")}
-            title="Appearance & Settings (⌘,)"
-            className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[#18181c] hover:text-[#f4f4f5]"
-          >
-            <Settings className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-1">
+            <div
+              className="flex items-center rounded-md bg-[var(--v-bg-hover)] p-0.5"
+              title={`Theme: ${themeMode} (active: ${resolvedTheme})`}
+            >
+              {(
+                [
+                  { id: "system", icon: Monitor, tip: "跟随系统 (System)" },
+                  { id: "light", icon: Sun, tip: "浅色模式 (Light)" },
+                  { id: "dark", icon: Moon, tip: "深色模式 (Dark)" },
+                ] as const
+              ).map(({ id, icon: Icon, tip }) => (
+                <button
+                  key={id}
+                  onClick={() => setThemeMode(id)}
+                  title={tip}
+                  className={`flex h-6 w-6 items-center justify-center rounded transition-colors ${
+                    themeMode === id
+                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                  }`}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                </button>
+              ))}
+            </div>
+
+            <button
+              onClick={() => setActiveModal("settings")}
+              title="Appearance & Settings (⌘,)"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+            >
+              <Settings className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       </aside>
 
       {/* =====================================================================
           2. MAIN WORKSPACE AREA (Clean Header + Natural Conversation + Docked Composer)
          ===================================================================== */}
-      <div className="flex flex-1 flex-col overflow-hidden bg-[#111113]">
+      <div className="flex flex-1 flex-col overflow-hidden bg-[var(--v-bg-canvas)]">
         {/* Clean Minimal Workspace Header (42px) */}
         <header
           data-tauri-drag-region
-          className={`flex h-[42px] shrink-0 items-center justify-between border-b border-[#1f1f23] pr-4 ${
+          className={`flex h-[42px] shrink-0 items-center justify-between border-b border-[var(--v-border-subtle)] pr-4 ${
             isMacDesktop && !sidebarOpen ? "pl-[78px]" : "pl-4"
           }`}
         >
@@ -1084,19 +1158,19 @@ export function App() {
               <button
                 onClick={() => setSidebarOpen(true)}
                 title="Show sidebar (⌘B)"
-                className="flex h-7 w-7 items-center justify-center rounded-md text-[#71717a] hover:bg-[#1c1c21] hover:text-[#f4f4f5]"
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
               >
                 <PanelLeft className="h-4 w-4" />
               </button>
             )}
-            <span className="truncate text-[13px] font-medium text-[#f4f4f5]">
+            <span className="truncate text-[13px] font-medium text-[var(--v-fg-primary)]">
               {activeSession.title}
             </span>
             <span
               title={activeSession.worktree_path}
-              className="inline-flex items-center gap-1 rounded-md bg-[#18181c] px-2 py-0.5 font-mono text-[11px] text-[#a1a1aa]"
+              className="inline-flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-secondary)]"
             >
-              <GitBranch className="h-3 w-3 text-[#71717a]" />
+              <GitBranch className="h-3 w-3 text-[var(--v-fg-muted)]" />
               {activeSession.branch_name}
             </span>
           </div>
@@ -1113,8 +1187,8 @@ export function App() {
               }}
               className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11.5px] transition-colors ${
                 drawerOpen && drawerTab === "diff"
-                  ? "bg-[#222228] text-[#f4f4f5]"
-                  : "text-[#a1a1aa] hover:bg-[#1a1a1f] hover:text-[#f4f4f5]"
+                  ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                  : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
               }`}
             >
               <span className="text-[#34d399]">+{activeSession.insertions}</span>
@@ -1132,8 +1206,8 @@ export function App() {
               title="Toggle Worktree Terminal (⌘J)"
               className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
                 drawerOpen && drawerTab === "terminal"
-                  ? "bg-[#222228] text-[#f4f4f5]"
-                  : "text-[#71717a] hover:bg-[#1a1a1f] hover:text-[#f4f4f5]"
+                  ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                  : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
               }`}
             >
               <Terminal className="h-4 w-4" />
@@ -1152,7 +1226,7 @@ export function App() {
                   if (ev.kind === "user") {
                     return (
                       <div key={ev.id} className="flex justify-end">
-                        <div className="max-w-[82%] whitespace-pre-wrap rounded-[18px] bg-[#1f1f24] px-4 py-2.5 text-[13.5px] leading-relaxed text-[#f4f4f5]">
+                        <div className="max-w-[82%] whitespace-pre-wrap rounded-[18px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-relaxed text-[var(--v-fg-primary)]">
                           {ev.content}
                         </div>
                       </div>
@@ -1168,7 +1242,7 @@ export function App() {
                           onClick={() =>
                             setExpandedThinking((p) => ({ ...p, [ev.id]: !isOpen }))
                           }
-                          className="flex items-center gap-1.5 text-left text-[12.5px] text-[#71717a] transition-colors hover:text-[#a1a1aa]"
+                          className="flex items-center gap-1.5 text-left text-[12.5px] text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-secondary)]"
                         >
                           {isOpen ? (
                             <ChevronDown className="h-3.5 w-3.5" />
@@ -1178,7 +1252,7 @@ export function App() {
                           <span>Thought for a moment</span>
                         </button>
                         {isOpen && (
-                          <div className="mt-2 border-l-2 border-[#232329] pl-3.5 text-[12.5px] leading-relaxed text-[#71717a]">
+                          <div className="mt-2 border-l-2 border-[var(--v-border-subtle)] pl-3.5 text-[12.5px] leading-relaxed text-[var(--v-fg-muted)]">
                             {ev.content}
                           </div>
                         )}
@@ -1194,11 +1268,11 @@ export function App() {
                         <div className="flex items-center gap-2">
                           <button
                             onClick={() => openDiffForFile(ev.tool_args)}
-                            className="group inline-flex items-center gap-2 rounded-lg border border-[#222228] bg-[#16161a] px-3 py-1.5 font-mono text-[12px] text-[#d4d4d8] transition-colors hover:border-[#34343d] hover:bg-[#1b1b20]"
+                            className="group inline-flex items-center gap-2 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3 py-1.5 font-mono text-[12px] text-[var(--v-fg-body)] transition-colors hover:border-[var(--v-border-strong)] hover:bg-[var(--v-bg-hover)]"
                           >
-                            <FileCode2 className="h-3.5 w-3.5 text-[#71717a]" />
-                            <span className="text-[#71717a]">{ev.tool_name}</span>
-                            <span className="text-[#f4f4f5]">{ev.tool_args}</span>
+                            <FileCode2 className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                            <span className="text-[var(--v-fg-muted)]">{ev.tool_name}</span>
+                            <span className="text-[var(--v-fg-primary)]">{ev.tool_args}</span>
                             <span className="text-[#34d399]">+24</span>
                             <span className="text-[#f87171]">−3</span>
                           </button>
@@ -1207,14 +1281,14 @@ export function App() {
                             onClick={() =>
                               setExpandedTools((p) => ({ ...p, [ev.id]: !isExpanded }))
                             }
-                            className="text-[11.5px] text-[#52525b] hover:text-[#a1a1aa]"
+                            className="text-[11.5px] text-[var(--v-fg-faint)] hover:text-[var(--v-fg-secondary)]"
                           >
                             {isExpanded ? "Hide" : "Preview"}
                           </button>
                         </div>
 
                         {isExpanded && (
-                          <pre className="overflow-x-auto rounded-lg border border-[#1f1f24] bg-[#0c0c0e] p-3 font-mono text-[11.5px] leading-relaxed text-[#a1a1aa]">
+                          <pre className="overflow-x-auto rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] p-3 font-mono text-[11.5px] leading-relaxed text-[var(--v-fg-secondary)]">
                             {ev.content}
                           </pre>
                         )}
@@ -1226,7 +1300,7 @@ export function App() {
                   return (
                     <div
                       key={ev.id}
-                      className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[#e4e4e7]"
+                      className="whitespace-pre-line text-[13.5px] leading-[1.68] text-[var(--v-fg-body)]"
                     >
                       {ev.content}
                     </div>
@@ -1248,10 +1322,10 @@ export function App() {
                       <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[#fbbf24]" />
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="font-medium text-[#f4f4f5]">
+                          <span className="font-medium text-[var(--v-fg-primary)]">
                             Permission required in worktree
                           </span>
-                          <span className="truncate font-mono text-[11px] text-[#a1a1aa]">
+                          <span className="truncate font-mono text-[11px] text-[var(--v-fg-secondary)]">
                             {activeSession.branch_name}
                           </span>
                         </div>
@@ -1264,19 +1338,19 @@ export function App() {
                     <div className="flex shrink-0 items-center gap-1.5">
                       <button
                         onClick={() => handleResolveApproval("deny")}
-                        className="rounded-lg px-2.5 py-1 text-[11.5px] text-[#a1a1aa] hover:bg-[#26262c] hover:text-[#f4f4f5]"
+                        className="rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[#26262c] hover:text-[var(--v-fg-primary)]"
                       >
                         Deny
                       </button>
                       <button
                         onClick={() => handleResolveApproval("always")}
-                        className="rounded-lg border border-[#2e2e36] bg-[#1f1f25] px-2.5 py-1 text-[11.5px] text-[#e4e4e7] hover:bg-[#292932]"
+                        className="rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] text-[var(--v-fg-body)] hover:bg-[#292932]"
                       >
                         Always allow
                       </button>
                       <button
                         onClick={() => handleResolveApproval("approve")}
-                        className="rounded-lg bg-[#f4f4f5] px-3 py-1 text-[11.5px] font-medium text-[#09090b] hover:opacity-90"
+                        className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90"
                       >
                         Approve & Run
                       </button>
@@ -1286,21 +1360,21 @@ export function App() {
 
                 {/* @file Context Picker Popover */}
                 {atQuery !== null && matchingFiles.length > 0 && (
-                  <div className="mb-2 overflow-hidden rounded-xl border border-[#27272e] bg-[#16161a] p-1.5 shadow-xl">
-                    <div className="px-2.5 py-1 text-[11px] text-[#71717a]">
+                  <div className="mb-2 overflow-hidden rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
+                    <div className="px-2.5 py-1 text-[11px] text-[var(--v-fg-muted)]">
                       Attach file from worktree ({activeSession.branch_name})
                     </div>
                     {matchingFiles.map((filePath) => (
                       <button
                         key={filePath}
                         onClick={() => attachFileToComposer(filePath)}
-                        className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left font-mono text-[12px] text-[#e4e4e7] hover:bg-[#222228]"
+                        className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left font-mono text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
                       >
                         <span className="flex items-center gap-2 truncate">
-                          <FileCode2 className="h-3.5 w-3.5 text-[#71717a]" />
+                          <FileCode2 className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
                           <span className="truncate">{filePath}</span>
                         </span>
-                        <span className="text-[11px] text-[#52525b]">Add context</span>
+                        <span className="text-[11px] text-[var(--v-fg-faint)]">Add context</span>
                       </button>
                     ))}
                   </div>
@@ -1308,40 +1382,40 @@ export function App() {
 
                 {/* Slash Command Popover */}
                 {slashFilter !== null && (
-                  <div className="mb-2 overflow-hidden rounded-xl border border-[#27272e] bg-[#16161a] p-1.5 shadow-xl">
+                  <div className="mb-2 overflow-hidden rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
                     {SLASH_SKILLS.filter((s) =>
                       s.cmd.toLowerCase().includes(slashFilter)
                     ).map((skill) => (
                       <button
                         key={skill.cmd}
                         onClick={() => handleSendPrompt(`${skill.cmd} `)}
-                        className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left text-[12.5px] hover:bg-[#222228]"
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left text-[12.5px] hover:bg-[var(--v-bg-active)]"
                       >
-                        <span className="font-mono font-medium text-[#f4f4f5]">
+                        <span className="font-mono font-medium text-[var(--v-fg-primary)]">
                           {skill.cmd}
                         </span>
-                        <span className="text-[12px] text-[#71717a]">{skill.desc}</span>
+                        <span className="text-[12px] text-[var(--v-fg-muted)]">{skill.desc}</span>
                       </button>
                     ))}
                   </div>
                 )}
 
-                <div className="rounded-[18px] border border-[#27272e] bg-[#16161a] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[#3f3f46]">
+                <div className="rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)]">
                   {/* Attached @file context pills */}
                   {attachedFiles.length > 0 && (
                     <div className="mb-2 flex flex-wrap gap-1.5">
                       {attachedFiles.map((f) => (
                         <span
                           key={f}
-                          className="inline-flex items-center gap-1.5 rounded-md bg-[#22222a] px-2 py-0.5 font-mono text-[11px] text-[#e4e4e7]"
+                          className="inline-flex items-center gap-1.5 rounded-md bg-[var(--v-bg-active)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-body)]"
                         >
-                          <FileCode2 className="h-3 w-3 text-[#71717a]" />
+                          <FileCode2 className="h-3 w-3 text-[var(--v-fg-muted)]" />
                           <span>{f}</span>
                           <button
                             onClick={() =>
                               setAttachedFiles((prev) => prev.filter((item) => item !== f))
                             }
-                            className="text-[#71717a] hover:text-[#f4f4f5]"
+                            className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
                           >
                             <X className="h-3 w-3" />
                           </button>
@@ -1361,7 +1435,7 @@ export function App() {
                       }
                     }}
                     placeholder={`Prompt ${activeSession.model_short}... (@ to attach files, / for commands)`}
-                    className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[#f4f4f5] placeholder-[#52525b] focus:outline-none"
+                    className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                   />
 
                   {/* Composer Bottom Toolbar */}
@@ -1369,16 +1443,16 @@ export function App() {
                     <div className="flex items-center gap-1.5">
                       <button
                         onClick={() => setActiveModal("command")}
-                        className="flex items-center gap-1 rounded-full bg-[#202026] px-2.5 py-1 text-[11.5px] font-medium text-[#d4d4d8] transition-colors hover:bg-[#27272f]"
+                        className="flex items-center gap-1 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] transition-colors hover:bg-[var(--v-bg-hover)]"
                       >
                         <span>{activeSession.model}</span>
-                        <ChevronDown className="h-3 w-3 text-[#71717a]" />
+                        <ChevronDown className="h-3 w-3 text-[var(--v-fg-muted)]" />
                       </button>
 
                       <button
                         onClick={() => setAtQuery((q) => (q === null ? "" : null))}
                         title="Attach file from worktree (@)"
-                        className="flex items-center gap-1 rounded-full px-2 py-1 text-[11.5px] text-[#71717a] transition-colors hover:bg-[#202026] hover:text-[#d4d4d8]"
+                        className="flex items-center gap-1 rounded-full px-2 py-1 text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
                       >
                         <AtSign className="h-3.5 w-3.5" />
                         <span>Context</span>
@@ -1387,7 +1461,7 @@ export function App() {
                       <button
                         onClick={handleToggleApprovalMode}
                         title="Click to toggle Auto-edit / Ask permissions"
-                        className="rounded-full px-2.5 py-1 text-[11.5px] text-[#71717a] transition-colors hover:bg-[#202026] hover:text-[#d4d4d8]"
+                        className="rounded-full px-2.5 py-1 text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
                       >
                         {activeSession.approval_mode === "auto_edit"
                           ? "Auto-edit"
@@ -1396,7 +1470,7 @@ export function App() {
 
                       <button
                         onClick={() => handleSendPrompt("/handoff")}
-                        className="rounded-full px-2 py-1 font-mono text-[11px] text-[#71717a] hover:bg-[#202026] hover:text-[#d4d4d8]"
+                        className="rounded-full px-2 py-1 font-mono text-[11px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
                       >
                         /handoff
                       </button>
@@ -1408,8 +1482,8 @@ export function App() {
                       disabled={!prompt.trim() && attachedFiles.length === 0}
                       className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
                         prompt.trim() || attachedFiles.length > 0
-                          ? "bg-[#f4f4f5] text-[#09090b] hover:opacity-90 cursor-pointer"
-                          : "bg-[#27272e] text-[#52525b] cursor-default"
+                          ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
+                          : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
                       }`}
                     >
                       <ArrowUp className="h-4 w-4 stroke-[2.25]" />
@@ -1424,18 +1498,18 @@ export function App() {
               5. ON-DEMAND SLIDE-OVER DIFF & TERMINAL DRAWER (Right Side)
              ================================================================= */}
           <aside
-            className={`flex flex-col overflow-hidden bg-[#0c0c0e] border-l border-[#1f1f23] transition-all duration-200 ease-out ${
+            className={`flex flex-col overflow-hidden bg-[var(--v-bg-sidebar)] border-l border-[var(--v-border-subtle)] transition-all duration-200 ease-out ${
               drawerOpen ? "w-[460px] opacity-100" : "w-0 border-l-0 opacity-0"
             }`}
           >
-            <div className="flex h-[42px] shrink-0 items-center justify-between border-b border-[#1f1f23] px-3.5">
+            <div className="flex h-[42px] shrink-0 items-center justify-between border-b border-[var(--v-border-subtle)] px-3.5">
               <div className="flex items-center gap-1">
                 <button
                   onClick={() => setDrawerTab("diff")}
                   className={`rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
                     drawerTab === "diff"
-                      ? "bg-[#1f1f25] text-[#f4f4f5]"
-                      : "text-[#71717a] hover:text-[#a1a1aa]"
+                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
                   }`}
                 >
                   Changes ({activeDiffFiles.length})
@@ -1444,8 +1518,8 @@ export function App() {
                   onClick={() => setDrawerTab("terminal")}
                   className={`rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
                     drawerTab === "terminal"
-                      ? "bg-[#1f1f25] text-[#f4f4f5]"
-                      : "text-[#71717a] hover:text-[#a1a1aa]"
+                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
                   }`}
                 >
                   Terminal
@@ -1459,7 +1533,7 @@ export function App() {
                     <button
                       onClick={() => refreshSessionDiffAndFiles(activeSession.id)}
                       title="Refresh live git diff from worktree"
-                      className="flex h-6 w-6 items-center justify-center rounded-md text-[#71717a] hover:bg-[#18181c] hover:text-[#f4f4f5]"
+                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
                     >
                       <RefreshCw
                         className={`h-3.5 w-3.5 ${diffLoading ? "animate-spin" : ""}`}
@@ -1468,7 +1542,7 @@ export function App() {
                     <button
                       onClick={() => setCommitBoxOpen((v) => !v)}
                       title="Commit changes in isolated worktree"
-                      className="flex items-center gap-1 rounded-md bg-[#18181c] px-2 py-1 text-[11px] text-[#d4d4d8] hover:bg-[#222228]"
+                      className="flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
                     >
                       <GitCommitHorizontal className="h-3.5 w-3.5 text-[#34d399]" />
                       <span>Commit</span>
@@ -1476,9 +1550,9 @@ export function App() {
                     <button
                       onClick={handleMergeWorktree}
                       title="Check branch readiness for merge"
-                      className="flex items-center gap-1 rounded-md bg-[#18181c] px-2 py-1 text-[11px] text-[#d4d4d8] hover:bg-[#222228]"
+                      className="flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
                     >
-                      <GitMerge className="h-3.5 w-3.5 text-[#a1a1aa]" />
+                      <GitMerge className="h-3.5 w-3.5 text-[var(--v-fg-secondary)]" />
                       <span>Merge</span>
                     </button>
                   </>
@@ -1486,7 +1560,7 @@ export function App() {
                 <button
                   onClick={() => setDrawerOpen(false)}
                   title="Close (Esc)"
-                  className="flex h-6 w-6 items-center justify-center rounded-md text-[#71717a] hover:bg-[#18181c] hover:text-[#f4f4f5]"
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
                 >
                   <X className="h-3.5 w-3.5" />
                 </button>
@@ -1494,22 +1568,22 @@ export function App() {
             </div>
 
             {gitActionNotice && (
-              <div className="border-b border-[#1f1f23] bg-[#141d19] px-3.5 py-1.5 font-mono text-[11px] text-[#34d399]">
+              <div className="border-b border-[var(--v-border-subtle)] bg-[#141d19] px-3.5 py-1.5 font-mono text-[11px] text-[#34d399]">
                 {gitActionNotice}
               </div>
             )}
 
             {commitBoxOpen && drawerTab === "diff" && (
-              <div className="flex items-center gap-1.5 border-b border-[#1f1f23] bg-[#141418] px-3 py-2">
+              <div className="flex items-center gap-1.5 border-b border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3 py-2">
                 <input
                   value={commitMsg}
                   onChange={(e) => setCommitMsg(e.target.value)}
                   placeholder="Commit message..."
-                  className="flex-1 rounded-md border border-[#27272e] bg-[#0c0c0e] px-2.5 py-1 font-mono text-[11.5px] text-[#f4f4f5] focus:outline-none"
+                  className="flex-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1 font-mono text-[11.5px] text-[var(--v-fg-primary)] focus:outline-none"
                 />
                 <button
                   onClick={handleCommitWorktree}
-                  className="rounded-md bg-[#f4f4f5] px-2.5 py-1 text-[11.5px] font-medium text-[#09090b]"
+                  className="rounded-md bg-[var(--v-btn-bg)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)]"
                 >
                   Commit
                 </button>
@@ -1518,7 +1592,7 @@ export function App() {
 
             {drawerTab === "diff" ? (
               <div className="flex flex-1 flex-col overflow-hidden">
-                <div className="flex flex-wrap gap-1 border-b border-[#18181c] p-2.5">
+                <div className="flex flex-wrap gap-1 border-b border-[var(--v-border-subtle)] p-2.5">
                   {activeDiffFiles.map((file) => {
                     const active = file.path === currentDiffFile.path;
                     return (
@@ -1527,8 +1601,8 @@ export function App() {
                         onClick={() => setSelectedDiffPath(file.path)}
                         className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11px] transition-colors ${
                           active
-                            ? "bg-[#1f1f25] text-[#f4f4f5]"
-                            : "text-[#71717a] hover:bg-[#16161a] hover:text-[#a1a1aa]"
+                            ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                            : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-secondary)]"
                         }`}
                       >
                         <span>{file.path.split("/").pop()}</span>
@@ -1539,7 +1613,7 @@ export function App() {
                   })}
                 </div>
 
-                <div className="flex items-center justify-between border-b border-[#18181c] px-3.5 py-2 font-mono text-[11px] text-[#71717a]">
+                <div className="flex items-center justify-between border-b border-[var(--v-border-subtle)] px-3.5 py-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
                   <span className="truncate">{currentDiffFile.path}</span>
                   <button
                     onClick={() =>
@@ -1548,7 +1622,7 @@ export function App() {
                         currentDiffFile.hunks.map((h) => h.content).join("\n")
                       )
                     }
-                    className="flex items-center gap-1 hover:text-[#f4f4f5]"
+                    className="flex items-center gap-1 hover:text-[var(--v-fg-primary)]"
                   >
                     {copiedKey === currentDiffFile.path ? (
                       <Check className="h-3 w-3 text-[#34d399]" />
@@ -1568,7 +1642,7 @@ export function App() {
                       ? "v-diff-add"
                       : line.type === "del"
                       ? "v-diff-del"
-                      : "text-[#71717a]";
+                      : "text-[var(--v-fg-muted)]";
                     const sign = isHunkHeader
                       ? ""
                       : line.type === "add"
@@ -1593,16 +1667,16 @@ export function App() {
               </div>
             ) : (
               <div className="flex flex-1 flex-col overflow-hidden p-3.5 font-mono text-[11.5px]">
-                <div className="mb-2 flex items-center justify-between text-[10.5px] text-[#52525b]">
+                <div className="mb-2 flex items-center justify-between text-[10.5px] text-[var(--v-fg-faint)]">
                   <span className="truncate">{activeSession.worktree_path}</span>
                   <span>{activeSession.branch_name}</span>
                 </div>
-                <div className="flex-1 space-y-1.5 overflow-y-auto text-[#d4d4d8]">
+                <div className="flex-1 space-y-1.5 overflow-y-auto text-[var(--v-fg-body)]">
                   {termLines.map((line, i) => (
                     <div
                       key={i}
                       className={
-                        line.startsWith("$") ? "font-medium text-[#f4f4f5]" : "text-[#71717a]"
+                        line.startsWith("$") ? "font-medium text-[var(--v-fg-primary)]" : "text-[var(--v-fg-muted)]"
                       }
                     >
                       {line}
@@ -1611,14 +1685,14 @@ export function App() {
                 </div>
                 <form
                   onSubmit={handleRunTermCommand}
-                  className="mt-2 flex items-center gap-2 border-t border-[#1f1f23] pt-2.5"
+                  className="mt-2 flex items-center gap-2 border-t border-[var(--v-border-subtle)] pt-2.5"
                 >
-                  <span className="text-[#71717a]">$</span>
+                  <span className="text-[var(--v-fg-muted)]">$</span>
                   <input
                     value={termInput}
                     onChange={(e) => setTermInput(e.target.value)}
                     placeholder="Run real git / cargo command in worktree..."
-                    className="flex-1 bg-transparent text-[#f4f4f5] placeholder-[#52525b] focus:outline-none"
+                    className="flex-1 bg-transparent text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                   />
                 </form>
               </div>
@@ -1637,24 +1711,24 @@ export function App() {
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[440px] rounded-xl border border-[#27272e] bg-[#141417] p-5 shadow-2xl"
+            className="w-full max-w-[440px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-5 shadow-2xl"
           >
             {activeModal === "new-worktree" && (
               <div>
                 <div className="mb-4 flex items-center justify-between">
-                  <h3 className="text-[14px] font-semibold text-[#f4f4f5]">
+                  <h3 className="text-[14px] font-semibold text-[var(--v-fg-primary)]">
                     New isolated worktree thread
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
-                    className="text-[#71717a] hover:text-[#f4f4f5]"
+                    className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
                   >
                     <X className="h-4 w-4" />
                   </button>
                 </div>
                 <div className="space-y-3 text-[12.5px]">
                   <div>
-                    <label className="mb-1 block text-[11.5px] text-[#a1a1aa]">
+                    <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
                       Project
                     </label>
                     <div className="grid grid-cols-3 gap-1.5">
@@ -1664,8 +1738,8 @@ export function App() {
                           onClick={() => setTargetRepoIdForNewWt(r.id)}
                           className={`truncate rounded-lg border px-2.5 py-1.5 text-[12px] ${
                             targetRepoIdForNewWt === r.id
-                              ? "border-[#f4f4f5] bg-[#1f1f25] text-[#f4f4f5]"
-                              : "border-[#27272e] text-[#71717a]"
+                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                              : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)]"
                           }`}
                         >
                           {r.name}
@@ -1674,7 +1748,7 @@ export function App() {
                     </div>
                   </div>
                   <div>
-                    <label className="mb-1 block text-[11.5px] text-[#a1a1aa]">
+                    <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
                       Agent Runtime
                     </label>
                     <div className="grid grid-cols-3 gap-1.5">
@@ -1684,8 +1758,8 @@ export function App() {
                           onClick={() => setNewAgentKind(kind)}
                           className={`rounded-lg border px-2.5 py-1.5 text-[12px] capitalize ${
                             newAgentKind === kind
-                              ? "border-[#f4f4f5] bg-[#1f1f25] text-[#f4f4f5]"
-                              : "border-[#27272e] text-[#71717a]"
+                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                              : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)]"
                           }`}
                         >
                           {kind}
@@ -1694,35 +1768,35 @@ export function App() {
                     </div>
                   </div>
                   <div>
-                    <label className="mb-1 block text-[11.5px] text-[#a1a1aa]">
+                    <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
                       Task title
                     </label>
                     <input
                       value={newTaskDesc}
                       onChange={(e) => setNewTaskDesc(e.target.value)}
-                      className="w-full rounded-lg border border-[#27272e] bg-[#0c0c0e] px-3 py-2 text-[12.5px] text-[#f4f4f5] focus:border-[#52525b] focus:outline-none"
+                      className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 text-[12.5px] text-[var(--v-fg-primary)] focus:border-[var(--v-fg-muted)] focus:outline-none"
                     />
                   </div>
                   <div>
-                    <label className="mb-1 block text-[11.5px] text-[#a1a1aa]">
+                    <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
                       Git Worktree branch
                     </label>
                     <input
                       value={newTaskName}
                       onChange={(e) => setNewTaskName(e.target.value)}
-                      className="w-full rounded-lg border border-[#27272e] bg-[#0c0c0e] px-3 py-2 font-mono text-[12px] text-[#f4f4f5] focus:border-[#52525b] focus:outline-none"
+                      className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:border-[var(--v-fg-muted)] focus:outline-none"
                     />
                   </div>
                   <div className="flex justify-end gap-2 pt-2">
                     <button
                       onClick={() => setActiveModal(null)}
-                      className="rounded-lg px-3 py-1.5 text-[12.5px] text-[#a1a1aa] hover:bg-[#1f1f25]"
+                      className="rounded-lg px-3 py-1.5 text-[12.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-active)]"
                     >
                       Cancel
                     </button>
                     <button
                       onClick={handleCreateWorktree}
-                      className="rounded-lg bg-[#f4f4f5] px-4 py-1.5 text-[12.5px] font-medium text-[#09090b] hover:opacity-90"
+                      className="rounded-lg bg-[var(--v-btn-bg)] px-4 py-1.5 text-[12.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90"
                     >
                       Start thread
                     </button>
@@ -1734,12 +1808,12 @@ export function App() {
             {activeModal === "new-repo" && (
               <div>
                 <div className="mb-4 flex items-center justify-between">
-                  <h3 className="text-[14px] font-semibold text-[#f4f4f5]">
+                  <h3 className="text-[14px] font-semibold text-[var(--v-fg-primary)]">
                     Add project
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
-                    className="text-[#71717a] hover:text-[#f4f4f5]"
+                    className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
                   >
                     <X className="h-4 w-4" />
                   </button>
@@ -1749,18 +1823,18 @@ export function App() {
                     value={newRepoPath}
                     onChange={(e) => setNewRepoPath(e.target.value)}
                     placeholder="/path/to/git/repo"
-                    className="w-full rounded-lg border border-[#27272e] bg-[#0c0c0e] px-3 py-2 font-mono text-[12px] text-[#f4f4f5] focus:outline-none"
+                    className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
                   />
                   <div className="flex justify-end gap-2 pt-2">
                     <button
                       onClick={() => setActiveModal(null)}
-                      className="rounded-lg px-3 py-1.5 text-[12.5px] text-[#a1a1aa]"
+                      className="rounded-lg px-3 py-1.5 text-[12.5px] text-[var(--v-fg-secondary)]"
                     >
                       Cancel
                     </button>
                     <button
                       onClick={handleCreateRepo}
-                      className="rounded-lg bg-[#f4f4f5] px-4 py-1.5 text-[12.5px] font-medium text-[#09090b]"
+                      className="rounded-lg bg-[var(--v-btn-bg)] px-4 py-1.5 text-[12.5px] font-medium text-[var(--v-btn-fg)]"
                     >
                       Add
                     </button>
@@ -1771,14 +1845,14 @@ export function App() {
 
             {activeModal === "command" && (
               <div>
-                <div className="mb-3 flex items-center gap-2 border-b border-[#222228] pb-2.5">
-                  <Search className="h-4 w-4 text-[#71717a]" />
+                <div className="mb-3 flex items-center gap-2 border-b border-[var(--v-border-subtle)] pb-2.5">
+                  <Search className="h-4 w-4 text-[var(--v-fg-muted)]" />
                   <input
                     autoFocus
                     value={cmdQuery}
                     onChange={(e) => setCmdQuery(e.target.value)}
                     placeholder="Search threads or run action..."
-                    className="w-full bg-transparent text-[13px] text-[#f4f4f5] focus:outline-none"
+                    className="w-full bg-transparent text-[13px] text-[var(--v-fg-primary)] focus:outline-none"
                   />
                 </div>
                 <div className="max-h-[280px] space-y-1 overflow-y-auto text-[12.5px]">
@@ -1795,10 +1869,10 @@ export function App() {
                           setActiveId(s.id);
                           setActiveModal(null);
                         }}
-                        className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left hover:bg-[#1f1f25]"
+                        className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left hover:bg-[var(--v-bg-active)]"
                       >
-                        <span className="truncate text-[#f4f4f5]">{s.title}</span>
-                        <span className="font-mono text-[11px] text-[#71717a]">
+                        <span className="truncate text-[var(--v-fg-primary)]">{s.title}</span>
+                        <span className="font-mono text-[11px] text-[var(--v-fg-muted)]">
                           {s.branch_name}
                         </span>
                       </button>
@@ -1810,12 +1884,12 @@ export function App() {
             {activeModal === "settings" && (
               <div>
                 <div className="mb-4 flex items-center justify-between">
-                  <h3 className="text-[14px] font-semibold text-[#f4f4f5]">
-                    Appearance & Surface Settings
+                  <h3 className="text-[14px] font-semibold text-[var(--v-fg-primary)]">
+                    外观与主题设置 (Appearance)
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
-                    className="text-[#71717a] hover:text-[#f4f4f5]"
+                    className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
                   >
                     <X className="h-4 w-4" />
                   </button>
@@ -1823,25 +1897,57 @@ export function App() {
 
                 <div className="space-y-4 text-[12.5px]">
                   <div>
-                    <label className="mb-1.5 block text-[11.5px] text-[#a1a1aa]">
-                      Color Palette
-                    </label>
-                    <div className="grid grid-cols-2 gap-1.5">
+                    <div className="mb-1.5 flex items-center justify-between">
+                      <label className="text-[11.5px] text-[var(--v-fg-secondary)]">
+                        主题模式 (Theme Mode)
+                      </label>
+                      <span className="font-mono text-[11px] text-[var(--v-fg-muted)]">
+                        当前生效: {resolvedTheme === "dark" ? "深色 (Dark)" : "浅色 (Light)"}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1.5">
                       {(
                         [
-                          { id: "zinc", label: "Carbon Zinc (Default)" },
-                          { id: "claude", label: "Claude Warm Dark" },
-                          { id: "paseo", label: "Paseo Forest Dark" },
-                          { id: "daylight", label: "Linear Daylight" },
-                        ] as { id: ThemeId; label: string }[]
+                          { id: "system", label: "跟随系统 (System)", icon: Monitor },
+                          { id: "light", label: "浅色 (Light)", icon: Sun },
+                          { id: "dark", label: "深色 (Dark)", icon: Moon },
+                        ] as const
+                      ).map(({ id, label, icon: Icon }) => (
+                        <button
+                          key={id}
+                          onClick={() => setThemeMode(id)}
+                          className={`flex items-center justify-center gap-1.5 rounded-lg border px-2.5 py-2 text-[12px] transition-colors ${
+                            themeMode === id
+                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                              : "border-[var(--v-border-strong)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]"
+                          }`}
+                        >
+                          <Icon className="h-3.5 w-3.5" />
+                          <span>{label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="mb-1.5 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                      色彩基调 (Color Tone — 同时适配深浅色)
+                    </label>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(
+                        [
+                          { id: "zinc", label: "Carbon Zinc" },
+                          { id: "claude", label: "Claude Warm" },
+                          { id: "paseo", label: "Paseo Forest" },
+                        ] as { id: ToneId; label: string }[]
                       ).map((t) => (
                         <button
                           key={t.id}
-                          onClick={() => setTheme(t.id)}
-                          className={`rounded-lg border px-3 py-2 text-left text-[12px] ${
-                            theme === t.id
-                              ? "border-[#f4f4f5] bg-[#1f1f25] font-medium text-[#f4f4f5]"
-                              : "border-[#27272e] text-[#a1a1aa] hover:bg-[#1a1a1f]"
+                          onClick={() => setTone(t.id)}
+                          className={`rounded-lg border px-3 py-2 text-center text-[12px] transition-colors ${
+                            tone === t.id
+                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                              : "border-[var(--v-border-strong)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]"
                           }`}
                         >
                           {t.label}
@@ -1851,8 +1957,8 @@ export function App() {
                   </div>
 
                   <div>
-                    <label className="mb-1.5 block text-[11.5px] text-[#a1a1aa]">
-                      Surface Material Variant
+                    <label className="mb-1.5 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                      表面材质 (Surface Material)
                     </label>
                     <div className="grid grid-cols-3 gap-1.5">
                       {(
@@ -1865,10 +1971,10 @@ export function App() {
                         <button
                           key={v.id}
                           onClick={() => setVariant(v.id)}
-                          className={`rounded-lg border px-2.5 py-2 text-center text-[11.5px] ${
+                          className={`rounded-lg border px-2.5 py-2 text-center text-[11.5px] transition-colors ${
                             variant === v.id
-                              ? "border-[#f4f4f5] bg-[#1f1f25] font-medium text-[#f4f4f5]"
-                              : "border-[#27272e] text-[#a1a1aa] hover:bg-[#1a1a1f]"
+                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                              : "border-[var(--v-border-strong)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]"
                           }`}
                         >
                           {v.label}
@@ -1883,18 +1989,18 @@ export function App() {
             {(activeModal === "skills" || activeModal === "qr") && (
               <div>
                 <div className="mb-3 flex items-center justify-between">
-                  <h3 className="text-[13.5px] font-semibold text-[#f4f4f5]">
+                  <h3 className="text-[13.5px] font-semibold text-[var(--v-fg-primary)]">
                     {activeModal === "qr" ? "Mobile E2EE Pairing" : "Automations & Skills"}
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
-                    className="text-[#71717a] hover:text-[#f4f4f5]"
+                    className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
                   >
                     <X className="h-4 w-4" />
                   </button>
                 </div>
                 {activeModal === "qr" ? (
-                  <div className="space-y-3 font-mono text-[11.5px] text-[#a1a1aa]">
+                  <div className="space-y-3 font-mono text-[11.5px] text-[var(--v-fg-secondary)]">
                     <p>X25519 + ChaCha20-Poly1305 E2EE Relay:</p>
                     {pairTicket?.qr_svg && (
                       <div
@@ -1902,7 +2008,7 @@ export function App() {
                         dangerouslySetInnerHTML={{ __html: pairTicket.qr_svg }}
                       />
                     )}
-                    <div className="break-all rounded-lg border border-[#27272e] bg-[#0c0c0e] p-3 text-[#f4f4f5]">
+                    <div className="break-all rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] p-3 text-[var(--v-fg-primary)]">
                       {pairTicket?.uri ||
                         "velo://pair?daemon=127.0.0.1:6767&fp=9F8B-441A-E2EE"}
                     </div>
@@ -1916,12 +2022,12 @@ export function App() {
                           setActiveModal(null);
                           handleSendPrompt(s.cmd);
                         }}
-                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-[#1f1f25]"
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-[var(--v-bg-active)]"
                       >
-                        <span className="font-mono text-[12px] font-medium text-[#f4f4f5]">
+                        <span className="font-mono text-[12px] font-medium text-[var(--v-fg-primary)]">
                           {s.cmd}
                         </span>
-                        <span className="text-[12px] text-[#71717a]">{s.desc}</span>
+                        <span className="text-[12px] text-[var(--v-fg-muted)]">{s.desc}</span>
                       </button>
                     ))}
                   </div>

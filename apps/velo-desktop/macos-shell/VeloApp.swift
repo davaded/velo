@@ -77,6 +77,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.name == "windowDrag", let event = NSApp.currentEvent {
             window.performDrag(with: event)
+        } else if message.name == "windowTheme", let mode = message.body as? String {
+            switch mode {
+            case "light":
+                window.appearance = NSAppearance(named: .aqua)
+                window.backgroundColor = NSColor(calibratedRed: 0.98, green: 0.98, blue: 0.99, alpha: 1.0)
+            case "dark":
+                window.appearance = NSAppearance(named: .darkAqua)
+                window.backgroundColor = NSColor(calibratedRed: 0.047, green: 0.047, blue: 0.055, alpha: 1.0)
+            default:
+                window.appearance = nil
+            }
         }
     }
 
@@ -96,12 +107,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = false
         window.minSize = NSSize(width: 960, height: 640)
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.backgroundColor = NSColor(calibratedRed: 0.047, green: 0.047, blue: 0.055, alpha: 1.0)
+        window.appearance = nil
+        window.backgroundColor = NSColor.windowBackgroundColor
         window.center()
 
         let contentController = WKUserContentController()
         contentController.add(self, name: "windowDrag")
+        contentController.add(self, name: "windowTheme")
         let scriptSource = """
         window.__VELO_MACOS_APP__ = true;
         window.addEventListener('mousedown', function(e) {
