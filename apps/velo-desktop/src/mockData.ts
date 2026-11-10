@@ -1,5 +1,82 @@
 export type AgentKind = "claude" | "codex" | "gemini";
 export type ApprovalMode = "auto_edit" | "ask_before_edit" | "full_auto";
+export type EffortLevel = "low" | "medium" | "high" | "max";
+
+export interface ModelOption {
+  id: string;
+  label: string;
+  shortLabel: string;
+  family: "Anthropic" | "OpenAI" | "Google";
+  runtimeId: "claude" | "codex" | "gemini";
+  agentKind: AgentKind;
+  desc: string;
+}
+
+export const MODEL_CATALOG: ModelOption[] = [
+  {
+    id: "claude-sonnet-4.5",
+    label: "Claude Sonnet 4.5",
+    shortLabel: "Claude Sonnet 4.5",
+    family: "Anthropic",
+    runtimeId: "claude",
+    agentKind: "claude",
+    desc: "主力编码模型，兼顾速度与代码质量",
+  },
+  {
+    id: "claude-opus-4.5",
+    label: "Claude Opus 4.5",
+    shortLabel: "Claude Opus 4.5",
+    family: "Anthropic",
+    runtimeId: "claude",
+    agentKind: "claude",
+    desc: "深度架构设计与复杂跨模块重构",
+  },
+  {
+    id: "claude-haiku-4.5",
+    label: "Claude Haiku 4.5",
+    shortLabel: "Claude Haiku 4.5",
+    family: "Anthropic",
+    runtimeId: "claude",
+    agentKind: "claude",
+    desc: "超快响应，适合轻量修改与快速问答",
+  },
+  {
+    id: "o3",
+    label: "o3",
+    shortLabel: "o3",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "高强推理模型，适合疑难 Bug 与算法攻坚",
+  },
+  {
+    id: "o4-mini",
+    label: "o4-mini",
+    shortLabel: "o4-mini",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "极速高性价比编码与自动化测试生成",
+  },
+  {
+    id: "gpt-4.1",
+    label: "GPT-4.1",
+    shortLabel: "GPT-4.1",
+    family: "OpenAI",
+    runtimeId: "codex",
+    agentKind: "codex",
+    desc: "通用全栈开发与稳健指令遵循",
+  },
+  {
+    id: "gemini-2.5-pro",
+    label: "Gemini 2.5 Pro",
+    shortLabel: "Gemini 2.5 Pro",
+    family: "Google",
+    runtimeId: "gemini",
+    agentKind: "gemini",
+    desc: "百万长上下文全库分析",
+  },
+];
 
 export interface VeloRepo {
   id: string;
@@ -16,6 +93,7 @@ export interface VeloSession {
   agent_kind: AgentKind;
   model: string;
   model_short: string;
+  effort?: EffortLevel;
   status: "running" | "waiting_approval" | "idle";
   branch_name: string;
   worktree_path: string;
@@ -92,18 +170,19 @@ export const DEMO_SESSIONS: VeloSession[] = [
     title: "WebSocket 指数退避与环形缓冲",
     agent_kind: "claude",
     model: "claude-sonnet-4.5",
-    model_short: "claude-4.5",
-    status: "running",
+    model_short: "Claude Sonnet 4.5",
+    effort: "medium",
+    status: "idle",
     branch_name: "feat/ws-reconnection",
-    worktree_path: "/Users/daiyudai/code/velo/.velo/worktrees/ws-reconnect",
+    worktree_path: "/Users/daiyudai/code/velo",
     project_path: "/Users/daiyudai/code/velo",
     approval_mode: "auto_edit",
-    tokens_used: 36400,
+    tokens_used: 12400,
     tokens_limit: 200000,
-    cost_usd: 0.14,
-    files_changed: 3,
-    insertions: 48,
-    deletions: 14,
+    cost_usd: 0.04,
+    files_changed: 0,
+    insertions: 0,
+    deletions: 0,
     updated_at: "just now",
   },
   {
@@ -111,216 +190,69 @@ export const DEMO_SESSIONS: VeloSession[] = [
     repo_id: "repo-velo",
     title: "修复并发 Worktree 锁竞争",
     agent_kind: "codex",
-    model: "codex-o3",
-    model_short: "codex-o3",
-    status: "waiting_approval",
-    branch_name: "fix/worktree-gc-lock",
-    worktree_path: "/Users/daiyudai/code/velo/.velo/worktrees/gc-lock",
-    project_path: "/Users/daiyudai/code/velo",
-    approval_mode: "ask_before_edit",
-    tokens_used: 21800,
-    tokens_limit: 200000,
-    cost_usd: 0.09,
-    files_changed: 2,
-    insertions: 19,
-    deletions: 5,
-    updated_at: "1m ago",
-  },
-  {
-    id: "sess-3",
-    repo_id: "repo-velo",
-    title: "MCP JSON-RPC 工具桥接器",
-    agent_kind: "gemini",
-    model: "gemini-2.5-pro",
-    model_short: "gemini-2.5",
+    model: "o3",
+    model_short: "o3",
+    effort: "high",
     status: "idle",
-    branch_name: "chore/mcp-bridge-tools",
-    worktree_path: "/Users/daiyudai/code/velo/.velo/worktrees/mcp-bridge",
+    branch_name: "fix/worktree-gc-lock",
+    worktree_path: "/Users/daiyudai/code/velo",
     project_path: "/Users/daiyudai/code/velo",
     approval_mode: "auto_edit",
-    tokens_used: 52000,
-    tokens_limit: 1000000,
-    cost_usd: 0.11,
-    files_changed: 4,
-    insertions: 112,
-    deletions: 8,
-    updated_at: "6m ago",
+    tokens_used: 8200,
+    tokens_limit: 200000,
+    cost_usd: 0.03,
+    files_changed: 0,
+    insertions: 0,
+    deletions: 0,
+    updated_at: "2m ago",
   },
   {
     id: "sess-4",
     repo_id: "repo-nexus",
     title: "零拷贝 Tokio IPC 帧调度",
     agent_kind: "claude",
-    model: "claude-opus-4.6",
-    model_short: "opus-4.6",
-    status: "running",
+    model: "claude-opus-4.5",
+    model_short: "Claude Opus 4.5",
+    effort: "high",
+    status: "idle",
     branch_name: "perf/zero-copy-ipc",
-    worktree_path: "/Users/daiyudai/code/nexus-engine/.velo/worktrees/zero-copy",
+    worktree_path: "/Users/daiyudai/code/nexus-engine",
     project_path: "/Users/daiyudai/code/nexus-engine",
     approval_mode: "auto_edit",
-    tokens_used: 41200,
+    tokens_used: 14200,
     tokens_limit: 200000,
-    cost_usd: 0.28,
-    files_changed: 5,
-    insertions: 86,
-    deletions: 21,
-    updated_at: "30s ago",
+    cost_usd: 0.08,
+    files_changed: 0,
+    insertions: 0,
+    deletions: 0,
+    updated_at: "10m ago",
   },
   {
     id: "sess-5",
     repo_id: "repo-uikit",
-    title: "黑白灰 Zinc 变量与主题导出",
+    title: "自适应系统主题变量导出",
     agent_kind: "codex",
-    model: "codex-o3",
-    model_short: "codex-o3",
+    model: "o4-mini",
+    model_short: "o4-mini",
+    effort: "medium",
     status: "idle",
-    branch_name: "feat/monochrome-tokens",
-    worktree_path: "/Users/daiyudai/code/design-tokens/.velo/worktrees/mono",
+    branch_name: "feat/theme-tokens",
+    worktree_path: "/Users/daiyudai/code/design-tokens",
     project_path: "/Users/daiyudai/code/design-tokens",
     approval_mode: "auto_edit",
-    tokens_used: 12900,
+    tokens_used: 6900,
     tokens_limit: 200000,
-    cost_usd: 0.04,
-    files_changed: 2,
-    insertions: 64,
-    deletions: 12,
+    cost_usd: 0.02,
+    files_changed: 0,
+    insertions: 0,
+    deletions: 0,
     updated_at: "14m ago",
   },
 ];
 
-export const DEMO_EVENTS: Record<string, AgentEvent[]> = {
-  "sess-1": [
-    {
-      id: "ev-1",
-      session_id: "sess-1",
-      timestamp: "00:12:04",
-      kind: "user",
-      content:
-        "重构 velo-daemon 的 WebSocket 重连与指数退避策略，并确保断线期间的 PTY 增量帧可以从环形缓冲区无损回放。",
-    },
-    {
-      id: "ev-2",
-      session_id: "sess-1",
-      timestamp: "00:12:05",
-      kind: "thinking",
-      content:
-        "Inspecting crates/velo-protocol/src/lib.rs and crates/velo-daemon/src/main.rs. We need a deterministic ReconnectPolicy struct with jitter_ratio and a bounded ring buffer per session so reconnecting clients resume from last_seq without frame loss.",
-    },
-    {
-      id: "ev-3",
-      session_id: "sess-1",
-      timestamp: "00:12:07",
-      kind: "tool_call",
-      tool_name: "Edit",
-      tool_args: "crates/velo-protocol/src/lib.rs",
-      content:
-        "@@ -42,6 +42,14 @@\n+pub struct ReconnectPolicy {\n+    pub base_delay_ms: u64,\n+    pub max_delay_ms: u64,\n+    pub jitter_ratio: f32,\n+}",
-      duration_ms: 38,
-    },
-    {
-      id: "ev-4",
-      session_id: "sess-1",
-      timestamp: "00:12:09",
-      kind: "tool_call",
-      tool_name: "Edit",
-      tool_args: "crates/velo-daemon/src/main.rs",
-      content:
-        "@@ -118,4 +118,12 @@\n+    let backoff = policy.next_delay(attempt);\n+    tracing::info!(?backoff, attempt, \"ws client re-subscribed with ring replay\");",
-      duration_ms: 52,
-    },
-    {
-      id: "ev-5",
-      session_id: "sess-1",
-      timestamp: "00:12:12",
-      kind: "assistant",
-      content:
-        "已完成 `ReconnectPolicy` 指数退避与 `last_seq` 环形缓冲回放机制（共修改 3 个文件，`+48 −14`）。\n你可以直接点击上方的文件修改胶囊（如 `Edit crates/velo-protocol/src/lib.rs`）或右上角的 `Diff` 按钮，按需滑出右侧的 Git Diff & PTY 抽屉。",
-    },
-  ],
-  "sess-2": [
-    {
-      id: "ev-201",
-      session_id: "sess-2",
-      timestamp: "00:09:30",
-      kind: "user",
-      content: "修复并发创建 Git Worktree 时的 .git/worktrees 锁竞争问题。",
-    },
-    {
-      id: "ev-202",
-      session_id: "sess-2",
-      timestamp: "00:09:34",
-      kind: "tool_call",
-      tool_name: "Edit",
-      tool_args: "crates/velo-worktree/src/lib.rs",
-      content: "+    let _guard = self.repo_lock.lock().await;",
-      duration_ms: 41,
-    },
-    {
-      id: "ev-203",
-      session_id: "sess-2",
-      timestamp: "00:09:38",
-      kind: "assistant",
-      content: "已为 `WorktreeManager` 增加异步互斥锁并在异常退出时自动清理陈旧 `.lock` 文件。",
-    },
-  ],
-  "sess-3": [
-    {
-      id: "ev-301",
-      session_id: "sess-3",
-      timestamp: "00:04:12",
-      kind: "assistant",
-      content: "MCP JSON-RPC 2.0 桥接器已就绪，支持 `spawn_subagent`、`list_worktrees` 与 `handoff_context`。",
-    },
-  ],
-};
+export const DEMO_EVENTS: Record<string, AgentEvent[]> = {};
 
-export const DEMO_DIFF_FILES: DiffFileItem[] = [
-  {
-    path: "crates/velo-protocol/src/lib.rs",
-    additions: 24,
-    deletions: 3,
-    hunks: [
-      { type: "ctx", oldLine: 39, newLine: 39, content: "#[derive(Debug, Clone, Serialize, Deserialize)]" },
-      { type: "ctx", oldLine: 40, newLine: 40, content: "pub struct WsEnvelope {" },
-      { type: "del", oldLine: 41, content: "    pub reconnect_ms: u64," },
-      { type: "add", newLine: 41, content: "    pub seq: u64," },
-      { type: "add", newLine: 42, content: "    pub policy: ReconnectPolicy," },
-      { type: "ctx", oldLine: 42, newLine: 43, content: "}" },
-      { type: "add", newLine: 44, content: "" },
-      { type: "add", newLine: 45, content: "#[derive(Debug, Clone, Serialize, Deserialize)]" },
-      { type: "add", newLine: 46, content: "pub struct ReconnectPolicy {" },
-      { type: "add", newLine: 47, content: "    pub base_delay_ms: u64," },
-      { type: "add", newLine: 48, content: "    pub max_delay_ms: u64," },
-      { type: "add", newLine: 49, content: "    pub jitter_ratio: f32," },
-      { type: "add", newLine: 50, content: "}" },
-    ],
-  },
-  {
-    path: "crates/velo-daemon/src/main.rs",
-    additions: 18,
-    deletions: 7,
-    hunks: [
-      { type: "ctx", oldLine: 114, newLine: 114, content: "async fn handle_ws_client(socket: WebSocket, state: Arc<AppState>) {" },
-      { type: "del", oldLine: 115, content: "    let mut rx = state.tx.subscribe();" },
-      { type: "add", newLine: 115, content: "    let (replay, mut rx) = state.ring.subscribe_from(last_seq).await;" },
-      { type: "add", newLine: 116, content: "    for frame in replay {" },
-      { type: "add", newLine: 117, content: "        let _ = socket.send(Message::Text(frame)).await;" },
-      { type: "add", newLine: 118, content: "    }" },
-      { type: "ctx", oldLine: 116, newLine: 119, content: "}" },
-    ],
-  },
-  {
-    path: "crates/velo-worktree/src/lib.rs",
-    additions: 6,
-    deletions: 4,
-    hunks: [
-      { type: "ctx", oldLine: 72, newLine: 72, content: "pub async fn create_isolated_worktree(&self, branch: &str) -> Result<PathBuf> {" },
-      { type: "add", newLine: 73, content: "    let _guard = self.mutex.lock().await;" },
-      { type: "ctx", oldLine: 73, newLine: 74, content: "    self.prune_stale_locks()?;" },
-      { type: "ctx", oldLine: 74, newLine: 75, content: "}" },
-    ],
-  },
-];
+export const DEMO_DIFF_FILES: DiffFileItem[] = [];
 
 export const SLASH_SKILLS: SlashSkillItem[] = [
   {
@@ -331,17 +263,17 @@ export const SLASH_SKILLS: SlashSkillItem[] = [
   {
     cmd: "/advisor",
     label: "Architect Advisor",
-    desc: "调用高阶推理模型 (Opus 4.6 / o3) 审计当前 Worktree Diff 与并发安全性",
+    desc: "调用高阶推理模型 (Claude Opus 4.5 / o3) 审计当前 Worktree Diff",
   },
   {
     cmd: "/committee",
-    label: "Dual-Agent Committee Race",
-    desc: "同时派发 Claude Code 与 Codex 在两个独立 Git Worktree 分支并发实现同一需求",
+    label: "Dual-Model Committee Race",
+    desc: "同时派发两个模型在独立 Git Worktree 分支并发实现同一需求",
   },
   {
     cmd: "/loop",
     label: "TDD Verification Loop",
-    desc: "持续运行 Agent 并自动执行验收测试命令 (cargo test) 直到全部通过",
+    desc: "持续运行模型并自动执行验收测试命令直到全部通过",
   },
   {
     cmd: "/worktree-GC",
@@ -363,24 +295,38 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
       : r.agent_kind === "gemini"
       ? "gemini"
       : "claude";
+  const modelId = String(
+    r.model ?? (agentKind === "codex" ? "o3" : agentKind === "gemini" ? "gemini-2.5-pro" : "claude-sonnet-4.5")
+  );
+  const foundModel = MODEL_CATALOG.find((m) => m.id === modelId);
+  const rawStatus = String(r.status ?? "idle");
+  const status: VeloSession["status"] =
+    rawStatus === "running" || rawStatus === "starting"
+      ? "running"
+      : rawStatus === "waiting_for_permission"
+      ? "waiting_approval"
+      : "idle";
   return {
     id: String(r.id ?? `daemon-${idx}`),
     repo_id: String(r.repo_id ?? "repo-velo"),
     title: String(r.title ?? r.prompt ?? r.name ?? branch),
     agent_kind: agentKind,
-    model: String(r.model ?? (agentKind === "codex" ? "codex-o3" : "claude-sonnet-4.5")),
-    model_short: agentKind === "codex" ? "codex-o3" : agentKind === "gemini" ? "gemini-2.5" : "claude-4.5",
-    status: r.status === "waiting_for_permission" ? "waiting_approval" : "running",
+    model: modelId,
+    model_short:
+      foundModel?.shortLabel ??
+      (agentKind === "codex" ? "o3" : agentKind === "gemini" ? "Gemini 2.5 Pro" : "Claude Sonnet 4.5"),
+    effort: "medium",
+    status,
     branch_name: branch,
-    worktree_path: String(r.worktree_path ?? `/Users/daiyudai/code/velo/.velo/worktrees/${branch}`),
+    worktree_path: String(r.worktree_path ?? `/Users/daiyudai/code/velo`),
     project_path: String(r.project_path ?? r.repo_root ?? "/Users/daiyudai/code/velo"),
     approval_mode: "auto_edit",
-    tokens_used: Number(r.tokens_used ?? 28400),
+    tokens_used: Number(r.tokens_used ?? 0),
     tokens_limit: Number(r.tokens_limit ?? 200000),
-    cost_usd: Number(r.cost_usd ?? 0.12),
-    files_changed: Number(r.files_changed ?? diff.files_changed ?? 3),
-    insertions: Number(r.insertions ?? diff.insertions ?? 32),
-    deletions: Number(r.deletions ?? diff.deletions ?? 8),
-    updated_at: "live",
+    cost_usd: Number(r.cost_usd ?? 0),
+    files_changed: Number(r.files_changed ?? diff.files_changed ?? 0),
+    insertions: Number(r.insertions ?? diff.insertions ?? 0),
+    deletions: Number(r.deletions ?? diff.deletions ?? 0),
+    updated_at: status === "running" ? "running" : "ready",
   };
 }

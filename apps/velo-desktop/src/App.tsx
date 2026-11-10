@@ -8,6 +8,8 @@ import {
   DEMO_REPOS,
   DEMO_SESSIONS,
   DiffFileItem,
+  EffortLevel,
+  MODEL_CATALOG,
   SLASH_SKILLS,
   VeloRepo,
   VeloSession,
@@ -16,7 +18,6 @@ import {
 import { parseUnifiedDiff } from "./utils/diffParser";
 import {
   ArrowUp,
-  AtSign,
   Check,
   ChevronDown,
   ChevronRight,
@@ -80,13 +81,7 @@ interface PendingApprovalItem {
   reason: string;
 }
 
-const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {
-  "sess-2": {
-    id: "perm-gc-lock",
-    command: "cargo test -p velo-worktree -- --nocapture",
-    reason: "Run worktree concurrency lock stress test inside isolated branch fix/worktree-gc-lock",
-  },
-};
+const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {};
 
 export function App() {
   const [daemonUrl] = useState<string>(() => {
@@ -161,16 +156,16 @@ export function App() {
     { id: "codex", name: "OpenAI Codex", available: true, version: "codex-cli 0.154.0" },
   ]);
   const [modelPickerOpen, setModelPickerOpen] = useState<boolean>(false);
+  const [effortPickerOpen, setEffortPickerOpen] = useState<boolean>(false);
 
   // Live Diff & Worktree Files per Session
   const [diffsBySession, setDiffsBySession] = useState<Record<string, DiffFileItem[]>>({});
-  const [worktreeFiles, setWorktreeFiles] = useState<string[]>([]);
   const [diffLoading, setDiffLoading] = useState<boolean>(false);
 
   // On-Demand Right Drawer State
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("diff");
-  const [selectedDiffPath, setSelectedDiffPath] = useState<string>(DEMO_DIFF_FILES[0].path);
+  const [selectedDiffPath, setSelectedDiffPath] = useState<string>("");
 
   // One-click Commit bar inside Changes Drawer
   const [commitBoxOpen, setCommitBoxOpen] = useState<boolean>(false);
@@ -202,11 +197,9 @@ export function App() {
     DEFAULT_PENDING_BY_SESSION
   );
 
-  // Composer State + @file Context Picker
+  // Clean Composer State (Natural language + slash skills; Agent explores worktree autonomously)
   const [prompt, setPrompt] = useState<string>("");
   const [slashFilter, setSlashFilter] = useState<string | null>(null);
-  const [atQuery, setAtQuery] = useState<string | null>(null);
-  const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   // Modals & E2EE Pairing Ticket
@@ -215,16 +208,14 @@ export function App() {
   const [cmdQuery, setCmdQuery] = useState<string>("");
   const [newTaskName, setNewTaskName] = useState<string>("feat/worktree-orchestrator");
   const [newTaskDesc, setNewTaskDesc] = useState<string>("并行 Agent 调度与状态同步");
-  const [newAgentKind, setNewAgentKind] = useState<AgentKind>("claude");
+  const [newModelId, setNewModelId] = useState<string>("claude-sonnet-4.5");
   const [newApproval] = useState<ApprovalMode>("auto_edit");
   const [newRepoPath, setNewRepoPath] = useState<string>("/Users/daiyudai/code/velo");
 
   // Terminal State inside Drawer
   const [termLines, setTermLines] = useState<string[]>([
     "$ velo status --worktrees",
-    "  ● feat/ws-reconnection      [claude-sonnet-4.5]  +48 -14  RUNNING",
-    "  ● fix/worktree-gc-lock      [codex-o3]           +19 -5   WAITING",
-    "  ✓ chore/mcp-bridge-tools    [gemini-2.5-pro]     +112 -8  IDLE",
+    "  Ready to execute commands inside the active isolated Git worktree.",
   ]);
   const [termInput, setTermInput] = useState<string>("");
 
@@ -241,15 +232,14 @@ export function App() {
   );
 
   const activeEvents = useMemo(
-    () => eventsBySession[activeSession.id] || DEMO_EVENTS["sess-1"] || [],
+    () => eventsBySession[activeSession.id] || [],
     [eventsBySession, activeSession.id]
   );
 
-  const activeDiffFiles = useMemo(() => {
-    const live = diffsBySession[activeSession.id];
-    if (live && live.length > 0) return live;
-    return DEMO_DIFF_FILES;
-  }, [diffsBySession, activeSession.id]);
+  const activeDiffFiles = useMemo(
+    () => diffsBySession[activeSession.id] || [],
+    [diffsBySession, activeSession.id]
+  );
 
   // Fetch live sessions and detected local CLI runtimes from Velo Daemon
   const refreshSessions = useCallback(() => {
@@ -281,15 +271,14 @@ export function App() {
     refreshSessions();
   }, [refreshSessions]);
 
-  // Fetch live unified git diff & worktree file list whenever activeSession changes
+  // Fetch live unified git diff whenever activeSession changes
   const refreshSessionDiffAndFiles = useCallback(
     async (sessionId: string) => {
       setDiffLoading(true);
       try {
-        const [diffRes, filesRes] = await Promise.all([
-          fetch(`${daemonUrl}/api/sessions/${sessionId}/diff`).catch(() => null),
-          fetch(`${daemonUrl}/api/sessions/${sessionId}/files`).catch(() => null),
-        ]);
+        const diffRes = await fetch(`${daemonUrl}/api/sessions/${sessionId}/diff`).catch(
+          () => null
+        );
 
         if (diffRes && diffRes.ok) {
           const data = (await diffRes.json()) as { diff?: string };
@@ -310,13 +299,6 @@ export function App() {
               setDiffsBySession((prev) => ({ ...prev, [sessionId]: converted }));
               setSelectedDiffPath(converted[0].path);
             }
-          }
-        }
-
-        if (filesRes && filesRes.ok) {
-          const fdata = (await filesRes.json()) as { files?: string[] };
-          if (Array.isArray(fdata.files) && fdata.files.length > 0) {
-            setWorktreeFiles(fdata.files);
           }
         }
       } finally {
@@ -556,14 +538,15 @@ export function App() {
         setActiveModal((m) => (m === "settings" ? null : "settings"));
       } else if (e.key === "Escape") {
         if (activeModal) setActiveModal(null);
-        else if (atQuery !== null) setAtQuery(null);
         else if (slashFilter !== null) setSlashFilter(null);
+        else if (modelPickerOpen) setModelPickerOpen(false);
+        else if (effortPickerOpen) setEffortPickerOpen(false);
         else if (drawerOpen) setDrawerOpen(false);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeModal, drawerOpen, atQuery, slashFilter]);
+  }, [activeModal, drawerOpen, slashFilter, modelPickerOpen, effortPickerOpen]);
 
   const openDiffForFile = (filePath?: string) => {
     if (filePath) {
@@ -576,53 +559,24 @@ export function App() {
     setDrawerOpen(true);
   };
 
-  // Composer input handler with `/` slash skills & `@` file context picker
+  // Composer input handler with `/` slash skills (Agent explores worktree files autonomously)
   const handlePromptChange = (val: string) => {
     setPrompt(val);
     if (val.startsWith("/")) {
       setSlashFilter(val.slice(1).toLowerCase());
-      setAtQuery(null);
       return;
     }
     setSlashFilter(null);
-
-    const lastAtIdx = val.lastIndexOf("@");
-    if (lastAtIdx !== -1) {
-      const afterAt = val.slice(lastAtIdx + 1);
-      if (!afterAt.includes(" ") && !afterAt.includes("\n")) {
-        setAtQuery(afterAt.toLowerCase());
-        return;
-      }
-    }
-    setAtQuery(null);
-  };
-
-  const attachFileToComposer = (filePath: string) => {
-    if (!attachedFiles.includes(filePath)) {
-      setAttachedFiles((prev) => [...prev, filePath]);
-    }
-    // Remove trailing `@query` token from prompt
-    const lastAtIdx = prompt.lastIndexOf("@");
-    if (lastAtIdx !== -1) {
-      setPrompt(prompt.slice(0, lastAtIdx));
-    }
-    setAtQuery(null);
   };
 
   const handleSendPrompt = async (customText?: string) => {
     const rawText = (customText ?? prompt).trim();
-    if (!rawText && attachedFiles.length === 0) return;
+    if (!rawText) return;
 
-    const contextPrefix =
-      attachedFiles.length > 0
-        ? `${attachedFiles.map((f) => `@${f}`).join(" ")}\n`
-        : "";
-    const text = `${contextPrefix}${rawText}`.trim();
+    const text = rawText;
 
     setPrompt("");
-    setAttachedFiles([]);
     setSlashFilter(null);
-    setAtQuery(null);
 
     const now = new Date().toLocaleTimeString([], { hour12: false });
     const userEv: AgentEvent = {
@@ -782,11 +736,16 @@ export function App() {
     const providerName = activeSession.agent_kind === "codex" ? "codex" : "claude";
 
     try {
-      // 1. Try sending input to existing daemon session
+      // 1. Try sending input to existing daemon session with selected concrete model & effort
       const inputRes = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: text }),
+        body: JSON.stringify({
+          input: text,
+          model: activeSession.model,
+          effort: activeSession.effort || "medium",
+          provider: providerName,
+        }),
       });
 
       if (inputRes.ok) {
@@ -807,6 +766,8 @@ export function App() {
           repo_path: "/Users/daiyudai/code/velo",
           branch: activeSession.branch_name,
           use_pty: false,
+          model: activeSession.model,
+          effort: activeSession.effort || "medium",
         }),
       });
 
@@ -816,6 +777,9 @@ export function App() {
         realSess.repo_id = activeSession.repo_id;
         realSess.title = activeSession.title;
         realSess.agent_kind = activeSession.agent_kind;
+        realSess.model = activeSession.model;
+        realSess.model_short = activeSession.model_short;
+        realSess.effort = activeSession.effort || "medium";
 
         const oldId = activeSession.id;
         setSessions((prev) => prev.map((s) => (s.id === oldId ? realSess : s)));
@@ -975,7 +939,8 @@ export function App() {
         ? clean
         : `feat/${clean}`;
     const title = newTaskDesc.trim() || branch;
-    const providerName = newAgentKind === "codex" ? "codex" : "claude";
+    const chosenModel = MODEL_CATALOG.find((m) => m.id === newModelId) || MODEL_CATALOG[0];
+    const providerName = chosenModel.runtimeId === "codex" ? "codex" : "claude";
 
     try {
       if (dispatchMode === "committee") {
@@ -1023,7 +988,9 @@ export function App() {
           const created = normalizeToVeloSession(rawSession, 0);
           created.repo_id = targetRepo.id;
           created.title = `[Loop] ${title}`;
-          created.agent_kind = newAgentKind;
+          created.agent_kind = chosenModel.agentKind;
+          created.model = chosenModel.id;
+          created.model_short = chosenModel.shortLabel;
           setSessions((prev) => [created, ...prev]);
           setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
           setActiveId(created.id);
@@ -1042,6 +1009,8 @@ export function App() {
           repo_path: targetRepo.path,
           branch,
           use_pty: false,
+          model: chosenModel.id,
+          effort: "medium",
         }),
       });
       if (res.ok) {
@@ -1049,31 +1018,11 @@ export function App() {
         const created = normalizeToVeloSession(rawSession, 0);
         created.repo_id = targetRepo.id;
         created.title = title;
-        created.agent_kind = newAgentKind;
+        created.agent_kind = chosenModel.agentKind;
+        created.model = chosenModel.id;
+        created.model_short = chosenModel.shortLabel;
         setSessions((prev) => [created, ...prev]);
         setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
-        setEventsBySession((prev) => ({
-          ...prev,
-          [created.id]: [
-            {
-              id: `init-${Date.now()}`,
-              session_id: created.id,
-              timestamp: new Date().toLocaleTimeString([], { hour12: false }),
-              kind: "tool_call",
-              tool_name: "GitWorktree",
-              tool_args: `git worktree add ${created.worktree_path} -b ${branch}`,
-              content: `Checked out isolated Git worktree at ${created.worktree_path}`,
-              duration_ms: 38,
-            },
-            {
-              id: `welcome-${Date.now() + 1}`,
-              session_id: created.id,
-              timestamp: new Date().toLocaleTimeString([], { hour12: false }),
-              kind: "assistant",
-              content: `Created real isolated Git worktree \`${branch}\` at \`${created.worktree_path}\`.`,
-            },
-          ],
-        }));
         setActiveId(created.id);
         setActiveModal(null);
         return;
@@ -1088,27 +1037,22 @@ export function App() {
       id: newId,
       repo_id: targetRepo.id,
       title,
-      agent_kind: newAgentKind,
-      model:
-        newAgentKind === "claude"
-          ? "claude-sonnet-4.5"
-          : newAgentKind === "codex"
-          ? "codex-o3"
-          : "gemini-2.5-pro",
-      model_short:
-        newAgentKind === "claude" ? "Claude" : newAgentKind === "codex" ? "Codex" : "Gemini",
-      status: "running",
+      agent_kind: chosenModel.agentKind,
+      model: chosenModel.id,
+      model_short: chosenModel.shortLabel,
+      effort: "medium",
+      status: "idle",
       branch_name: branch,
       worktree_path: `${targetRepo.path}/.velo/worktrees/${slug}`,
       project_path: targetRepo.path,
       approval_mode: newApproval,
-      tokens_used: 2400,
+      tokens_used: 0,
       tokens_limit: 200000,
-      cost_usd: 0.01,
-      files_changed: 1,
-      insertions: 14,
-      deletions: 2,
-      updated_at: "now",
+      cost_usd: 0,
+      files_changed: 0,
+      insertions: 0,
+      deletions: 0,
+      updated_at: "ready",
     };
 
     setSessions((prev) => [fallbackCreated, ...prev]);
@@ -1206,30 +1150,14 @@ export function App() {
   };
 
   const currentDiffFile = useMemo(
-    () => activeDiffFiles.find((f) => f.path === selectedDiffPath) || activeDiffFiles[0],
+    () => activeDiffFiles.find((f) => f.path === selectedDiffPath) || activeDiffFiles[0] || null,
     [activeDiffFiles, selectedDiffPath]
   );
-
-  const matchingFiles = useMemo(() => {
-    if (atQuery === null) return [];
-    const pool =
-      worktreeFiles.length > 0
-        ? worktreeFiles
-        : [
-            "crates/velo-protocol/src/lib.rs",
-            "crates/velo-daemon/src/lib.rs",
-            "crates/velo-worktree/src/lib.rs",
-            "crates/velo-agent/src/lib.rs",
-            "crates/velo-relay/src/lib.rs",
-            "apps/velo-desktop/src/App.tsx",
-          ];
-    return pool.filter((f) => f.toLowerCase().includes(atQuery)).slice(0, 8);
-  }, [atQuery, worktreeFiles]);
 
   const tokenPercent = Math.min(
     100,
     Math.round(
-      ((activeSession.tokens_used || 36400) / (activeSession.tokens_limit || 200000)) * 100
+      ((activeSession.tokens_used || 0) / (activeSession.tokens_limit || 200000)) * 100
     )
   );
 
@@ -1651,6 +1579,31 @@ export function App() {
             {/* Scrollable Stream (Claude Code / Codex / Paseo Natural Proportions) */}
             <div className="w-full flex-1 overflow-y-auto px-6 py-6">
               <div className="mx-auto flex max-w-[680px] flex-col gap-5">
+                {activeEvents.length === 0 && (
+                  <div className="my-12 flex flex-col items-start gap-2.5 rounded-2xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] p-5">
+                    <div className="flex items-center gap-2 text-[13.5px] font-medium text-[var(--v-fg-primary)]">
+                      <GitBranch className="h-4 w-4 text-[var(--v-fg-muted)]" />
+                      <span>{activeSession.title}</span>
+                    </div>
+                    <p className="text-[12.5px] leading-relaxed text-[var(--v-fg-muted)]">
+                      当前会话绑定于隔离工作区{" "}
+                      <span className="font-mono text-[var(--v-fg-body)]">
+                        {activeSession.branch_name}
+                      </span>{" "}
+                      (
+                      <span className="font-mono text-[var(--v-fg-secondary)]">
+                        {activeSession.worktree_path}
+                      </span>
+                      )。直接输入自然语言指令，
+                      <span className="font-medium text-[var(--v-fg-body)]">
+                        {MODEL_CATALOG.find((m) => m.id === activeSession.model)?.label ||
+                          activeSession.model_short}
+                      </span>{" "}
+                      会自动在当前代码库中检索、读取并修改相关文件，无需手动挂载文件。
+                    </p>
+                  </div>
+                )}
+
                 {activeEvents.map((ev) => {
                   // 1. User Message: Right-aligned soft bubble, no robotic header
                   if (ev.kind === "user") {
@@ -1690,7 +1643,7 @@ export function App() {
                     );
                   }
 
-                  // 3. Tool Call: Clean inline row with IndentRail
+                  // 3. Tool Call: Clean inline row
                   if (ev.kind === "tool_call") {
                     const isExpanded = !!expandedTools[ev.id];
                     return (
@@ -1703,8 +1656,6 @@ export function App() {
                             <FileCode2 className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
                             <span className="text-[var(--v-fg-muted)]">{ev.tool_name}</span>
                             <span className="text-[var(--v-fg-primary)]">{ev.tool_args}</span>
-                            <span className="text-[#34d399]">+24</span>
-                            <span className="text-[#f87171]">−3</span>
                           </button>
 
                           <button
@@ -1713,7 +1664,7 @@ export function App() {
                             }
                             className="text-[11.5px] text-[var(--v-fg-faint)] hover:text-[var(--v-fg-secondary)]"
                           >
-                            {isExpanded ? "Hide" : "Preview"}
+                            {isExpanded ? "Hide" : "Output"}
                           </button>
                         </div>
 
@@ -1741,7 +1692,10 @@ export function App() {
             </div>
 
             {/* ===============================================================
-                4. AUTHENTIC COMPOSER DOCK + INLINE PERMISSION CARD + @FILE PICKER
+                4. AUTHENTIC PASEO / CODEX / CLAUDE CODE COMPOSER DOCK
+                   - Pure natural language input (zero manual @file clutter)
+                   - Direct Model Picker (Claude Sonnet 4.5, Opus 4.5, o3, o4-mini...)
+                   - Effort Picker (Low / Medium / High / Max) + Permission Mode
                =============================================================== */}
             <div className="w-full px-6 pb-5 pt-1">
               <div className="mx-auto max-w-[680px]">
@@ -1788,28 +1742,6 @@ export function App() {
                   </div>
                 )}
 
-                {/* @file Context Picker Popover */}
-                {atQuery !== null && matchingFiles.length > 0 && (
-                  <div className="mb-2 overflow-hidden rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
-                    <div className="px-2.5 py-1 text-[11px] text-[var(--v-fg-muted)]">
-                      Attach file from worktree ({activeSession.branch_name})
-                    </div>
-                    {matchingFiles.map((filePath) => (
-                      <button
-                        key={filePath}
-                        onClick={() => attachFileToComposer(filePath)}
-                        className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left font-mono text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
-                      >
-                        <span className="flex items-center gap-2 truncate">
-                          <FileCode2 className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
-                          <span className="truncate">{filePath}</span>
-                        </span>
-                        <span className="text-[11px] text-[var(--v-fg-faint)]">Add context</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-
                 {/* Slash Command Popover */}
                 {slashFilter !== null && (
                   <div className="mb-2 overflow-hidden rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
@@ -1831,29 +1763,6 @@ export function App() {
                 )}
 
                 <div className="rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)]">
-                  {/* Attached @file context pills */}
-                  {attachedFiles.length > 0 && (
-                    <div className="mb-2 flex flex-wrap gap-1.5">
-                      {attachedFiles.map((f) => (
-                        <span
-                          key={f}
-                          className="inline-flex items-center gap-1.5 rounded-md bg-[var(--v-bg-active)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-body)]"
-                        >
-                          <FileCode2 className="h-3 w-3 text-[var(--v-fg-muted)]" />
-                          <span>{f}</span>
-                          <button
-                            onClick={() =>
-                              setAttachedFiles((prev) => prev.filter((item) => item !== f))
-                            }
-                            className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
-                          >
-                            <X className="h-3 w-3" />
-                          </button>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-
                   <textarea
                     rows={2}
                     value={prompt}
@@ -1864,77 +1773,127 @@ export function App() {
                         handleSendPrompt();
                       }
                     }}
-                    placeholder={`Prompt ${activeSession.model_short}... (@ to attach files, / for commands)`}
+                    placeholder={`Ask ${
+                      MODEL_CATALOG.find((m) => m.id === activeSession.model)?.label ||
+                      activeSession.model_short
+                    } anything... (/ for commands)`}
                     className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                   />
 
-                  {/* Composer Bottom Toolbar */}
+                  {/* Composer Bottom Toolbar: Concrete Model Picker + Effort + Permission Mode */}
                   <div className="relative mt-1.5 flex items-center justify-between">
+                    {/* 1. Concrete Model Picker Popover (Grouped by Model Family) */}
                     {modelPickerOpen && (
-                      <div className="absolute bottom-9 left-0 z-30 w-[290px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
-                        <div className="px-2.5 py-1 text-[11px] font-medium text-[var(--v-fg-muted)]">
-                          Local Logged-in Agent CLIs (Zero API Key)
+                      <div className="absolute bottom-9 left-0 z-30 w-[310px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                        {(["Anthropic", "OpenAI", "Google"] as const).map((family) => {
+                          const familyModels = MODEL_CATALOG.filter((m) => m.family === family);
+                          if (familyModels.length === 0) return null;
+                          const runtimeId = familyModels[0].runtimeId;
+                          const rt = runtimes.find((r) => r.id === runtimeId);
+                          const isConnected = rt ? rt.available : runtimeId !== "gemini";
+                          return (
+                            <div key={family} className="mb-1 last:mb-0">
+                              <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
+                                <span>{family}</span>
+                                <span className="font-mono text-[10px]">
+                                  {isConnected ? "Connected" : "Not configured"}
+                                </span>
+                              </div>
+                              {familyModels.map((m) => {
+                                const isCurrent = activeSession.model === m.id;
+                                return (
+                                  <button
+                                    key={m.id}
+                                    disabled={!isConnected}
+                                    onClick={() => {
+                                      setSessions((prev) =>
+                                        prev.map((s) =>
+                                          s.id === activeSession.id
+                                            ? {
+                                                ...s,
+                                                agent_kind: m.agentKind,
+                                                model: m.id,
+                                                model_short: m.shortLabel,
+                                              }
+                                            : s
+                                        )
+                                      );
+                                      setModelPickerOpen(false);
+                                    }}
+                                    className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
+                                      isCurrent
+                                        ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                        : isConnected
+                                        ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
+                                        : "cursor-not-allowed text-[var(--v-fg-muted)] opacity-40"
+                                    }`}
+                                  >
+                                    <div className="min-w-0 pr-2">
+                                      <div className="font-medium">{m.label}</div>
+                                      <div className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
+                                        {m.desc}
+                                      </div>
+                                    </div>
+                                    {isCurrent && (
+                                      <Check className="h-3.5 w-3.5 shrink-0 text-[#34d399]" />
+                                    )}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          );
+                        })}
+
+                        <div className="mt-1 border-t border-[var(--v-border-subtle)] pt-1">
+                          <button
+                            onClick={() => {
+                              setModelPickerOpen(false);
+                              setActiveModal("settings");
+                            }}
+                            className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                          >
+                            <span>Manage CLI & Provider Connections...</span>
+                            <Settings className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                          </button>
                         </div>
-                        {runtimes.map((rt) => {
-                          const kind: AgentKind =
-                            rt.id === "codex"
-                              ? "codex"
-                              : rt.id === "gemini"
-                              ? "gemini"
-                              : "claude";
-                          const isCurrent = activeSession.agent_kind === kind;
+                      </div>
+                    )}
+
+                    {/* 2. Reasoning Effort Popover */}
+                    {effortPickerOpen && (
+                      <div className="absolute bottom-9 left-[165px] z-30 w-[160px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                        <div className="px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
+                          Reasoning Effort
+                        </div>
+                        {(
+                          [
+                            { id: "low", label: "Low" },
+                            { id: "medium", label: "Medium" },
+                            { id: "high", label: "High" },
+                            { id: "max", label: "Max" },
+                          ] as { id: EffortLevel; label: string }[]
+                        ).map((eff) => {
+                          const currentEff = activeSession.effort || "medium";
+                          const active = currentEff === eff.id;
                           return (
                             <button
-                              key={rt.id}
-                              disabled={!rt.available}
+                              key={eff.id}
                               onClick={() => {
                                 setSessions((prev) =>
                                   prev.map((s) =>
-                                    s.id === activeSession.id
-                                      ? {
-                                          ...s,
-                                          agent_kind: kind,
-                                          model:
-                                            kind === "codex"
-                                              ? "codex-o3"
-                                              : kind === "gemini"
-                                              ? "gemini-2.5-pro"
-                                              : "claude-sonnet-4.5",
-                                          model_short:
-                                            kind === "codex"
-                                              ? "codex-o3"
-                                              : kind === "gemini"
-                                              ? "gemini-2.5"
-                                              : "claude-4.5",
-                                        }
-                                      : s
+                                    s.id === activeSession.id ? { ...s, effort: eff.id } : s
                                   )
                                 );
-                                setModelPickerOpen(false);
+                                setEffortPickerOpen(false);
                               }}
-                              className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-[12px] transition-colors ${
-                                isCurrent
-                                  ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                                  : rt.available
-                                  ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
-                                  : "opacity-40 cursor-not-allowed text-[var(--v-fg-muted)]"
+                              className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] ${
+                                active
+                                  ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                                  : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
                               }`}
                             >
-                              <div className="min-w-0">
-                                <div className="flex items-center gap-1.5 font-medium">
-                                  <span
-                                    className="h-1.5 w-1.5 rounded-full"
-                                    style={{
-                                      background: rt.available ? "#34d399" : "#71717a",
-                                    }}
-                                  />
-                                  <span>{rt.name}</span>
-                                </div>
-                                <div className="truncate font-mono text-[10.5px] text-[var(--v-fg-muted)]">
-                                  {rt.version || (rt.available ? "Ready" : "Not installed")}
-                                </div>
-                              </div>
-                              {isCurrent && <Check className="h-3.5 w-3.5 text-[#34d399]" />}
+                              <span>{eff.label}</span>
+                              {active && <Check className="h-3.5 w-3.5 text-[#34d399]" />}
                             </button>
                           );
                         })}
@@ -1942,24 +1901,37 @@ export function App() {
                     )}
 
                     <div className="flex items-center gap-1.5">
+                      {/* Pill 1: Concrete Model Name */}
                       <button
-                        onClick={() => setModelPickerOpen((o) => !o)}
+                        onClick={() => {
+                          setEffortPickerOpen(false);
+                          setModelPickerOpen((o) => !o);
+                        }}
                         className="flex items-center gap-1.5 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] transition-colors hover:bg-[var(--v-bg-hover)]"
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-[#34d399]" />
-                        <span>{activeSession.model}</span>
+                        <span>
+                          {MODEL_CATALOG.find((m) => m.id === activeSession.model)?.label ||
+                            activeSession.model_short ||
+                            activeSession.model}
+                        </span>
                         <ChevronDown className="h-3 w-3 text-[var(--v-fg-muted)]" />
                       </button>
 
+                      {/* Pill 2: Reasoning Effort */}
                       <button
-                        onClick={() => setAtQuery((q) => (q === null ? "" : null))}
-                        title="Attach file from worktree (@)"
-                        className="flex items-center gap-1 rounded-full px-2 py-1 text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
+                        onClick={() => {
+                          setModelPickerOpen(false);
+                          setEffortPickerOpen((o) => !o);
+                        }}
+                        title="Reasoning Effort (--effort)"
+                        className="flex items-center gap-1 rounded-full px-2.5 py-1 text-[11.5px] capitalize text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
                       >
-                        <AtSign className="h-3.5 w-3.5" />
-                        <span>Context</span>
+                        <span>{activeSession.effort || "medium"}</span>
+                        <ChevronDown className="h-3 w-3 opacity-60" />
                       </button>
 
+                      {/* Pill 3: Worktree Permission Mode */}
                       <button
                         onClick={handleToggleApprovalMode}
                         title="Click to toggle Auto-edit / Ask permissions"
@@ -1969,21 +1941,14 @@ export function App() {
                           ? "Auto-edit"
                           : "Ask permissions"}
                       </button>
-
-                      <button
-                        onClick={() => handleSendPrompt("/handoff")}
-                        className="rounded-full px-2 py-1 font-mono text-[11px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
-                      >
-                        /handoff
-                      </button>
                     </div>
 
                     {/* Signature Circular Submit Disc (Paseo / Claude Code / Codex) */}
                     <button
                       onClick={() => handleSendPrompt()}
-                      disabled={!prompt.trim() && attachedFiles.length === 0}
+                      disabled={!prompt.trim()}
                       className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
-                        prompt.trim() || attachedFiles.length > 0
+                        prompt.trim()
                           ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
                           : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
                       }`}
@@ -2093,149 +2058,160 @@ export function App() {
             )}
 
             {drawerTab === "diff" ? (
-              <div className="flex flex-1 flex-col overflow-hidden">
-                <div className="flex flex-wrap gap-1 border-b border-[var(--v-border-subtle)] p-2.5">
-                  {activeDiffFiles.map((file) => {
-                    const active = file.path === currentDiffFile.path;
-                    return (
-                      <button
-                        key={file.path}
-                        onClick={() => setSelectedDiffPath(file.path)}
-                        className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11px] transition-colors ${
-                          active
-                            ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                            : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-secondary)]"
-                        }`}
-                      >
-                        <span>{file.path.split("/").pop()}</span>
-                        <span className="text-[#34d399]">+{file.additions}</span>
-                        <span className="text-[#f87171]">−{file.deletions}</span>
-                      </button>
-                    );
-                  })}
+              !currentDiffFile ? (
+                <div className="flex flex-1 flex-col items-center justify-center p-6 text-center text-[12.5px] text-[var(--v-fg-muted)]">
+                  <p>当前 Worktree 暂无未提交的代码改动</p>
+                  <p className="mt-1 font-mono text-[11px] text-[var(--v-fg-faint)]">
+                    {activeSession.branch_name}
+                  </p>
                 </div>
-
-                <div className="flex items-center justify-between border-b border-[var(--v-border-subtle)] px-3.5 py-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
-                  <span className="truncate">{currentDiffFile.path}</span>
-                  <button
-                    onClick={() =>
-                      copyText(
-                        currentDiffFile.path,
-                        currentDiffFile.hunks.map((h) => h.content).join("\n")
-                      )
-                    }
-                    className="flex items-center gap-1 hover:text-[var(--v-fg-primary)]"
-                  >
-                    {copiedKey === currentDiffFile.path ? (
-                      <Check className="h-3 w-3 text-[#34d399]" />
-                    ) : (
-                      <Copy className="h-3 w-3" />
-                    )}
-                  </button>
-                </div>
-
-                {/* Dual-Line-Number Unified Diff Viewer (Click any line to add inline review comment for Agent) */}
-                <div className="flex-1 overflow-y-auto py-2 font-mono text-[11.5px] leading-[1.65]">
-                  {currentDiffFile.hunks.map((line, idx) => {
-                    const isHunkHeader = line.content.startsWith("@@");
-                    const rowClass = isHunkHeader
-                      ? "v-diff-hunk"
-                      : line.type === "add"
-                      ? "v-diff-add"
-                      : line.type === "del"
-                      ? "v-diff-del"
-                      : "text-[var(--v-fg-muted)]";
-                    const sign = isHunkHeader
-                      ? ""
-                      : line.type === "add"
-                      ? "+"
-                      : line.type === "del"
-                      ? "-"
-                      : " ";
-                    const lineNum = line.newLine ?? line.oldLine ?? idx + 1;
-                    const isCommenting = diffCommentIdx === idx;
-                    return (
-                      <div key={idx}>
-                        <div
-                          onClick={() => {
-                            if (!isHunkHeader) {
-                              setDiffCommentIdx(isCommenting ? null : idx);
-                              setDiffCommentText("");
-                            }
-                          }}
-                          title={
-                            isHunkHeader ? undefined : "Click line to send inline review comment to Agent"
-                          }
-                          className={`group flex cursor-pointer items-center px-3 py-0.5 hover:brightness-110 ${rowClass}`}
+              ) : (
+                <div className="flex flex-1 flex-col overflow-hidden">
+                  <div className="flex flex-wrap gap-1 border-b border-[var(--v-border-subtle)] p-2.5">
+                    {activeDiffFiles.map((file) => {
+                      const active = file.path === currentDiffFile.path;
+                      return (
+                        <button
+                          key={file.path}
+                          onClick={() => setSelectedDiffPath(file.path)}
+                          className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11px] transition-colors ${
+                            active
+                              ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                              : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-secondary)]"
+                          }`}
                         >
-                          <span className="w-7 shrink-0 select-none pr-1.5 text-right opacity-35">
-                            {line.oldLine ?? ""}
-                          </span>
-                          <span className="w-7 shrink-0 select-none pr-2 text-right opacity-35">
-                            {line.newLine ?? ""}
-                          </span>
-                          <span className="w-4 shrink-0 select-none">
-                            {!isHunkHeader ? (
-                              <span className="group-hover:hidden">{sign}</span>
-                            ) : (
-                              sign
-                            )}
-                            {!isHunkHeader && (
-                              <span className="hidden text-[#38bdf8] group-hover:inline">+</span>
-                            )}
-                          </span>
-                          <span className="whitespace-pre">{line.content}</span>
-                        </div>
+                          <span>{file.path.split("/").pop()}</span>
+                          <span className="text-[#34d399]">+{file.additions}</span>
+                          <span className="text-[#f87171]">−{file.deletions}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
 
-                        {isCommenting && (
-                          <div className="mx-3 my-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-2.5 font-sans shadow-lg">
-                            <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--v-fg-muted)]">
-                              <span className="font-mono">
-                                Review {currentDiffFile.path}:L{lineNum}
-                              </span>
-                              <button
-                                onClick={() => setDiffCommentIdx(null)}
-                                className="hover:text-[var(--v-fg-primary)]"
-                              >
-                                <X className="h-3 w-3" />
-                              </button>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                              <input
-                                autoFocus
-                                value={diffCommentText}
-                                onChange={(e) => setDiffCommentText(e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" && diffCommentText.trim()) {
+                  <div className="flex items-center justify-between border-b border-[var(--v-border-subtle)] px-3.5 py-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
+                    <span className="truncate">{currentDiffFile.path}</span>
+                    <button
+                      onClick={() =>
+                        copyText(
+                          currentDiffFile.path,
+                          currentDiffFile.hunks.map((h) => h.content).join("\n")
+                        )
+                      }
+                      className="flex items-center gap-1 hover:text-[var(--v-fg-primary)]"
+                    >
+                      {copiedKey === currentDiffFile.path ? (
+                        <Check className="h-3 w-3 text-[#34d399]" />
+                      ) : (
+                        <Copy className="h-3 w-3" />
+                      )}
+                    </button>
+                  </div>
+
+                  {/* Dual-Line-Number Unified Diff Viewer (Click any line to add inline review comment for Agent) */}
+                  <div className="flex-1 overflow-y-auto py-2 font-mono text-[11.5px] leading-[1.65]">
+                    {currentDiffFile.hunks.map((line, idx) => {
+                      const isHunkHeader = line.content.startsWith("@@");
+                      const rowClass = isHunkHeader
+                        ? "v-diff-hunk"
+                        : line.type === "add"
+                        ? "v-diff-add"
+                        : line.type === "del"
+                        ? "v-diff-del"
+                        : "text-[var(--v-fg-muted)]";
+                      const sign = isHunkHeader
+                        ? ""
+                        : line.type === "add"
+                        ? "+"
+                        : line.type === "del"
+                        ? "-"
+                        : " ";
+                      const lineNum = line.newLine ?? line.oldLine ?? idx + 1;
+                      const isCommenting = diffCommentIdx === idx;
+                      return (
+                        <div key={idx}>
+                          <div
+                            onClick={() => {
+                              if (!isHunkHeader) {
+                                setDiffCommentIdx(isCommenting ? null : idx);
+                                setDiffCommentText("");
+                              }
+                            }}
+                            title={
+                              isHunkHeader
+                                ? undefined
+                                : "Click line to send inline review comment to Agent"
+                            }
+                            className={`group flex cursor-pointer items-center px-3 py-0.5 hover:brightness-110 ${rowClass}`}
+                          >
+                            <span className="w-7 shrink-0 select-none pr-1.5 text-right opacity-35">
+                              {line.oldLine ?? ""}
+                            </span>
+                            <span className="w-7 shrink-0 select-none pr-2 text-right opacity-35">
+                              {line.newLine ?? ""}
+                            </span>
+                            <span className="w-4 shrink-0 select-none">
+                              {!isHunkHeader ? (
+                                <span className="group-hover:hidden">{sign}</span>
+                              ) : (
+                                sign
+                              )}
+                              {!isHunkHeader && (
+                                <span className="hidden text-[#38bdf8] group-hover:inline">+</span>
+                              )}
+                            </span>
+                            <span className="whitespace-pre">{line.content}</span>
+                          </div>
+
+                          {isCommenting && (
+                            <div className="mx-3 my-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-2.5 font-sans shadow-lg">
+                              <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--v-fg-muted)]">
+                                <span className="font-mono">
+                                  Review {currentDiffFile.path}:L{lineNum}
+                                </span>
+                                <button
+                                  onClick={() => setDiffCommentIdx(null)}
+                                  className="hover:text-[var(--v-fg-primary)]"
+                                >
+                                  <X className="h-3 w-3" />
+                                </button>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  autoFocus
+                                  value={diffCommentText}
+                                  onChange={(e) => setDiffCommentText(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" && diffCommentText.trim()) {
+                                      const reviewPrompt = `In \`${currentDiffFile.path}\` at line ${lineNum} (\`${line.content.trim()}\`), please make this change: ${diffCommentText.trim()}`;
+                                      setDiffCommentIdx(null);
+                                      setDiffCommentText("");
+                                      handleSendPrompt(reviewPrompt);
+                                    }
+                                  }}
+                                  placeholder="Ask Agent to change this line..."
+                                  className="flex-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1 text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
+                                />
+                                <button
+                                  onClick={() => {
+                                    if (!diffCommentText.trim()) return;
                                     const reviewPrompt = `In \`${currentDiffFile.path}\` at line ${lineNum} (\`${line.content.trim()}\`), please make this change: ${diffCommentText.trim()}`;
                                     setDiffCommentIdx(null);
                                     setDiffCommentText("");
                                     handleSendPrompt(reviewPrompt);
-                                  }
-                                }}
-                                placeholder="Ask Agent to change this line..."
-                                className="flex-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1 text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
-                              />
-                              <button
-                                onClick={() => {
-                                  if (!diffCommentText.trim()) return;
-                                  const reviewPrompt = `In \`${currentDiffFile.path}\` at line ${lineNum} (\`${line.content.trim()}\`), please make this change: ${diffCommentText.trim()}`;
-                                  setDiffCommentIdx(null);
-                                  setDiffCommentText("");
-                                  handleSendPrompt(reviewPrompt);
-                                }}
-                                className="rounded-md bg-[var(--v-btn-bg)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)]"
-                              >
-                                Ask Agent
-                              </button>
+                                  }}
+                                  className="rounded-md bg-[var(--v-btn-bg)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)]"
+                                >
+                                  Ask Agent
+                                </button>
+                              </div>
                             </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
+              )
             ) : (
               <div className="flex flex-1 flex-col overflow-hidden p-3.5 font-mono text-[11.5px]">
                 <div className="mb-2 flex items-center justify-between text-[10.5px] text-[var(--v-fg-faint)]">
@@ -2282,7 +2258,7 @@ export function App() {
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[440px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-5 shadow-2xl"
+            className="w-full max-w-[480px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-5 shadow-2xl"
           >
             {activeModal === "new-worktree" && (
               <div>
@@ -2320,12 +2296,12 @@ export function App() {
                   </div>
                   <div>
                     <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                      Orchestration Mode (Phase 3)
+                      Orchestration Mode
                     </label>
                     <div className="grid grid-cols-3 gap-1.5">
                       {(
                         [
-                          { id: "single", label: "Single Agent" },
+                          { id: "single", label: "Single Model" },
                           { id: "committee", label: "Committee Race" },
                           { id: "loop", label: "TDD Auto-Loop" },
                         ] as const
@@ -2347,20 +2323,21 @@ export function App() {
                   {dispatchMode !== "committee" && (
                     <div>
                       <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                        Agent Runtime
+                        Model
                       </label>
-                      <div className="grid grid-cols-3 gap-1.5">
-                        {(["claude", "codex", "gemini"] as AgentKind[]).map((kind) => (
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {MODEL_CATALOG.filter((m) => m.family !== "Google").map((m) => (
                           <button
-                            key={kind}
-                            onClick={() => setNewAgentKind(kind)}
-                            className={`rounded-lg border px-2.5 py-1.5 text-[12px] capitalize ${
-                              newAgentKind === kind
-                                ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                                : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)]"
+                            key={m.id}
+                            onClick={() => setNewModelId(m.id)}
+                            className={`flex items-center justify-between rounded-lg border px-2.5 py-1.5 text-left text-[12px] ${
+                              newModelId === m.id
+                                ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                                : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)]"
                             }`}
                           >
-                            {kind}
+                            <span className="truncate">{m.label}</span>
+                            <span className="font-mono text-[10px] opacity-60">{m.family}</span>
                           </button>
                         ))}
                       </div>
@@ -2380,7 +2357,7 @@ export function App() {
                   )}
                   <div>
                     <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                      Task title
+                      Task title / initial prompt
                     </label>
                     <input
                       value={newTaskDesc}
@@ -2504,7 +2481,7 @@ export function App() {
               <div>
                 <div className="mb-4 flex items-center justify-between">
                   <h3 className="text-[14px] font-semibold text-[var(--v-fg-primary)]">
-                    外观与主题设置 (Appearance)
+                    Settings · 模型服务连接与外观设置
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
@@ -2514,8 +2491,76 @@ export function App() {
                   </button>
                 </div>
 
-                <div className="space-y-4 text-[12.5px]">
+                <div className="max-h-[75vh] space-y-5 overflow-y-auto pr-1 text-[12.5px]">
+                  {/* Section 1: CLI & Model Providers (Paseo / Conductor Style) */}
                   <div>
+                    <div className="mb-2 flex items-center justify-between">
+                      <label className="text-[11.5px] font-medium text-[var(--v-fg-secondary)]">
+                        CLI & Model Providers (本地订阅 CLI 接入 — 解锁对应模型池)
+                      </label>
+                      <button
+                        onClick={refreshSessions}
+                        className="flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                      >
+                        <RefreshCw className="h-3 w-3" />
+                        <span>Re-scan</span>
+                      </button>
+                    </div>
+
+                    <div className="space-y-2">
+                      {runtimes.map((rt) => {
+                        const unlockedModels = MODEL_CATALOG.filter(
+                          (m) => m.runtimeId === rt.id
+                        ).map((m) => m.label);
+                        return (
+                          <div
+                            key={rt.id}
+                            className="rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3.5 py-2.5"
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2 font-medium text-[var(--v-fg-primary)]">
+                                <span
+                                  className="h-2 w-2 rounded-full"
+                                  style={{
+                                    background: rt.available ? "#34d399" : "#71717a",
+                                  }}
+                                />
+                                <span>{rt.name}</span>
+                              </div>
+                              <span
+                                className={`rounded-full px-2 py-0.5 font-mono text-[10.5px] ${
+                                  rt.available
+                                    ? "bg-[#34d399]/15 text-[#34d399]"
+                                    : "bg-[var(--v-bg-active)] text-[var(--v-fg-muted)]"
+                                }`}
+                              >
+                                {rt.available ? "Connected" : "Not installed"}
+                              </span>
+                            </div>
+                            <div className="mt-1 truncate font-mono text-[11px] text-[var(--v-fg-muted)]">
+                              {rt.version || "CLI binary not detected in PATH"}
+                              {rt.binary_path ? ` · ${rt.binary_path}` : ""}
+                            </div>
+                            {unlockedModels.length > 0 && (
+                              <div className="mt-1.5 flex flex-wrap gap-1">
+                                {unlockedModels.map((mLabel) => (
+                                  <span
+                                    key={mLabel}
+                                    className="rounded-md bg-[var(--v-bg-surface)] px-2 py-0.5 text-[10.5px] text-[var(--v-fg-secondary)]"
+                                  >
+                                    {mLabel}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Section 2: Appearance & Theme */}
+                  <div className="border-t border-[var(--v-border-subtle)] pt-4">
                     <div className="mb-1.5 flex items-center justify-between">
                       <label className="text-[11.5px] text-[var(--v-fg-secondary)]">
                         主题模式 (Theme Mode)

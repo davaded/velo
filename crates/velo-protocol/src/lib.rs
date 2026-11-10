@@ -185,6 +185,10 @@ pub struct CreateSessionRequest {
     pub branch: Option<String>,
     pub use_pty: bool,
     pub parent_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// Request payload to hand off an existing session's worktree & context to another agent.
@@ -198,6 +202,12 @@ pub struct HandoffSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInputRequest {
     pub input: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub provider: Option<AgentProvider>,
 }
 
 /// Client-to-daemon WebSocket command envelope.

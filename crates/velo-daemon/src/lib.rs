@@ -594,13 +594,16 @@ async fn send_input_handler(
             .into_response();
     };
 
+    let target_provider = req.provider.clone().unwrap_or_else(|| session.provider.clone());
     let wt_path = PathBuf::from(&session.worktree_path);
-    match AgentSpawner::spawn_agent(
+    match AgentSpawner::spawn_agent_with_options(
         id,
-        session.provider.clone(),
+        target_provider.clone(),
         req.input.clone(),
         wt_path,
         false,
+        req.model.clone(),
+        req.effort.clone(),
         state.event_tx.clone(),
     )
     .await
@@ -610,6 +613,7 @@ async fn send_input_handler(
             {
                 let mut guard = state.inner.write().await;
                 if let Some(s) = guard.sessions.get_mut(&id) {
+                    s.provider = target_provider;
                     s.status = SessionStatus::Running;
                     s.pid = pid;
                     s.updated_at = Utc::now();
@@ -816,6 +820,8 @@ async fn committee_handler(
             branch: Some(branch),
             use_pty: false,
             parent_session_id: None,
+            model: None,
+            effort: None,
         };
         match state.create_session(create_req).await {
             Ok(s) => spawned.push(s),
@@ -858,6 +864,8 @@ async fn loop_handler(
         branch: req.branch.clone(),
         use_pty: false,
         parent_session_id: None,
+        model: None,
+        effort: None,
     };
 
     let initial_session = match state.create_session(create_req).await {
@@ -1109,6 +1117,8 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                         branch,
                         use_pty: false,
                         parent_session_id: None,
+                        model: None,
+                        effort: None,
                     };
                     match state.create_session(req).await {
                         Ok(s) => json!({

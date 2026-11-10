@@ -264,6 +264,8 @@ async fn main() -> Result<()> {
                 branch,
                 use_pty: pty,
                 parent_session_id: None,
+                model: None,
+                effort: None,
             };
 
             let session: SessionInfo = http_post_json(addr, "/api/sessions", &req).await?;

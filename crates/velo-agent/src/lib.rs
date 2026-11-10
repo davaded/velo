@@ -193,11 +193,42 @@ impl AgentSpawner {
         use_pty: bool,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
+        Self::spawn_agent_with_options(
+            session_id,
+            provider,
+            prompt,
+            worktree_path,
+            use_pty,
+            None,
+            None,
+            event_tx,
+        )
+        .await
+    }
+
+    pub async fn spawn_agent_with_options(
+        session_id: Uuid,
+        provider: AgentProvider,
+        prompt: String,
+        worktree_path: PathBuf,
+        use_pty: bool,
+        model: Option<String>,
+        effort: Option<String>,
+        event_tx: broadcast::Sender<AgentEvent>,
+    ) -> Result<AgentHandle> {
         if use_pty {
             Self::spawn_pty_agent(session_id, provider, prompt, worktree_path, event_tx).await
         } else {
-            Self::spawn_structured_agent(session_id, provider, prompt, worktree_path, event_tx)
-                .await
+            Self::spawn_structured_agent(
+                session_id,
+                provider,
+                prompt,
+                worktree_path,
+                model,
+                effort,
+                event_tx,
+            )
+            .await
         }
     }
 
@@ -207,9 +238,17 @@ impl AgentSpawner {
         provider: AgentProvider,
         prompt: String,
         worktree_path: PathBuf,
+        model: Option<String>,
+        effort: Option<String>,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
-        let mut cmd = Self::build_tokio_command(&provider, &prompt, &worktree_path);
+        let mut cmd = Self::build_tokio_command(
+            &provider,
+            &prompt,
+            &worktree_path,
+            model.as_deref(),
+            effort.as_deref(),
+        );
         cmd.current_dir(&worktree_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -486,7 +525,13 @@ impl AgentSpawner {
         })
     }
 
-    fn build_tokio_command(provider: &AgentProvider, prompt: &str, _cwd: &Path) -> Command {
+    fn build_tokio_command(
+        provider: &AgentProvider,
+        prompt: &str,
+        _cwd: &Path,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Command {
         let aug_path = discover_augmented_path();
         let mut cmd = match provider {
             AgentProvider::Claude => {
@@ -501,6 +546,21 @@ impl AgentSpawner {
                     "--permission-mode",
                     "acceptEdits",
                 ]);
+                if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+                    let cli_model = if m.contains("opus") {
+                        "opus"
+                    } else if m.contains("haiku") {
+                        "haiku"
+                    } else if m.contains("sonnet") {
+                        "sonnet"
+                    } else {
+                        m
+                    };
+                    c.args(["--model", cli_model]);
+                }
+                if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
+                    c.args(["--effort", eff]);
+                }
                 c
             }
             AgentProvider::Codex => {
@@ -512,8 +572,15 @@ impl AgentSpawner {
                     "-s",
                     "workspace-write",
                     "--skip-git-repo-check",
-                    prompt,
                 ]);
+                if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+                    let cli_model = match m {
+                        "codex-o3" => "o3",
+                        other => other,
+                    };
+                    c.args(["-m", cli_model]);
+                }
+                c.arg(prompt);
                 c
             }
             AgentProvider::OpenCode => {
