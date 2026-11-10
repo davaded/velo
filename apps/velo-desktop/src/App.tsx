@@ -143,13 +143,77 @@ export function App() {
 
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(true);
   const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
-  const [repos, setRepos] = useState<VeloRepo[]>(DEMO_REPOS);
+  const [repos, setRepos] = useState<VeloRepo[]>(() => {
+    try {
+      const saved = localStorage.getItem("velo.repos.v2");
+      if (saved) {
+        const parsed = JSON.parse(saved) as VeloRepo[];
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return DEMO_REPOS;
+  });
   const [targetRepoIdForNewWt, setTargetRepoIdForNewWt] = useState<string>(DEMO_REPOS[0].id);
 
-  // Core Sessions & Events
-  const [sessions, setSessions] = useState<VeloSession[]>(DEMO_SESSIONS);
-  const [activeId, setActiveId] = useState<string>(DEMO_SESSIONS[0].id);
-  const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(DEMO_EVENTS);
+  // Core Sessions & Events (Persisted across restarts)
+  const [sessions, setSessions] = useState<VeloSession[]>(() => {
+    try {
+      const saved = localStorage.getItem("velo.sessions.v2");
+      if (saved) {
+        const parsed = JSON.parse(saved) as VeloSession[];
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return DEMO_SESSIONS;
+  });
+  const [activeId, setActiveId] = useState<string>(() => {
+    return localStorage.getItem("velo.activeId.v2") || DEMO_SESSIONS[0].id;
+  });
+  const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(() => {
+    try {
+      const saved = localStorage.getItem("velo.events.v2");
+      if (saved) {
+        const parsed = JSON.parse(saved) as Record<string, AgentEvent[]>;
+        if (parsed && typeof parsed === "object") return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return DEMO_EVENTS;
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("velo.repos.v2", JSON.stringify(repos));
+    } catch {
+      // ignore
+    }
+  }, [repos]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("velo.sessions.v2", JSON.stringify(sessions));
+    } catch {
+      // ignore
+    }
+  }, [sessions]);
+
+  useEffect(() => {
+    localStorage.setItem("velo.activeId.v2", activeId);
+  }, [activeId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("velo.events.v2", JSON.stringify(eventsBySession));
+    } catch {
+      // ignore
+    }
+  }, [eventsBySession]);
+
   const [connected, setConnected] = useState<boolean>(false);
   const [runtimes, setRuntimes] = useState<LocalRuntimeDto[]>([
     { id: "claude", name: "Claude Code", available: true, version: "2.1.233 (Claude Code)" },
@@ -206,8 +270,8 @@ export function App() {
   const [activeModal, setActiveModal] = useState<ModalKind>(null);
   const [pairTicket, setPairTicket] = useState<PairingTicketDto | null>(null);
   const [cmdQuery, setCmdQuery] = useState<string>("");
-  const [newTaskName, setNewTaskName] = useState<string>("feat/worktree-orchestrator");
-  const [newTaskDesc, setNewTaskDesc] = useState<string>("并行 Agent 调度与状态同步");
+  const [newTaskName, setNewTaskName] = useState<string>("feat/new-thread");
+  const [newTaskDesc, setNewTaskDesc] = useState<string>("");
   const [newModelId, setNewModelId] = useState<string>("claude-sonnet-4.5");
   const [newApproval] = useState<ApprovalMode>("auto_edit");
   const [newRepoPath, setNewRepoPath] = useState<string>("/Users/daiyudai/code/velo");
@@ -247,12 +311,38 @@ export function App() {
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((list: unknown) => {
         setConnected(true);
-        if (Array.isArray(list) && list.length > 0) {
-          const normalized = list.map((item, idx) => normalizeToVeloSession(item, idx));
-          setSessions((prev) => {
-            const existingIds = new Set(normalized.map((s) => s.id));
-            return [...normalized, ...prev.filter((d) => !existingIds.has(d.id))];
+        if (Array.isArray(list)) {
+          // Ignore legacy /tmp/velo_demo_agent.sh test sessions
+          const realItems = list.filter((raw) => {
+            if (!raw || typeof raw !== "object") return false;
+            const p = (raw as Record<string, unknown>).provider;
+            if (p && typeof p === "object" && "custom" in (p as Record<string, unknown>)) {
+              const c = String((p as Record<string, unknown>).custom ?? "");
+              if (c.includes("velo_demo_agent")) return false;
+            }
+            return true;
           });
+          if (realItems.length > 0) {
+            const normalized = realItems.map((item, idx) => normalizeToVeloSession(item, idx));
+            setSessions((prev) => {
+              const prevById = new Map(prev.map((s) => [s.id, s]));
+              const merged = normalized.map((n) => {
+                const existing = prevById.get(n.id);
+                if (!existing) return n;
+                return {
+                  ...n,
+                  title: existing.title || n.title,
+                  repo_id: existing.repo_id || n.repo_id,
+                  agent_kind: existing.agent_kind || n.agent_kind,
+                  model: existing.model || n.model,
+                  model_short: existing.model_short || n.model_short,
+                  effort: existing.effort || n.effort,
+                };
+              });
+              const mergedIds = new Set(merged.map((s) => s.id));
+              return [...merged, ...prev.filter((d) => !mergedIds.has(d.id))];
+            });
+          }
         }
       })
       .catch(() => setConnected(false));
@@ -726,10 +816,29 @@ export function App() {
       }
     }
 
+    // Auto-title "New thread" from the user's first prompt
+    const nextTitle =
+      activeSession.title === "New thread" || !activeSession.title.trim()
+        ? text.replace(/\s+/g, " ").slice(0, 44)
+        : activeSession.title;
+
+    // Build multi-turn context if there are prior messages in this thread
+    const priorHistory = (eventsBySession[activeSession.id] || [])
+      .filter((ev) => ev.kind === "user" || ev.kind === "assistant")
+      .slice(-6);
+    const promptWithContext =
+      priorHistory.length > 0
+        ? `Previous conversation context in this worktree thread:\n${priorHistory
+            .map((ev) => `${ev.kind === "user" ? "User" : "Assistant"}: ${ev.content}`)
+            .join("\n\n")}\n\nCurrent User Request:\n${text}`
+        : text;
+
     // Dispatch prompt to real local Claude Code / Codex CLI via Velo Daemon
     setSessions((prev) =>
       prev.map((s) =>
-        s.id === activeSession.id ? { ...s, status: "running", updated_at: "running" } : s
+        s.id === activeSession.id
+          ? { ...s, title: nextTitle, status: "running", updated_at: "running" }
+          : s
       )
     );
 
@@ -741,7 +850,7 @@ export function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          input: text,
+          input: promptWithContext,
           model: activeSession.model,
           effort: activeSession.effort || "medium",
           provider: providerName,
@@ -755,15 +864,15 @@ export function App() {
         return;
       }
 
-      // 2. If activeSession was a static demo session not yet on the daemon, promote it to a real daemon session
+      // 2. If activeSession was a local thread not yet on the daemon, promote it to a real daemon session
       const createRes = await fetch(`${daemonUrl}/api/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: activeSession.title,
+          name: nextTitle,
           provider: providerName,
-          prompt: text,
-          repo_path: "/Users/daiyudai/code/velo",
+          prompt: promptWithContext,
+          repo_path: activeRepo.path || "/Users/daiyudai/code/velo",
           branch: activeSession.branch_name,
           use_pty: false,
           model: activeSession.model,
@@ -775,7 +884,7 @@ export function App() {
         const rawCreated = await createRes.json();
         const realSess = normalizeToVeloSession(rawCreated, 0);
         realSess.repo_id = activeSession.repo_id;
-        realSess.title = activeSession.title;
+        realSess.title = nextTitle;
         realSess.agent_kind = activeSession.agent_kind;
         realSess.model = activeSession.model;
         realSess.model_short = activeSession.model_short;
@@ -800,6 +909,71 @@ export function App() {
     setTimeout(() => {
       streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, 50);
+  };
+
+  // Stop currently running agent turn via POST /api/sessions/{id}/stop
+  const handleStopSession = async () => {
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === activeSession.id ? { ...s, status: "idle", updated_at: "now" } : s
+      )
+    );
+    try {
+      await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/stop`, {
+        method: "POST",
+      });
+      refreshSessions();
+    } catch {
+      // ignore if local-only
+    }
+  };
+
+  // Delete / archive a thread from sidebar and daemon
+  const handleDeleteSession = async (sessionId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const target = sessions.find((s) => s.id === sessionId);
+    setSessions((prev) => {
+      const remaining = prev.filter((s) => s.id !== sessionId);
+      if (remaining.length === 0) {
+        const fallback: VeloSession = {
+          ...DEMO_SESSIONS[0],
+          id: `wt-${Date.now()}`,
+          repo_id: target?.repo_id || repos[0]?.id || "repo-velo",
+        };
+        setActiveId(fallback.id);
+        return [fallback];
+      }
+      if (activeSession.id === sessionId) {
+        setActiveId(remaining[0].id);
+      }
+      return remaining;
+    });
+    setEventsBySession((prev) => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+    try {
+      await fetch(`${daemonUrl}/api/sessions/${sessionId}?cleanup_worktree=false`, {
+        method: "DELETE",
+      });
+    } catch {
+      // ignore if local-only
+    }
+  };
+
+  // Remove a project workspace from sidebar
+  const handleRemoveRepo = (repoId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (repos.length <= 1) return;
+    setRepos((prev) => prev.filter((r) => r.id !== repoId));
+    setSessions((prev) => {
+      const remaining = prev.filter((s) => s.repo_id !== repoId);
+      if (remaining.length > 0 && activeSession.repo_id === repoId) {
+        setActiveId(remaining[0].id);
+      }
+      return remaining.length > 0 ? remaining : DEMO_SESSIONS;
+    });
   };
 
   // Real Worktree Command Execution via POST /api/sessions/{id}/exec
@@ -1281,16 +1455,27 @@ export function App() {
                       </span>
                     </button>
 
-                    <button
-                      onClick={() => {
-                        setTargetRepoIdForNewWt(repo.id);
-                        setActiveModal("new-worktree");
-                      }}
-                      title={`New thread in ${repo.name}`}
-                      className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] opacity-0 transition-opacity hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:opacity-100"
-                    >
-                      <Plus className="h-3.5 w-3.5" />
-                    </button>
+                    <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                      <button
+                        onClick={() => {
+                          setTargetRepoIdForNewWt(repo.id);
+                          setActiveModal("new-worktree");
+                        }}
+                        title={`New thread in ${repo.name}`}
+                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                      </button>
+                      {repos.length > 1 && (
+                        <button
+                          onClick={(e) => handleRemoveRepo(repo.id, e)}
+                          title={`Remove ${repo.name} from workspaces`}
+                          className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171]"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {/* Thread Rows under Project */}
@@ -1300,10 +1485,18 @@ export function App() {
                         const isSelected = w.id === activeSession.id;
                         const hasPending = !!pendingApprovals[w.id];
                         return (
-                          <button
+                          <div
                             key={w.id}
                             onClick={() => setActiveId(w.id)}
-                            className={`group flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
+                            role="button"
+                            tabIndex={0}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                setActiveId(w.id);
+                              }
+                            }}
+                            className={`group flex w-full cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
                               isSelected
                                 ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                                 : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-body)]"
@@ -1326,7 +1519,7 @@ export function App() {
 
                             {/* Thread Content Column */}
                             <div className="min-w-0 flex-1">
-                              <div className="flex items-baseline justify-between gap-2">
+                              <div className="flex items-baseline justify-between gap-1.5">
                                 <span
                                   className={`truncate text-[13px] leading-snug ${
                                     isSelected ? "font-medium text-[var(--v-fg-primary)]" : "font-normal"
@@ -1334,9 +1527,19 @@ export function App() {
                                 >
                                   {w.title}
                                 </span>
-                                <span className="shrink-0 font-mono text-[11px] text-[var(--v-fg-faint)]">
-                                  {w.updated_at}
-                                </span>
+                                <div className="flex shrink-0 items-center gap-1">
+                                  <span className="font-mono text-[11px] text-[var(--v-fg-faint)] group-hover:hidden">
+                                    {w.updated_at}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleDeleteSession(w.id, e)}
+                                    title="Archive / remove thread"
+                                    className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171] group-hover:flex"
+                                  >
+                                    <X className="h-3 w-3" />
+                                  </button>
+                                </div>
                               </div>
 
                               {/* Subtle Meta Line: Branch + Diff Stats */}
@@ -1350,7 +1553,7 @@ export function App() {
                                 )}
                               </div>
                             </div>
-                          </button>
+                          </div>
                         );
                       })}
                     </div>
@@ -1762,6 +1965,33 @@ export function App() {
                   </div>
                 )}
 
+                {/* Live Running Status Bar */}
+                {activeSession.status === "running" && (
+                  <div className="mb-2 flex items-center justify-between rounded-xl border border-[#34d399]/25 bg-[#34d399]/10 px-3.5 py-2">
+                    <div className="flex items-center gap-2 text-[12px] text-[var(--v-fg-body)]">
+                      <span className="h-2.5 w-2.5 rounded-full border-[1.5px] border-[#34d399] border-t-transparent animate-spin" />
+                      <span>
+                        <strong className="font-medium text-[var(--v-fg-primary)]">
+                          {MODEL_CATALOG.find((m) => m.id === activeSession.model)?.label ||
+                            activeSession.model_short}
+                        </strong>{" "}
+                        is working in{" "}
+                        <code className="font-mono text-[11px] text-[var(--v-fg-secondary)]">
+                          {activeSession.branch_name}
+                        </code>
+                        ...
+                      </span>
+                    </div>
+                    <button
+                      onClick={handleStopSession}
+                      className="flex items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
+                    >
+                      <span className="h-2 w-2 rounded-[2px] bg-[#f87171]" />
+                      <span>Stop</span>
+                    </button>
+                  </div>
+                )}
+
                 <div className="rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)]">
                   <textarea
                     rows={2}
@@ -1943,18 +2173,28 @@ export function App() {
                       </button>
                     </div>
 
-                    {/* Signature Circular Submit Disc (Paseo / Claude Code / Codex) */}
-                    <button
-                      onClick={() => handleSendPrompt()}
-                      disabled={!prompt.trim()}
-                      className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
-                        prompt.trim()
-                          ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
-                          : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
-                      }`}
-                    >
-                      <ArrowUp className="h-4 w-4 stroke-[2.25]" />
-                    </button>
+                    {/* Signature Circular Submit / Stop Disc (Paseo / Claude Code / Codex) */}
+                    {activeSession.status === "running" && !prompt.trim() ? (
+                      <button
+                        onClick={handleStopSession}
+                        title="Stop generation"
+                        className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] transition-all hover:opacity-90"
+                      >
+                        <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => handleSendPrompt()}
+                        disabled={!prompt.trim()}
+                        className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
+                          prompt.trim()
+                            ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
+                            : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
+                        }`}
+                      >
+                        <ArrowUp className="h-4 w-4 stroke-[2.25]" />
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>

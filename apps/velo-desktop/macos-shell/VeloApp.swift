@@ -7,8 +7,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     var daemonProcess: Process?
 
     func ensureDaemonRunning() {
-        let daemonBin = "/Users/daiyudai/code/velo/target/debug/velo"
-        guard FileManager.default.isExecutableFile(atPath: daemonBin) else { return }
+        let bundledBin = Bundle.main.bundlePath + "/Contents/MacOS/velo-daemon"
+        let devBin = "/Users/daiyudai/code/velo/target/debug/velo"
+        let daemonBin: String
+        if FileManager.default.isExecutableFile(atPath: bundledBin) {
+            daemonBin = bundledBin
+        } else if FileManager.default.isExecutableFile(atPath: devBin) {
+            daemonBin = devBin
+        } else {
+            return
+        }
 
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -31,10 +39,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: daemonBin)
-        proc.arguments = ["--addr", "127.0.0.1:6767", "up", "--foreground"]
+        proc.arguments = ["--addr", "0.0.0.0:6767", "up", "--foreground"]
         try? proc.run()
         self.daemonProcess = proc
-        Thread.sleep(forTimeInterval: 0.35)
+        Thread.sleep(forTimeInterval: 0.45)
     }
 
     func setupMenu() {
