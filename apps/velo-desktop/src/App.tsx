@@ -167,7 +167,7 @@ export function App() {
   // Core Sessions & Events (Persisted across restarts; auto-migrate outdated model IDs)
   const [sessions, setSessions] = useState<VeloSession[]>(() => {
     try {
-      const saved = localStorage.getItem("velo.sessions.v2");
+      const saved = localStorage.getItem("velo.sessions.v3");
       if (saved) {
         const parsed = JSON.parse(saved) as VeloSession[];
         if (Array.isArray(parsed) && parsed.length > 0) {
@@ -192,11 +192,11 @@ export function App() {
     return DEMO_SESSIONS;
   });
   const [activeId, setActiveId] = useState<string>(() => {
-    return localStorage.getItem("velo.activeId.v2") || DEMO_SESSIONS[0].id;
+    return localStorage.getItem("velo.activeId.v3") || DEMO_SESSIONS[0].id;
   });
   const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(() => {
     try {
-      const saved = localStorage.getItem("velo.events.v2");
+      const saved = localStorage.getItem("velo.events.v3");
       if (saved) {
         const parsed = JSON.parse(saved) as Record<string, AgentEvent[]>;
         if (parsed && typeof parsed === "object") return parsed;
@@ -209,7 +209,7 @@ export function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem("velo.repos.v2", JSON.stringify(repos));
+      localStorage.setItem("velo.repos.v3", JSON.stringify(repos));
     } catch {
       // ignore
     }
@@ -217,19 +217,19 @@ export function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem("velo.sessions.v2", JSON.stringify(sessions));
+      localStorage.setItem("velo.sessions.v3", JSON.stringify(sessions));
     } catch {
       // ignore
     }
   }, [sessions]);
 
   useEffect(() => {
-    localStorage.setItem("velo.activeId.v2", activeId);
+    localStorage.setItem("velo.activeId.v3", activeId);
   }, [activeId]);
 
   useEffect(() => {
     try {
-      localStorage.setItem("velo.events.v2", JSON.stringify(eventsBySession));
+      localStorage.setItem("velo.events.v3", JSON.stringify(eventsBySession));
     } catch {
       // ignore
     }
@@ -499,18 +499,27 @@ export function App() {
                 .then((r) => (r.ok ? r.json() : Promise.reject()))
                 .then((evList: Array<Record<string, unknown>>) => {
                   if (!Array.isArray(evList)) return;
-                  const texts = evList
+                  // Only inspect events from the latest turn (after the last status_changed: running)
+                  let lastRunStart = 0;
+                  for (let i = evList.length - 1; i >= 0; i--) {
+                    if (evList[i].type === "status_changed" && evList[i].status === "running") {
+                      lastRunStart = i;
+                      break;
+                    }
+                  }
+                  const latestTurnEvents = evList.slice(lastRunStart);
+                  const texts = latestTurnEvents
                     .filter((e) => e.type === "message_delta" && typeof e.text === "string")
                     .map((e) => String(e.text).trim())
                     .filter(Boolean);
                   if (texts.length === 0) return;
-                  const combined = texts.join("\n");
+                  const lastText = texts[texts.length - 1];
                   setEventsBySession((prev) => {
                     const list = prev[sid] || [];
-                    const hasReply = list.some(
-                      (item) => item.kind === "assistant" && item.content.includes(texts[texts.length - 1])
-                    );
-                    if (hasReply) return prev;
+                    const lastEv = list[list.length - 1];
+                    if (lastEv && lastEv.kind === "assistant" && lastEv.content.includes(lastText)) {
+                      return prev;
+                    }
                     return {
                       ...prev,
                       [sid]: [
@@ -520,7 +529,7 @@ export function App() {
                           session_id: sid,
                           timestamp: now,
                           kind: "assistant",
-                          content: combined,
+                          content: lastText,
                         },
                       ],
                     };
@@ -770,30 +779,9 @@ export function App() {
       content: text,
     };
 
-    const isSlashSpecial =
-      rawText.startsWith("/handoff") ||
-      rawText.startsWith("/advisor") ||
-      rawText.startsWith("/committee") ||
-      rawText.startsWith("/loop");
-
-    const modelLabel =
-      modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-      activeSession.model_short ||
-      activeSession.model;
-
-    const initThinkingEv: AgentEvent = {
-      id: `th-init-${Date.now()}`,
-      session_id: activeSession.id,
-      timestamp: now,
-      kind: "thinking",
-      content: `Routing prompt to ${modelLabel} (${activeSession.effort || "medium"} effort) in ${activeSession.branch_name}...`,
-    };
-
     setEventsBySession((prev) => ({
       ...prev,
-      [activeSession.id]: isSlashSpecial
-        ? [...baseEvents, userEv]
-        : [...baseEvents, userEv, initThinkingEv],
+      [activeSession.id]: [...baseEvents, userEv],
     }));
 
     // Real Daemon /handoff endpoint
@@ -2238,10 +2226,7 @@ export function App() {
                       {activeSession.status === "running" &&
                         activeEvents[activeEvents.length - 1]?.kind !== "thinking" && (
                           <BeautifulThinkingBlock
-                            text={`正在使用 ${
-                              modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-                              activeSession.model_short
-                            } 思考并规划下一步操作...`}
+                            text=""
                             isStreaming={true}
                             defaultExpanded={false}
                           />

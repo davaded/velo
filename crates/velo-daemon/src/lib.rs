@@ -756,15 +756,11 @@ async fn send_input_handler(
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<SessionInputRequest>,
 ) -> impl IntoResponse {
-    // 1. Try forwarding to a live running PTY/stdin handle first
+    // 1. Stop any previous running process handle for this session before spawning the new turn
     let existing_session = {
-        let guard = state.inner.read().await;
-        if let Some(handle) = guard.handles.get(&id) {
-            if let Some(sess) = guard.sessions.get(&id) {
-                if sess.status == SessionStatus::Running && handle.send_input(req.input.clone()).is_ok() {
-                    return (StatusCode::OK, Json(json!({ "ok": true, "mode": "stdin" }))).into_response();
-                }
-            }
+        let mut guard = state.inner.write().await;
+        if let Some(mut old_handle) = guard.handles.remove(&id) {
+            old_handle.stop();
         }
         guard.sessions.get(&id).cloned()
     };
@@ -825,7 +821,7 @@ async fn stop_session_handler(
 ) -> impl IntoResponse {
     {
         let mut guard = state.inner.write().await;
-        if let Some(handle) = guard.handles.get_mut(&id) {
+        if let Some(mut handle) = guard.handles.remove(&id) {
             handle.stop();
         }
         if let Some(session) = guard.sessions.get_mut(&id) {
@@ -1446,7 +1442,10 @@ async fn ui_index_handler() -> impl IntoResponse {
     match tokio::fs::read_to_string(&index_path).await {
         Ok(html) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            ],
             html,
         )
             .into_response(),
@@ -1480,7 +1479,15 @@ async fn ui_asset_handler(AxumPath(file): AxumPath<String>) -> impl IntoResponse
     };
 
     match tokio::fs::read(&full_path).await {
-        Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], bytes).into_response(),
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            ],
+            bytes,
+        )
+            .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

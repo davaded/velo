@@ -299,6 +299,8 @@ impl AgentSpawner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -348,7 +350,7 @@ impl AgentSpawner {
         // Parse stdout lines (Claude stream-json or Codex --json)
         let tx_out = event_tx.clone();
         let provider_clone = provider.clone();
-        tokio::spawn(async move {
+        let stdout_task = tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 for ev in parse_agent_stdout_line(session_id, &provider_clone, &line) {
@@ -359,7 +361,7 @@ impl AgentSpawner {
 
         // Parse stderr lines (ignore benign stdin notice from codex)
         let tx_err = event_tx.clone();
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
@@ -378,7 +380,16 @@ impl AgentSpawner {
         tokio::spawn(async move {
             tokio::select! {
                 _ = &mut kill_rx => {
-                    info!("Stopping agent session {}", session_id);
+                    info!("Stopping agent session {} (pid={:?})", session_id, pid);
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    #[cfg(unix)]
+                    if let Some(p) = pid {
+                        let _ = Command::new("kill")
+                            .args(["-9", &format!("-{}", p)])
+                            .status()
+                            .await;
+                    }
                     let _ = child.kill().await;
                     let _ = tx_status.send(AgentEvent::StatusChanged {
                         session_id,
@@ -711,30 +722,7 @@ pub fn parse_agent_stdout_line(
             let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             match msg_type {
-                // 0. Session / Turn Initialization -> Immediate Thinking feedback
-                "system" => {
-                    if json.get("subtype").and_then(|v| v.as_str()) == Some("init") {
-                        let model_label = json
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Claude");
-                        events.push(AgentEvent::ThinkingDelta {
-                            session_id,
-                            text: format!(
-                                "Initialized {} runtime • Inspecting workspace context...\n",
-                                model_label
-                            ),
-                            timestamp: Utc::now(),
-                        });
-                    }
-                    return events;
-                }
-                "turn.started" => {
-                    events.push(AgentEvent::ThinkingDelta {
-                        session_id,
-                        text: "Analyzing prompt and workspace context...\n".to_string(),
-                        timestamp: Utc::now(),
-                    });
+                "system" | "turn.started" => {
                     return events;
                 }
                 // 1. Claude Code stream-json events

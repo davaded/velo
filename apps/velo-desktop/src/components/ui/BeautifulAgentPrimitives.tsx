@@ -23,14 +23,18 @@ export const BeautifulThinkingBlock: React.FC<{
   isStreaming?: boolean;
   defaultExpanded?: boolean;
 }> = ({ text, isStreaming = false, defaultExpanded = false }) => {
-  const [expanded, setExpanded] = useState(defaultExpanded || isStreaming);
+  const hasBody = text.trim().length > 0;
+  const [expanded, setExpanded] = useState(defaultExpanded && hasBody);
   const [elapsedSec, setElapsedSec] = useState<number>(0.4);
 
   useEffect(() => {
-    if (isStreaming) {
+    if (isStreaming && hasBody) {
       setExpanded(true);
+    } else if (!isStreaming) {
+      // Automatically fold into a clean 1-line summary once thinking completes
+      setExpanded(false);
     }
-  }, [isStreaming]);
+  }, [isStreaming, hasBody]);
 
   useEffect(() => {
     if (!isStreaming) return;
@@ -41,19 +45,21 @@ export const BeautifulThinkingBlock: React.FC<{
     return () => clearInterval(timer);
   }, [isStreaming]);
 
-  const estimatedTokens = Math.max(24, Math.round(text.length * 1.3));
+  const estimatedTokens = hasBody ? Math.max(12, Math.round(text.length * 1.2)) : 0;
   const previewLine =
     text
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean)
-      .pop() || text;
+      .pop() || "";
 
   return (
     <div className="t-blur-swap my-1">
       <button
         type="button"
-        onClick={() => setExpanded((v) => !v)}
+        onClick={() => {
+          if (hasBody) setExpanded((v) => !v);
+        }}
         className="group inline-flex items-center gap-2 px-2.5 py-1 rounded-[7px] text-[12px] border transition-all cursor-pointer rare-specular-pill max-w-full"
         style={{
           backgroundColor: expanded ? "var(--surface-2)" : "var(--surface-1)",
@@ -65,13 +71,15 @@ export const BeautifulThinkingBlock: React.FC<{
           color: "var(--fg-muted)",
         }}
       >
-        <ChevronRight
-          className="w-3.5 h-3.5 shrink-0 transition-transform duration-200"
-          style={{
-            transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
-            color: "var(--fg-extra-muted)",
-          }}
-        />
+        {hasBody && (
+          <ChevronRight
+            className="w-3.5 h-3.5 shrink-0 transition-transform duration-200"
+            style={{
+              transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
+              color: "var(--fg-extra-muted)",
+            }}
+          />
+        )}
         {isStreaming ? (
           <Loader2
             className="w-3.5 h-3.5 shrink-0 animate-spin"
@@ -89,12 +97,14 @@ export const BeautifulThinkingBlock: React.FC<{
         >
           {isStreaming ? "Thinking..." : `Thought for ${elapsedSec.toFixed(1)}s`}
         </span>
-        <span
-          className="truncate max-w-[320px] text-[11.5px]"
-          style={{ color: "var(--fg-extra-muted)" }}
-        >
-          {previewLine}
-        </span>
+        {!expanded && previewLine && (
+          <span
+            className="truncate max-w-[320px] text-[11.5px]"
+            style={{ color: "var(--fg-extra-muted)" }}
+          >
+            {previewLine}
+          </span>
+        )}
         <span
           className="font-mono-code text-[10px] px-1.5 py-0.2 rounded-full ml-1 shrink-0 flex items-center gap-1"
           style={{
@@ -103,23 +113,25 @@ export const BeautifulThinkingBlock: React.FC<{
           }}
         >
           <Clock className="w-2.5 h-2.5" />
-          {elapsedSec.toFixed(1)}s · {estimatedTokens} tok
+          {elapsedSec.toFixed(1)}s{estimatedTokens > 0 ? ` · ${estimatedTokens} tok` : ""}
         </span>
       </button>
 
-      <div className={`t-grid-collapse ${expanded ? "t-expanded" : ""}`}>
-        <div className="t-grid-collapse-inner">
-          <div
-            className="paseo-indent-rail ml-3 mt-1.5 py-1.5 px-3 rounded-r-[7px] text-[12.5px] leading-relaxed whitespace-pre-wrap"
-            style={{
-              backgroundColor: "rgba(255,255,255,0.015)",
-              color: "var(--fg-muted)",
-            }}
-          >
-            {text}
+      {hasBody && (
+        <div className={`t-grid-collapse ${expanded ? "t-expanded" : ""}`}>
+          <div className="t-grid-collapse-inner">
+            <div
+              className="paseo-indent-rail ml-3 mt-1.5 py-1.5 px-3 rounded-r-[7px] text-[12.5px] leading-relaxed whitespace-pre-wrap"
+              style={{
+                backgroundColor: "rgba(255,255,255,0.015)",
+                color: "var(--fg-muted)",
+              }}
+            >
+              {text}
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

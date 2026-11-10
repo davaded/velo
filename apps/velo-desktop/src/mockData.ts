@@ -339,7 +339,7 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
   return {
     id: String(r.id ?? `daemon-${idx}`),
     repo_id: String(r.repo_id ?? "repo-velo"),
-    title: String(r.title ?? r.prompt ?? r.name ?? branch),
+    title: String(r.title ?? r.name ?? r.prompt ?? branch),
     agent_kind: agentKind,
     model: modelId,
     model_short:
