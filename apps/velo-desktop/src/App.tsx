@@ -66,6 +66,14 @@ interface PairingTicketDto {
   qr_svg: string;
 }
 
+interface LocalRuntimeDto {
+  id: string;
+  name: string;
+  available: boolean;
+  version?: string | null;
+  binary_path?: string | null;
+}
+
 interface PendingApprovalItem {
   id: string;
   command: string;
@@ -148,6 +156,11 @@ export function App() {
   const [activeId, setActiveId] = useState<string>(DEMO_SESSIONS[0].id);
   const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(DEMO_EVENTS);
   const [connected, setConnected] = useState<boolean>(false);
+  const [runtimes, setRuntimes] = useState<LocalRuntimeDto[]>([
+    { id: "claude", name: "Claude Code", available: true, version: "2.1.233 (Claude Code)" },
+    { id: "codex", name: "OpenAI Codex", available: true, version: "codex-cli 0.154.0" },
+  ]);
+  const [modelPickerOpen, setModelPickerOpen] = useState<boolean>(false);
 
   // Live Diff & Worktree Files per Session
   const [diffsBySession, setDiffsBySession] = useState<Record<string, DiffFileItem[]>>({});
@@ -222,7 +235,7 @@ export function App() {
     return DEMO_DIFF_FILES;
   }, [diffsBySession, activeSession.id]);
 
-  // Fetch live sessions from Velo Daemon
+  // Fetch live sessions and detected local CLI runtimes from Velo Daemon
   const refreshSessions = useCallback(() => {
     fetch(`${daemonUrl}/api/sessions`)
       .then((r) => (r.ok ? r.json() : Promise.reject()))
@@ -237,6 +250,15 @@ export function App() {
         }
       })
       .catch(() => setConnected(false));
+
+    fetch(`${daemonUrl}/api/runtimes`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data: { runtimes?: LocalRuntimeDto[] }) => {
+        if (Array.isArray(data.runtimes) && data.runtimes.length > 0) {
+          setRuntimes(data.runtimes);
+        }
+      })
+      .catch(() => {});
   }, [daemonUrl]);
 
   useEffect(() => {
@@ -301,7 +323,7 @@ export function App() {
       .catch(() => {});
   }, [activeModal, daemonUrl]);
 
-  // Subscribe to live WebSocket events
+  // Subscribe to live WebSocket events from real Claude Code / Codex CLI turns
   useEffect(() => {
     const wsUrl = `${daemonUrl.replace(/^http/, "ws")}/ws`;
     let ws: WebSocket | null = null;
@@ -311,26 +333,183 @@ export function App() {
       ws.onmessage = (msg) => {
         try {
           const raw = JSON.parse(msg.data) as Record<string, unknown>;
-          if (raw.type === "session_updated" && raw.session) {
-            const updated = normalizeToVeloSession(raw.session, 0);
+          const now = new Date().toLocaleTimeString([], { hour12: false });
+
+          // Handle WsServerMessage::Event { event: AgentEvent }
+          const evObj =
+            raw.kind === "event" && raw.event && typeof raw.event === "object"
+              ? (raw.event as Record<string, unknown>)
+              : raw;
+
+          const evType = String(evObj.type ?? "");
+          const sid = String(evObj.session_id ?? activeId);
+
+          if (evType === "status_changed") {
+            const st = String(evObj.status ?? "");
             setSessions((prev) =>
-              prev.map((s) => (s.id === updated.id ? { ...s, ...updated } : s))
+              prev.map((s) =>
+                s.id === sid
+                  ? {
+                      ...s,
+                      status:
+                        st === "running"
+                          ? "running"
+                          : st === "waiting_for_permission"
+                          ? "waiting_approval"
+                          : "idle",
+                      updated_at: "just now",
+                    }
+                  : s
+              )
             );
+            if (st === "completed") {
+              refreshSessionDiffAndFiles(sid);
+            }
             return;
           }
-          const content = String(raw.text ?? raw.content ?? raw.line ?? "");
-          if (!content) return;
-          const ev: AgentEvent = {
-            id: `ws-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            session_id: String(raw.session_id ?? activeId),
-            timestamp: new Date().toLocaleTimeString([], { hour12: false }),
-            kind: "assistant",
-            content,
-          };
-          setEventsBySession((prev) => ({
-            ...prev,
-            [ev.session_id]: [...(prev[ev.session_id] || []), ev],
-          }));
+
+          if (evType === "diff_updated" && evObj.stats && typeof evObj.stats === "object") {
+            const st = evObj.stats as Record<string, unknown>;
+            setSessions((prev) =>
+              prev.map((s) =>
+                s.id === sid
+                  ? {
+                      ...s,
+                      files_changed: Number(st.files_changed ?? s.files_changed),
+                      insertions: Number(st.insertions ?? s.insertions),
+                      deletions: Number(st.deletions ?? s.deletions),
+                    }
+                  : s
+              )
+            );
+            refreshSessionDiffAndFiles(sid);
+            return;
+          }
+
+          if (evType === "thinking_delta") {
+            const text = String(evObj.text ?? "").trim();
+            if (!text) return;
+            setEventsBySession((prev) => {
+              const list = prev[sid] || [];
+              const last = list[list.length - 1];
+              if (last && last.kind === "thinking") {
+                const updatedLast = { ...last, content: `${last.content}\n${text}` };
+                return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
+              }
+              return {
+                ...prev,
+                [sid]: [
+                  ...list,
+                  {
+                    id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                    session_id: sid,
+                    timestamp: now,
+                    kind: "thinking",
+                    content: text,
+                  },
+                ],
+              };
+            });
+            return;
+          }
+
+          if (evType === "tool_call_requested") {
+            const toolName = String(evObj.tool_name ?? "Tool");
+            const argsObj = (
+              evObj.arguments && typeof evObj.arguments === "object" ? evObj.arguments : {}
+            ) as Record<string, unknown>;
+            const argSummary = String(
+              argsObj.file_path ??
+                argsObj.path ??
+                argsObj.command ??
+                argsObj.pattern ??
+                JSON.stringify(argsObj).slice(0, 80)
+            );
+            const toolEv: AgentEvent = {
+              id: String(evObj.tool_id ?? `tl-${Date.now()}`),
+              session_id: sid,
+              timestamp: now,
+              kind: "tool_call",
+              tool_name: toolName,
+              tool_args: argSummary,
+              content: JSON.stringify(argsObj, null, 2),
+            };
+            setEventsBySession((prev) => ({
+              ...prev,
+              [sid]: [...(prev[sid] || []), toolEv],
+            }));
+            return;
+          }
+
+          if (evType === "tool_call_completed") {
+            const toolId = String(evObj.tool_id ?? "");
+            const output = String(evObj.output ?? "");
+            if (!output) return;
+            setEventsBySession((prev) => {
+              const list = prev[sid] || [];
+              const idx = list.findIndex((item) => item.id === toolId);
+              if (idx !== -1) {
+                const next = [...list];
+                next[idx] = { ...next[idx], content: output };
+                return { ...prev, [sid]: next };
+              }
+              return prev;
+            });
+            return;
+          }
+
+          if (evType === "message_delta") {
+            const text = String(evObj.text ?? "");
+            if (!text.trim()) return;
+            setEventsBySession((prev) => {
+              const list = prev[sid] || [];
+              const last = list[list.length - 1];
+              if (last && last.kind === "assistant") {
+                const updatedLast = {
+                  ...last,
+                  content: last.content.includes(text)
+                    ? last.content
+                    : `${last.content}\n${text}`.trim(),
+                };
+                return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
+              }
+              return {
+                ...prev,
+                [sid]: [
+                  ...list,
+                  {
+                    id: `as-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                    session_id: sid,
+                    timestamp: now,
+                    kind: "assistant",
+                    content: text,
+                  },
+                ],
+              };
+            });
+            setTimeout(() => {
+              streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
+            }, 30);
+            return;
+          }
+
+          if (evType === "error") {
+            const errText = String(evObj.error ?? "Agent execution error");
+            setEventsBySession((prev) => ({
+              ...prev,
+              [sid]: [
+                ...(prev[sid] || []),
+                {
+                  id: `err-${Date.now()}`,
+                  session_id: sid,
+                  timestamp: now,
+                  kind: "assistant",
+                  content: `⚠️ ${errText}`,
+                },
+              ],
+            }));
+            return;
+          }
         } catch {
           // ignore malformed frames
         }
@@ -342,7 +521,7 @@ export function App() {
     return () => {
       if (ws) ws.close();
     };
-  }, [daemonUrl, activeId]);
+  }, [daemonUrl, activeId, refreshSessionDiffAndFiles]);
 
   // Global Shortcuts
   useEffect(() => {
@@ -510,51 +689,65 @@ export function App() {
       }
     }
 
-    // Standard prompt -> send to PTY input + append realistic trace
-    const thinkEv: AgentEvent = {
-      id: `th-${Date.now() + 1}`,
-      session_id: activeSession.id,
-      timestamp: now,
-      kind: "thinking",
-      content: `Analyzing ${
-        attachedFiles.length > 0 ? attachedFiles.join(", ") : activeSession.branch_name
-      } in isolated worktree ${activeSession.worktree_path}...`,
-    };
+    // Dispatch prompt to real local Claude Code / Codex CLI via Velo Daemon
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === activeSession.id ? { ...s, status: "running", updated_at: "running" } : s
+      )
+    );
 
-    const targetFile = attachedFiles[0] || "crates/velo-protocol/src/lib.rs";
-    const toolEv: AgentEvent = {
-      id: `tl-${Date.now() + 2}`,
-      session_id: activeSession.id,
-      timestamp: now,
-      kind: "tool_call",
-      tool_name: "Edit",
-      tool_args: targetFile,
-      content:
-        "@@ -42,6 +42,14 @@\n+pub struct ReconnectPolicy {\n+    pub base_delay_ms: u64,\n+    pub max_delay_ms: u64,\n+    pub jitter_ratio: f32,\n+}",
-      duration_ms: 42,
-    };
-
-    const replyEv: AgentEvent = {
-      id: `as-${Date.now() + 3}`,
-      session_id: activeSession.id,
-      timestamp: now,
-      kind: "assistant",
-      content: `Updated \`${targetFile}\` on branch \`${activeSession.branch_name}\` and verified workspace build.`,
-    };
-
-    setEventsBySession((prev) => ({
-      ...prev,
-      [activeSession.id]: [...(prev[activeSession.id] || []), thinkEv, toolEv, replyEv],
-    }));
+    const providerName = activeSession.agent_kind === "codex" ? "codex" : "claude";
 
     try {
-      await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/input`, {
+      // 1. Try sending input to existing daemon session
+      const inputRes = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ data: text + "\n" }),
+        body: JSON.stringify({ input: text }),
       });
+
+      if (inputRes.ok) {
+        setTimeout(() => {
+          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        }, 50);
+        return;
+      }
+
+      // 2. If activeSession was a static demo session not yet on the daemon, promote it to a real daemon session
+      const createRes = await fetch(`${daemonUrl}/api/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: activeSession.title,
+          provider: providerName,
+          prompt: text,
+          repo_path: "/Users/daiyudai/code/velo",
+          branch: activeSession.branch_name,
+          use_pty: false,
+        }),
+      });
+
+      if (createRes.ok) {
+        const rawCreated = await createRes.json();
+        const realSess = normalizeToVeloSession(rawCreated, 0);
+        realSess.repo_id = activeSession.repo_id;
+        realSess.title = activeSession.title;
+        realSess.agent_kind = activeSession.agent_kind;
+
+        const oldId = activeSession.id;
+        setSessions((prev) => prev.map((s) => (s.id === oldId ? realSess : s)));
+        setEventsBySession((prev) => ({
+          ...prev,
+          [realSess.id]: (prev[oldId] || []).map((ev) => ({
+            ...ev,
+            session_id: realSess.id,
+          })),
+        }));
+        setActiveId(realSess.id);
+        return;
+      }
     } catch {
-      // optimistic stream already updated
+      // fallback if daemon unreachable
     }
 
     setTimeout(() => {
@@ -700,15 +893,14 @@ export function App() {
         : `feat/${clean}`;
     const title = newTaskDesc.trim() || branch;
 
+    const providerName = newAgentKind === "codex" ? "codex" : "claude";
     try {
       const res = await fetch(`${daemonUrl}/api/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: title,
-          provider: {
-            custom: "printf '\\n// isolated worktree ready\\n' >> README.md && git status -sb",
-          },
+          provider: providerName,
           prompt: title,
           repo_path: targetRepo.path,
           branch,
@@ -1439,12 +1631,84 @@ export function App() {
                   />
 
                   {/* Composer Bottom Toolbar */}
-                  <div className="mt-1.5 flex items-center justify-between">
+                  <div className="relative mt-1.5 flex items-center justify-between">
+                    {modelPickerOpen && (
+                      <div className="absolute bottom-9 left-0 z-30 w-[290px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                        <div className="px-2.5 py-1 text-[11px] font-medium text-[var(--v-fg-muted)]">
+                          Local Logged-in Agent CLIs (Zero API Key)
+                        </div>
+                        {runtimes.map((rt) => {
+                          const kind: AgentKind =
+                            rt.id === "codex"
+                              ? "codex"
+                              : rt.id === "gemini"
+                              ? "gemini"
+                              : "claude";
+                          const isCurrent = activeSession.agent_kind === kind;
+                          return (
+                            <button
+                              key={rt.id}
+                              disabled={!rt.available}
+                              onClick={() => {
+                                setSessions((prev) =>
+                                  prev.map((s) =>
+                                    s.id === activeSession.id
+                                      ? {
+                                          ...s,
+                                          agent_kind: kind,
+                                          model:
+                                            kind === "codex"
+                                              ? "codex-o3"
+                                              : kind === "gemini"
+                                              ? "gemini-2.5-pro"
+                                              : "claude-sonnet-4.5",
+                                          model_short:
+                                            kind === "codex"
+                                              ? "codex-o3"
+                                              : kind === "gemini"
+                                              ? "gemini-2.5"
+                                              : "claude-4.5",
+                                        }
+                                      : s
+                                  )
+                                );
+                                setModelPickerOpen(false);
+                              }}
+                              className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-[12px] transition-colors ${
+                                isCurrent
+                                  ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                  : rt.available
+                                  ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
+                                  : "opacity-40 cursor-not-allowed text-[var(--v-fg-muted)]"
+                              }`}
+                            >
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-1.5 font-medium">
+                                  <span
+                                    className="h-1.5 w-1.5 rounded-full"
+                                    style={{
+                                      background: rt.available ? "#34d399" : "#71717a",
+                                    }}
+                                  />
+                                  <span>{rt.name}</span>
+                                </div>
+                                <div className="truncate font-mono text-[10.5px] text-[var(--v-fg-muted)]">
+                                  {rt.version || (rt.available ? "Ready" : "Not installed")}
+                                </div>
+                              </div>
+                              {isCurrent && <Check className="h-3.5 w-3.5 text-[#34d399]" />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
                     <div className="flex items-center gap-1.5">
                       <button
-                        onClick={() => setActiveModal("command")}
-                        className="flex items-center gap-1 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] transition-colors hover:bg-[var(--v-bg-hover)]"
+                        onClick={() => setModelPickerOpen((o) => !o)}
+                        className="flex items-center gap-1.5 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] transition-colors hover:bg-[var(--v-bg-hover)]"
                       >
+                        <span className="h-1.5 w-1.5 rounded-full bg-[#34d399]" />
                         <span>{activeSession.model}</span>
                         <ChevronDown className="h-3 w-3 text-[var(--v-fg-muted)]" />
                       </button>

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,151 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info};
 use uuid::Uuid;
 use velo_protocol::{AgentEvent, AgentProvider, SessionStatus};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRuntimeInfo {
+    pub id: String,
+    pub name: String,
+    pub available: bool,
+    pub version: Option<String>,
+    pub binary_path: Option<String>,
+}
+
+/// Discovers local Node/fnm/nvm/Homebrew/Cargo binary directories so macOS `.app` bundles
+/// can invoke `claude`, `codex`, `gemini`, `opencode`, and `node` without manual PATH configuration.
+pub fn discover_augmented_path() -> String {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        // 1. fnm node installations (~/.local/share/fnm/node-versions/*/installation/bin)
+        let fnm_bases = [
+            home.join(".local/share/fnm/node-versions"),
+            home.join("Library/Application Support/fnm/node-versions"),
+        ];
+        for base in &fnm_bases {
+            if let Ok(entries) = std::fs::read_dir(base) {
+                let mut versions: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .collect();
+                versions.sort();
+                versions.reverse();
+                for v in versions {
+                    let bin = v.join("installation/bin");
+                    if bin.is_dir() {
+                        dirs.push(bin);
+                    }
+                }
+            }
+        }
+
+        // 2. nvm node installations (~/.nvm/versions/node/*/bin)
+        let nvm_base = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_base) {
+            let mut versions: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect();
+            versions.sort();
+            versions.reverse();
+            for v in versions {
+                let bin = v.join("bin");
+                if bin.is_dir() {
+                    dirs.push(bin);
+                }
+            }
+        }
+
+        // 3. Common user bin paths
+        for rel in [".local/bin", ".cargo/bin", ".bun/bin", "bin"] {
+            let p = home.join(rel);
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    }
+
+    for sys in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        let p = PathBuf::from(sys);
+        if p.is_dir() {
+            dirs.push(p);
+        }
+    }
+
+    if let Ok(existing) = std::env::var("PATH") {
+        for part in existing.split(':') {
+            if !part.is_empty() {
+                let p = PathBuf::from(part);
+                if !dirs.contains(&p) {
+                    dirs.push(p);
+                }
+            }
+        }
+    }
+
+    dirs.iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+pub fn resolve_cli_binary(name: &str) -> Option<PathBuf> {
+    let path_str = discover_augmented_path();
+    for dir in path_str.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub async fn detect_local_runtimes() -> Vec<LocalRuntimeInfo> {
+    let aug_path = discover_augmented_path();
+    let specs = [
+        ("claude", "Claude Code"),
+        ("codex", "OpenAI Codex"),
+        ("gemini", "Gemini CLI"),
+        ("opencode", "OpenCode"),
+    ];
+
+    let mut out = Vec::new();
+    for (bin, label) in specs {
+        let resolved = resolve_cli_binary(bin);
+        if let Some(bin_path) = resolved {
+            let ver_out = Command::new(&bin_path)
+                .arg("--version")
+                .env("PATH", &aug_path)
+                .output()
+                .await;
+            let version = match ver_out {
+                Ok(o) => {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    let e = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    let combined = if !s.is_empty() { s } else { e };
+                    combined.lines().next().map(|l| l.trim().to_string())
+                }
+                Err(_) => None,
+            };
+            out.push(LocalRuntimeInfo {
+                id: bin.to_string(),
+                name: label.to_string(),
+                available: true,
+                version,
+                binary_path: Some(bin_path.to_string_lossy().to_string()),
+            });
+        } else {
+            out.push(LocalRuntimeInfo {
+                id: bin.to_string(),
+                name: label.to_string(),
+                available: false,
+                version: None,
+                binary_path: None,
+            });
+        }
+    }
+    out
+}
 
 /// Handle to control an active agent process (send input or stop).
 pub struct AgentHandle {
@@ -341,25 +487,39 @@ impl AgentSpawner {
     }
 
     fn build_tokio_command(provider: &AgentProvider, prompt: &str, _cwd: &Path) -> Command {
-        match provider {
+        let aug_path = discover_augmented_path();
+        let mut cmd = match provider {
             AgentProvider::Claude => {
-                let mut c = Command::new("claude");
+                let bin = resolve_cli_binary("claude").unwrap_or_else(|| PathBuf::from("claude"));
+                let mut c = Command::new(bin);
                 c.args([
                     "-p",
                     prompt,
                     "--output-format",
                     "stream-json",
                     "--verbose",
+                    "--permission-mode",
+                    "acceptEdits",
                 ]);
                 c
             }
             AgentProvider::Codex => {
-                let mut c = Command::new("codex");
-                c.args(["exec", prompt]);
+                let bin = resolve_cli_binary("codex").unwrap_or_else(|| PathBuf::from("codex"));
+                let mut c = Command::new(bin);
+                c.args([
+                    "exec",
+                    "--json",
+                    "-s",
+                    "workspace-write",
+                    "--skip-git-repo-check",
+                    prompt,
+                ]);
                 c
             }
             AgentProvider::OpenCode => {
-                let mut c = Command::new("opencode");
+                let bin =
+                    resolve_cli_binary("opencode").unwrap_or_else(|| PathBuf::from("opencode"));
+                let mut c = Command::new(bin);
                 c.args(["run", prompt]);
                 c
             }
@@ -373,7 +533,9 @@ impl AgentSpawner {
                 c.args(["-c", &full_cmd]);
                 c
             }
-        }
+        };
+        cmd.env("PATH", aug_path);
+        cmd
     }
 
     fn build_pty_command(
@@ -381,23 +543,33 @@ impl AgentSpawner {
         prompt: &str,
         cwd: &Path,
     ) -> CommandBuilder {
+        let aug_path = discover_augmented_path();
         let mut cmd = match provider {
             AgentProvider::Claude => {
-                let mut c = CommandBuilder::new("claude");
+                let bin = resolve_cli_binary("claude")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "claude".to_string());
+                let mut c = CommandBuilder::new(bin);
                 if !prompt.trim().is_empty() {
                     c.arg(prompt);
                 }
                 c
             }
             AgentProvider::Codex => {
-                let mut c = CommandBuilder::new("codex");
+                let bin = resolve_cli_binary("codex")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "codex".to_string());
+                let mut c = CommandBuilder::new(bin);
                 if !prompt.trim().is_empty() {
                     c.arg(prompt);
                 }
                 c
             }
             AgentProvider::OpenCode => {
-                let mut c = CommandBuilder::new("opencode");
+                let bin = resolve_cli_binary("opencode")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "opencode".to_string());
+                let mut c = CommandBuilder::new(bin);
                 if !prompt.trim().is_empty() {
                     c.args(["run", prompt]);
                 }
@@ -414,6 +586,7 @@ impl AgentSpawner {
                 c
             }
         };
+        cmd.env("PATH", aug_path);
         cmd.cwd(cwd);
         cmd
     }
@@ -423,7 +596,7 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Parses a single stdout line from Claude Code (`stream-json`) or other agents into `AgentEvent`s.
+/// Parses a single stdout line from Claude Code (`stream-json`), OpenAI Codex (`--json`), or other agents into `AgentEvent`s.
 pub fn parse_agent_stdout_line(
     session_id: Uuid,
     provider: &AgentProvider,
@@ -440,6 +613,7 @@ pub fn parse_agent_stdout_line(
             let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             match msg_type {
+                // 1. Claude Code stream-json events
                 "assistant" => {
                     if let Some(content_arr) = json
                         .pointer("/message/content")
@@ -494,6 +668,7 @@ pub fn parse_agent_stdout_line(
                             }
                         }
                     }
+                    return events;
                 }
                 "user" | "tool_result" => {
                     if let Some(content_arr) = json
@@ -528,25 +703,104 @@ pub fn parse_agent_stdout_line(
                             }
                         }
                     }
+                    return events;
                 }
                 "result" => {
-                    if let Some(result_text) = json.get("result").and_then(|v| v.as_str()) {
-                        if !result_text.is_empty() {
-                            events.push(AgentEvent::MessageDelta {
+                    let is_err = json
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if is_err {
+                        if let Some(result_text) = json.get("result").and_then(|v| v.as_str()) {
+                            events.push(AgentEvent::Error {
                                 session_id,
-                                text: result_text.to_string(),
+                                error: result_text.to_string(),
                                 timestamp: Utc::now(),
                             });
                         }
                     }
+                    return events;
+                }
+                // 2. OpenAI Codex `--json` JSONL events
+                "item.completed" | "item.started" => {
+                    if let Some(item) = json.get("item") {
+                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match item_type {
+                            "reasoning" if msg_type == "item.completed" => {
+                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                    if !text.trim().is_empty() {
+                                        events.push(AgentEvent::ThinkingDelta {
+                                            session_id,
+                                            text: text.to_string(),
+                                            timestamp: Utc::now(),
+                                        });
+                                    }
+                                }
+                            }
+                            "agent_message" if msg_type == "item.completed" => {
+                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                    if !text.trim().is_empty() {
+                                        events.push(AgentEvent::MessageDelta {
+                                            session_id,
+                                            text: text.to_string(),
+                                            timestamp: Utc::now(),
+                                        });
+                                    }
+                                }
+                            }
+                            "command_execution" => {
+                                let tool_id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("cmd")
+                                    .to_string();
+                                let cmd_str = item
+                                    .get("command")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if msg_type == "item.started" {
+                                    events.push(AgentEvent::ToolCallRequested {
+                                        session_id,
+                                        tool_id,
+                                        tool_name: "Bash".to_string(),
+                                        arguments: serde_json::json!({ "command": cmd_str }),
+                                        timestamp: Utc::now(),
+                                    });
+                                } else if let Some(out) =
+                                    item.get("aggregated_output").and_then(|v| v.as_str())
+                                {
+                                    events.push(AgentEvent::ToolCallCompleted {
+                                        session_id,
+                                        tool_id,
+                                        output: out.to_string(),
+                                        is_error: false,
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    return events;
+                }
+                "error" => {
+                    if let Some(msg) = json.get("message").and_then(|v| v.as_str()) {
+                        events.push(AgentEvent::Error {
+                            session_id,
+                            error: msg.to_string(),
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    return events;
+                }
+                "system" | "thread.started" | "turn.started" | "turn.completed" => {
+                    return vec![];
                 }
                 _ => {
                     debug!("Unhandled JSON event from {}: {}", provider, msg_type);
+                    return events;
                 }
-            }
-
-            if !events.is_empty() {
-                return events;
             }
         }
     }

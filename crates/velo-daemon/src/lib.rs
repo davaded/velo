@@ -277,7 +277,9 @@ pub fn build_router(state: DaemonState) -> Router {
     Router::new()
         .route("/", get(ui_index_handler))
         .route("/assets/{file}", get(ui_asset_handler))
-        .route("/api/health", get(health_handler)).route("/api/pair", get(pair_ticket_handler))
+        .route("/api/health", get(health_handler))
+        .route("/api/runtimes", get(list_runtimes_handler))
+        .route("/api/pair", get(pair_ticket_handler))
         .route(
             "/api/sessions",
             get(list_sessions_handler).post(create_session_handler),
@@ -315,6 +317,11 @@ async fn health_handler() -> impl IntoResponse {
         "service": "velo-daemon",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+async fn list_runtimes_handler() -> impl IntoResponse {
+    let runtimes = velo_agent::detect_local_runtimes().await;
+    Json(json!({ "runtimes": runtimes }))
 }
 
 async fn list_sessions_handler(State(state): State<DaemonState>) -> impl IntoResponse {
@@ -495,19 +502,60 @@ async fn send_input_handler(
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<SessionInputRequest>,
 ) -> impl IntoResponse {
-    let guard = state.inner.read().await;
-    match guard.handles.get(&id) {
-        Some(handle) => match handle.send_input(req.input) {
-            Ok(_) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
-            Err(err) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response(),
-        },
-        None => (
+    // 1. Try forwarding to a live running PTY/stdin handle first
+    let existing_session = {
+        let guard = state.inner.read().await;
+        if let Some(handle) = guard.handles.get(&id) {
+            if let Some(sess) = guard.sessions.get(&id) {
+                if sess.status == SessionStatus::Running && handle.send_input(req.input.clone()).is_ok() {
+                    return (StatusCode::OK, Json(json!({ "ok": true, "mode": "stdin" }))).into_response();
+                }
+            }
+        }
+        guard.sessions.get(&id).cloned()
+    };
+
+    // 2. Otherwise, spawn a new real CLI turn (claude / codex) in the session's isolated worktree
+    let Some(session) = existing_session else {
+        return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Active session handle not found" })),
+            Json(json!({ "error": "Session not found" })),
+        )
+            .into_response();
+    };
+
+    let wt_path = PathBuf::from(&session.worktree_path);
+    match AgentSpawner::spawn_agent(
+        id,
+        session.provider.clone(),
+        req.input.clone(),
+        wt_path,
+        false,
+        state.event_tx.clone(),
+    )
+    .await
+    {
+        Ok(new_handle) => {
+            let pid = new_handle.pid;
+            {
+                let mut guard = state.inner.write().await;
+                if let Some(s) = guard.sessions.get_mut(&id) {
+                    s.status = SessionStatus::Running;
+                    s.pid = pid;
+                    s.updated_at = Utc::now();
+                }
+                guard.handles.insert(id, new_handle);
+            }
+            let _ = state.persist_sessions().await;
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "mode": "spawned_turn", "pid": pid })),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
         )
             .into_response(),
     }
