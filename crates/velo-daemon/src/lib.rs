@@ -3869,59 +3869,99 @@ mod tests {
     }
 }
 
-async fn pair_ticket_handler(State(state): State<DaemonState>) -> impl IntoResponse {
-    let lan_ip = Command::new("ipconfig")
-        .args(["getifaddr", "en0"])
+#[derive(Debug, serde::Deserialize, Default)]
+struct PairTicketQuery {
+    relay: Option<String>,
+    web: Option<String>,
+}
+
+async fn detect_interface_ipv4(iface: &str) -> Option<String> {
+    Command::new("ipconfig")
+        .args(["getifaddr", iface])
         .output()
         .await
         .ok()
         .and_then(|o| {
+            if !o.status.success() {
+                return None;
+            }
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if s.is_empty() { None } else { Some(s) }
         })
-        .unwrap_or_else(|| velo_protocol::DEFAULT_DAEMON_HOST.to_string());
+}
+
+async fn detect_tailscale_ipv4() -> Option<String> {
+    for bin in ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"] {
+        if let Ok(out) = Command::new(bin).args(["ip", "-4"]).output().await {
+            if out.status.success() {
+                if let Some(line) = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                {
+                    return Some(line.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn pair_ticket_handler(
+    State(state): State<DaemonState>,
+    Query(query): Query<PairTicketQuery>,
+) -> impl IntoResponse {
+    let lan_ip = match detect_interface_ipv4("en0").await {
+        Some(ip) => ip,
+        None => detect_interface_ipv4("en1")
+            .await
+            .unwrap_or_else(|| velo_protocol::DEFAULT_DAEMON_HOST.to_string()),
+    };
+    let tailscale_ip = detect_tailscale_ipv4().await;
 
     relay_bridge::ensure_local_relay_running().await;
 
-    let relay_url = format!("ws://{}:{}", lan_ip, velo_relay::DEFAULT_RELAY_PORT);
-    let daemon_addr = format!("{}:{}", lan_ip, velo_protocol::DEFAULT_DAEMON_PORT);
+    let relay_url = query
+        .relay
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("ws://{}:{}", lan_ip, velo_relay::DEFAULT_RELAY_PORT));
+    let daemon_addr = query
+        .web
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}:{}", lan_ip, velo_protocol::DEFAULT_DAEMON_PORT));
+
+    let lan_uri = format!("http://{}:{}/?mobile=1", lan_ip, velo_protocol::DEFAULT_DAEMON_PORT);
+    let lan_qr_svg = velo_relay::render_qr_svg(&lan_uri, 184);
+
+    let (tailscale_uri, tailscale_qr_svg) = match &tailscale_ip {
+        Some(ts) => {
+            let u = format!("http://{}:{}/?mobile=1", ts, velo_protocol::DEFAULT_DAEMON_PORT);
+            let svg = velo_relay::render_qr_svg(&u, 184);
+            (Some(u), Some(svg))
+        }
+        None => (None, None),
+    };
+
     let ticket = velo_relay::PairingTicket::generate(&relay_url, &daemon_addr);
     let mobile_url = ticket.mobile_web_url.clone();
 
     relay_bridge::spawn_daemon_e2ee_bridge(state, ticket.clone());
 
-    // Render crisp SVG matrix for the QR modal
-    let bytes = mobile_url.as_bytes();
-    let size = 21usize;
-    let mut rects = String::new();
-    for r in 0..size {
-        for c in 0..size {
-            let in_tl = r < 7 && c < 7;
-            let in_tr = r < 7 && c >= size - 7;
-            let in_bl = r >= size - 7 && c < 7;
-            let is_finder = if in_tl || in_tr || in_bl {
-                let lr = if r >= size - 7 { r - (size - 7) } else { r };
-                let lc = if c >= size - 7 { c - (size - 7) } else { c };
-                lr == 0 || lr == 6 || lc == 0 || lc == 6 || (lr >= 2 && lr <= 4 && lc >= 2 && lc <= 4)
-            } else {
-                let idx = (r * size + c) % bytes.len();
-                ((bytes[idx] as usize) ^ (r * 11 + c * 17)) & 1 == 1
-            };
-            if is_finder {
-                rects.push_str(&format!(
-                    "<rect x=\"{}\" y=\"{}\" width=\"1\" height=\"1\" fill=\"#09090b\"/>",
-                    c + 2,
-                    r + 2
-                ));
-            }
-        }
-    }
-    let qr_svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 25 25\" width=\"160\" height=\"160\" shape-rendering=\"crispEdges\"><rect width=\"25\" height=\"25\" fill=\"#ffffff\"/>{}</svg>",
-        rects
-    );
+    let qr_svg = velo_relay::render_qr_svg(&mobile_url, 184);
 
     Json(json!({
+        "lan_ip": lan_ip,
+        "lan_uri": lan_uri,
+        "lan_qr_svg": lan_qr_svg,
+        "tailscale_ip": tailscale_ip,
+        "tailscale_uri": tailscale_uri,
+        "tailscale_qr_svg": tailscale_qr_svg,
         "room_id": ticket.room_id,
         "shared_key_hex": ticket.shared_key_hex,
         "daemon_pubkey_hex": ticket.daemon_pubkey_hex,

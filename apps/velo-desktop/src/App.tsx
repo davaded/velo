@@ -65,6 +65,7 @@ import {
   Search,
   Server,
   Settings,
+  Smartphone,
   Square,
   SquarePen,
   Sun,
@@ -89,6 +90,12 @@ type ModalKind =
   | "automations";
 
 interface PairingTicketDto {
+  lan_ip?: string;
+  lan_uri?: string;
+  lan_qr_svg?: string;
+  tailscale_ip?: string | null;
+  tailscale_uri?: string | null;
+  tailscale_qr_svg?: string | null;
   room_id?: string;
   shared_key_hex?: string;
   daemon_pubkey_hex?: string;
@@ -137,10 +144,188 @@ interface PendingAttachmentItem {
 
 const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {};
 
+function reconstructEventsFromHistory(
+  sid: string,
+  rawList: Array<Record<string, unknown>>
+): AgentEvent[] {
+  const reconstructed: AgentEvent[] = [];
+  let activeHistUserIdx = -1;
+  let activeHistStartMs = 0;
+  for (let i = 0; i < rawList.length; i++) {
+    const ev = rawList[i];
+    const evType = String(ev.type ?? "");
+    const tsRaw = typeof ev.timestamp === "string" ? new Date(ev.timestamp) : new Date();
+    const tsMs = Number.isNaN(tsRaw.getTime()) ? 0 : tsRaw.getTime();
+    const ts = Number.isNaN(tsRaw.getTime())
+      ? new Date().toLocaleTimeString([], { hour12: false })
+      : tsRaw.toLocaleTimeString([], { hour12: false });
+
+    if (evType === "user_message") {
+      const text = String(ev.text ?? "").trim();
+      const imgs = Array.isArray(ev.images) ? ev.images.map(String).filter(Boolean) : [];
+      if (text || imgs.length > 0) {
+        reconstructed.push({
+          id: `u-hist-${i}`,
+          session_id: sid,
+          timestamp: ts,
+          kind: "user",
+          content: text,
+          images: imgs.length > 0 ? imgs : undefined,
+        });
+        activeHistUserIdx = reconstructed.length - 1;
+        activeHistStartMs = tsMs;
+      }
+    } else if (evType === "status_changed") {
+      const st = String(ev.status ?? "");
+      if (st === "running" && activeHistStartMs === 0 && tsMs > 0) {
+        activeHistStartMs = tsMs;
+      } else if (
+        (st === "completed" || st === "failed" || st === "stopped") &&
+        activeHistUserIdx >= 0
+      ) {
+        const dur =
+          activeHistStartMs > 0 && tsMs >= activeHistStartMs
+            ? Math.max(500, tsMs - activeHistStartMs)
+            : undefined;
+        reconstructed[activeHistUserIdx] = {
+          ...reconstructed[activeHistUserIdx],
+          duration_ms: dur,
+          completed_at: ts,
+        };
+      }
+    } else if (evType === "thinking_delta") {
+      const text = String(ev.text ?? "").trim();
+      if (!text) continue;
+      const last = reconstructed[reconstructed.length - 1];
+      if (last && last.kind === "thinking") {
+        if (!last.content.includes(text)) {
+          last.content = `${last.content}\n${text}`;
+        }
+      } else {
+        reconstructed.push({
+          id: `th-hist-${i}`,
+          session_id: sid,
+          timestamp: ts,
+          kind: "thinking",
+          content: text,
+        });
+      }
+    } else if (evType === "tool_call_requested") {
+      const toolId = String(ev.tool_id ?? `tl-hist-${i}`);
+      const toolName = String(ev.tool_name ?? "Tool");
+      const argsObj = (
+        ev.arguments && typeof ev.arguments === "object" ? ev.arguments : {}
+      ) as Record<string, unknown>;
+      const argSummary = String(
+        argsObj.file_path ??
+          argsObj.path ??
+          argsObj.command ??
+          argsObj.pattern ??
+          argsObj.query ??
+          (Object.keys(argsObj).length > 0 ? JSON.stringify(argsObj).slice(0, 80) : "")
+      );
+      const existingIdx = reconstructed.findIndex(
+        (item) => item.kind === "tool_call" && item.id === toolId
+      );
+      if (existingIdx !== -1) {
+        reconstructed[existingIdx] = {
+          ...reconstructed[existingIdx],
+          tool_name: toolName,
+          tool_args: argSummary || reconstructed[existingIdx].tool_args,
+          tool_input:
+            Object.keys(argsObj).length > 0 ? argsObj : reconstructed[existingIdx].tool_input,
+        };
+      } else {
+        reconstructed.push({
+          id: toolId,
+          session_id: sid,
+          timestamp: ts,
+          kind: "tool_call",
+          tool_name: toolName,
+          tool_args: argSummary,
+          tool_input: argsObj,
+          tool_output: undefined,
+          tool_is_error: false,
+          content: JSON.stringify(argsObj, null, 2),
+        });
+      }
+    } else if (evType === "tool_call_completed") {
+      const toolId = String(ev.tool_id ?? "");
+      const output = String(ev.output ?? "(completed)");
+      const isError = Boolean(ev.is_error);
+      let idx = reconstructed.findIndex(
+        (item) => item.kind === "tool_call" && item.id === toolId
+      );
+      if (idx === -1) {
+        for (let j = reconstructed.length - 1; j >= 0; j--) {
+          if (reconstructed[j].kind === "tool_call" && reconstructed[j].tool_output === undefined) {
+            idx = j;
+            break;
+          }
+        }
+      }
+      if (idx !== -1) {
+        reconstructed[idx] = {
+          ...reconstructed[idx],
+          tool_output: output,
+          tool_is_error: isError,
+          content: output,
+        };
+      }
+    } else if (evType === "setup_hook_output") {
+      const cmd = String(ev.command ?? ".velo/setup.sh");
+      const out = String(ev.output ?? "(exit 0)");
+      const code = Number(ev.exit_code ?? 0);
+      reconstructed.push({
+        id: `hook-hist-${i}`,
+        session_id: sid,
+        timestamp: ts,
+        kind: "tool_call",
+        tool_name: "Worktree Setup Hook",
+        tool_args: cmd,
+        tool_input: { command: cmd },
+        tool_output: out,
+        tool_is_error: code !== 0,
+        content: out,
+      });
+    } else if (evType === "message_delta") {
+      const text = String(ev.text ?? "");
+      if (!text.trim() || text.startsWith("[stderr]")) continue;
+      reconstructed.push({
+        id: `as-hist-${i}`,
+        session_id: sid,
+        timestamp: ts,
+        kind: "assistant",
+        content: text,
+      });
+    } else if (evType === "error") {
+      const errText = String(ev.error ?? "Agent execution error");
+      reconstructed.push({
+        id: `err-hist-${i}`,
+        session_id: sid,
+        timestamp: ts,
+        kind: "assistant",
+        content: `⚠️ ${errText}`,
+      });
+    }
+  }
+  return reconstructed;
+}
+
 export function App() {
   const [daemonUrl] = useState<string>(() => {
+    const sp = new URLSearchParams(window.location.search);
+    const explicitDaemon = sp.get("daemon");
+    if (explicitDaemon && explicitDaemon.startsWith("http")) {
+      return explicitDaemon.replace(/\/$/, "");
+    }
     const origin = window.location.origin;
-    if (origin.includes(":6767")) return origin;
+    if (
+      (origin.startsWith("http://") || origin.startsWith("https://")) &&
+      !origin.includes(":5173")
+    ) {
+      return origin;
+    }
     return "http://127.0.0.1:6767";
   });
 
@@ -326,8 +511,10 @@ export function App() {
   const [loopCheckCmd, setLoopCheckCmd] = useState<string>("cargo test --workspace --offline");
 
   // Phase 4 Mobile Remote Controller & True E2EE Relay (?mobile=1&relay=...&room=...&key=...)
-  const [mobileMode, setMobileMode] = useState<boolean>(() =>
-    window.location.search.includes("mobile=1")
+  const [mobileMode, setMobileMode] = useState<boolean>(
+    () =>
+      window.location.search.includes("mobile=1") ||
+      (typeof window !== "undefined" && window.innerWidth < 768)
   );
   const [e2eeRelayConfig] = useState<{
     relayUrl: string;
@@ -344,8 +531,12 @@ export function App() {
     return null;
   });
   const [e2eeConnected, setE2eeConnected] = useState<boolean>(false);
+  const directWsConnectedRef = useRef<boolean>(false);
+  const initialDaemonSyncedRef = useRef<boolean>(false);
   const e2eeWsRef = useRef<WebSocket | null>(null);
   const e2eeNonceRef = useRef<number>(1);
+  const [pairModeTab, setPairModeTab] = useState<"lan" | "e2ee">("lan");
+  const [customRelayInput, setCustomRelayInput] = useState<string>("");
 
   // Stream disclosure states & Inline User Message Editing state
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
@@ -471,6 +662,36 @@ export function App() {
             return true;
           });
           const normalized = realItems.map((item, idx) => normalizeToVeloSession(item, idx));
+          if (normalized.length > 0) {
+            // Auto-register any project paths from the Mac daemon so mobile browsers see all workspaces
+            setRepos((prevRepos) => {
+              const knownPaths = new Set(prevRepos.map((r) => r.path));
+              const extra: VeloRepo[] = [];
+              for (const s of normalized) {
+                if (s.project_path && !knownPaths.has(s.project_path)) {
+                  knownPaths.add(s.project_path);
+                  const folder =
+                    s.project_path.split("/").filter(Boolean).pop() || "workspace";
+                  extra.push({
+                    id: `repo-${folder.toLowerCase().replace(/[^a-z0-9]/g, "-")}`,
+                    code: folder.slice(0, 2).toUpperCase(),
+                    name: folder,
+                    path: s.project_path,
+                    default_branch: "main",
+                  });
+                }
+              }
+              return extra.length > 0 ? [...prevRepos, ...extra] : prevRepos;
+            });
+
+            // On a fresh mobile/browser open where activeId is still the empty placeholder, jump straight to the latest active thread
+            if (!initialDaemonSyncedRef.current) {
+              initialDaemonSyncedRef.current = true;
+              setActiveId((curId) =>
+                curId === "sess-default" || !curId ? normalized[0].id : curId
+              );
+            }
+          }
           const runningDaemonIds = new Set(
             normalized.filter((n) => n.status === "running").map((n) => n.id)
           );
@@ -494,6 +715,7 @@ export function App() {
               .filter(
                 (d) =>
                   !mergedIds.has(d.id) &&
+                  !(normalized.length > 0 && d.id === "sess-default" && d.title === "New thread") &&
                   (d.id.startsWith("sess-") || d.id.startsWith("wt-"))
               )
               .map((d) =>
@@ -604,190 +826,45 @@ export function App() {
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((rawList: Array<Record<string, unknown>>) => {
         if (!Array.isArray(rawList) || rawList.length === 0) return;
-        const reconstructed: AgentEvent[] = [];
-        let activeHistUserIdx = -1;
-        let activeHistStartMs = 0;
-        for (let i = 0; i < rawList.length; i++) {
-          const ev = rawList[i];
-          const evType = String(ev.type ?? "");
-          const tsRaw = typeof ev.timestamp === "string" ? new Date(ev.timestamp) : new Date();
-          const tsMs = Number.isNaN(tsRaw.getTime()) ? 0 : tsRaw.getTime();
-          const ts = Number.isNaN(tsRaw.getTime())
-            ? new Date().toLocaleTimeString([], { hour12: false })
-            : tsRaw.toLocaleTimeString([], { hour12: false });
-
-          if (evType === "user_message") {
-            const text = String(ev.text ?? "").trim();
-            const imgs = Array.isArray(ev.images) ? ev.images.map(String).filter(Boolean) : [];
-            if (text || imgs.length > 0) {
-              reconstructed.push({
-                id: `u-hist-${i}`,
-                session_id: sid,
-                timestamp: ts,
-                kind: "user",
-                content: text,
-                images: imgs.length > 0 ? imgs : undefined,
-              });
-              activeHistUserIdx = reconstructed.length - 1;
-              activeHistStartMs = tsMs;
-            }
-          } else if (evType === "status_changed") {
-            const st = String(ev.status ?? "");
-            if (st === "running" && activeHistStartMs === 0 && tsMs > 0) {
-              activeHistStartMs = tsMs;
-            } else if (
-              (st === "completed" || st === "failed" || st === "stopped") &&
-              activeHistUserIdx >= 0
-            ) {
-              const dur =
-                activeHistStartMs > 0 && tsMs >= activeHistStartMs
-                  ? Math.max(500, tsMs - activeHistStartMs)
-                  : undefined;
-              reconstructed[activeHistUserIdx] = {
-                ...reconstructed[activeHistUserIdx],
-                duration_ms: dur,
-                completed_at: ts,
-              };
-            }
-          } else if (evType === "thinking_delta") {
-            const text = String(ev.text ?? "").trim();
-            if (!text) continue;
-            const last = reconstructed[reconstructed.length - 1];
-            if (last && last.kind === "thinking") {
-              if (!last.content.includes(text)) {
-                last.content = `${last.content}\n${text}`;
-              }
-            } else {
-              reconstructed.push({
-                id: `th-hist-${i}`,
-                session_id: sid,
-                timestamp: ts,
-                kind: "thinking",
-                content: text,
-              });
-            }
-          } else if (evType === "tool_call_requested") {
-            const toolId = String(ev.tool_id ?? `tl-hist-${i}`);
-            const toolName = String(ev.tool_name ?? "Tool");
-            const argsObj = (
-              ev.arguments && typeof ev.arguments === "object" ? ev.arguments : {}
-            ) as Record<string, unknown>;
-            const argSummary = String(
-              argsObj.file_path ??
-                argsObj.path ??
-                argsObj.command ??
-                argsObj.pattern ??
-                argsObj.query ??
-                (Object.keys(argsObj).length > 0 ? JSON.stringify(argsObj).slice(0, 80) : "")
-            );
-            const existingIdx = reconstructed.findIndex(
-              (item) => item.kind === "tool_call" && item.id === toolId
-            );
-            if (existingIdx !== -1) {
-              reconstructed[existingIdx] = {
-                ...reconstructed[existingIdx],
-                tool_name: toolName,
-                tool_args: argSummary || reconstructed[existingIdx].tool_args,
-                tool_input:
-                  Object.keys(argsObj).length > 0
-                    ? argsObj
-                    : reconstructed[existingIdx].tool_input,
-              };
-            } else {
-              reconstructed.push({
-                id: toolId,
-                session_id: sid,
-                timestamp: ts,
-                kind: "tool_call",
-                tool_name: toolName,
-                tool_args: argSummary,
-                tool_input: argsObj,
-                tool_output: undefined,
-                tool_is_error: false,
-                content: JSON.stringify(argsObj, null, 2),
-              });
-            }
-          } else if (evType === "tool_call_completed") {
-            const toolId = String(ev.tool_id ?? "");
-            const output = String(ev.output ?? "(completed)");
-            const isError = Boolean(ev.is_error);
-            let idx = reconstructed.findIndex(
-              (item) => item.kind === "tool_call" && item.id === toolId
-            );
-            if (idx === -1) {
-              for (let j = reconstructed.length - 1; j >= 0; j--) {
-                if (
-                  reconstructed[j].kind === "tool_call" &&
-                  reconstructed[j].tool_output === undefined
-                ) {
-                  idx = j;
-                  break;
-                }
-              }
-            }
-            if (idx !== -1) {
-              reconstructed[idx] = {
-                ...reconstructed[idx],
-                tool_output: output,
-                tool_is_error: isError,
-                content: output,
-              };
-            }
-          } else if (evType === "setup_hook_output") {
-            const cmd = String(ev.command ?? ".velo/setup.sh");
-            const out = String(ev.output ?? "(exit 0)");
-            const code = Number(ev.exit_code ?? 0);
-            reconstructed.push({
-              id: `hook-hist-${i}`,
-              session_id: sid,
-              timestamp: ts,
-              kind: "tool_call",
-              tool_name: "Worktree Setup Hook",
-              tool_args: cmd,
-              tool_input: { command: cmd },
-              tool_output: out,
-              tool_is_error: code !== 0,
-              content: out,
-            });
-          } else if (evType === "message_delta") {
-            const text = String(ev.text ?? "");
-            if (!text.trim() || text.startsWith("[stderr]")) continue;
-            reconstructed.push({
-              id: `as-hist-${i}`,
-              session_id: sid,
-              timestamp: ts,
-              kind: "assistant",
-              content: text,
-            });
-          } else if (evType === "error") {
-            const errText = String(ev.error ?? "Agent execution error");
-            reconstructed.push({
-              id: `err-hist-${i}`,
-              session_id: sid,
-              timestamp: ts,
-              kind: "assistant",
-              content: `⚠️ ${errText}`,
-            });
-          }
-        }
-
+        const reconstructed = reconstructEventsFromHistory(sid, rawList);
         if (reconstructed.length > 0) {
           setEventsBySession((prev) =>
             prev[sid] && prev[sid].length > 0 ? prev : { ...prev, [sid]: reconstructed }
           );
         }
       })
-      .catch(() => {});
-  }, [activeSession.id, daemonUrl, eventsBySession]);
+      .catch(() => {
+        if (e2eeRelayConfig && e2eeWsRef.current && e2eeWsRef.current.readyState === WebSocket.OPEN) {
+          const sealed = e2eeSealJson(
+            e2eeRelayConfig.sharedKeyHex,
+            "mobile-web",
+            e2eeNonceRef.current++,
+            { cmd: "get_events", session_id: sid }
+          );
+          e2eeWsRef.current.send(sealed);
+        }
+      });
+  }, [activeSession.id, daemonUrl, e2eeRelayConfig, eventsBySession]);
 
-  // Fetch E2EE Pairing Ticket when QR modal opens
+  const fetchPairTicket = useCallback(
+    (relayOverride?: string) => {
+      const qs =
+        relayOverride && relayOverride.trim()
+          ? `?relay=${encodeURIComponent(relayOverride.trim())}`
+          : "";
+      fetch(`${daemonUrl}/api/pair${qs}`)
+        .then((r) => (r.ok ? r.json() : Promise.reject()))
+        .then((ticket: PairingTicketDto) => setPairTicket(ticket))
+        .catch(() => {});
+    },
+    [daemonUrl]
+  );
+
+  // Fetch Pairing Ticket when QR modal opens
   useEffect(() => {
     if (activeModal !== "qr") return;
-    fetch(`${daemonUrl}/api/pair`)
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((ticket: PairingTicketDto) => setPairTicket(ticket))
-      .catch(() => {});
-  }, [activeModal, daemonUrl]);
+    fetchPairTicket(customRelayInput || undefined);
+  }, [activeModal, customRelayInput, fetchPairTicket]);
 
   // Shared event dispatcher for both direct Daemon `/ws` and E2EE `velo-relay` (`ChaCha20-Poly1305`)
   const processServerPayload = useCallback(
@@ -796,6 +873,30 @@ export function App() {
         const normalized = raw.sessions.map((item, idx) => normalizeToVeloSession(item, idx));
         if (normalized.length > 0) {
           setSessions(normalized);
+          if (!initialDaemonSyncedRef.current) {
+            initialDaemonSyncedRef.current = true;
+            setActiveId((curId) =>
+              curId === "sess-default" || !curId ? normalized[0].id : curId
+            );
+          }
+        }
+        return;
+      }
+
+      if (
+        raw.type === "events_snapshot" &&
+        typeof raw.session_id === "string" &&
+        Array.isArray(raw.events)
+      ) {
+        const snapSid = raw.session_id;
+        const reconstructed = reconstructEventsFromHistory(
+          snapSid,
+          raw.events as Array<Record<string, unknown>>
+        );
+        if (reconstructed.length > 0) {
+          setEventsBySession((prev) =>
+            prev[snapSid] && prev[snapSid].length > 0 ? prev : { ...prev, [snapSid]: reconstructed }
+          );
         }
         return;
       }
@@ -1447,7 +1548,10 @@ export function App() {
     let ws: WebSocket | null = null;
     try {
       ws = new WebSocket(wsUrl);
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => {
+        directWsConnectedRef.current = true;
+        setConnected(true);
+      };
       ws.onmessage = (msg) => {
         try {
           const raw = JSON.parse(msg.data) as Record<string, unknown>;
@@ -1456,11 +1560,16 @@ export function App() {
           // ignore malformed frames
         }
       };
-      ws.onclose = () => setConnected(false);
+      ws.onclose = () => {
+        directWsConnectedRef.current = false;
+        setConnected(Boolean(e2eeWsRef.current && e2eeWsRef.current.readyState === WebSocket.OPEN));
+      };
     } catch {
+      directWsConnectedRef.current = false;
       setConnected(false);
     }
     return () => {
+      directWsConnectedRef.current = false;
       if (ws) ws.close();
     };
   }, [daemonUrl, processServerPayload]);
@@ -1486,6 +1595,8 @@ export function App() {
       };
       rws.onmessage = (ev) => {
         if (typeof ev.data !== "string") return;
+        // Avoid double-appending streaming chunks when direct LAN `/ws` is already open
+        if (directWsConnectedRef.current) return;
         const opened = e2eeOpenFrame(e2eeRelayConfig.sharedKeyHex, ev.data);
         if (!opened || opened.senderId === "mobile-web") return;
         processServerPayload(opened.message);
@@ -2090,6 +2201,9 @@ export function App() {
           cmd: "send_input",
           session_id: activeSession.id,
           input: text,
+          model: activeSession.model,
+          effort: activeSession.effort || "medium",
+          approval_mode: activeSession.approval_mode,
         })
       ) {
         return;
@@ -2108,7 +2222,7 @@ export function App() {
             session_id: activeSession.id,
             timestamp: now,
             kind: "assistant",
-            content: "⚠️ Daemon unreachable on 127.0.0.1:6767. Please check Velo daemon status.",
+            content: `⚠️ 无法连接到 Velo 守护进程 (${daemonUrl})，请确认电脑端 Velo 正在运行且处于同一网络或已连接 E2EE 中继。`,
           },
         ],
       }));
@@ -2156,14 +2270,16 @@ export function App() {
       });
       return { ...prev, [sid]: updated };
     });
-    sendE2eeCommand({ cmd: "stop_session", session_id: sid });
     try {
-      await fetch(`${daemonUrl}/api/sessions/${sid}/stop`, {
+      const res = await fetch(`${daemonUrl}/api/sessions/${sid}/stop`, {
         method: "POST",
       });
+      if (!res.ok) {
+        sendE2eeCommand({ cmd: "stop_session", session_id: sid });
+      }
       refreshSessions();
     } catch {
-      // ignore if local-only or remote relay
+      sendE2eeCommand({ cmd: "stop_session", session_id: sid });
     }
   }, [activeSession.id, daemonUrl, refreshSessions, sendE2eeCommand]);
   stopSessionRef.current = () => {
@@ -2370,15 +2486,8 @@ export function App() {
       )
     );
 
-    sendE2eeCommand({
-      cmd: "resolve_approval",
-      session_id: sid,
-      request_id: pending.id,
-      decision: action,
-    });
-
     try {
-      await fetch(
+      const res = await fetch(
         `${daemonUrl}/api/sessions/${sid}/approvals/${encodeURIComponent(pending.id)}`,
         {
           method: "POST",
@@ -2386,8 +2495,21 @@ export function App() {
           body: JSON.stringify({ decision: action }),
         }
       );
+      if (!res.ok) {
+        sendE2eeCommand({
+          cmd: "resolve_approval",
+          session_id: sid,
+          request_id: pending.id,
+          decision: action,
+        });
+      }
     } catch {
-      // handled via E2EE relay if remote
+      sendE2eeCommand({
+        cmd: "resolve_approval",
+        session_id: sid,
+        request_id: pending.id,
+        decision: action,
+      });
     }
   };
 
@@ -2403,15 +2525,8 @@ export function App() {
       return next;
     });
 
-    sendE2eeCommand({
-      cmd: "answer_question",
-      session_id: sid,
-      question_id: pendingQ.id,
-      answers,
-    });
-
     try {
-      await fetch(
+      const res = await fetch(
         `${daemonUrl}/api/sessions/${sid}/questions/${encodeURIComponent(pendingQ.id)}`,
         {
           method: "POST",
@@ -2419,8 +2534,21 @@ export function App() {
           body: JSON.stringify({ answers }),
         }
       );
+      if (!res.ok) {
+        sendE2eeCommand({
+          cmd: "answer_question",
+          session_id: sid,
+          question_id: pendingQ.id,
+          answers,
+        });
+      }
     } catch {
-      // handled via E2EE relay if remote
+      sendE2eeCommand({
+        cmd: "answer_question",
+        session_id: sid,
+        question_id: pendingQ.id,
+        answers,
+      });
     }
   };
 
@@ -2880,7 +3008,7 @@ export function App() {
     <div
       data-theme={resolvedTheme}
       data-tone={tone}
-      className={`velo-variant-${variant} flex h-screen w-screen overflow-hidden select-none bg-[var(--v-bg-canvas)] text-[var(--v-fg-primary)]`}
+      className={`velo-variant-${variant} flex h-[100dvh] w-screen overflow-hidden select-none bg-[var(--v-bg-canvas)] text-[var(--v-fg-primary)] pt-[env(safe-area-inset-top)]`}
     >
       {/* Mobile Sidebar Backdrop (<768px) */}
       {sidebarOpen && (
@@ -3197,10 +3325,10 @@ export function App() {
             </button>
             <button
               onClick={() => setActiveModal("qr")}
-              title={`Local Daemon (${connected ? "Connected" : "Offline"}) & Mobile E2EE Pairing`}
+              title={`手机扫码连接 (${connected ? "守护进程在线" : "离线"})`}
               className="relative flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
-              <Server className="h-4 w-4" />
+              <Smartphone className="h-4 w-4" />
               <span
                 className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full"
                 style={{ background: connected || e2eeConnected ? "#34d399" : "#fbbf24" }}
@@ -3411,12 +3539,31 @@ export function App() {
             >
               <Terminal className="h-4 w-4" />
             </button>
+
+            {!mobileMode && (
+              <button
+                onClick={() => setActiveModal("qr")}
+                title="手机扫码连接 (Mobile Remote)"
+                className="flex h-7 items-center gap-1 rounded-md px-2 text-[11.5px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              >
+                <Smartphone className="h-3.5 w-3.5" />
+                <span className="hidden lg:inline">手机端</span>
+              </button>
+            )}
           </div>
         </header>
 
-        {/* Mobile E2EE Remote Controller Worktree Strip */}
+        {/* Mobile Remote Controller Session & Worktree Strip */}
         {mobileMode && (
-          <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-4 py-2">
+          <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-1.5">
+            <button
+              type="button"
+              onClick={() => handleQuickNewThread()}
+              className="flex shrink-0 items-center gap-1 rounded-full border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] active:scale-[0.98]"
+            >
+              <Plus className="h-3 w-3" />
+              <span>新建</span>
+            </button>
             {sessions.map((s) => {
               const active = s.id === activeSession.id;
               return (
@@ -3436,7 +3583,9 @@ export function App() {
                     <span className="h-2 w-2 rounded-full bg-[#fbbf24]" />
                   )}
                   <span className="max-w-[140px] truncate">{s.title}</span>
-                  <span className="font-mono text-[10.5px] text-[#34d399]">+{s.insertions}</span>
+                  {(s.insertions > 0 || s.deletions > 0) && (
+                    <span className="font-mono text-[10.5px] text-[#34d399]">+{s.insertions}</span>
+                  )}
                 </button>
               );
             })}
@@ -3455,7 +3604,7 @@ export function App() {
                 isPinnedToBottomRef.current = nearBottom;
                 setShowJumpToBottom(!nearBottom);
               }}
-              className="w-full flex-1 overflow-y-auto px-6 py-6"
+              className="w-full flex-1 overflow-y-auto px-3.5 py-4 sm:px-6 sm:py-6"
               data-testid="agent-chat-scroll"
             >
               <div className="mx-auto flex max-w-[680px] flex-col gap-1.5">
@@ -3829,7 +3978,7 @@ export function App() {
                    - Direct Model Picker (Claude Fable 5.2, Opus 5.5, GPT-6.1-Sol...)
                    - Effort Picker (Low / Medium / High / Max) + Permission Mode
                =============================================================== */}
-            <div className="w-full px-4 sm:px-6 pb-5 pt-1">
+            <div className="w-full px-3 sm:px-6 pb-[max(0.85rem,env(safe-area-inset-bottom))] sm:pb-5 pt-1">
               <div className="mx-auto max-w-[680px]">
                 {/* Live Bidirectional Permission Approval Card (`PreToolUse` / `velo_request_approval` / ACP) */}
                 {activePendingApproval && (
@@ -3974,7 +4123,7 @@ export function App() {
                       modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                       activeSession.model_short
                     } anything... (/ for commands, ⌘V paste screenshot, or click mic to dictate)`}
-                    className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
+                    className="w-full resize-none bg-transparent text-[13.5px] max-md:text-[16px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                   />
 
                   {/* Composer Bottom Toolbar: Concrete Model Picker (Claude / Codex / ACP) + Effort + Permission Mode + Voice */}
@@ -5218,9 +5367,7 @@ export function App() {
               <div>
                 <div className="mb-3 flex items-center justify-between">
                   <h3 className="text-[13.5px] font-semibold text-[var(--v-fg-primary)]">
-                    {activeModal === "qr"
-                      ? "True E2EE Remote Relay Pairing (X25519 + ChaCha20)"
-                      : "Skills & Slash Commands"}
+                    {activeModal === "qr" ? "手机端扫码连接 (Velo Mobile)" : "Skills & Slash Commands"}
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
@@ -5230,66 +5377,159 @@ export function App() {
                   </button>
                 </div>
                 {activeModal === "qr" ? (
-                  <div className="space-y-3 font-mono text-[11.5px] text-[var(--v-fg-secondary)]">
-                    <div className="flex items-center justify-between rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-2 text-[11px]">
-                      <span className="flex items-center gap-1.5 text-[#34d399]">
-                        <Lock className="h-3.5 w-3.5" />
-                        <span>RFC 8439 ChaCha20-Poly1305</span>
-                      </span>
-                      <span className="text-[var(--v-fg-muted)]">
-                        Room: {pairTicket?.room_id?.slice(0, 14) || "initializing…"}
-                      </span>
-                    </div>
-                    {pairTicket?.qr_svg && (
-                      <div
-                        className="mx-auto flex h-44 w-44 items-center justify-center rounded-xl bg-white p-2"
-                        dangerouslySetInnerHTML={{ __html: pairTicket.qr_svg }}
-                      />
-                    )}
-                    {pairTicket?.daemon_pubkey_hex && (
-                      <div className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
-                        X25519 Pubkey: {pairTicket.daemon_pubkey_hex}
-                      </div>
-                    )}
-                    <div className="flex items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] p-2.5 text-[11px] text-[var(--v-fg-primary)]">
-                      <span className="flex-1 break-all">
-                        {pairTicket?.uri ||
-                          "http://127.0.0.1:6767/?mobile=1&relay=ws://127.0.0.1:6768"}
-                      </span>
+                  <div className="space-y-3 text-[12px] text-[var(--v-fg-secondary)]">
+                    {/* Mode Switcher: Same Wi-Fi LAN vs Cross-Network E2EE Relay */}
+                    <div className="grid grid-cols-2 gap-1 rounded-lg bg-[var(--v-bg-sidebar)] p-1">
                       <button
                         type="button"
-                        onClick={() =>
-                          copyText("e2ee-uri", pairTicket?.uri || "")
-                        }
-                        title="Copy E2EE Mobile Web URL"
-                        className="shrink-0 rounded-md bg-[var(--v-bg-active)] px-2 py-1 text-[10.5px] hover:bg-[var(--v-bg-hover)]"
+                        onClick={() => setPairModeTab("lan")}
+                        className={`rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors cursor-pointer ${
+                          pairModeTab === "lan"
+                            ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                            : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                        }`}
                       >
-                        {copiedKey === "e2ee-uri" ? "Copied" : "Copy"}
+                        同一 Wi-Fi 秒连（推荐）
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPairModeTab("e2ee")}
+                        className={`rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors cursor-pointer ${
+                          pairModeTab === "e2ee"
+                            ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                            : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                        }`}
+                      >
+                        跨网 E2EE 加密中继
                       </button>
                     </div>
-                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1 font-sans">
-                      <span className="text-[11px] text-[var(--v-fg-muted)]">
-                        Zero-knowledge Relay (`{pairTicket?.relay_url || "ws://127.0.0.1:6768"}`)
-                      </span>
-                      <div className="flex items-center gap-1.5">
-                        {pairTicket?.uri && (
+
+                    {pairModeTab === "lan" ? (
+                      <>
+                        <div className="flex items-center justify-between rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[11px]">
+                          <span className="flex items-center gap-1.5 text-[#34d399]">
+                            <Server className="h-3.5 w-3.5" />
+                            <span>Mac 局域网直连在线</span>
+                          </span>
+                          <span className="text-[var(--v-fg-muted)]">
+                            {pairTicket?.daemon_addr || "127.0.0.1:6767"}
+                          </span>
+                        </div>
+
+                        {(pairTicket?.lan_qr_svg || pairTicket?.qr_svg) && (
+                          <div
+                            className="mx-auto flex h-48 w-48 items-center justify-center rounded-xl bg-white p-2.5 shadow-sm"
+                            dangerouslySetInnerHTML={{
+                              __html: pairTicket.lan_qr_svg || pairTicket.qr_svg,
+                            }}
+                          />
+                        )}
+
+                        <div className="flex items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] p-2.5 font-mono text-[11.5px] text-[var(--v-fg-primary)]">
+                          <span className="flex-1 break-all">
+                            {pairTicket?.lan_uri || "http://127.0.0.1:6767/?mobile=1"}
+                          </span>
                           <button
                             type="button"
-                            onClick={() => window.open(pairTicket.uri, "_blank")}
-                            className="rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-2.5 py-1.5 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
+                            onClick={() =>
+                              copyText("lan-uri", pairTicket?.lan_uri || "")
+                            }
+                            className="shrink-0 rounded-md bg-[var(--v-bg-active)] px-2.5 py-1 font-sans text-[11px] hover:bg-[var(--v-bg-hover)] cursor-pointer"
                           >
-                            Open E2EE Tab ↗
+                            {copiedKey === "lan-uri" ? "已复制" : "复制链接"}
                           </button>
+                        </div>
+
+                        {pairTicket?.tailscale_uri && (
+                          <div className="flex items-center justify-between gap-2 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[11px]">
+                            <span className="truncate text-[var(--v-fg-secondary)]">
+                              Tailscale 异地直连: {pairTicket.tailscale_uri}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                copyText("ts-uri", pairTicket.tailscale_uri || "")
+                              }
+                              className="shrink-0 rounded bg-[var(--v-bg-active)] px-2 py-0.5 font-sans text-[10.5px] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                            >
+                              {copiedKey === "ts-uri" ? "已复制" : "复制"}
+                            </button>
+                          </div>
                         )}
+
+                        <p className="rounded-lg bg-[var(--v-bg-sidebar)] px-3 py-2 text-[11.5px] leading-relaxed text-[var(--v-fg-muted)]">
+                          手机与 Mac 连接同一 Wi-Fi 后，直接用<strong>系统相机</strong>扫上方二维码即可秒开（实时同步所有会话、流式输出、审批确认与代码 Diff）。在 iOS Safari 点<strong>「分享 → 添加到主屏幕」</strong>即可变成全屏独立 App。
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <div className="flex items-center justify-between rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[11px]">
+                          <span className="flex items-center gap-1.5 text-[#34d399]">
+                            <Lock className="h-3.5 w-3.5" />
+                            <span>X25519 + ChaCha20-Poly1305</span>
+                          </span>
+                          <span className="text-[var(--v-fg-muted)]">
+                            Room: {pairTicket?.room_id?.slice(0, 12) || "initializing…"}
+                          </span>
+                        </div>
+
+                        {pairTicket?.qr_svg && (
+                          <div
+                            className="mx-auto flex h-48 w-48 items-center justify-center rounded-xl bg-white p-2.5 shadow-sm"
+                            dangerouslySetInnerHTML={{ __html: pairTicket.qr_svg }}
+                          />
+                        )}
+
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            value={customRelayInput}
+                            onChange={(e) => setCustomRelayInput(e.target.value)}
+                            placeholder={`公网中继地址，默认 ${pairTicket?.relay_url || "ws://127.0.0.1:6768"}`}
+                            className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => fetchPairTicket(customRelayInput || undefined)}
+                            className="shrink-0 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                          >
+                            刷新中继码
+                          </button>
+                        </div>
+
+                        <div className="flex items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] p-2.5 font-mono text-[11px] text-[var(--v-fg-primary)]">
+                          <span className="flex-1 break-all">
+                            {pairTicket?.uri ||
+                              "http://127.0.0.1:6767/?mobile=1&relay=ws://127.0.0.1:6768"}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              copyText("e2ee-uri", pairTicket?.uri || "")
+                            }
+                            className="shrink-0 rounded-md bg-[var(--v-bg-active)] px-2 py-1 font-sans text-[10.5px] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                          >
+                            {copiedKey === "e2ee-uri" ? "已复制" : "复制"}
+                          </button>
+                        </div>
+                      </>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                      <span className="text-[11px] text-[var(--v-fg-muted)]">
+                        {pairModeTab === "lan"
+                          ? "零配置 · 局域网低延迟 WebSocket 直连"
+                          : `零知识加密中继 (${pairTicket?.relay_url || "ws://127.0.0.1:6768"})`}
+                      </span>
+                      <div className="flex items-center gap-1.5">
                         <button
                           onClick={() => {
                             setMobileMode(true);
                             setSidebarOpen(false);
                             setActiveModal(null);
                           }}
-                          className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1.5 text-[11.5px] font-medium text-[var(--v-btn-fg)]"
+                          className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1.5 text-[11.5px] font-medium text-[var(--v-btn-fg)] cursor-pointer"
                         >
-                          Preview Mobile UI
+                          在本机预览手机界面
                         </button>
                       </div>
                     </div>

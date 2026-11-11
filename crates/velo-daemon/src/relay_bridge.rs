@@ -32,7 +32,18 @@ pub async fn ensure_local_relay_running() {
 
 /// Spawns a background E2EE bridge connecting `velo-daemon` to `velo-relay` for `ticket`.
 pub fn spawn_daemon_e2ee_bridge(state: DaemonState, ticket: PairingTicket) {
-    let connect_base = if ticket.relay_url.contains(":6768") {
+    let daemon_host = ticket
+        .daemon_addr
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .unwrap_or("127.0.0.1");
+    let is_embedded_local = ticket.relay_url.contains(&format!(":{DEFAULT_RELAY_PORT}"))
+        && (ticket.relay_url.contains("127.0.0.1")
+            || ticket.relay_url.contains("localhost")
+            || (!daemon_host.is_empty() && ticket.relay_url.contains(daemon_host)));
+    let connect_base = if is_embedded_local {
         format!("ws://127.0.0.1:{}/room/{}", DEFAULT_RELAY_PORT, ticket.room_id)
     } else {
         format!("{}/room/{}", ticket.relay_url.trim_end_matches('/'), ticket.room_id)
@@ -105,9 +116,38 @@ pub fn spawn_daemon_e2ee_bridge(state: DaemonState, ticket: PairingTicket) {
                             let guard = state.inner.read().await;
                             let mut sessions: Vec<SessionInfo> = guard.sessions.values().cloned().collect();
                             sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                            let top_ids: Vec<Uuid> = sessions.iter().take(5).map(|s| s.id).collect();
                             if let Ok(snap) = serde_json::to_value(WsServerMessage::SessionsSnapshot { sessions }) {
                                 if let Some(frame_txt) = send_sealed(&snap, &mut out_nonce) {
                                     let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                }
+                            }
+                            for sid in top_ids {
+                                if let Some(evs) = guard.event_history.get(&sid) {
+                                    let ev_snap = json!({
+                                        "type": "events_snapshot",
+                                        "session_id": sid,
+                                        "events": evs,
+                                    });
+                                    if let Some(frame_txt) = send_sealed(&ev_snap, &mut out_nonce) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                            }
+                        }
+                        "get_events" => {
+                            if let Some(sid_s) = cmd_val.get("session_id").and_then(|v| v.as_str()) {
+                                if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                    let guard = state.inner.read().await;
+                                    let evs = guard.event_history.get(&sid).cloned().unwrap_or_default();
+                                    let ev_snap = json!({
+                                        "type": "events_snapshot",
+                                        "session_id": sid,
+                                        "events": evs,
+                                    });
+                                    if let Some(frame_txt) = send_sealed(&ev_snap, &mut out_nonce) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
                                 }
                             }
                         }
@@ -143,18 +183,30 @@ pub fn spawn_daemon_e2ee_bridge(state: DaemonState, ticket: PairingTicket) {
                                 cmd_val.get("input").and_then(|v| v.as_str()),
                             ) {
                                 if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                    let model = cmd_val
+                                        .get("model")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string);
+                                    let effort = cmd_val
+                                        .get("effort")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string);
+                                    let approval_mode = cmd_val
+                                        .get("approval_mode")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string);
                                     let _ = state
                                         .dispatch_session_input(
                                             sid,
                                             SessionInputRequest {
                                                 input: inp.to_string(),
-                                                model: None,
-                                                effort: None,
+                                                model,
+                                                effort,
                                                 provider: None,
                                                 reset_thread: false,
                                                 truncate_to_user_turn: None,
                                                 images: Vec::new(),
-                                                approval_mode: None,
+                                                approval_mode,
                                             },
                                         )
                                         .await;

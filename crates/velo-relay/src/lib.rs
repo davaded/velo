@@ -22,6 +22,9 @@ use tracing::info;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub mod qr;
+pub use qr::{encode_qr, render_qr_svg, render_qr_unicode};
+
 pub const DEFAULT_RELAY_PORT: u16 = 6768;
 
 /// Ephemeral or static X25519 ECDH keypair for zero-trust session key negotiation.
@@ -113,29 +116,14 @@ impl PairingTicket {
         }
     }
 
-    /// Renders a visual terminal QR-style matrix from the pairing URI for easy mobile pairing.
+    /// Renders a genuine ISO-18004 scannable terminal QR matrix from the mobile Web URL.
     pub fn render_terminal_qr(&self) -> String {
-        let bytes = self.pairing_uri.as_bytes();
-        let size = 15usize;
-        let mut out = String::new();
-        out.push_str("  ┌────────────────────────────────┐\n");
-        for r in 0..size {
-            out.push_str("  │ ");
-            for c in 0..size {
-                let is_finder =
-                    (r < 3 && c < 3) || (r < 3 && c >= size - 3) || (r >= size - 3 && c < 3);
-                let idx = (r * size + c) % bytes.len();
-                let bit = ((bytes[idx] as usize) ^ (r * 7 + c * 13)) & 1 == 1;
-                if is_finder || bit {
-                    out.push_str("██");
-                } else {
-                    out.push_str("  ");
-                }
-            }
-            out.push_str(" │\n");
+        let rendered = qr::render_qr_unicode(&self.mobile_web_url);
+        if !rendered.is_empty() {
+            rendered
+        } else {
+            qr::render_qr_unicode(&self.pairing_uri)
         }
-        out.push_str("  └────────────────────────────────┘");
-        out
     }
 }
 
