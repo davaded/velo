@@ -536,7 +536,7 @@ fn handle_acp_session_update(
     }
 }
 
-async fn request_daemon_approval(
+pub(crate) async fn request_daemon_approval(
     daemon_http_base: Option<&str>,
     session_id: Uuid,
     tool_name: &str,

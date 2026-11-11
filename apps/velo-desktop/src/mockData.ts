@@ -272,6 +272,7 @@ export interface AgentEvent {
   tool_output?: string;
   tool_is_error?: boolean;
   duration_ms?: number;
+  completed_at?: string;
 }
 
 export interface DiffHunkLine {
@@ -312,7 +313,7 @@ export const DEMO_SESSIONS: VeloSession[] = [
     agent_kind: "claude",
     model: "claude-fable-5-2",
     model_short: "Claude Fable 5.2",
-    effort: "high",
+    effort: "medium",
     status: "idle",
     branch_name: "main",
     worktree_path: "/Users/daiyudai/code/velo",

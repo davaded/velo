@@ -105,12 +105,8 @@ export const PaseoSyncedLoader: React.FC<{
  *    Copy + Retry + "Worked for Xs" (swaps to timestamp on hover).
  * ============================================================================
  */
-export function formatPaseoDuration(ms: number, subSecondUnder10s = false): string {
-  const safeMs = Math.max(0, ms);
-  if (subSecondUnder10s && safeMs < 10_000) {
-    return `${(safeMs / 1000).toFixed(1)}s`;
-  }
-  const totalSeconds = Math.max(0, Math.round(safeMs / 1000));
+export function formatPaseoDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
   if (totalSeconds < 60) {
     return `${totalSeconds}s`;
   }
@@ -129,78 +125,49 @@ export const PaseoLiveElapsed: React.FC<{
   useEffect(() => {
     const update = () => setElapsedMs(Math.max(0, Date.now() - startedAtMs));
     update();
-    // Smooth 100ms sub-second ticks during the first 10s for snappy feedback, then 1s ticks
-    const intervalMs = Date.now() - startedAtMs < 10_000 ? 100 : 1000;
-    const timer = setInterval(update, intervalMs);
+    const timer = setInterval(update, 1000);
     return () => clearInterval(timer);
-  }, [startedAtMs, elapsedMs >= 10_000]);
+  }, [startedAtMs]);
 
   return (
     <span
-      className="font-mono-code text-[12px] tabular-nums select-none"
-      style={{ color: "var(--fg-extra-muted)" }}
+      className="text-[13px] tabular-nums select-none"
+      style={{ color: "var(--fg-muted)" }}
       data-testid="turn-working-elapsed"
     >
-      {formatPaseoDuration(elapsedMs, true)}
+      {formatPaseoDuration(elapsedMs)}
     </span>
   );
 };
 
 export interface PaseoTurnTelemetry {
-  ttftMs?: number;
-  completedToolsCount?: number;
-  runningToolsCount?: number;
-  toolBreakdownSummary?: string;
-  tokensUsed?: number;
-  costUsd?: number;
   insertions?: number;
   deletions?: number;
 }
 
 export const PaseoTurnFooter: React.FC<{
   isRunning: boolean;
-  activePhaseLabel?: string;
-  isInlineBlockAnimating?: boolean;
-  isWaitingUser?: boolean;
+  waitingLabel?: string;
   startedAtMs?: number;
   durationMs?: number;
   completedAtLabel?: string;
   assistantContent?: string;
   telemetry?: PaseoTurnTelemetry;
-  onStop?: () => void;
   onOpenDiff?: () => void;
   onRetry?: () => void;
 }> = ({
   isRunning,
-  activePhaseLabel,
-  isInlineBlockAnimating = false,
-  isWaitingUser = false,
+  waitingLabel,
   startedAtMs,
   durationMs,
   completedAtLabel,
   assistantContent,
   telemetry,
-  onStop,
   onOpenDiff,
   onRetry,
 }) => {
   const [copied, setCopied] = useState(false);
-  const [showBreakdown, setShowBreakdown] = useState(false);
-  const [phaseGapSec, setPhaseGapSec] = useState(0);
-
-  // Track how long the current silent gap phase has been waiting so we can offer calm >8s reassurance
-  useEffect(() => {
-    if (!isRunning || isInlineBlockAnimating || isWaitingUser) {
-      setPhaseGapSec(0);
-      return;
-    }
-    const phaseStart = Date.now();
-    setPhaseGapSec(0);
-    const id = setInterval(() => {
-      setPhaseGapSec(Math.floor((Date.now() - phaseStart) / 1000));
-    }, 1000);
-    return () => clearInterval(id);
-  }, [isRunning, isInlineBlockAnimating, isWaitingUser, activePhaseLabel]);
+  const [hoveredTiming, setHoveredTiming] = useState(false);
 
   const handleCopy = async () => {
     if (!assistantContent) return;
@@ -214,121 +181,55 @@ export const PaseoTurnFooter: React.FC<{
   };
 
   if (isRunning) {
-    // Smart De-duplication:
-    // When a Thinking card, Tool card, or streaming Markdown block right above is ALREADY animating,
-    // step back into Calm Telemetry Mode so we never show redundant double-shimmer lines!
-    const showGapPhase = !isInlineBlockAnimating && Boolean(activePhaseLabel);
-    const reassuranceHint =
-      showGapPhase && !isWaitingUser
-        ? phaseGapSec >= 20
-          ? "大上下文推理中，进程在线"
-          : phaseGapSec >= 8
-          ? "深度推理中，进程在线"
-          : null
-        : null;
-
-    const runningTools = telemetry?.runningToolsCount || 0;
-    const doneTools = telemetry?.completedToolsCount || 0;
-
+    const isWaiting = Boolean(waitingLabel);
     return (
       <div
-        className="group/footer mt-2 flex min-h-[26px] flex-wrap items-center gap-2"
+        className="mt-2 flex min-h-[24px] items-center gap-2.5"
         data-testid="turn-footer"
       >
         <PaseoSyncedLoader
           size={14}
-          color={isWaitingUser ? "var(--status-warning)" : "var(--fg)"}
+          color={isWaiting ? "var(--status-warning)" : "var(--fg)"}
         />
-
-        {showGapPhase && activePhaseLabel && (
-          <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
-            <span
-              key={activePhaseLabel}
-              className={`velo-phase-morph max-w-[420px] truncate text-[12.5px] font-normal select-none ${
-                isWaitingUser ? "" : "beautiful-shimmer-text"
-              }`}
-              style={isWaitingUser ? { color: "var(--status-warning)" } : undefined}
-            >
-              {activePhaseLabel}
-            </span>
-            {reassuranceHint && (
-              <span
-                className="velo-phase-morph hidden sm:inline text-[11.5px] select-none"
-                style={{ color: "var(--fg-extra-muted)" }}
-              >
-                ({reassuranceHint})
-              </span>
-            )}
-            <span
-              className="text-[12px] select-none"
-              style={{ color: "var(--fg-extra-muted)" }}
-            >
-              ·
-            </span>
-          </div>
-        )}
-
-        <PaseoLiveElapsed startedAtMs={startedAtMs || Date.now()} />
-
-        {/* Live Micro-Telemetry Badges (Calm, non-distracting tabular counters) */}
-        {(runningTools > 0 || doneTools > 0) && (
+        {waitingLabel && (
           <span
-            className="font-mono-code text-[11.5px] tabular-nums select-none"
-            style={{ color: "var(--fg-extra-muted)" }}
+            className="text-[13px] select-none"
+            style={{ color: "var(--status-warning)" }}
           >
-            ·{" "}
-            {runningTools > 0
-              ? `${runningTools} 执行中${doneTools > 0 ? ` / ${doneTools} 完成` : ""}`
-              : `${doneTools} 工具完成`}
+            {waitingLabel}
           </span>
         )}
-
-        {/* Inline Quick Stop Action (⌘.) right where the user's eyes already are */}
-        {onStop && (
-          <button
-            type="button"
-            onClick={onStop}
-            title="停止当前回合 (⌘.)"
-            className="ml-0.5 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
-            style={{ color: "var(--fg-extra-muted)" }}
-          >
-            <span
-              className="inline-block h-1.5 w-1.5 rounded-[1.5px]"
-              style={{ backgroundColor: "currentColor" }}
-            />
-            <span>停止</span>
-            <span className="font-mono-code text-[10px] opacity-65">⌘.</span>
-          </button>
-        )}
+        <PaseoLiveElapsed startedAtMs={startedAtMs || Date.now()} />
       </div>
     );
   }
 
   const durationText =
     durationMs !== undefined && durationMs > 0
-      ? `Worked for ${formatPaseoDuration(durationMs, durationMs < 10_000)}`
+      ? `Worked for ${formatPaseoDuration(durationMs)}`
       : completedAtLabel || "";
 
-  const doneTools = telemetry?.completedToolsCount || 0;
+  const canSwapTimestamp = Boolean(
+    durationMs !== undefined && durationMs > 0 && completedAtLabel
+  );
+
   const ins = telemetry?.insertions || 0;
   const del = telemetry?.deletions || 0;
-  const hasBreakdown = Boolean(
-    (durationMs !== undefined && durationMs > 0) ||
-      telemetry?.ttftMs ||
-      doneTools > 0 ||
-      (telemetry?.tokensUsed && telemetry.tokensUsed > 0)
-  );
+
+  if (!assistantContent && !onRetry && !durationText) {
+    return null;
+  }
 
   return (
     <div
-      className="relative mt-1.5 flex min-h-[24px] flex-wrap items-center gap-1.5"
+      className="mt-1 flex min-h-[24px] items-center gap-1.5"
       data-testid="turn-footer"
     >
       {assistantContent && (
         <button
           type="button"
           onClick={handleCopy}
-          title={copied ? "已复制" : "复制回答"}
+          title={copied ? "Copied" : "Copy response"}
           className="-ml-1 flex h-6 w-6 items-center justify-center rounded-md transition-colors hover:bg-[var(--surface-2)] cursor-pointer"
           style={{ color: copied ? "var(--status-success)" : "var(--fg-muted)" }}
         >
@@ -339,109 +240,30 @@ export const PaseoTurnFooter: React.FC<{
         <button
           type="button"
           onClick={onRetry}
-          title="重新生成本轮回答"
+          title="Retry turn"
           className="flex h-6 w-6 items-center justify-center rounded-md transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
-          style={{ color: "var(--fg-muted)" }}
         >
-          <RotateCcw className="h-3.5 w-3.5" />
+          <RotateCcw className="h-3.5 w-3.5" style={{ color: "var(--fg-muted)" }} />
         </button>
       )}
 
       {durationText && (
-        <div
-          className="relative inline-flex items-center"
-          onMouseEnter={() => hasBreakdown && setShowBreakdown(true)}
-          onMouseLeave={() => setShowBreakdown(false)}
+        <span
+          onMouseEnter={() => canSwapTimestamp && setHoveredTiming(true)}
+          onMouseLeave={() => setHoveredTiming(false)}
+          className="ml-0.5 text-[12.5px] tabular-nums select-none transition-colors"
+          style={{ color: "var(--fg-muted)" }}
         >
-          <button
-            type="button"
-            onClick={() => hasBreakdown && setShowBreakdown((v) => !v)}
-            className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[12.5px] tabular-nums select-none transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
-            style={{ color: "var(--fg-muted)" }}
-          >
-            <span>{durationText}</span>
-            {doneTools > 0 && (
-              <span style={{ color: "var(--fg-extra-muted)" }}>
-                · {doneTools} {doneTools === 1 ? "tool" : "tools"}
-              </span>
-            )}
-          </button>
-
-          {/* Hover / Click Turn Execution Breakdown Popover */}
-          {showBreakdown && hasBreakdown && (
-            <div
-              className="velo-phase-morph absolute bottom-7 left-0 z-30 min-w-[230px] rounded-xl border p-2.5 text-[11.5px] shadow-xl"
-              style={{
-                backgroundColor: "var(--surface-1)",
-                borderColor: "var(--border-accent)",
-                color: "var(--fg)",
-              }}
-            >
-              <div
-                className="mb-1.5 flex items-center justify-between border-b pb-1 font-medium"
-                style={{ borderColor: "var(--border-subtle)" }}
-              >
-                <span>本轮执行明细</span>
-                {completedAtLabel && (
-                  <span
-                    className="font-mono-code text-[10.5px]"
-                    style={{ color: "var(--fg-extra-muted)" }}
-                  >
-                    {completedAtLabel}
-                  </span>
-                )}
-              </div>
-              <div className="space-y-1">
-                {durationMs !== undefined && durationMs > 0 && (
-                  <div className="flex items-center justify-between gap-4">
-                    <span style={{ color: "var(--fg-muted)" }}>总耗时</span>
-                    <span className="font-mono-code tabular-nums">
-                      {formatPaseoDuration(durationMs, true)}
-                    </span>
-                  </div>
-                )}
-                {telemetry?.ttftMs !== undefined && telemetry.ttftMs > 0 && (
-                  <div className="flex items-center justify-between gap-4">
-                    <span style={{ color: "var(--fg-muted)" }}>首包响应 (TTFT)</span>
-                    <span className="font-mono-code tabular-nums">
-                      {formatPaseoDuration(telemetry.ttftMs, true)}
-                    </span>
-                  </div>
-                )}
-                {telemetry?.toolBreakdownSummary && (
-                  <div className="flex items-center justify-between gap-4">
-                    <span style={{ color: "var(--fg-muted)" }}>工具调用</span>
-                    <span className="font-mono-code truncate max-w-[140px]">
-                      {telemetry.toolBreakdownSummary}
-                    </span>
-                  </div>
-                )}
-                {telemetry?.tokensUsed !== undefined && telemetry.tokensUsed > 0 && (
-                  <div className="flex items-center justify-between gap-4">
-                    <span style={{ color: "var(--fg-muted)" }}>上下文 Token</span>
-                    <span className="font-mono-code tabular-nums">
-                      {telemetry.tokensUsed >= 1000
-                        ? `${(telemetry.tokensUsed / 1000).toFixed(1)}k`
-                        : telemetry.tokensUsed}
-                      {telemetry.costUsd && telemetry.costUsd > 0
-                        ? ` ($${telemetry.costUsd.toFixed(3)})`
-                        : ""}
-                    </span>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
+          {hoveredTiming && canSwapTimestamp ? completedAtLabel : durationText}
+        </span>
       )}
 
-      {/* Direct Diff Stat Jump Pill on Completed Turn when files were modified */}
       {(ins > 0 || del > 0) && onOpenDiff && (
         <button
           type="button"
           onClick={onOpenDiff}
-          title="查看当前隔离工作区代码改动"
-          className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono-code text-[11.5px] tabular-nums transition-colors hover:bg-[var(--surface-2)] cursor-pointer"
+          title="Review worktree changes"
+          className="ml-1 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono-code text-[11.5px] tabular-nums transition-colors hover:bg-[var(--surface-2)] cursor-pointer"
         >
           <span style={{ color: "var(--status-success)" }}>+{ins}</span>
           <span style={{ color: "var(--status-danger)" }}>−{del}</span>
@@ -723,8 +545,7 @@ export const BeautifulThinkingBlock: React.FC<{
   const scrollBoxRef = useRef<HTMLDivElement | null>(null);
 
   const hasDetail = cleanedLines.length > 0;
-  const effectiveExpanded =
-    userExpanded !== null ? userExpanded : isStreaming && cleanedLines.length > 1;
+  const effectiveExpanded = userExpanded ?? defaultExpanded;
 
   useEffect(() => {
     if (isStreaming && effectiveExpanded && scrollBoxRef.current) {
@@ -736,8 +557,7 @@ export const BeautifulThinkingBlock: React.FC<{
     return null;
   }
 
-  const displaySecondary =
-    summary || (isStreaming ? "分析工作区上下文与执行路径…" : undefined);
+  const displaySecondary = summary || undefined;
 
   return (
     <PaseoExpandableBadge

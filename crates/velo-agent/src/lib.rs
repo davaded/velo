@@ -15,6 +15,7 @@ use uuid::Uuid;
 use velo_protocol::{AgentEvent, AgentProvider, SessionStatus};
 
 pub mod acp;
+pub mod codex_app_server;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalRuntimeInfo {
@@ -367,6 +368,20 @@ impl AgentSpawner {
         }
         if use_pty {
             Self::spawn_pty_agent(session_id, provider, prompt, worktree_path, event_tx).await
+        } else if matches!(provider, AgentProvider::Codex) {
+            codex_app_server::spawn_codex_app_server(
+                session_id,
+                prompt,
+                worktree_path,
+                model,
+                effort,
+                resume_session_id,
+                images,
+                approval_mode,
+                daemon_http_base,
+                event_tx,
+            )
+            .await
         } else {
             Self::spawn_structured_agent(
                 session_id,

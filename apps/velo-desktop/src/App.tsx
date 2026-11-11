@@ -387,6 +387,7 @@ export function App() {
   // Full-Color xterm.js PTY Stream Packet & Turn Timing State
   const [latestTerminalChunk, setLatestTerminalChunk] = useState<TerminalChunkPacket | null>(null);
   const termSeqRef = useRef<number>(0);
+  const turnStartMsRef = useRef<Record<string, number>>({});
   const [turnTimingBySession, setTurnTimingBySession] = useState<
     Record<
       string,
@@ -604,10 +605,13 @@ export function App() {
       .then((rawList: Array<Record<string, unknown>>) => {
         if (!Array.isArray(rawList) || rawList.length === 0) return;
         const reconstructed: AgentEvent[] = [];
+        let activeHistUserIdx = -1;
+        let activeHistStartMs = 0;
         for (let i = 0; i < rawList.length; i++) {
           const ev = rawList[i];
           const evType = String(ev.type ?? "");
           const tsRaw = typeof ev.timestamp === "string" ? new Date(ev.timestamp) : new Date();
+          const tsMs = Number.isNaN(tsRaw.getTime()) ? 0 : tsRaw.getTime();
           const ts = Number.isNaN(tsRaw.getTime())
             ? new Date().toLocaleTimeString([], { hour12: false })
             : tsRaw.toLocaleTimeString([], { hour12: false });
@@ -624,6 +628,26 @@ export function App() {
                 content: text,
                 images: imgs.length > 0 ? imgs : undefined,
               });
+              activeHistUserIdx = reconstructed.length - 1;
+              activeHistStartMs = tsMs;
+            }
+          } else if (evType === "status_changed") {
+            const st = String(ev.status ?? "");
+            if (st === "running" && activeHistStartMs === 0 && tsMs > 0) {
+              activeHistStartMs = tsMs;
+            } else if (
+              (st === "completed" || st === "failed" || st === "stopped") &&
+              activeHistUserIdx >= 0
+            ) {
+              const dur =
+                activeHistStartMs > 0 && tsMs >= activeHistStartMs
+                  ? Math.max(500, tsMs - activeHistStartMs)
+                  : undefined;
+              reconstructed[activeHistUserIdx] = {
+                ...reconstructed[activeHistUserIdx],
+                duration_ms: dur,
+                completed_at: ts,
+              };
             }
           } else if (evType === "thinking_delta") {
             const text = String(ev.text ?? "").trim();
@@ -953,12 +977,15 @@ export function App() {
         if (st === "running") {
           const pidMatch = statusMsg.match(/PID\s+(?:Some\()?(\d+)/i);
           const parsedPid = pidMatch ? Number(pidMatch[1]) : undefined;
+          if (!turnStartMsRef.current[sid]) {
+            turnStartMsRef.current[sid] = Date.now();
+          }
           setTurnTimingBySession((prev) => {
             const cur = prev[sid];
             return {
               ...prev,
               [sid]: {
-                startedAtMs: cur?.startedAtMs || Date.now(),
+                startedAtMs: cur?.startedAtMs || turnStartMsRef.current[sid] || Date.now(),
                 ttftMs: cur?.ttftMs,
                 bootStage: cur?.bootStage === "bound" ? "bound" : "spawned",
                 agentPid: parsedPid ?? cur?.agentPid,
@@ -967,28 +994,48 @@ export function App() {
             };
           });
         } else if (st === "completed" || st === "failed" || st === "stopped") {
+          const startedAtMs = turnStartMsRef.current[sid] || Date.now() - 1000;
+          delete turnStartMsRef.current[sid];
+          const computedDur = Math.max(500, Date.now() - startedAtMs);
           setTurnTimingBySession((prev) => {
             const cur = prev[sid];
-            const startedAtMs = cur?.startedAtMs || Date.now() - 1000;
+            const sMs = cur?.startedAtMs || startedAtMs;
             return {
               ...prev,
               [sid]: {
                 ...cur,
-                startedAtMs,
-                durationMs: Math.max(300, Date.now() - startedAtMs),
+                startedAtMs: sMs,
+                durationMs: Math.max(500, Date.now() - sMs),
                 completedAtLabel: now,
               },
             };
           });
-          // Finalize any active streaming indicators cleanly
+          // Finalize active streaming chunks & stamp per-turn duration onto the turn's user message
           setEventsBySession((prev) => {
             const list = prev[sid];
-            if (!list || !list.some((item) => item.is_streaming_chunk)) return prev;
+            if (!list || list.length === 0) return prev;
+            let lastUserIdx = -1;
+            for (let i = list.length - 1; i >= 0; i--) {
+              if (list[i].kind === "user") {
+                lastUserIdx = i;
+                break;
+              }
+            }
             return {
               ...prev,
-              [sid]: list.map((item) =>
-                item.is_streaming_chunk ? { ...item, is_streaming_chunk: false } : item
-              ),
+              [sid]: list.map((item, idx) => {
+                if (idx === lastUserIdx) {
+                  return {
+                    ...item,
+                    duration_ms: computedDur,
+                    completed_at: now,
+                  };
+                }
+                if (item.is_streaming_chunk) {
+                  return { ...item, is_streaming_chunk: false };
+                }
+                return item;
+              }),
             };
           });
         }
@@ -1705,6 +1752,7 @@ export function App() {
     };
 
     const startedAtMs = Date.now();
+    turnStartMsRef.current[activeSession.id] = startedAtMs;
     setTurnTimingBySession((prev) => ({
       ...prev,
       [activeSession.id]: {
@@ -1968,6 +2016,9 @@ export function App() {
         realSess.effort = activeSession.effort || "medium";
 
         const oldId = activeSession.id;
+        turnStartMsRef.current[realSess.id] =
+          turnStartMsRef.current[oldId] || startedAtMs;
+        delete turnStartMsRef.current[oldId];
         setSessions((prev) => prev.map((s) => (s.id === oldId ? realSess : s)));
         setTurnTimingBySession((prev) => {
           const oldTiming = prev[oldId] || { startedAtMs };
@@ -3409,417 +3460,346 @@ export function App() {
             >
               <div className="mx-auto flex max-w-[680px] flex-col gap-1.5">
                 {activeEvents.length === 0 && (
-                  <div className="my-12 flex flex-col items-start gap-3 rounded-2xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] p-5">
-                    <div className="flex w-full items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 text-[13.5px] font-medium text-[var(--v-fg-primary)]">
-                        <GitBranch className="h-4 w-4 text-[var(--v-fg-muted)]" />
-                        <span>{activeSession.title}</span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setTargetRepoIdForNewWt(activeRepo.id);
-                          setNewSetupCommand(repoHooks[activeRepo.path] || "");
-                          setActiveModal("new-worktree");
-                        }}
-                        className="rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-hover)] px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
-                      >
-                        自定义分支 / Committee 竞速 / TDD 循环…
-                      </button>
-                    </div>
-                    <p className="text-[12.5px] leading-relaxed text-[var(--v-fg-muted)]">
-                      当前会话绑定于隔离工作区{" "}
-                      <span className="font-mono text-[var(--v-fg-body)]">
-                        {activeSession.branch_name}
-                      </span>{" "}
-                      (
-                      <span className="font-mono text-[var(--v-fg-secondary)]">
-                        {activeSession.worktree_path}
+                  <div className="my-20 flex flex-col items-center justify-center gap-3 text-center select-none">
+                    <div className="inline-flex items-center gap-2 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3 py-1 text-[12px] text-[var(--v-fg-secondary)]">
+                      <GitBranch className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                      <span className="font-medium text-[var(--v-fg-primary)]">
+                        {activeRepo.name}
                       </span>
-                      )。在下方直接输入你的任务并回车，
-                      <span className="font-medium text-[var(--v-fg-body)]">
-                        {modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-                          activeSession.model_short}
-                      </span>{" "}
-                      将实时展示思考轨迹、工具调用与流式回答。
-                    </p>
+                      <span className="text-[var(--v-fg-faint)]">/</span>
+                      <span className="font-mono text-[11.5px]">{activeSession.branch_name}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTargetRepoIdForNewWt(activeRepo.id);
+                        setNewSetupCommand(repoHooks[activeRepo.path] || "");
+                        setActiveModal("new-worktree");
+                      }}
+                      className="text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-primary)] cursor-pointer"
+                    >
+                      Configure isolated branch · Committee race · TDD loop →
+                    </button>
                   </div>
                 )}
 
                 {(() => {
-                  let lastUserIdx = -1;
-                  for (let i = activeEvents.length - 1; i >= 0; i--) {
-                    if (activeEvents[i].kind === "user") {
-                      lastUserIdx = i;
-                      break;
-                    }
+                  // Group flat chronological events into clean Paseo Conversation Turns
+                  interface ConversationTurn {
+                    key: string;
+                    userEv: AgentEvent | null;
+                    items: AgentEvent[];
                   }
-                  const lastUserEv = lastUserIdx >= 0 ? activeEvents[lastUserIdx] : null;
-                  const turnSlice =
-                    lastUserIdx >= 0 ? activeEvents.slice(lastUserIdx + 1) : activeEvents;
-                  const lastAssistantAfterUser = [...turnSlice]
-                    .reverse()
-                    .find((e) => e.kind === "assistant");
-                  const activeTurnTiming = turnTimingBySession[activeSession.id];
-                  const lastEvent = activeEvents[activeEvents.length - 1];
-
-                  const activeModelLabel =
-                    modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-                    activeSession.model_short ||
-                    "Agent";
-
-                  const turnTools = turnSlice.filter((e) => e.kind === "tool_call");
-                  const runningTools = turnTools.filter(
-                    (e) => e.tool_output === undefined && e.tool_input !== undefined
-                  );
-                  const completedTools = turnTools.filter(
-                    (e) => e.tool_output !== undefined || e.tool_input === undefined
-                  );
-                  const toolCounts = new Map<string, number>();
-                  for (const t of completedTools) {
-                    const shortName = (t.tool_name || "Tool")
-                      .replace(/^mcp__[^_]+__/, "")
-                      .slice(0, 16);
-                    toolCounts.set(shortName, (toolCounts.get(shortName) || 0) + 1);
-                  }
-                  const toolBreakdownSummary =
-                    toolCounts.size > 0
-                      ? Array.from(toolCounts.entries())
-                          .slice(0, 3)
-                          .map(([name, count]) => `${name} ×${count}`)
-                          .join(", ")
-                      : undefined;
-
-                  const isWaitingUser = Boolean(
-                    activePendingApproval ||
-                      activePendingQuestion ||
-                      activeSession.status === "waiting_approval"
-                  );
-
-                  const isTrailingThinkingStreaming =
-                    lastEvent?.kind === "thinking" && Boolean(lastEvent.is_streaming_chunk);
-                  const isTrailingToolRunning =
-                    lastEvent?.kind === "tool_call" && runningTools.length > 0;
-                  const isTrailingAssistantStreaming =
-                    lastEvent?.kind === "assistant" && Boolean(lastEvent.is_streaming_chunk);
-
-                  const isInlineBlockAnimating =
-                    !isWaitingUser &&
-                    activeSession.status === "running" &&
-                    (isTrailingThinkingStreaming ||
-                      isTrailingToolRunning ||
-                      isTrailingAssistantStreaming);
-
-                  const bootStage = activeTurnTiming?.bootStage;
-                  const agentPid = activeTurnTiming?.agentPid;
-                  const providerThreadShort = activeTurnTiming?.providerThreadShort;
-
-                  let activePhaseLabel: string;
-                  if (activePendingApproval) {
-                    activePhaseLabel = `等待你的权限确认 (${activePendingApproval.toolName || "Tool"})…`;
-                  } else if (activePendingQuestion) {
-                    activePhaseLabel = "等待你回答澄清问题…";
-                  } else if (turnSlice.length === 0) {
-                    if (bootStage === "bound") {
-                      activePhaseLabel = `已建立模型会话${providerThreadShort ? ` #${providerThreadShort}` : ""} · 等待 ${activeModelLabel} 首包推理…`;
-                    } else if (bootStage === "spawned") {
-                      activePhaseLabel = `已拉起 ${activeModelLabel} 进程${agentPid ? ` (PID ${agentPid})` : ""} · 握手 MCP 工具链…`;
+                  const turns: ConversationTurn[] = [];
+                  for (const ev of activeEvents) {
+                    if (ev.kind === "user") {
+                      turns.push({ key: ev.id, userEv: ev, items: [] });
+                    } else if (turns.length === 0) {
+                      turns.push({ key: `turn-init-${ev.id}`, userEv: null, items: [ev] });
                     } else {
-                      activePhaseLabel = `准备隔离工作区 (${activeSession.branch_name}) · 连接 ${activeModelLabel}…`;
+                      turns[turns.length - 1].items.push(ev);
                     }
-                  } else if (completedTools.length > 0) {
-                    activePhaseLabel = `已完成 ${completedTools.length} 项工具执行 · ${activeModelLabel} 正在整合结果生成回复…`;
-                  } else {
-                    activePhaseLabel = `已完成思考规划 · ${activeModelLabel} 正在生成下一步响应…`;
                   }
 
-                  const turnTelemetry: PaseoTurnTelemetry = {
-                    ttftMs: activeTurnTiming?.ttftMs,
-                    completedToolsCount: completedTools.length,
-                    runningToolsCount: runningTools.length,
-                    toolBreakdownSummary,
-                    tokensUsed: activeSession.tokens_used,
-                    costUsd: activeSession.cost_usd,
-                    insertions: activeSession.insertions,
-                    deletions: activeSession.deletions,
-                  };
+                  const activeTurnTiming = turnTimingBySession[activeSession.id];
+                  const isSessionRunning =
+                    activeSession.status === "running" ||
+                    activeSession.status === "waiting_approval";
+
+                  const waitingLabel = activePendingApproval
+                    ? `Waiting for approval (${activePendingApproval.toolName || "Tool"})`
+                    : activePendingQuestion
+                    ? "Waiting for your answer"
+                    : undefined;
 
                   return (
                     <>
-                      {activeEvents.map((ev, idx) => {
-                        const isLastEvent = idx === activeEvents.length - 1;
+                      {turns.map((turn, turnIdx) => {
+                        const isLatestTurn = turnIdx === turns.length - 1;
+                        const isTurnRunning = isLatestTurn && isSessionRunning;
+                        const lastTurnItem = turn.items[turn.items.length - 1];
+                        const lastTurnAssistant = [...turn.items]
+                          .reverse()
+                          .find((e) => e.kind === "assistant");
 
-                        // 1. User Message: Authentic Paseo UserMessage (asymmetric surface3 bubble + hover trailingRow with Timestamp, Rewind, Edit, Copy)
-                        if (ev.kind === "user") {
-                          const isEditing = editingEventId === ev.id;
-
-                          if (isEditing) {
-                            return (
-                              <div key={ev.id} className="mt-3 mb-2 flex justify-end">
-                                <div className="w-full max-w-[86%] rounded-2xl rounded-tr-[4px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-3.5 shadow-lg">
-                                  <textarea
-                                    rows={3}
-                                    autoFocus
-                                    value={editingText}
-                                    onChange={(e) => setEditingText(e.target.value)}
-                                    onKeyDown={(e) => {
-                                      if (e.key === "Enter" && !e.shiftKey) {
-                                        e.preventDefault();
-                                        handleSaveAndResendEdit(ev);
-                                      } else if (e.key === "Escape") {
-                                        setEditingEventId(null);
-                                        setEditingText("");
-                                      }
-                                    }}
-                                    className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] focus:outline-none"
-                                  />
-                                  <div className="mt-2 flex items-center justify-between border-t border-[var(--v-border-subtle)] pt-2">
-                                    <span className="text-[11px] text-[var(--v-fg-muted)]">
-                                      Enter 重新发送 · Esc 取消
-                                    </span>
-                                    <div className="flex items-center gap-2">
-                                      <button
-                                        onClick={() => {
-                                          setEditingEventId(null);
-                                          setEditingText("");
-                                        }}
-                                        className="rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                                      >
-                                        取消
-                                      </button>
-                                      <button
-                                        onClick={() => handleSaveAndResendEdit(ev)}
-                                        disabled={!editingText.trim()}
-                                        className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] transition-opacity hover:opacity-90 disabled:opacity-40"
-                                      >
-                                        重新发送
-                                      </button>
-                                    </div>
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          }
-
-                          return (
-                            <div
-                              key={ev.id}
-                              data-testid="user-message"
-                              className="group mt-3 mb-1 flex flex-col items-end"
-                            >
-                              <div
-                                onClick={() => {
-                                  if (activeSession.status !== "running") {
-                                    handleStartEditMessage(ev);
-                                  }
-                                }}
-                                title={
-                                  activeSession.status !== "running"
-                                    ? "点击可编辑并重新发送"
-                                    : undefined
-                                }
-                                className={`max-w-[82%] whitespace-pre-wrap rounded-2xl rounded-tr-[4px] bg-[var(--v-bg-bubble)] px-4 py-3 text-[13.5px] leading-[1.45] text-[var(--v-fg-primary)] transition-colors ${
-                                  activeSession.status !== "running"
-                                    ? "cursor-pointer hover:brightness-105"
-                                    : ""
-                                }`}
-                              >
-                                {ev.images && ev.images.length > 0 && (
-                                  <div className="mb-2 flex flex-wrap gap-2">
-                                    {ev.images.map((imgRef, imgIdx) => (
-                                      <img
-                                        key={`${imgRef}-${imgIdx}`}
-                                        src={resolveAttachmentUrl(imgRef)}
-                                        alt="Attached screenshot"
-                                        className="max-h-[180px] max-w-[260px] rounded-xl border border-[var(--v-border-subtle)] object-cover"
-                                      />
-                                    ))}
-                                  </div>
-                                )}
-                                {ev.content}
-                              </div>
-                              {/* Paseo Trailing Row: Timestamp + Rewind (Undo2) + Inline Edit + Copy */}
-                              <div
-                                data-testid="user-message-trailing-row"
-                                className="mt-1.5 flex h-6 items-center justify-end gap-1.5 text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100"
-                              >
-                                <span className="mr-0.5 text-[12.5px] tabular-nums select-none">
-                                  {ev.timestamp}
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={() => handleRewindUserMessage(ev)}
-                                  title="回退到此消息并恢复到输入框 (Rewind conversation)"
-                                  className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
-                                >
-                                  <Undo2 className="h-3.5 w-3.5" />
-                                </button>
-                                {activeSession.status !== "running" && (
-                                  <button
-                                    type="button"
-                                    onClick={() => handleStartEditMessage(ev)}
-                                    title="行内编辑并重发"
-                                    className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
-                                  >
-                                    <SquarePen className="h-3.5 w-3.5" />
-                                  </button>
-                                )}
-                                <button
-                                  type="button"
-                                  onClick={() => copyText(ev.id, ev.content)}
-                                  title="复制消息"
-                                  className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
-                                >
-                                  {copiedKey === ev.id ? (
-                                    <Check className="h-3.5 w-3.5 text-[#34d399]" />
-                                  ) : (
-                                    <Copy className="h-3.5 w-3.5" />
-                                  )}
-                                </button>
-                              </div>
-                            </div>
-                          );
-                        }
-
-                        // 2. Thinking Trace: Paseo ExpandableBadge (Brain -> ChevronRight on hover + clean step summary)
-                        if (ev.kind === "thinking") {
-                          const isStreamingThinking = Boolean(
-                            ev.is_streaming_chunk &&
-                              activeSession.status === "running" &&
-                              isLastEvent
-                          );
-                          return (
-                            <BeautifulThinkingBlock
-                              key={ev.id}
-                              text={ev.content}
-                              isStreaming={isStreamingThinking}
-                              defaultExpanded={false}
-                            />
-                          );
-                        }
-
-                        // 3. Tool Call / Consecutive Tool Call Group: Paseo ExpandableBadge + OverviewToolCallGroupView
-                        if (ev.kind === "tool_call") {
-                          if (idx > 0 && activeEvents[idx - 1].kind === "tool_call") {
-                            return null;
-                          }
-                          let endIdx = idx;
-                          while (
-                            endIdx + 1 < activeEvents.length &&
-                            activeEvents[endIdx + 1].kind === "tool_call"
-                          ) {
-                            endIdx++;
-                          }
-                          if (endIdx > idx) {
-                            const groupItems: PaseoToolGroupItem[] = activeEvents
-                              .slice(idx, endIdx + 1)
-                              .map((tev) => ({
-                                id: tev.id,
-                                toolName: tev.tool_name || "Tool",
-                                input:
-                                  tev.tool_input ??
-                                  (tev.tool_args ? { target: tev.tool_args } : tev.content),
-                                output:
-                                  tev.tool_output ??
-                                  (tev.tool_input === undefined ? tev.content : undefined),
-                                isError: tev.tool_is_error,
-                                fileArg: tev.tool_args,
-                              }));
-                            return (
-                              <PaseoToolCallGroup
-                                key={ev.id}
-                                items={groupItems}
-                                onOpenDiffForFile={openDiffForFile}
-                              />
-                            );
-                          }
-
-                          const toolInput =
-                            ev.tool_input ??
-                            (ev.tool_args ? { target: ev.tool_args } : ev.content);
-                          const toolOutput =
-                            ev.tool_output ??
-                            (ev.tool_input === undefined ? ev.content : undefined);
-                          return (
-                            <BeautifulToolCallCard
-                              key={ev.id}
-                              toolName={ev.tool_name || "Tool"}
-                              input={toolInput}
-                              output={toolOutput}
-                              isError={ev.tool_is_error}
-                              onOpenDiffTab={() => openDiffForFile(ev.tool_args)}
-                            />
-                          );
-                        }
-
-                        // 4. Assistant Response: Rich Paseo Markdown & Code Block Renderer + Worktree Diff Summary Card
                         return (
-                          <div
-                            key={ev.id}
-                            data-testid="assistant-message"
-                            className="flex flex-col items-start gap-2.5 py-2"
-                          >
-                            <PaseoMarkdown
-                              content={ev.content}
-                              isStreaming={Boolean(
-                                ev.is_streaming_chunk &&
-                                  activeSession.status === "running" &&
-                                  isLastEvent
-                              )}
-                            />
-
-                            {/* Worktree Verification & Diff Card when files were modified */}
-                            {isLastEvent && activeDiffFiles.length > 0 && (
-                              <div className="mt-1 flex w-full items-center justify-between gap-3 rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-3.5 py-2.5">
-                                <div className="flex min-w-0 items-center gap-2.5">
-                                  <FileCode2 className="h-4 w-4 shrink-0 text-[#34d399]" />
-                                  <div className="min-w-0">
-                                    <div className="truncate text-[12px] font-medium text-[var(--v-fg-primary)]">
-                                      Worktree Changes Ready ({activeDiffFiles.length} files modified)
+                          <div key={turn.key} className="flex flex-col gap-1.5 pb-3">
+                            {/* 1. User Message (Right-aligned Paseo Bubble + Hover Trailing Actions) */}
+                            {turn.userEv &&
+                              (() => {
+                                const ev = turn.userEv;
+                                const isEditing = editingEventId === ev.id;
+                                if (isEditing) {
+                                  return (
+                                    <div className="mt-2 mb-1 flex justify-end">
+                                      <div className="w-full max-w-[86%] rounded-2xl rounded-tr-[4px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-3.5 shadow-lg">
+                                        <textarea
+                                          rows={3}
+                                          autoFocus
+                                          value={editingText}
+                                          onChange={(e) => setEditingText(e.target.value)}
+                                          onKeyDown={(e) => {
+                                            if (e.key === "Enter" && !e.shiftKey) {
+                                              e.preventDefault();
+                                              handleSaveAndResendEdit(ev);
+                                            } else if (e.key === "Escape") {
+                                              setEditingEventId(null);
+                                              setEditingText("");
+                                            }
+                                          }}
+                                          className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] focus:outline-none"
+                                        />
+                                        <div className="mt-2 flex items-center justify-between border-t border-[var(--v-border-subtle)] pt-2">
+                                          <span className="text-[11px] text-[var(--v-fg-muted)]">
+                                            Enter 重新发送 · Esc 取消
+                                          </span>
+                                          <div className="flex items-center gap-2">
+                                            <button
+                                              onClick={() => {
+                                                setEditingEventId(null);
+                                                setEditingText("");
+                                              }}
+                                              className="rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                            >
+                                              取消
+                                            </button>
+                                            <button
+                                              onClick={() => handleSaveAndResendEdit(ev)}
+                                              disabled={!editingText.trim()}
+                                              className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] transition-opacity hover:opacity-90 disabled:opacity-40"
+                                            >
+                                              重新发送
+                                            </button>
+                                          </div>
+                                        </div>
+                                      </div>
                                     </div>
-                                    <div className="truncate font-mono text-[11px] text-[var(--v-fg-muted)]">
-                                      {activeDiffFiles.map((f) => f.path.split("/").pop()).join(", ")}
+                                  );
+                                }
+
+                                return (
+                                  <div
+                                    data-testid="user-message"
+                                    className="group mt-2 mb-0.5 flex flex-col items-end"
+                                  >
+                                    <div
+                                      onClick={() => {
+                                        if (!isSessionRunning) {
+                                          handleStartEditMessage(ev);
+                                        }
+                                      }}
+                                      title={!isSessionRunning ? "点击可编辑并重新发送" : undefined}
+                                      className={`max-w-[82%] whitespace-pre-wrap rounded-2xl rounded-tr-[4px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-[1.48] text-[var(--v-fg-primary)] transition-colors ${
+                                        !isSessionRunning
+                                          ? "cursor-pointer hover:brightness-105"
+                                          : ""
+                                      }`}
+                                    >
+                                      {ev.images && ev.images.length > 0 && (
+                                        <div className="mb-2 flex flex-wrap gap-2">
+                                          {ev.images.map((imgRef, imgIdx) => (
+                                            <img
+                                              key={`${imgRef}-${imgIdx}`}
+                                              src={resolveAttachmentUrl(imgRef)}
+                                              alt="Attached screenshot"
+                                              className="max-h-[180px] max-w-[260px] rounded-xl border border-[var(--v-border-subtle)] object-cover"
+                                            />
+                                          ))}
+                                        </div>
+                                      )}
+                                      {ev.content}
+                                    </div>
+                                    <div
+                                      data-testid="user-message-trailing-row"
+                                      className="mt-1 flex h-5 items-center justify-end gap-1.5 text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100"
+                                    >
+                                      <span className="mr-0.5 text-[12px] tabular-nums select-none">
+                                        {ev.timestamp}
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRewindUserMessage(ev)}
+                                        title="回退到此消息并恢复到输入框"
+                                        className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                      >
+                                        <Undo2 className="h-3.5 w-3.5" />
+                                      </button>
+                                      {!isSessionRunning && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleStartEditMessage(ev)}
+                                          title="行内编辑并重发"
+                                          className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                        >
+                                          <SquarePen className="h-3.5 w-3.5" />
+                                        </button>
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={() => copyText(ev.id, ev.content)}
+                                        title="复制消息"
+                                        className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                      >
+                                        {copiedKey === ev.id ? (
+                                          <Check className="h-3.5 w-3.5 text-[#34d399]" />
+                                        ) : (
+                                          <Copy className="h-3.5 w-3.5" />
+                                        )}
+                                      </button>
                                     </div>
                                   </div>
-                                </div>
-                                <button
-                                  onClick={() => openDiffForFile()}
-                                  className="shrink-0 rounded-lg bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
+                                );
+                              })()}
+
+                            {/* 2. Chronological Agent Turn Items (Thinking -> Tools -> Markdown Reply) */}
+                            {turn.items.map((ev, idx) => {
+                              const isLastTurnItem = idx === turn.items.length - 1;
+
+                              if (ev.kind === "thinking") {
+                                const isStreamingThinking = Boolean(
+                                  ev.is_streaming_chunk && isTurnRunning && isLastTurnItem
+                                );
+                                return (
+                                  <BeautifulThinkingBlock
+                                    key={ev.id}
+                                    text={ev.content}
+                                    isStreaming={isStreamingThinking}
+                                    defaultExpanded={false}
+                                  />
+                                );
+                              }
+
+                              if (ev.kind === "tool_call") {
+                                if (idx > 0 && turn.items[idx - 1].kind === "tool_call") {
+                                  return null;
+                                }
+                                let endIdx = idx;
+                                while (
+                                  endIdx + 1 < turn.items.length &&
+                                  turn.items[endIdx + 1].kind === "tool_call"
+                                ) {
+                                  endIdx++;
+                                }
+                                if (endIdx > idx) {
+                                  const groupItems: PaseoToolGroupItem[] = turn.items
+                                    .slice(idx, endIdx + 1)
+                                    .map((tev) => ({
+                                      id: tev.id,
+                                      toolName: tev.tool_name || "Tool",
+                                      input:
+                                        tev.tool_input ??
+                                        (tev.tool_args ? { target: tev.tool_args } : tev.content),
+                                      output:
+                                        tev.tool_output ??
+                                        (tev.tool_input === undefined ? tev.content : undefined),
+                                      isError: tev.tool_is_error,
+                                      fileArg: tev.tool_args,
+                                    }));
+                                  return (
+                                    <PaseoToolCallGroup
+                                      key={ev.id}
+                                      items={groupItems}
+                                      onOpenDiffForFile={openDiffForFile}
+                                    />
+                                  );
+                                }
+
+                                const toolInput =
+                                  ev.tool_input ??
+                                  (ev.tool_args ? { target: ev.tool_args } : ev.content);
+                                const toolOutput =
+                                  ev.tool_output ??
+                                  (ev.tool_input === undefined ? ev.content : undefined);
+                                return (
+                                  <BeautifulToolCallCard
+                                    key={ev.id}
+                                    toolName={ev.tool_name || "Tool"}
+                                    input={toolInput}
+                                    output={toolOutput}
+                                    isError={ev.tool_is_error}
+                                    onOpenDiffTab={() => openDiffForFile(ev.tool_args)}
+                                  />
+                                );
+                              }
+
+                              return (
+                                <div
+                                  key={ev.id}
+                                  data-testid="assistant-message"
+                                  className="flex flex-col items-start gap-2.5 py-1.5"
                                 >
-                                  Review Diff →
-                                </button>
-                              </div>
-                            )}
+                                  <PaseoMarkdown
+                                    content={ev.content}
+                                    isStreaming={Boolean(
+                                      ev.is_streaming_chunk && isTurnRunning && isLastTurnItem
+                                    )}
+                                  />
+
+                                  {isLatestTurn &&
+                                    isLastTurnItem &&
+                                    !isTurnRunning &&
+                                    activeDiffFiles.length > 0 && (
+                                      <div className="mt-1 flex w-full items-center justify-between gap-3 rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-3.5 py-2.5">
+                                        <div className="flex min-w-0 items-center gap-2.5">
+                                          <FileCode2 className="h-4 w-4 shrink-0 text-[#34d399]" />
+                                          <div className="min-w-0">
+                                            <div className="truncate text-[12px] font-medium text-[var(--v-fg-primary)]">
+                                              Worktree Changes Ready ({activeDiffFiles.length} files modified)
+                                            </div>
+                                            <div className="truncate font-mono text-[11px] text-[var(--v-fg-muted)]">
+                                              {activeDiffFiles
+                                                .map((f) => f.path.split("/").pop())
+                                                .join(", ")}
+                                            </div>
+                                          </div>
+                                        </div>
+                                        <button
+                                          onClick={() => openDiffForFile()}
+                                          className="shrink-0 rounded-lg bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
+                                        >
+                                          Review Diff →
+                                        </button>
+                                      </div>
+                                    )}
+                                </div>
+                              );
+                            })}
+
+                            {/* 3. Authentic Per-Turn Paseo Footer:
+                               - Running: Calm 6-dot SyncedLoader + whole-second LiveElapsed
+                               - Completed: Copy + Retry + "Worked for Xs" (swaps to timestamp on hover) */}
+                            <PaseoTurnFooter
+                              isRunning={isTurnRunning}
+                              waitingLabel={isTurnRunning ? waitingLabel : undefined}
+                              startedAtMs={isLatestTurn ? activeTurnTiming?.startedAtMs : undefined}
+                              durationMs={
+                                turn.userEv?.duration_ms ??
+                                (isLatestTurn ? activeTurnTiming?.durationMs : undefined)
+                              }
+                              completedAtLabel={
+                                turn.userEv?.completed_at ??
+                                (isLatestTurn ? activeTurnTiming?.completedAtLabel : undefined) ??
+                                lastTurnItem?.timestamp
+                              }
+                              assistantContent={lastTurnAssistant?.content}
+                              telemetry={
+                                isLatestTurn
+                                  ? {
+                                      insertions: activeSession.insertions,
+                                      deletions: activeSession.deletions,
+                                    }
+                                  : undefined
+                              }
+                              onOpenDiff={() => openDiffForFile()}
+                              onRetry={
+                                turn.userEv && !isSessionRunning
+                                  ? () => handleRetryUserMessage(turn.userEv!)
+                                  : undefined
+                              }
+                            />
                           </div>
                         );
                       })}
-
-                      {/* 5. PaseoTurnFooter 2.0:
-                         - Smart De-duplication: Calm Telemetry Mode when trailing inline block is animating; Gap Illumination Mode during silent lifecycle gaps
-                         - Completed Turn: Swaps in-place to Copy + Retry + "Worked for Xs · N tools" (with Execution Breakdown popover) + "+ins −del" Diff jump */}
-                      {activeEvents.length > 0 && (
-                        <PaseoTurnFooter
-                          isRunning={
-                            activeSession.status === "running" ||
-                            activeSession.status === "waiting_approval"
-                          }
-                          activePhaseLabel={activePhaseLabel}
-                          isInlineBlockAnimating={isInlineBlockAnimating}
-                          isWaitingUser={isWaitingUser}
-                          startedAtMs={activeTurnTiming?.startedAtMs}
-                          durationMs={activeTurnTiming?.durationMs}
-                          completedAtLabel={
-                            activeTurnTiming?.completedAtLabel || lastEvent?.timestamp
-                          }
-                          assistantContent={lastAssistantAfterUser?.content}
-                          telemetry={turnTelemetry}
-                          onStop={handleStopSession}
-                          onOpenDiff={() => openDiffForFile()}
-                          onRetry={
-                            lastUserEv ? () => handleRetryUserMessage(lastUserEv) : undefined
-                          }
-                        />
-                      )}
                     </>
                   );
                 })()}
