@@ -271,6 +271,7 @@ export interface AgentEvent {
   tool_input?: unknown;
   tool_output?: string;
   tool_is_error?: boolean;
+  started_at_ms?: number;
   duration_ms?: number;
   completed_at?: string;
 }

@@ -292,25 +292,67 @@ body,
 
 @keyframes veloShimmer {
   0% {
-    background-position: -200% 0;
+    background-position: 100% 0;
   }
   100% {
-    background-position: 200% 0;
+    background-position: -100% 0;
   }
 }
 
+/* Vercel AI Elements / Prompt-Kit TextShimmer (crisp in both Dark & Light themes) */
 .beautiful-shimmer-text {
-  background: linear-gradient(
-    90deg,
-    var(--v-fg-secondary) 0%,
-    var(--v-fg-primary) 50%,
-    var(--v-fg-secondary) 100%
+  display: inline-block;
+  background-image: linear-gradient(
+    110deg,
+    #71717a 34%,
+    #ffffff 50%,
+    #71717a 66%
   );
-  background-size: 200% 100%;
+  background-size: 250% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: veloShimmer 2.2s linear infinite;
+  animation: veloShimmer 2s linear infinite;
+}
+
+[data-theme="light"] .beautiful-shimmer-text {
+  background-image: linear-gradient(
+    110deg,
+    #3f3f46 34%,
+    #a1a1aa 47%,
+    #d4d4d8 50%,
+    #a1a1aa 53%,
+    #3f3f46 66%
+  );
+}
+
+@keyframes veloOrbitalSpin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.velo-orbital-spin {
+  animation: veloOrbitalSpin 0.95s linear infinite;
+}
+
+@keyframes veloSparkleBreath {
+  0%,
+  100% {
+    transform: scale(0.92) rotate(-4deg);
+    opacity: 0.78;
+  }
+  50% {
+    transform: scale(1.08) rotate(6deg);
+    opacity: 1;
+  }
+}
+
+.velo-sparkle-breath {
+  animation: veloSparkleBreath 1.8s ease-in-out infinite;
 }
 
 @keyframes veloPhaseSlideIn {

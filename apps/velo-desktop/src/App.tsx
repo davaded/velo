@@ -18,6 +18,7 @@ import {
 } from "./mockData";
 import { parseUnifiedDiff } from "./utils/diffParser";
 import {
+  AgentStatusPhase,
   BeautifulApprovalCard,
   BeautifulContextMeter,
   BeautifulQuestionCard,
@@ -28,6 +29,7 @@ import {
   PaseoToolGroupItem,
   PaseoTurnFooter,
   PaseoTurnTelemetry,
+  resolvePaseoToolPresentation,
 } from "./components/ui/BeautifulAgentPrimitives";
 import { XtermTerminalDrawer, TerminalChunkPacket } from "./components/XtermTerminalDrawer";
 import { PullRequestDrawer } from "./components/PullRequestDrawer";
@@ -151,6 +153,7 @@ function reconstructEventsFromHistory(
   const reconstructed: AgentEvent[] = [];
   let activeHistUserIdx = -1;
   let activeHistStartMs = 0;
+  let lastStepMs = 0;
   for (let i = 0; i < rawList.length; i++) {
     const ev = rawList[i];
     const evType = String(ev.type ?? "");
@@ -174,11 +177,17 @@ function reconstructEventsFromHistory(
         });
         activeHistUserIdx = reconstructed.length - 1;
         activeHistStartMs = tsMs;
+        lastStepMs = tsMs;
       }
     } else if (evType === "status_changed") {
       const st = String(ev.status ?? "");
-      if (st === "running" && activeHistStartMs === 0 && tsMs > 0) {
-        activeHistStartMs = tsMs;
+      if (st === "running") {
+        if (activeHistStartMs === 0 && tsMs > 0) {
+          activeHistStartMs = tsMs;
+        }
+        if (lastStepMs === 0 && tsMs > 0) {
+          lastStepMs = tsMs;
+        }
       } else if (
         (st === "completed" || st === "failed" || st === "stopped") &&
         activeHistUserIdx >= 0
@@ -196,10 +205,18 @@ function reconstructEventsFromHistory(
     } else if (evType === "thinking_delta") {
       const text = String(ev.text ?? "").trim();
       if (!text) continue;
+      const stepDeltaMs =
+        lastStepMs > 0 && tsMs >= lastStepMs ? Math.max(500, tsMs - lastStepMs) : undefined;
+      if (tsMs > 0) {
+        lastStepMs = tsMs;
+      }
       const last = reconstructed[reconstructed.length - 1];
       if (last && last.kind === "thinking") {
         if (!last.content.includes(text)) {
           last.content = `${last.content}\n${text}`;
+        }
+        if (stepDeltaMs !== undefined) {
+          last.duration_ms = Math.max(500, (last.duration_ms || 0) + stepDeltaMs);
         }
       } else {
         reconstructed.push({
@@ -208,9 +225,13 @@ function reconstructEventsFromHistory(
           timestamp: ts,
           kind: "thinking",
           content: text,
+          duration_ms: stepDeltaMs,
         });
       }
     } else if (evType === "tool_call_requested") {
+      if (lastStepMs === 0 && tsMs > 0) {
+        lastStepMs = tsMs;
+      }
       const toolId = String(ev.tool_id ?? `tl-hist-${i}`);
       const toolName = String(ev.tool_name ?? "Tool");
       const argsObj = (
@@ -250,6 +271,9 @@ function reconstructEventsFromHistory(
         });
       }
     } else if (evType === "tool_call_completed") {
+      if (tsMs > 0) {
+        lastStepMs = tsMs;
+      }
       const toolId = String(ev.tool_id ?? "");
       const output = String(ev.output ?? "(completed)");
       const isError = Boolean(ev.is_error);
@@ -273,6 +297,9 @@ function reconstructEventsFromHistory(
         };
       }
     } else if (evType === "setup_hook_output") {
+      if (tsMs > 0) {
+        lastStepMs = tsMs;
+      }
       const cmd = String(ev.command ?? ".velo/setup.sh");
       const out = String(ev.output ?? "(exit 0)");
       const code = Number(ev.exit_code ?? 0);
@@ -291,6 +318,9 @@ function reconstructEventsFromHistory(
     } else if (evType === "message_delta") {
       const text = String(ev.text ?? "");
       if (!text.trim() || text.startsWith("[stderr]")) continue;
+      if (tsMs > 0) {
+        lastStepMs = tsMs;
+      }
       reconstructed.push({
         id: `as-hist-${i}`,
         session_id: sid,
@@ -436,7 +466,7 @@ export function App() {
   });
   const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(() => {
     try {
-      const saved = localStorage.getItem("velo.events.v3");
+      const saved = localStorage.getItem("velo.events.v4");
       if (saved) {
         const parsed = JSON.parse(saved) as Record<string, AgentEvent[]>;
         if (parsed && typeof parsed === "object") return parsed;
@@ -469,7 +499,7 @@ export function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem("velo.events.v3", JSON.stringify(eventsBySession));
+      localStorage.setItem("velo.events.v4", JSON.stringify(eventsBySession));
     } catch {
       // ignore
     }
@@ -579,6 +609,7 @@ export function App() {
   const [latestTerminalChunk, setLatestTerminalChunk] = useState<TerminalChunkPacket | null>(null);
   const termSeqRef = useRef<number>(0);
   const turnStartMsRef = useRef<Record<string, number>>({});
+  const stepStartMsRef = useRef<Record<string, number>>({});
   const [turnTimingBySession, setTurnTimingBySession] = useState<
     Record<
       string,
@@ -1081,6 +1112,9 @@ export function App() {
           if (!turnStartMsRef.current[sid]) {
             turnStartMsRef.current[sid] = Date.now();
           }
+          if (!stepStartMsRef.current[sid]) {
+            stepStartMsRef.current[sid] = turnStartMsRef.current[sid];
+          }
           setTurnTimingBySession((prev) => {
             const cur = prev[sid];
             return {
@@ -1095,9 +1129,12 @@ export function App() {
             };
           });
         } else if (st === "completed" || st === "failed" || st === "stopped") {
-          const startedAtMs = turnStartMsRef.current[sid] || Date.now() - 1000;
+          const nowDoneMs = Date.now();
+          const startedAtMs = turnStartMsRef.current[sid] || nowDoneMs - 1000;
+          const stepOriginMs = stepStartMsRef.current[sid] || startedAtMs;
           delete turnStartMsRef.current[sid];
-          const computedDur = Math.max(500, Date.now() - startedAtMs);
+          delete stepStartMsRef.current[sid];
+          const computedDur = Math.max(500, nowDoneMs - startedAtMs);
           setTurnTimingBySession((prev) => {
             const cur = prev[sid];
             const sMs = cur?.startedAtMs || startedAtMs;
@@ -1106,7 +1143,7 @@ export function App() {
               [sid]: {
                 ...cur,
                 startedAtMs: sMs,
-                durationMs: Math.max(500, Date.now() - sMs),
+                durationMs: Math.max(500, nowDoneMs - sMs),
                 completedAtLabel: now,
               },
             };
@@ -1133,7 +1170,16 @@ export function App() {
                   };
                 }
                 if (item.is_streaming_chunk) {
-                  return { ...item, is_streaming_chunk: false };
+                  const finalizedDur =
+                    item.kind === "thinking"
+                      ? item.duration_ms ??
+                        Math.max(500, nowDoneMs - (item.started_at_ms || stepOriginMs))
+                      : item.duration_ms;
+                  return {
+                    ...item,
+                    is_streaming_chunk: false,
+                    duration_ms: finalizedDur,
+                  };
                 }
                 return item;
               }),
@@ -1234,6 +1280,8 @@ export function App() {
       if (evType === "thinking_chunk") {
         const delta = String(evObj.delta ?? "");
         const replace = Boolean(evObj.replace);
+        const originMs =
+          stepStartMsRef.current[sid] || turnStartMsRef.current[sid] || Date.now();
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
           const last = list[list.length - 1];
@@ -1245,7 +1293,12 @@ export function App() {
               ...prev,
               [sid]: [
                 ...list.slice(0, -1),
-                { ...last, content: nextContent, is_streaming_chunk: true },
+                {
+                  ...last,
+                  content: nextContent,
+                  started_at_ms: last.started_at_ms || originMs,
+                  is_streaming_chunk: true,
+                },
               ],
             };
           }
@@ -1259,6 +1312,7 @@ export function App() {
                 timestamp: now,
                 kind: "thinking",
                 content: delta,
+                started_at_ms: originMs,
                 is_streaming_chunk: true,
               },
             ],
@@ -1271,6 +1325,10 @@ export function App() {
       if (evType === "thinking_delta") {
         const text = String(evObj.text ?? "").trim();
         if (!text) return;
+        const nowMs = Date.now();
+        const originMs =
+          stepStartMsRef.current[sid] || turnStartMsRef.current[sid] || nowMs;
+        stepStartMsRef.current[sid] = nowMs;
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
           const last = list[list.length - 1];
@@ -1281,24 +1339,40 @@ export function App() {
               : last.content.trim() === text || last.content.endsWith(text)
               ? last.content
               : `${last.content}\n${text}`.trim();
+            const startRef = last.started_at_ms || originMs;
+            const computedThinkDur = Math.max(
+              500,
+              last.is_streaming_chunk
+                ? nowMs - startRef
+                : (last.duration_ms || 0) + Math.max(0, nowMs - originMs)
+            );
             return {
               ...prev,
               [sid]: [
                 ...list.slice(0, -1),
-                { ...last, content: nextContent, is_streaming_chunk: false },
+                {
+                  ...last,
+                  content: nextContent,
+                  started_at_ms: startRef,
+                  duration_ms: computedThinkDur,
+                  is_streaming_chunk: false,
+                },
               ],
             };
           }
+          const computedThinkDur = Math.max(500, nowMs - originMs);
           return {
             ...prev,
             [sid]: [
               ...list,
               {
-                id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                id: `th-${nowMs}-${Math.random().toString(36).slice(2, 5)}`,
                 session_id: sid,
                 timestamp: now,
                 kind: "thinking",
                 content: text,
+                started_at_ms: originMs,
+                duration_ms: computedThinkDur,
                 is_streaming_chunk: false,
               },
             ],
@@ -1322,12 +1396,23 @@ export function App() {
             argsObj.query ??
             (Object.keys(argsObj).length > 0 ? JSON.stringify(argsObj).slice(0, 80) : "")
         );
+        const nowReqMs = Date.now();
+        const originMs =
+          stepStartMsRef.current[sid] || turnStartMsRef.current[sid] || nowReqMs;
         setEventsBySession((prev) => {
           const rawList = prev[sid] || [];
           // Finalize any preceding streaming block cleanly before running tool
           const list = rawList.map((item, idx) =>
             idx === rawList.length - 1 && item.is_streaming_chunk
-              ? { ...item, is_streaming_chunk: false }
+              ? {
+                  ...item,
+                  is_streaming_chunk: false,
+                  duration_ms:
+                    item.kind === "thinking"
+                      ? item.duration_ms ??
+                        Math.max(500, nowReqMs - (item.started_at_ms || originMs))
+                      : item.duration_ms,
+                }
               : item
           );
           const existingIdx = list.findIndex(
@@ -1370,6 +1455,7 @@ export function App() {
       }
 
       if (evType === "tool_call_completed") {
+        stepStartMsRef.current[sid] = Date.now();
         const toolId = String(evObj.tool_id ?? "");
         const output = String(evObj.output ?? "(completed)");
         const isError = Boolean(evObj.is_error);
@@ -1433,6 +1519,9 @@ export function App() {
         const delta = String(evObj.delta ?? "");
         const replace = Boolean(evObj.replace);
         if (!delta) return;
+        const nowChunkMs = Date.now();
+        const originMs =
+          stepStartMsRef.current[sid] || turnStartMsRef.current[sid] || nowChunkMs;
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
           const last = list[list.length - 1];
@@ -1445,14 +1534,23 @@ export function App() {
           }
           const cleanedPrev =
             last && last.kind === "thinking" && last.is_streaming_chunk
-              ? [...list.slice(0, -1), { ...last, is_streaming_chunk: false }]
+              ? [
+                  ...list.slice(0, -1),
+                  {
+                    ...last,
+                    is_streaming_chunk: false,
+                    duration_ms:
+                      last.duration_ms ??
+                      Math.max(500, nowChunkMs - (last.started_at_ms || originMs)),
+                  },
+                ]
               : list;
           return {
             ...prev,
             [sid]: [
               ...cleanedPrev,
               {
-                id: `as-stream-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                id: `as-stream-${nowChunkMs}-${Math.random().toString(36).slice(2, 5)}`,
                 session_id: sid,
                 timestamp: now,
                 kind: "assistant",
@@ -1469,6 +1567,10 @@ export function App() {
       if (evType === "message_delta") {
         const text = String(evObj.text ?? "");
         if (!text.trim()) return;
+        const nowMsgMs = Date.now();
+        const originMs =
+          stepStartMsRef.current[sid] || turnStartMsRef.current[sid] || nowMsgMs;
+        stepStartMsRef.current[sid] = nowMsgMs;
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
           // Search current post-tool / post-user segment for a streaming assistant block
@@ -1500,14 +1602,23 @@ export function App() {
           const last = list[list.length - 1];
           const cleanedPrev =
             last && last.kind === "thinking" && last.is_streaming_chunk
-              ? [...list.slice(0, -1), { ...last, is_streaming_chunk: false }]
+              ? [
+                  ...list.slice(0, -1),
+                  {
+                    ...last,
+                    is_streaming_chunk: false,
+                    duration_ms:
+                      last.duration_ms ??
+                      Math.max(500, nowMsgMs - (last.started_at_ms || originMs)),
+                  },
+                ]
               : list;
           return {
             ...prev,
             [sid]: [
               ...cleanedPrev,
               {
-                id: `as-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                id: `as-${nowMsgMs}-${Math.random().toString(36).slice(2, 5)}`,
                 session_id: sid,
                 timestamp: now,
                 kind: "assistant",
@@ -1864,6 +1975,7 @@ export function App() {
 
     const startedAtMs = Date.now();
     turnStartMsRef.current[activeSession.id] = startedAtMs;
+    stepStartMsRef.current[activeSession.id] = startedAtMs;
     setTurnTimingBySession((prev) => ({
       ...prev,
       [activeSession.id]: {
@@ -3671,6 +3783,49 @@ export function App() {
                           .reverse()
                           .find((e) => e.kind === "assistant");
 
+                        let turnPhase: AgentStatusPhase = "working";
+                        let turnStatusLabel: string | undefined = "Working…";
+                        if (isTurnRunning) {
+                          if (waitingLabel) {
+                            turnPhase = "waiting";
+                            turnStatusLabel = waitingLabel;
+                          } else if (!lastTurnItem) {
+                            turnPhase = "thinking";
+                            turnStatusLabel = undefined;
+                          } else if (
+                            lastTurnItem.kind === "thinking" &&
+                            lastTurnItem.is_streaming_chunk
+                          ) {
+                            turnPhase = "working";
+                            turnStatusLabel = "Working…";
+                          } else if (
+                            lastTurnItem.kind === "tool_call" &&
+                            lastTurnItem.tool_output === undefined
+                          ) {
+                            const activeToolInput =
+                              lastTurnItem.tool_input ??
+                              (lastTurnItem.tool_args
+                                ? { target: lastTurnItem.tool_args }
+                                : lastTurnItem.content);
+                            const pres = resolvePaseoToolPresentation(
+                              lastTurnItem.tool_name || "Tool",
+                              activeToolInput,
+                              lastTurnItem.tool_output
+                            );
+                            turnPhase = "tool";
+                            turnStatusLabel = `Working · ${pres.workingVerb}…`;
+                          } else if (
+                            lastTurnItem.kind === "assistant" &&
+                            lastTurnItem.is_streaming_chunk
+                          ) {
+                            turnPhase = "writing";
+                            turnStatusLabel = "Writing…";
+                          } else {
+                            turnPhase = "working";
+                            turnStatusLabel = "Working…";
+                          }
+                        }
+
                         return (
                           <div key={turn.key} className="flex flex-col gap-1.5 pb-3">
                             {/* 1. User Message (Right-aligned Paseo Bubble + Hover Trailing Actions) */}
@@ -3813,6 +3968,11 @@ export function App() {
                                     key={ev.id}
                                     text={ev.content}
                                     isStreaming={isStreamingThinking}
+                                    startedAtMs={
+                                      ev.started_at_ms ??
+                                      (isLatestTurn ? activeTurnTiming?.startedAtMs : undefined)
+                                    }
+                                    durationMs={ev.duration_ms}
                                     defaultExpanded={false}
                                   />
                                 );
@@ -3914,11 +4074,13 @@ export function App() {
                               );
                             })}
 
-                            {/* 3. Authentic Per-Turn Paseo Footer:
-                               - Running: Calm 6-dot SyncedLoader + whole-second LiveElapsed
+                            {/* 3. Vercel AI Elements + Prompt-Kit Per-Turn Status Footer:
+                               - Running: Orbital / Sparkle Status + TextShimmer (`Thinking for Xs…` / `Working · <tool>…` / `Working…` / `Writing…`)
                                - Completed: Copy + Retry + "Worked for Xs" (swaps to timestamp on hover) */}
                             <PaseoTurnFooter
                               isRunning={isTurnRunning}
+                              phase={turnPhase}
+                              statusLabel={turnStatusLabel}
                               waitingLabel={isTurnRunning ? waitingLabel : undefined}
                               startedAtMs={isLatestTurn ? activeTurnTiming?.startedAtMs : undefined}
                               durationMs={

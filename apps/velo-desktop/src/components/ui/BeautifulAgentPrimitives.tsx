@@ -11,6 +11,7 @@ import {
   RotateCcw,
   Search,
   ShieldAlert,
+  Sparkles,
   SquareTerminal,
   TriangleAlert,
   Wrench,
@@ -19,90 +20,99 @@ import {
 
 /**
  * ============================================================================
- * 1. PASEO SYNCED LOADER (packages/app/src/components/synced-loader.tsx)
- *    2x3 6-dot matrix synchronized to a 950ms 6-step opacity cycle
+ * 1. VERCEL AI ELEMENTS + PROMPT-KIT STATUS PRIMITIVES
+ *    - `TextShimmer`: Smooth specular light band across active reasoning/working text
+ *    - `PromptKitStatusIcon`: Retina orbital arc spinner & breathing Sparkles glyph
+ *      (replaces smudgy 6-dot braille matrix in both Light & Dark themes)
  * ============================================================================
  */
-const SYNCED_LOADER_DURATION_MS = 950;
-const SYNCED_LOADER_DOT_COUNT = 6;
-const SYNCED_LOADER_OPACITY_STATES = [
-  [1, 0, 0.78, 0, 0.56, 0.34],
-  [0.78, 1, 0.56, 0, 0.34, 0],
-  [0.56, 0.78, 0.34, 1, 0, 0],
-  [0.34, 0.56, 0, 0.78, 0, 1],
-  [0, 0.34, 0, 0.56, 1, 0.78],
-  [0, 0, 1, 0.34, 0.78, 0.56],
-] as const;
+export type AgentStatusPhase = "thinking" | "tool" | "working" | "writing" | "waiting";
 
-function getSyncedLoaderStep(nowMs: number): number {
-  const elapsedMs = nowMs % SYNCED_LOADER_DURATION_MS;
-  return Math.floor((elapsedMs * SYNCED_LOADER_DOT_COUNT) / SYNCED_LOADER_DURATION_MS);
-}
+export const TextShimmer: React.FC<{
+  children: React.ReactNode;
+  className?: string;
+}> = ({ children, className = "" }) => (
+  <span className={`beautiful-shimmer-text ${className}`}>{children}</span>
+);
 
-export const PaseoSyncedLoader: React.FC<{
+export const PromptKitStatusIcon: React.FC<{
+  phase?: AgentStatusPhase;
   size?: number;
-  color?: string;
-}> = ({ size = 14, color = "var(--fg)" }) => {
-  const [step, setStep] = useState<number>(() => getSyncedLoaderStep(Date.now()));
+}> = ({ phase = "working", size = 15 }) => {
+  if (phase === "waiting") {
+    return (
+      <span
+        className="inline-flex shrink-0 items-center justify-center"
+        style={{ width: size, height: size }}
+        data-testid="turn-working-indicator"
+      >
+        <ShieldAlert
+          className="h-3.5 w-3.5 animate-pulse"
+          style={{ color: "var(--status-warning)" }}
+        />
+      </span>
+    );
+  }
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setStep(getSyncedLoaderStep(Date.now()));
-    }, 80);
-    return () => clearInterval(interval);
-  }, []);
-
-  const gap = Math.max(1.5, Math.round(size * 0.12));
-  const dotSize = Math.max(2.2, (size - gap * 2) / 3);
-  const gridWidth = dotSize * 2 + gap;
-  const gridHeight = dotSize * 3 + gap * 2;
-  const opacities = SYNCED_LOADER_OPACITY_STATES[step] ?? SYNCED_LOADER_OPACITY_STATES[0];
+  if (phase === "thinking") {
+    return (
+      <span
+        className="inline-flex shrink-0 items-center justify-center"
+        style={{ width: size, height: size }}
+        data-testid="turn-working-indicator"
+      >
+        <Sparkles
+          className="h-3.5 w-3.5 velo-sparkle-breath"
+          style={{ color: "var(--accent)" }}
+        />
+      </span>
+    );
+  }
 
   return (
-    <div
-      style={{
-        width: size,
-        height: size,
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        flexShrink: 0,
-      }}
+    <span
+      className="relative inline-flex shrink-0 items-center justify-center"
+      style={{ width: size, height: size }}
       data-testid="turn-working-indicator"
     >
-      <div
-        style={{
-          width: gridWidth,
-          height: gridHeight,
-          display: "grid",
-          gridTemplateColumns: `repeat(2, ${dotSize}px)`,
-          gridTemplateRows: `repeat(3, ${dotSize}px)`,
-          gap: `${gap}px`,
-        }}
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 16 16"
+        fill="none"
+        className="velo-orbital-spin"
       >
-        {opacities.map((opacity, idx) => (
-          <span
-            key={idx}
-            style={{
-              width: dotSize,
-              height: dotSize,
-              borderRadius: dotSize / 2,
-              backgroundColor: color,
-              opacity,
-              transition: "opacity 90ms linear",
-            }}
-          />
-        ))}
-      </div>
-    </div>
+        <circle
+          cx="8"
+          cy="8"
+          r="6"
+          stroke="var(--fg-extra-muted)"
+          strokeOpacity="0.25"
+          strokeWidth="1.75"
+        />
+        <path
+          d="M14 8a6 6 0 0 0-6-6"
+          stroke={phase === "writing" ? "var(--status-success)" : "var(--accent)"}
+          strokeWidth="1.85"
+          strokeLinecap="round"
+        />
+      </svg>
+    </span>
   );
 };
 
+// Backwards-compatible alias if imported elsewhere
+export const PaseoSyncedLoader: React.FC<{
+  size?: number;
+  color?: string;
+}> = ({ size = 15 }) => <PromptKitStatusIcon phase="working" size={size} />;
+
 /**
  * ============================================================================
- * 2. PASEO LIVE ELAPSED & TURN FOOTER (packages/app/src/agent-stream/turn-footer.tsx)
- *    Fixed 24px slot: swaps seamlessly from SyncedLoader + LiveElapsed to
- *    Copy + Retry + "Worked for Xs" (swaps to timestamp on hover).
+ * 2. AI ELEMENTS + PROMPT-KIT LIVE STATUS & TURN FOOTER
+ *    - Running: Crisp status icon + Shimmering phase text
+ *      (`Thinking…` -> `Thinking for Xs` -> `Working · Searching…` -> `Working…` -> `Writing…`)
+ *    - Completed: Copy + Retry + `Worked for Xs` (hover swaps to timestamp) + Diff pill
  * ============================================================================
  */
 export function formatPaseoDuration(ms: number): string {
@@ -131,8 +141,8 @@ export const PaseoLiveElapsed: React.FC<{
 
   return (
     <span
-      className="text-[13px] tabular-nums select-none"
-      style={{ color: "var(--fg-muted)" }}
+      className="text-[12.5px] tabular-nums select-none"
+      style={{ color: "var(--fg-extra-muted)" }}
       data-testid="turn-working-elapsed"
     >
       {formatPaseoDuration(elapsedMs)}
@@ -147,6 +157,8 @@ export interface PaseoTurnTelemetry {
 
 export const PaseoTurnFooter: React.FC<{
   isRunning: boolean;
+  phase?: AgentStatusPhase;
+  statusLabel?: string;
   waitingLabel?: string;
   startedAtMs?: number;
   durationMs?: number;
@@ -157,6 +169,8 @@ export const PaseoTurnFooter: React.FC<{
   onRetry?: () => void;
 }> = ({
   isRunning,
+  phase = "thinking",
+  statusLabel,
   waitingLabel,
   startedAtMs,
   durationMs,
@@ -168,6 +182,18 @@ export const PaseoTurnFooter: React.FC<{
 }) => {
   const [copied, setCopied] = useState(false);
   const [hoveredTiming, setHoveredTiming] = useState(false);
+  const [liveMs, setLiveMs] = useState<number>(() =>
+    startedAtMs ? Math.max(0, Date.now() - startedAtMs) : 0
+  );
+
+  useEffect(() => {
+    if (!isRunning) return;
+    const origin = startedAtMs || Date.now();
+    const tick = () => setLiveMs(Math.max(0, Date.now() - origin));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [isRunning, startedAtMs]);
 
   const handleCopy = async () => {
     if (!assistantContent) return;
@@ -181,25 +207,65 @@ export const PaseoTurnFooter: React.FC<{
   };
 
   if (isRunning) {
-    const isWaiting = Boolean(waitingLabel);
+    const effectivePhase: AgentStatusPhase = waitingLabel ? "waiting" : phase;
+    const liveSec = Math.max(0, Math.round(liveMs / 1000));
+    const formattedElapsed = formatPaseoDuration(liveMs);
+
+    let primaryStatus = statusLabel || "Working…";
+    let showTrailingClock = true;
+
+    if (waitingLabel) {
+      primaryStatus = waitingLabel;
+    } else if (effectivePhase === "thinking") {
+      if (statusLabel) {
+        primaryStatus = statusLabel;
+      } else if (liveSec >= 1) {
+        primaryStatus = `Thinking for ${formattedElapsed}…`;
+        showTrailingClock = false;
+      } else {
+        primaryStatus = "Thinking…";
+        showTrailingClock = false;
+      }
+    } else if (effectivePhase === "writing") {
+      primaryStatus = statusLabel || "Writing…";
+    } else if (effectivePhase === "tool") {
+      primaryStatus = statusLabel || "Working…";
+    } else {
+      primaryStatus = statusLabel || "Working…";
+    }
+
     return (
       <div
-        className="mt-2 flex min-h-[24px] items-center gap-2.5"
+        className="mt-2 flex min-h-[26px] items-center gap-2 select-none"
         data-testid="turn-footer"
       >
-        <PaseoSyncedLoader
-          size={14}
-          color={isWaiting ? "var(--status-warning)" : "var(--fg)"}
-        />
-        {waitingLabel && (
-          <span
-            className="text-[13px] select-none"
-            style={{ color: "var(--status-warning)" }}
-          >
-            {waitingLabel}
-          </span>
-        )}
-        <PaseoLiveElapsed startedAtMs={startedAtMs || Date.now()} />
+        <PromptKitStatusIcon phase={effectivePhase} size={15} />
+        <div
+          key={`${effectivePhase}-${statusLabel || ""}`}
+          className="velo-phase-morph flex min-w-0 items-center gap-1.5 text-[13px]"
+        >
+          {waitingLabel ? (
+            <span className="font-medium" style={{ color: "var(--status-warning)" }}>
+              {primaryStatus}
+            </span>
+          ) : (
+            <TextShimmer className="font-medium truncate">{primaryStatus}</TextShimmer>
+          )}
+          {showTrailingClock && (
+            <>
+              <span className="text-[12px]" style={{ color: "var(--fg-extra-muted)" }}>
+                ·
+              </span>
+              <span
+                className="text-[12.5px] tabular-nums"
+                style={{ color: "var(--fg-extra-muted)" }}
+                data-testid="turn-working-elapsed"
+              >
+                {formattedElapsed}
+              </span>
+            </>
+          )}
+        </div>
       </div>
     );
   }
@@ -379,9 +445,9 @@ export const PaseoExpandableBadge: React.FC<{
             />
           ) : (
             <IconComponent
-              className="h-3 w-3"
+              className={`h-3.5 w-3.5 ${isLoading ? "velo-sparkle-breath" : ""}`}
               style={{
-                color: isActive ? "var(--fg)" : "var(--fg-muted)",
+                color: isActive || isLoading ? "var(--fg)" : "var(--fg-muted)",
               }}
             />
           )}
@@ -390,8 +456,8 @@ export const PaseoExpandableBadge: React.FC<{
         {/* Label + Secondary Label Row */}
         <div className="flex min-w-0 flex-1 items-center overflow-hidden">
           <span
-            className={`shrink-0 font-normal transition-colors ${
-              isLoading ? "beautiful-shimmer-text" : ""
+            className={`shrink-0 transition-colors ${
+              isLoading ? "beautiful-shimmer-text font-medium" : "font-normal"
             }`}
             style={
               !isLoading
@@ -530,19 +596,41 @@ function renderFormattedLine(line: string, idx: number) {
 
 /**
  * ============================================================================
- * 5. PASEO THINKING BLOCK (ThoughtSlot -> ToolCall(toolName="thinking"))
+ * 5. VERCEL AI ELEMENTS `<Reasoning>` (`BeautifulThinkingBlock`)
+ *    - Streaming: Shimmering `Thinking…` / `Thinking for Xs` + live headline
+ *    - Completed: Collapsible `Thought for Xs` trigger + clean reasoning rail
  * ============================================================================
  */
 export const BeautifulThinkingBlock: React.FC<{
   text: string;
   isStreaming?: boolean;
+  startedAtMs?: number;
+  durationMs?: number;
   defaultExpanded?: boolean;
-}> = ({ text, isStreaming = false, defaultExpanded = false }) => {
+}> = ({
+  text,
+  isStreaming = false,
+  startedAtMs,
+  durationMs,
+  defaultExpanded = false,
+}) => {
   const { summary, cleanedLines } = useMemo(() => parseReasoningContent(text), [text]);
   const [userExpanded, setUserExpanded] = useState<boolean | null>(
     defaultExpanded ? true : null
   );
+  const [liveThinkMs, setLiveThinkMs] = useState<number>(() =>
+    startedAtMs ? Math.max(0, Date.now() - startedAtMs) : 0
+  );
   const scrollBoxRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!isStreaming) return;
+    const origin = startedAtMs || Date.now();
+    const tick = () => setLiveThinkMs(Math.max(0, Date.now() - origin));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [isStreaming, startedAtMs]);
 
   const hasDetail = cleanedLines.length > 0;
   const effectiveExpanded = userExpanded ?? defaultExpanded;
@@ -557,13 +645,21 @@ export const BeautifulThinkingBlock: React.FC<{
     return null;
   }
 
-  const displaySecondary = summary || undefined;
+  const primaryLabel = isStreaming
+    ? Math.round(liveThinkMs / 1000) >= 1
+      ? `Thinking for ${formatPaseoDuration(liveThinkMs)}`
+      : "Thinking…"
+    : durationMs !== undefined && durationMs >= 500
+    ? `Thought for ${formatPaseoDuration(durationMs)}`
+    : "Thought";
+
+  const displaySecondary = summary ? `· ${summary}` : undefined;
 
   return (
     <PaseoExpandableBadge
-      label="Thinking"
+      label={primaryLabel}
       secondaryLabel={displaySecondary}
-      icon={Brain}
+      icon={isStreaming ? Sparkles : Brain}
       isExpanded={effectiveExpanded && hasDetail}
       onToggle={
         hasDetail
@@ -571,14 +667,17 @@ export const BeautifulThinkingBlock: React.FC<{
           : undefined
       }
       isLoading={isStreaming}
+      borderlessWhenExpanded
     >
       {hasDetail && (
-        <div
-          ref={scrollBoxRef}
-          className="max-h-[240px] overflow-y-auto px-3.5 py-2.5 space-y-1"
-        >
-          {cleanedLines.map((line, i) => renderFormattedLine(line, i))}
-        </div>
+        <PaseoIndentRail className="my-1">
+          <div
+            ref={scrollBoxRef}
+            className="max-h-[240px] overflow-y-auto py-1 space-y-1"
+          >
+            {cleanedLines.map((line, i) => renderFormattedLine(line, i))}
+          </div>
+        </PaseoIndentRail>
       )}
     </PaseoExpandableBadge>
   );
@@ -589,11 +688,13 @@ export const BeautifulThinkingBlock: React.FC<{
  * 6. PASEO TOOL CALL CARD (packages/app/src/components/message.tsx + tool-call-details.tsx)
  * ============================================================================
  */
-function resolvePaseoToolPresentation(
+export function resolvePaseoToolPresentation(
   toolName: string,
-  input: unknown
+  input: unknown,
+  output?: string
 ): {
   displayName: string;
+  workingVerb: string;
   summary?: string;
   icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
   kind: "shell" | "edit" | "read" | "search" | "other";
@@ -616,10 +717,14 @@ function resolvePaseoToolPresentation(
     (inputObj.command as string) ||
     (inputObj.cmd as string) ||
     (typeof input === "string" ? input : undefined);
-  const query =
+  let query =
     (inputObj.pattern as string) ||
     (inputObj.query as string) ||
     undefined;
+
+  if ((!query || !query.trim()) && output && output.startsWith("Searched:")) {
+    query = output.replace(/^Searched:\s*/i, "").split("\n")[0].trim();
+  }
 
   const shortPath = filePath
     ? filePath.replace(/^\/Users\/[^/]+\/code\/[^/]+\//, "")
@@ -628,6 +733,7 @@ function resolvePaseoToolPresentation(
   if (lower.includes("bash") || lower.includes("shell") || lower.includes("cmd")) {
     return {
       displayName: "Shell",
+      workingVerb: "Running command",
       summary: command || shortPath,
       icon: SquareTerminal,
       kind: "shell",
@@ -637,6 +743,7 @@ function resolvePaseoToolPresentation(
   if (lower.includes("read") || lower.includes("view")) {
     return {
       displayName: "Read",
+      workingVerb: shortPath ? `Reading ${shortPath}` : "Reading file",
       summary: shortPath || command,
       icon: Eye,
       kind: "read",
@@ -651,6 +758,7 @@ function resolvePaseoToolPresentation(
   ) {
     return {
       displayName: lower.includes("write") ? "Write" : "Edit",
+      workingVerb: shortPath ? `Editing ${shortPath}` : "Editing code",
       summary: shortPath || command,
       icon: Pencil,
       kind: "edit",
@@ -665,6 +773,7 @@ function resolvePaseoToolPresentation(
   ) {
     return {
       displayName: "Search",
+      workingVerb: query ? `Searching "${query.slice(0, 36)}"` : "Searching",
       summary: query || shortPath || command,
       icon: Search,
       kind: "search",
@@ -673,6 +782,7 @@ function resolvePaseoToolPresentation(
   if (lower.includes("task") || lower.includes("agent")) {
     return {
       displayName: "Task",
+      workingVerb: "Delegating subagent",
       summary: shortPath || command,
       icon: Bot,
       kind: "other",
@@ -681,6 +791,7 @@ function resolvePaseoToolPresentation(
 
   return {
     displayName: toolName,
+    workingVerb: `Running ${toolName}`,
     summary: shortPath || command || query,
     icon: Wrench,
     kind: "other",
@@ -696,15 +807,15 @@ export const BeautifulToolCallCard: React.FC<{
 }> = ({ toolName, input, output, isError = false, onOpenDiffTab }) => {
   const [expanded, setExpanded] = useState(false);
   const pres = useMemo(
-    () => resolvePaseoToolPresentation(toolName, input),
-    [toolName, input]
+    () => resolvePaseoToolPresentation(toolName, input, output),
+    [toolName, input, output]
   );
   const isRunning = output === undefined;
 
   return (
     <PaseoExpandableBadge
-      label={pres.displayName}
-      secondaryLabel={pres.summary}
+      label={isRunning ? pres.workingVerb : pres.displayName}
+      secondaryLabel={isRunning ? (pres.kind === "shell" ? pres.summary : undefined) : pres.summary}
       icon={pres.icon}
       isExpanded={expanded}
       onToggle={() => setExpanded((v) => !v)}
@@ -796,11 +907,15 @@ function summarizeToolGroup(items: PaseoToolGroupItem[]): {
   let otherCount = 0;
   let hasError = false;
   let isAnyRunning = false;
+  let activeWorkingVerb = "";
 
   for (const item of items) {
     if (item.isError) hasError = true;
-    if (item.output === undefined) isAnyRunning = true;
-    const pres = resolvePaseoToolPresentation(item.toolName, item.input);
+    const pres = resolvePaseoToolPresentation(item.toolName, item.input, item.output);
+    if (item.output === undefined) {
+      isAnyRunning = true;
+      activeWorkingVerb = pres.workingVerb;
+    }
     if (pres.kind === "shell") shellCount++;
     else if (pres.kind === "read") readCount++;
     else if (pres.kind === "edit") editCount++;
@@ -815,10 +930,11 @@ function summarizeToolGroup(items: PaseoToolGroupItem[]): {
   if (editCount > 0) parts.push(`edited ${editCount} ${editCount === 1 ? "file" : "files"}`);
   if (otherCount > 0) parts.push(`${otherCount} other`);
 
-  const summaryText =
-    parts.length > 0
-      ? parts.join(", ").replace(/^./, (c) => c.toUpperCase())
-      : `${items.length} tool calls`;
+  const summaryText = isAnyRunning && activeWorkingVerb
+    ? `${activeWorkingVerb}…`
+    : parts.length > 0
+    ? parts.join(", ").replace(/^./, (c) => c.toUpperCase())
+    : `${items.length} tool calls`;
 
   return {
     label: `${items.length} tool calls`,
