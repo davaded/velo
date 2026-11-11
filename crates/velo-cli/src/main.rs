@@ -267,6 +267,8 @@ async fn main() -> Result<()> {
                 model: None,
                 effort: None,
                 images: Vec::new(),
+                approval_mode: None,
+                setup_command: None,
             };
 
             let session: SessionInfo = http_post_json(addr, "/api/sessions", &req).await?;
@@ -646,6 +648,23 @@ fn print_agent_event(ev: &AgentEvent) {
             ..
         } => {
             println!("⚠️  [permission requested: {}] {}", tool_name, description);
+        }
+        AgentEvent::PermissionResolved { decision, .. } => {
+            println!("🛡️  [permission {}]", decision);
+        }
+        AgentEvent::UserQuestionRequested { question, .. } => {
+            println!("❓ [question] {}", question);
+        }
+        AgentEvent::UserQuestionAnswered { answers, .. } => {
+            println!("💬 [answered] {}", answers.join(", "));
+        }
+        AgentEvent::BrowserCommand { action, url, .. } => {
+            println!("🌐 [browser:{}] {}", action, url.as_deref().unwrap_or(""));
+        }
+        AgentEvent::SetupHookOutput {
+            command, exit_code, ..
+        } => {
+            println!("⚙️  [setup hook] `{}` (exit {})", command, exit_code);
         }
         AgentEvent::PtyOutput { line, .. } => {
             println!("{}", line);

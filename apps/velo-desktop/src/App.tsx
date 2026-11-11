@@ -20,6 +20,7 @@ import { parseUnifiedDiff } from "./utils/diffParser";
 import {
   BeautifulApprovalCard,
   BeautifulContextMeter,
+  BeautifulQuestionCard,
   BeautifulThinkingBlock,
   BeautifulToolCallCard,
   PaseoMarkdown,
@@ -27,8 +28,14 @@ import {
   PaseoToolGroupItem,
   PaseoTurnFooter,
 } from "./components/ui/BeautifulAgentPrimitives";
+import { XtermTerminalDrawer, TerminalChunkPacket } from "./components/XtermTerminalDrawer";
+import { PullRequestDrawer } from "./components/PullRequestDrawer";
+import { BrowserPreviewDrawer } from "./components/BrowserPreviewDrawer";
+import { AutomationsModal } from "./components/AutomationsModal";
+import { e2eeOpenFrame, e2eeSealJson } from "./utils/e2eeRelayClient";
 import {
   ArrowUp,
+  CalendarClock,
   Check,
   ChevronDown,
   ChevronRight,
@@ -40,8 +47,13 @@ import {
   GitBranch,
   GitCommitHorizontal,
   GitMerge,
+  GitPullRequest,
+  Globe,
   ImagePlus,
   Layers,
+  Lock,
+  MessageSquarePlus,
+  Mic,
   Monitor,
   Moon,
   PanelLeft,
@@ -51,10 +63,11 @@ import {
   Search,
   Server,
   Settings,
-  ShieldAlert,
+  Square,
   SquarePen,
   Sun,
   Terminal,
+  Trash2,
   Undo2,
   X,
 } from "lucide-react";
@@ -62,7 +75,7 @@ import {
 type VariantId = "a" | "b" | "c";
 type ThemeMode = "system" | "light" | "dark";
 type ToneId = "zinc" | "claude" | "paseo";
-type DrawerTab = "diff" | "terminal";
+type DrawerTab = "diff" | "pr" | "browser" | "terminal";
 type ModalKind =
   | null
   | "new-worktree"
@@ -70,13 +83,16 @@ type ModalKind =
   | "command"
   | "skills"
   | "qr"
-  | "settings";
+  | "settings"
+  | "automations";
 
 interface PairingTicketDto {
+  room_id?: string;
+  shared_key_hex?: string;
+  daemon_pubkey_hex?: string;
+  pairing_uri?: string;
   relay_url: string;
   daemon_addr: string;
-  session_token: string;
-  public_key_b64: string;
   uri: string;
   qr_svg: string;
 }
@@ -91,31 +107,30 @@ interface LocalRuntimeDto {
 
 interface PendingApprovalItem {
   id: string;
+  toolName: string;
   command: string;
   reason: string;
+}
+
+interface PendingQuestionItem {
+  id: string;
+  question: string;
+  options: string[];
+  allowMultiple: boolean;
+}
+
+interface DraftDiffReviewComment {
+  id: string;
+  filePath: string;
+  lineNum: number;
+  codeContent: string;
+  comment: string;
 }
 
 interface PendingAttachmentItem {
   filename: string;
   path: string;
   url: string;
-}
-
-function stripAnsiSequences(raw: string): string {
-  // Strip OSC (e.g. window title) and CSI/ANSI color & cursor control codes cleanly
-  const withoutOsc = raw.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
-  const withoutCsi = withoutOsc.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
-  const withoutEsc = withoutCsi.replace(/\x1b[@-_]/g, "");
-  // Normalize CRLF -> LF and process carriage-return overwrites per line
-  return withoutEsc
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => {
-      if (!line.includes("\r")) return line;
-      const segments = line.split("\r");
-      return segments[segments.length - 1];
-    })
-    .join("\n");
 }
 
 const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {};
@@ -178,7 +193,14 @@ export function App() {
     w.webkit?.messageHandlers?.windowTheme?.postMessage(themeMode);
   }, [themeMode, tone, resolvedTheme]);
 
-  const [sidebarOpen, setSidebarOpen] = useState<boolean>(true);
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    if (typeof window !== "undefined") {
+      if (window.location.search.includes("mobile=1") || window.innerWidth < 768) {
+        return false;
+      }
+    }
+    return true;
+  });
   const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
   const [repos, setRepos] = useState<VeloRepo[]>(() => {
     try {
@@ -204,7 +226,7 @@ export function App() {
         if (Array.isArray(parsed) && parsed.length > 0) {
           return parsed.map((s) => {
             const valid = MODEL_CATALOG.find((m) => m.id === s.model);
-            if (valid) return s;
+            if (valid || String(s.agent_kind || "").startsWith("acp:")) return s;
             const fallback =
               s.agent_kind === "codex"
                 ? MODEL_CATALOG.find((m) => m.id === "gpt-6.1-sol")!
@@ -289,9 +311,10 @@ export function App() {
   const [commitMsg, setCommitMsg] = useState<string>("feat: checkpoint isolated worktree changes");
   const [gitActionNotice, setGitActionNotice] = useState<string | null>(null);
 
-  // Inline Diff Line Review Comment State
+  // Inline Diff Line Review Comment State (Single + Batch Multi-Comment Dispatch)
   const [diffCommentIdx, setDiffCommentIdx] = useState<number | null>(null);
   const [diffCommentText, setDiffCommentText] = useState<string>("");
+  const [draftDiffComments, setDraftDiffComments] = useState<DraftDiffReviewComment[]>([]);
 
   // Open in External IDE Menu State
   const [openInMenuOpen, setOpenInMenuOpen] = useState<boolean>(false);
@@ -300,46 +323,68 @@ export function App() {
   const [dispatchMode, setDispatchMode] = useState<"single" | "committee" | "loop">("single");
   const [loopCheckCmd, setLoopCheckCmd] = useState<string>("cargo test --workspace --offline");
 
-  // Phase 4 Mobile Remote Controller Mode (?mobile=1 or preview toggle)
+  // Phase 4 Mobile Remote Controller & True E2EE Relay (?mobile=1&relay=...&room=...&key=...)
   const [mobileMode, setMobileMode] = useState<boolean>(() =>
     window.location.search.includes("mobile=1")
   );
+  const [e2eeRelayConfig] = useState<{
+    relayUrl: string;
+    roomId: string;
+    sharedKeyHex: string;
+  } | null>(() => {
+    const sp = new URLSearchParams(window.location.search);
+    const relayUrl = sp.get("relay");
+    const roomId = sp.get("room");
+    const sharedKeyHex = sp.get("key");
+    if (relayUrl && roomId && sharedKeyHex) {
+      return { relayUrl, roomId, sharedKeyHex };
+    }
+    return null;
+  });
+  const [e2eeConnected, setE2eeConnected] = useState<boolean>(false);
+  const e2eeWsRef = useRef<WebSocket | null>(null);
+  const e2eeNonceRef = useRef<number>(1);
 
   // Stream disclosure states & Inline User Message Editing state
-  const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
-  const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState<string>("");
 
-  // Human-in-the-Loop Pending Approvals per Session
+  // Human-in-the-Loop Pending Approvals & Bidirectional User Questions per Session
   const [pendingApprovals, setPendingApprovals] = useState<Record<string, PendingApprovalItem>>(
     DEFAULT_PENDING_BY_SESSION
   );
+  const [pendingQuestions, setPendingQuestions] = useState<Record<string, PendingQuestionItem>>({});
 
-  // Clean Composer State (Natural language + slash skills + multimodal image attachments)
+  // Clean Composer State (Natural language + slash skills + multimodal image attachments + voice STT)
   const [prompt, setPrompt] = useState<string>("");
   const [slashFilter, setSlashFilter] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachmentItem[]>([]);
   const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
   const [composerDragOver, setComposerDragOver] = useState<boolean>(false);
+  const [isDictating, setIsDictating] = useState<boolean>(false);
+  const speechRecRef = useRef<{ stop: () => void } | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renamingTitle, setRenamingTitle] = useState<string>("");
 
-  // Modals & E2EE Pairing Ticket
+  // Modals, Repo Worktree Setup Hooks, Custom ACP Runtime, & E2EE Pairing Ticket
   const [activeModal, setActiveModal] = useState<ModalKind>(null);
   const [pairTicket, setPairTicket] = useState<PairingTicketDto | null>(null);
   const [cmdQuery, setCmdQuery] = useState<string>("");
   const [newTaskName, setNewTaskName] = useState<string>("feat/new-thread");
   const [newTaskDesc, setNewTaskDesc] = useState<string>("");
   const [newModelId, setNewModelId] = useState<string>("claude-fable-5-2");
-  const [newApproval] = useState<ApprovalMode>("auto_edit");
+  const [newApproval, setNewApproval] = useState<ApprovalMode>("auto_edit");
+  const [newSetupCommand, setNewSetupCommand] = useState<string>("");
+  const [repoHooks, setRepoHooks] = useState<Record<string, string>>({});
+  const [hookEditCmd, setHookEditCmd] = useState<string>("");
+  const [customAcpCmd, setCustomAcpCmd] = useState<string>("");
   const [newRepoPath, setNewRepoPath] = useState<string>("/Users/daiyudai/code/velo");
 
-  // Interactive Persistent PTY Terminal State inside Drawer
-  const [ptyOutputBySession, setPtyOutputBySession] = useState<Record<string, string>>({});
-  const [ptyPidBySession, setPtyPidBySession] = useState<Record<string, number | null>>({});
-  const [termInput, setTermInput] = useState<string>("");
+  // Full-Color xterm.js PTY Stream Packet & Turn Timing State
+  const [latestTerminalChunk, setLatestTerminalChunk] = useState<TerminalChunkPacket | null>(null);
+  const termSeqRef = useRef<number>(0);
   const [turnTimingBySession, setTurnTimingBySession] = useState<
     Record<string, { startedAtMs: number; durationMs?: number; completedAtLabel?: string }>
   >({});
@@ -347,7 +392,6 @@ export function App() {
   const streamEndRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const terminalScrollRef = useRef<HTMLDivElement | null>(null);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeId) || sessions[0] || DEMO_SESSIONS[0],
@@ -438,6 +482,15 @@ export function App() {
       .then((data: { models?: ModelOption[] }) => {
         if (Array.isArray(data.models) && data.models.length > 0) {
           setModelCatalog(data.models);
+        }
+      })
+      .catch(() => {});
+
+    fetch(`${daemonUrl}/api/hooks`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data: { hooks?: Record<string, string> }) => {
+        if (data.hooks && typeof data.hooks === "object") {
+          setRepoHooks(data.hooks);
         }
       })
       .catch(() => {});
@@ -594,6 +647,22 @@ export function App() {
                 content: output,
               };
             }
+          } else if (evType === "setup_hook_output") {
+            const cmd = String(ev.command ?? ".velo/setup.sh");
+            const out = String(ev.output ?? "(exit 0)");
+            const code = Number(ev.exit_code ?? 0);
+            reconstructed.push({
+              id: `hook-hist-${i}`,
+              session_id: sid,
+              timestamp: ts,
+              kind: "tool_call",
+              tool_name: "Worktree Setup Hook",
+              tool_args: cmd,
+              tool_input: { command: cmd },
+              tool_output: out,
+              tool_is_error: code !== 0,
+              content: out,
+            });
           } else if (evType === "message_delta") {
             const text = String(ev.text ?? "");
             if (!text.trim() || text.startsWith("[stderr]")) continue;
@@ -625,37 +694,6 @@ export function App() {
       .catch(() => {});
   }, [activeSession.id, daemonUrl, eventsBySession]);
 
-  // Attach / spawn persistent interactive PTY shell when Terminal drawer opens
-  useEffect(() => {
-    if (!drawerOpen || drawerTab !== "terminal") return;
-    const sid = activeSession.id;
-    if (!sid || sid.startsWith("sess-") || sid.startsWith("wt-")) return;
-
-    fetch(`${daemonUrl}/api/sessions/${sid}/terminal/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cols: 96, rows: 28 }),
-    })
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((data: { pid?: number | null; scrollback?: string }) => {
-        if (typeof data.pid === "number") {
-          setPtyPidBySession((prev) => ({ ...prev, [sid]: data.pid ?? null }));
-        }
-        if (typeof data.scrollback === "string" && data.scrollback.length > 0) {
-          setPtyOutputBySession((prev) => ({
-            ...prev,
-            [sid]: prev[sid] ? prev[sid] : data.scrollback!,
-          }));
-        }
-        setTimeout(() => {
-          if (terminalScrollRef.current) {
-            terminalScrollRef.current.scrollTop = terminalScrollRef.current.scrollHeight;
-          }
-        }, 40);
-      })
-      .catch(() => {});
-  }, [drawerOpen, drawerTab, activeSession.id, daemonUrl]);
-
   // Fetch E2EE Pairing Ticket when QR modal opens
   useEffect(() => {
     if (activeModal !== "qr") return;
@@ -665,7 +703,510 @@ export function App() {
       .catch(() => {});
   }, [activeModal, daemonUrl]);
 
-  // Subscribe to live WebSocket events from real Claude Code / Codex CLI turns
+  // Shared event dispatcher for both direct Daemon `/ws` and E2EE `velo-relay` (`ChaCha20-Poly1305`)
+  const processServerPayload = useCallback(
+    (raw: Record<string, unknown>) => {
+      if (raw.kind === "sessions_snapshot" && Array.isArray(raw.sessions)) {
+        const normalized = raw.sessions.map((item, idx) => normalizeToVeloSession(item, idx));
+        if (normalized.length > 0) {
+          setSessions(normalized);
+        }
+        return;
+      }
+
+      const now = new Date().toLocaleTimeString([], { hour12: false });
+      const evObj =
+        raw.kind === "event" && raw.event && typeof raw.event === "object"
+          ? (raw.event as Record<string, unknown>)
+          : raw;
+
+      const evType = String(evObj.type ?? "");
+      const sid = String(evObj.session_id ?? "");
+      if (!sid) return;
+
+      if (evType === "permission_requested") {
+        const reqId = String(evObj.request_id ?? `perm-${Date.now()}`);
+        const toolName = String(evObj.tool_name ?? "Bash");
+        const cmdPreview = String(evObj.command_preview ?? evObj.description ?? toolName);
+        const reason = String(evObj.description ?? "");
+        setPendingApprovals((prev) => ({
+          ...prev,
+          [sid]: {
+            id: reqId,
+            toolName,
+            command: cmdPreview,
+            reason,
+          },
+        }));
+        setSessions((prev) =>
+          prev.map((s) => (s.id === sid ? { ...s, status: "waiting_approval" } : s))
+        );
+        setTimeout(() => {
+          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        }, 25);
+        return;
+      }
+
+      if (evType === "permission_resolved") {
+        setPendingApprovals((prev) => {
+          const next = { ...prev };
+          delete next[sid];
+          return next;
+        });
+        return;
+      }
+
+      if (evType === "user_question_requested") {
+        const qId = String(evObj.question_id ?? `q-${Date.now()}`);
+        const question = String(evObj.question ?? "Please select an option:");
+        const options = Array.isArray(evObj.options) ? evObj.options.map(String) : [];
+        const allowMultiple = Boolean(evObj.allow_multiple);
+        setPendingQuestions((prev) => ({
+          ...prev,
+          [sid]: {
+            id: qId,
+            question,
+            options,
+            allowMultiple,
+          },
+        }));
+        setTimeout(() => {
+          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        }, 25);
+        return;
+      }
+
+      if (evType === "user_question_answered") {
+        setPendingQuestions((prev) => {
+          const next = { ...prev };
+          delete next[sid];
+          return next;
+        });
+        return;
+      }
+
+      if (evType === "browser_command") {
+        const url = typeof evObj.url === "string" ? evObj.url : null;
+        if (url) {
+          setSessions((prev) =>
+            prev.map((s) => (s.id === sid ? { ...s, preview_url: url } : s))
+          );
+          setDrawerTab("browser");
+          setDrawerOpen(true);
+        }
+        return;
+      }
+
+      if (evType === "setup_hook_output") {
+        const cmd = String(evObj.command ?? ".velo/setup.sh");
+        const out = String(evObj.output ?? "(exit 0)");
+        const code = Number(evObj.exit_code ?? 0);
+        setEventsBySession((prev) => ({
+          ...prev,
+          [sid]: [
+            ...(prev[sid] || []),
+            {
+              id: `hook-${Date.now()}`,
+              session_id: sid,
+              timestamp: now,
+              kind: "tool_call",
+              tool_name: "Worktree Setup Hook",
+              tool_args: cmd,
+              tool_input: { command: cmd },
+              tool_output: out,
+              tool_is_error: code !== 0,
+              content: out,
+            },
+          ],
+        }));
+        return;
+      }
+
+      if (evType === "status_changed") {
+        const st = String(evObj.status ?? "");
+        if (st === "running") {
+          setTurnTimingBySession((prev) => ({
+            ...prev,
+            [sid]: {
+              startedAtMs: prev[sid]?.startedAtMs || Date.now(),
+            },
+          }));
+        } else if (st === "completed" || st === "failed" || st === "stopped") {
+          setTurnTimingBySession((prev) => {
+            const startedAtMs = prev[sid]?.startedAtMs || Date.now() - 1000;
+            return {
+              ...prev,
+              [sid]: {
+                startedAtMs,
+                durationMs: Math.max(500, Date.now() - startedAtMs),
+                completedAtLabel: now,
+              },
+            };
+          });
+        }
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === sid
+              ? {
+                  ...s,
+                  status:
+                    st === "running"
+                      ? "running"
+                      : st === "waiting_for_permission" || st === "waiting_permission"
+                      ? "waiting_approval"
+                      : "idle",
+                  updated_at: "just now",
+                }
+              : s
+          )
+        );
+        if (st === "completed") {
+          refreshSessionDiffAndFiles(sid);
+          fetch(`${daemonUrl}/api/sessions/${sid}/events`)
+            .then((r) => (r.ok ? r.json() : Promise.reject()))
+            .then((evList: Array<Record<string, unknown>>) => {
+              if (!Array.isArray(evList)) return;
+              let lastRunStart = 0;
+              for (let i = evList.length - 1; i >= 0; i--) {
+                if (evList[i].type === "status_changed" && evList[i].status === "running") {
+                  lastRunStart = i;
+                  break;
+                }
+              }
+              const latestTurnEvents = evList.slice(lastRunStart);
+              const thinkingTexts = latestTurnEvents
+                .filter((e) => e.type === "thinking_delta" && typeof e.text === "string")
+                .map((e) => String(e.text).trim())
+                .filter(Boolean);
+              const texts = latestTurnEvents
+                .filter((e) => e.type === "message_delta" && typeof e.text === "string")
+                .map((e) => String(e.text).trim())
+                .filter(Boolean);
+              setEventsBySession((prev) => {
+                let list = [...(prev[sid] || [])];
+                if (thinkingTexts.length > 0) {
+                  const combinedThinking = Array.from(new Set(thinkingTexts)).join("\n");
+                  let lastUserIdx = -1;
+                  for (let i = list.length - 1; i >= 0; i--) {
+                    if (list[i].kind === "user") {
+                      lastUserIdx = i;
+                      break;
+                    }
+                  }
+                  let thIdx = -1;
+                  for (let i = list.length - 1; i > lastUserIdx; i--) {
+                    if (list[i].kind === "thinking") {
+                      thIdx = i;
+                      break;
+                    }
+                  }
+                  if (thIdx !== -1) {
+                    list[thIdx] = { ...list[thIdx], content: combinedThinking };
+                  } else {
+                    const thEv: AgentEvent = {
+                      id: `th-sync-${Date.now()}`,
+                      session_id: sid,
+                      timestamp: now,
+                      kind: "thinking",
+                      content: combinedThinking,
+                    };
+                    if (lastUserIdx !== -1) {
+                      list = [
+                        ...list.slice(0, lastUserIdx + 1),
+                        thEv,
+                        ...list.slice(lastUserIdx + 1),
+                      ];
+                    } else {
+                      list = [thEv, ...list];
+                    }
+                  }
+                }
+
+                if (texts.length > 0) {
+                  const lastText = texts[texts.length - 1];
+                  const lastEv = list[list.length - 1];
+                  if (!lastEv || lastEv.kind !== "assistant" || !lastEv.content.includes(lastText)) {
+                    list = [
+                      ...list,
+                      {
+                        id: `as-sync-${Date.now()}`,
+                        session_id: sid,
+                        timestamp: now,
+                        kind: "assistant",
+                        content: lastText,
+                      },
+                    ];
+                  }
+                }
+                return {
+                  ...prev,
+                  [sid]: list,
+                };
+              });
+            })
+            .catch(() => {});
+        }
+        return;
+      }
+
+      if (evType === "diff_updated" && evObj.stats && typeof evObj.stats === "object") {
+        const st = evObj.stats as Record<string, unknown>;
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === sid
+              ? {
+                  ...s,
+                  files_changed: Number(st.files_changed ?? s.files_changed),
+                  insertions: Number(st.insertions ?? s.insertions),
+                  deletions: Number(st.deletions ?? s.deletions),
+                }
+              : s
+          )
+        );
+        refreshSessionDiffAndFiles(sid);
+        return;
+      }
+
+      if (evType === "thinking_delta") {
+        const text = String(evObj.text ?? "").trim();
+        if (!text) return;
+        setEventsBySession((prev) => {
+          const list = [...(prev[sid] || [])];
+          let lastUserIdx = -1;
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].kind === "user") {
+              lastUserIdx = i;
+              break;
+            }
+          }
+          let thIdx = -1;
+          for (let i = list.length - 1; i > lastUserIdx; i--) {
+            if (list[i].kind === "thinking") {
+              thIdx = i;
+              break;
+            }
+          }
+          if (thIdx !== -1) {
+            const existing = list[thIdx].content;
+            const nextContent = existing.includes(text) ? existing : `${existing}\n${text}`;
+            list[thIdx] = { ...list[thIdx], content: nextContent };
+            return { ...prev, [sid]: list };
+          }
+          const newTh: AgentEvent = {
+            id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+            session_id: sid,
+            timestamp: now,
+            kind: "thinking",
+            content: text,
+          };
+          if (lastUserIdx !== -1) {
+            return {
+              ...prev,
+              [sid]: [
+                ...list.slice(0, lastUserIdx + 1),
+                newTh,
+                ...list.slice(lastUserIdx + 1),
+              ],
+            };
+          }
+          return {
+            ...prev,
+            [sid]: [...list, newTh],
+          };
+        });
+        return;
+      }
+
+      if (evType === "tool_call_requested") {
+        const toolName = String(evObj.tool_name ?? "Tool");
+        const argsObj = (
+          evObj.arguments && typeof evObj.arguments === "object" ? evObj.arguments : {}
+        ) as Record<string, unknown>;
+        const argSummary = String(
+          argsObj.file_path ??
+            argsObj.path ??
+            argsObj.command ??
+            argsObj.pattern ??
+            JSON.stringify(argsObj).slice(0, 80)
+        );
+        const toolEv: AgentEvent = {
+          id: String(evObj.tool_id ?? `tl-${Date.now()}`),
+          session_id: sid,
+          timestamp: now,
+          kind: "tool_call",
+          tool_name: toolName,
+          tool_args: argSummary,
+          tool_input: argsObj,
+          tool_output: undefined,
+          tool_is_error: false,
+          content: JSON.stringify(argsObj, null, 2),
+        };
+        setEventsBySession((prev) => ({
+          ...prev,
+          [sid]: [...(prev[sid] || []), toolEv],
+        }));
+        return;
+      }
+
+      if (evType === "tool_call_completed") {
+        const toolId = String(evObj.tool_id ?? "");
+        const output = String(evObj.output ?? "(completed)");
+        const isError = Boolean(evObj.is_error);
+        setEventsBySession((prev) => {
+          const list = prev[sid] || [];
+          let idx = list.findIndex((item) => item.id === toolId);
+          if (idx === -1) {
+            for (let i = list.length - 1; i >= 0; i--) {
+              if (list[i].kind === "tool_call" && list[i].tool_output === undefined) {
+                idx = i;
+                break;
+              }
+            }
+          }
+          if (idx !== -1) {
+            const next = [...list];
+            next[idx] = {
+              ...next[idx],
+              content: output,
+              tool_output: output,
+              tool_is_error: isError,
+            };
+            return { ...prev, [sid]: next };
+          }
+          return prev;
+        });
+        return;
+      }
+
+      if (evType === "usage_updated") {
+        const totalTok = Number(evObj.total_tokens ?? 0);
+        const costDelta = Number(evObj.cost_usd ?? 0);
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === sid
+              ? {
+                  ...s,
+                  tokens_used: totalTok > 0 ? totalTok : s.tokens_used,
+                  cost_usd: costDelta > 0 ? (s.cost_usd || 0) + costDelta : s.cost_usd,
+                }
+              : s
+          )
+        );
+        return;
+      }
+
+      if (evType === "terminal_output") {
+        const chunk = String(evObj.data ?? "");
+        if (!chunk) return;
+        termSeqRef.current += 1;
+        setLatestTerminalChunk({
+          seq: termSeqRef.current,
+          sessionId: sid,
+          data: chunk,
+        });
+        return;
+      }
+
+      if (evType === "message_chunk") {
+        const delta = String(evObj.delta ?? "");
+        if (!delta) return;
+        setEventsBySession((prev) => {
+          const list = prev[sid] || [];
+          const last = list[list.length - 1];
+          if (last && last.kind === "assistant" && last.is_streaming_chunk) {
+            const updatedLast: AgentEvent = {
+              ...last,
+              content: `${last.content}${delta}`,
+            };
+            return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
+          }
+          return {
+            ...prev,
+            [sid]: [
+              ...list,
+              {
+                id: `as-stream-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                session_id: sid,
+                timestamp: now,
+                kind: "assistant",
+                content: delta,
+                is_streaming_chunk: true,
+              },
+            ],
+          };
+        });
+        setTimeout(() => {
+          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        }, 25);
+        return;
+      }
+
+      if (evType === "message_delta") {
+        const text = String(evObj.text ?? "");
+        if (!text.trim()) return;
+        setEventsBySession((prev) => {
+          const list = prev[sid] || [];
+          const last = list[list.length - 1];
+          if (last && last.kind === "assistant") {
+            if (last.is_streaming_chunk) {
+              return {
+                ...prev,
+                [sid]: [
+                  ...list.slice(0, -1),
+                  { ...last, content: text, is_streaming_chunk: false },
+                ],
+              };
+            }
+            const updatedLast = {
+              ...last,
+              content: last.content.includes(text)
+                ? last.content
+                : `${last.content}\n${text}`.trim(),
+            };
+            return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
+          }
+          return {
+            ...prev,
+            [sid]: [
+              ...list,
+              {
+                id: `as-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                session_id: sid,
+                timestamp: now,
+                kind: "assistant",
+                content: text,
+                is_streaming_chunk: false,
+              },
+            ],
+          };
+        });
+        setTimeout(() => {
+          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        }, 30);
+        return;
+      }
+
+      if (evType === "error") {
+        const errText = String(evObj.error ?? "Agent execution error");
+        setEventsBySession((prev) => ({
+          ...prev,
+          [sid]: [
+            ...(prev[sid] || []),
+            {
+              id: `err-${Date.now()}`,
+              session_id: sid,
+              timestamp: now,
+              kind: "assistant",
+              content: `⚠️ ${errText}`,
+            },
+          ],
+        }));
+      }
+    },
+    [daemonUrl, refreshSessionDiffAndFiles]
+  );
+
+  // Subscribe to live WebSocket events from real Claude Code / Codex / ACP turns
   useEffect(() => {
     const wsUrl = `${daemonUrl.replace(/^http/, "ws")}/ws`;
     let ws: WebSocket | null = null;
@@ -675,408 +1216,7 @@ export function App() {
       ws.onmessage = (msg) => {
         try {
           const raw = JSON.parse(msg.data) as Record<string, unknown>;
-          const now = new Date().toLocaleTimeString([], { hour12: false });
-
-          // Handle WsServerMessage::Event { event: AgentEvent }
-          const evObj =
-            raw.kind === "event" && raw.event && typeof raw.event === "object"
-              ? (raw.event as Record<string, unknown>)
-              : raw;
-
-          const evType = String(evObj.type ?? "");
-          const sid = String(evObj.session_id ?? "");
-          if (!sid) return;
-
-          if (evType === "status_changed") {
-            const st = String(evObj.status ?? "");
-            if (st === "running") {
-              setTurnTimingBySession((prev) => ({
-                ...prev,
-                [sid]: {
-                  startedAtMs: prev[sid]?.startedAtMs || Date.now(),
-                },
-              }));
-            } else if (st === "completed" || st === "failed" || st === "stopped") {
-              setTurnTimingBySession((prev) => {
-                const startedAtMs = prev[sid]?.startedAtMs || Date.now() - 1000;
-                return {
-                  ...prev,
-                  [sid]: {
-                    startedAtMs,
-                    durationMs: Math.max(500, Date.now() - startedAtMs),
-                    completedAtLabel: now,
-                  },
-                };
-              });
-            }
-            setSessions((prev) =>
-              prev.map((s) =>
-                s.id === sid
-                  ? {
-                      ...s,
-                      status:
-                        st === "running"
-                          ? "running"
-                          : st === "waiting_for_permission"
-                          ? "waiting_approval"
-                          : "idle",
-                      updated_at: "just now",
-                    }
-                  : s
-              )
-            );
-            if (st === "completed") {
-              refreshSessionDiffAndFiles(sid);
-              fetch(`${daemonUrl}/api/sessions/${sid}/events`)
-                .then((r) => (r.ok ? r.json() : Promise.reject()))
-                .then((evList: Array<Record<string, unknown>>) => {
-                  if (!Array.isArray(evList)) return;
-                  // Only inspect events from the latest turn (after the last status_changed: running)
-                  let lastRunStart = 0;
-                  for (let i = evList.length - 1; i >= 0; i--) {
-                    if (evList[i].type === "status_changed" && evList[i].status === "running") {
-                      lastRunStart = i;
-                      break;
-                    }
-                  }
-                  const latestTurnEvents = evList.slice(lastRunStart);
-                  const thinkingTexts = latestTurnEvents
-                    .filter((e) => e.type === "thinking_delta" && typeof e.text === "string")
-                    .map((e) => String(e.text).trim())
-                    .filter(Boolean);
-                  const texts = latestTurnEvents
-                    .filter((e) => e.type === "message_delta" && typeof e.text === "string")
-                    .map((e) => String(e.text).trim())
-                    .filter(Boolean);
-                  setEventsBySession((prev) => {
-                    let list = [...(prev[sid] || [])];
-                    // Ensure thinking trace from this turn is synced
-                    if (thinkingTexts.length > 0) {
-                      const combinedThinking = Array.from(new Set(thinkingTexts)).join("\n");
-                      let lastUserIdx = -1;
-                      for (let i = list.length - 1; i >= 0; i--) {
-                        if (list[i].kind === "user") {
-                          lastUserIdx = i;
-                          break;
-                        }
-                      }
-                      let thIdx = -1;
-                      for (let i = list.length - 1; i > lastUserIdx; i--) {
-                        if (list[i].kind === "thinking") {
-                          thIdx = i;
-                          break;
-                        }
-                      }
-                      if (thIdx !== -1) {
-                        list[thIdx] = { ...list[thIdx], content: combinedThinking };
-                      } else {
-                        const thEv: AgentEvent = {
-                          id: `th-sync-${Date.now()}`,
-                          session_id: sid,
-                          timestamp: now,
-                          kind: "thinking",
-                          content: combinedThinking,
-                        };
-                        if (lastUserIdx !== -1) {
-                          list = [
-                            ...list.slice(0, lastUserIdx + 1),
-                            thEv,
-                            ...list.slice(lastUserIdx + 1),
-                          ];
-                        } else {
-                          list = [thEv, ...list];
-                        }
-                      }
-                    }
-
-                    if (texts.length > 0) {
-                      const lastText = texts[texts.length - 1];
-                      const lastEv = list[list.length - 1];
-                      if (!lastEv || lastEv.kind !== "assistant" || !lastEv.content.includes(lastText)) {
-                        list = [
-                          ...list,
-                          {
-                            id: `as-sync-${Date.now()}`,
-                            session_id: sid,
-                            timestamp: now,
-                            kind: "assistant",
-                            content: lastText,
-                          },
-                        ];
-                      }
-                    }
-                    return {
-                      ...prev,
-                      [sid]: list,
-                    };
-                  });
-                })
-                .catch(() => {});
-            }
-            return;
-          }
-
-          if (evType === "diff_updated" && evObj.stats && typeof evObj.stats === "object") {
-            const st = evObj.stats as Record<string, unknown>;
-            setSessions((prev) =>
-              prev.map((s) =>
-                s.id === sid
-                  ? {
-                      ...s,
-                      files_changed: Number(st.files_changed ?? s.files_changed),
-                      insertions: Number(st.insertions ?? s.insertions),
-                      deletions: Number(st.deletions ?? s.deletions),
-                    }
-                  : s
-              )
-            );
-            refreshSessionDiffAndFiles(sid);
-            return;
-          }
-
-          if (evType === "thinking_delta") {
-            const text = String(evObj.text ?? "").trim();
-            if (!text) return;
-            setEventsBySession((prev) => {
-              const list = [...(prev[sid] || [])];
-              let lastUserIdx = -1;
-              for (let i = list.length - 1; i >= 0; i--) {
-                if (list[i].kind === "user") {
-                  lastUserIdx = i;
-                  break;
-                }
-              }
-              let thIdx = -1;
-              for (let i = list.length - 1; i > lastUserIdx; i--) {
-                if (list[i].kind === "thinking") {
-                  thIdx = i;
-                  break;
-                }
-              }
-              if (thIdx !== -1) {
-                const existing = list[thIdx].content;
-                const nextContent = existing.includes(text)
-                  ? existing
-                  : `${existing}\n${text}`;
-                list[thIdx] = { ...list[thIdx], content: nextContent };
-                return { ...prev, [sid]: list };
-              }
-              const newTh: AgentEvent = {
-                id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-                session_id: sid,
-                timestamp: now,
-                kind: "thinking",
-                content: text,
-              };
-              if (lastUserIdx !== -1) {
-                return {
-                  ...prev,
-                  [sid]: [
-                    ...list.slice(0, lastUserIdx + 1),
-                    newTh,
-                    ...list.slice(lastUserIdx + 1),
-                  ],
-                };
-              }
-              return {
-                ...prev,
-                [sid]: [...list, newTh],
-              };
-            });
-            return;
-          }
-
-          if (evType === "tool_call_requested") {
-            const toolName = String(evObj.tool_name ?? "Tool");
-            const argsObj = (
-              evObj.arguments && typeof evObj.arguments === "object" ? evObj.arguments : {}
-            ) as Record<string, unknown>;
-            const argSummary = String(
-              argsObj.file_path ??
-                argsObj.path ??
-                argsObj.command ??
-                argsObj.pattern ??
-                JSON.stringify(argsObj).slice(0, 80)
-            );
-            const toolEv: AgentEvent = {
-              id: String(evObj.tool_id ?? `tl-${Date.now()}`),
-              session_id: sid,
-              timestamp: now,
-              kind: "tool_call",
-              tool_name: toolName,
-              tool_args: argSummary,
-              tool_input: argsObj,
-              tool_output: undefined,
-              tool_is_error: false,
-              content: JSON.stringify(argsObj, null, 2),
-            };
-            setEventsBySession((prev) => ({
-              ...prev,
-              [sid]: [...(prev[sid] || []), toolEv],
-            }));
-            return;
-          }
-
-          if (evType === "tool_call_completed") {
-            const toolId = String(evObj.tool_id ?? "");
-            const output = String(evObj.output ?? "(completed)");
-            const isError = Boolean(evObj.is_error);
-            setEventsBySession((prev) => {
-              const list = prev[sid] || [];
-              let idx = list.findIndex((item) => item.id === toolId);
-              if (idx === -1) {
-                // Fallback to the latest pending tool_call in this session
-                for (let i = list.length - 1; i >= 0; i--) {
-                  if (list[i].kind === "tool_call" && list[i].tool_output === undefined) {
-                    idx = i;
-                    break;
-                  }
-                }
-              }
-              if (idx !== -1) {
-                const next = [...list];
-                next[idx] = {
-                  ...next[idx],
-                  content: output,
-                  tool_output: output,
-                  tool_is_error: isError,
-                };
-                return { ...prev, [sid]: next };
-              }
-              return prev;
-            });
-            return;
-          }
-
-          if (evType === "usage_updated") {
-            const totalTok = Number(evObj.total_tokens ?? 0);
-            const costDelta = Number(evObj.cost_usd ?? 0);
-            setSessions((prev) =>
-              prev.map((s) =>
-                s.id === sid
-                  ? {
-                      ...s,
-                      tokens_used: totalTok > 0 ? totalTok : s.tokens_used,
-                      cost_usd: costDelta > 0 ? (s.cost_usd || 0) + costDelta : s.cost_usd,
-                    }
-                  : s
-              )
-            );
-            return;
-          }
-
-          if (evType === "terminal_output") {
-            const chunk = String(evObj.data ?? "");
-            if (!chunk) return;
-            setPtyOutputBySession((prev) => {
-              const combined = (prev[sid] || "") + chunk;
-              const trimmed = combined.length > 49152 ? combined.slice(-49152) : combined;
-              return { ...prev, [sid]: trimmed };
-            });
-            setTimeout(() => {
-              if (terminalScrollRef.current) {
-                terminalScrollRef.current.scrollTop = terminalScrollRef.current.scrollHeight;
-              }
-            }, 15);
-            return;
-          }
-
-          if (evType === "message_chunk") {
-            const delta = String(evObj.delta ?? "");
-            if (!delta) return;
-            setEventsBySession((prev) => {
-              const list = prev[sid] || [];
-              const last = list[list.length - 1];
-              if (last && last.kind === "assistant" && last.is_streaming_chunk) {
-                const updatedLast: AgentEvent = {
-                  ...last,
-                  content: `${last.content}${delta}`,
-                };
-                return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
-              }
-              return {
-                ...prev,
-                [sid]: [
-                  ...list,
-                  {
-                    id: `as-stream-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-                    session_id: sid,
-                    timestamp: now,
-                    kind: "assistant",
-                    content: delta,
-                    is_streaming_chunk: true,
-                  },
-                ],
-              };
-            });
-            setTimeout(() => {
-              streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
-            }, 25);
-            return;
-          }
-
-          if (evType === "message_delta") {
-            const text = String(evObj.text ?? "");
-            if (!text.trim()) return;
-            setEventsBySession((prev) => {
-              const list = prev[sid] || [];
-              const last = list[list.length - 1];
-              if (last && last.kind === "assistant") {
-                if (last.is_streaming_chunk) {
-                  return {
-                    ...prev,
-                    [sid]: [
-                      ...list.slice(0, -1),
-                      { ...last, content: text, is_streaming_chunk: false },
-                    ],
-                  };
-                }
-                const updatedLast = {
-                  ...last,
-                  content: last.content.includes(text)
-                    ? last.content
-                    : `${last.content}\n${text}`.trim(),
-                };
-                return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
-              }
-              return {
-                ...prev,
-                [sid]: [
-                  ...list,
-                  {
-                    id: `as-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-                    session_id: sid,
-                    timestamp: now,
-                    kind: "assistant",
-                    content: text,
-                    is_streaming_chunk: false,
-                  },
-                ],
-              };
-            });
-            setTimeout(() => {
-              streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
-            }, 30);
-            return;
-          }
-
-          if (evType === "error") {
-            const errText = String(evObj.error ?? "Agent execution error");
-            setEventsBySession((prev) => ({
-              ...prev,
-              [sid]: [
-                ...(prev[sid] || []),
-                {
-                  id: `err-${Date.now()}`,
-                  session_id: sid,
-                  timestamp: now,
-                  kind: "assistant",
-                  content: `⚠️ ${errText}`,
-                },
-              ],
-            }));
-            return;
-          }
+          processServerPayload(raw);
         } catch {
           // ignore malformed frames
         }
@@ -1088,7 +1228,62 @@ export function App() {
     return () => {
       if (ws) ws.close();
     };
-  }, [daemonUrl, refreshSessionDiffAndFiles]);
+  }, [daemonUrl, processServerPayload]);
+
+  // Connect to True E2EE Remote Relay (`ChaCha20-Poly1305`) when `?relay=...&room=...&key=...` is present
+  useEffect(() => {
+    if (!e2eeRelayConfig) return;
+    const roomWsUrl = `${e2eeRelayConfig.relayUrl.replace(/\/$/, "")}/room/${e2eeRelayConfig.roomId}`;
+    let rws: WebSocket | null = null;
+    try {
+      rws = new WebSocket(roomWsUrl);
+      e2eeWsRef.current = rws;
+      rws.onopen = () => {
+        setE2eeConnected(true);
+        setConnected(true);
+        const syncFrame = e2eeSealJson(
+          e2eeRelayConfig.sharedKeyHex,
+          "mobile-web",
+          e2eeNonceRef.current++,
+          { cmd: "sync" }
+        );
+        rws?.send(syncFrame);
+      };
+      rws.onmessage = (ev) => {
+        if (typeof ev.data !== "string") return;
+        const opened = e2eeOpenFrame(e2eeRelayConfig.sharedKeyHex, ev.data);
+        if (!opened || opened.senderId === "mobile-web") return;
+        processServerPayload(opened.message);
+      };
+      rws.onclose = () => {
+        setE2eeConnected(false);
+        e2eeWsRef.current = null;
+      };
+    } catch {
+      setE2eeConnected(false);
+    }
+    return () => {
+      if (rws) rws.close();
+      e2eeWsRef.current = null;
+    };
+  }, [e2eeRelayConfig, processServerPayload]);
+
+  const sendE2eeCommand = useCallback(
+    (payload: Record<string, unknown>): boolean => {
+      if (!e2eeRelayConfig || !e2eeWsRef.current || e2eeWsRef.current.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+      const sealed = e2eeSealJson(
+        e2eeRelayConfig.sharedKeyHex,
+        "mobile-web",
+        e2eeNonceRef.current++,
+        payload
+      );
+      e2eeWsRef.current.send(sealed);
+      return true;
+    },
+    [e2eeRelayConfig]
+  );
 
   // Global Shortcuts
   useEffect(() => {
@@ -1218,6 +1413,21 @@ export function App() {
     setSlashFilter(null);
     if (overrideImages === undefined) {
       setPendingAttachments([]);
+    }
+
+    if (rawText.toLowerCase() === "/automations") {
+      setActiveModal("automations");
+      return;
+    }
+    if (rawText.toLowerCase() === "/pr") {
+      setDrawerTab("pr");
+      setDrawerOpen(true);
+      return;
+    }
+    if (rawText.toLowerCase() === "/browser") {
+      setDrawerTab("browser");
+      setDrawerOpen(true);
+      return;
     }
 
     const now = new Date().toLocaleTimeString([], { hour12: false });
@@ -1438,10 +1648,10 @@ export function App() {
       )
     );
 
-    const providerName = activeSession.agent_kind === "codex" ? "codex" : "claude";
+    const providerName = activeSession.agent_kind || "claude";
 
     try {
-      // 1. Send clean user input to existing daemon session (uses native `codex exec resume` / `claude --resume` or daemon transcript fallback)
+      // 1. Send clean user input to existing daemon session (uses native `codex exec resume` / `claude --resume` or ACP session/load)
       const inputRes = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1450,6 +1660,7 @@ export function App() {
           model: activeSession.model,
           effort: activeSession.effort || "medium",
           provider: providerName,
+          approval_mode: activeSession.approval_mode,
           truncate_to_user_turn: truncateToUserTurn,
           reset_thread: truncateToUserTurn !== undefined,
           images: attachedPaths,
@@ -1476,6 +1687,7 @@ export function App() {
           use_pty: false,
           model: activeSession.model,
           effort: activeSession.effort || "medium",
+          approval_mode: activeSession.approval_mode,
           images: attachedPaths,
         }),
       });
@@ -1546,6 +1758,15 @@ export function App() {
         }));
       }
     } catch {
+      if (
+        sendE2eeCommand({
+          cmd: "send_input",
+          session_id: activeSession.id,
+          input: text,
+        })
+      ) {
+        return;
+      }
       setSessions((prev) =>
         prev.map((s) =>
           s.id === activeSession.id ? { ...s, status: "idle", updated_at: "now" } : s
@@ -1571,14 +1792,13 @@ export function App() {
     }, 50);
   };
 
-  // Stop currently running agent turn via POST /api/sessions/{id}/stop
+  // Stop currently running agent turn via POST /api/sessions/{id}/stop (or E2EE Relay)
   const handleStopSession = async () => {
     setSessions((prev) =>
       prev.map((s) =>
         s.id === activeSession.id ? { ...s, status: "idle", updated_at: "now" } : s
       )
     );
-    // Finalize any in-flight tool_call spinner so it doesn't stay spinning after stopping
     setEventsBySession((prev) => {
       const list = prev[activeSession.id] || [];
       const updated = list.map((item) =>
@@ -1588,13 +1808,14 @@ export function App() {
       );
       return { ...prev, [activeSession.id]: updated };
     });
+    sendE2eeCommand({ cmd: "stop_session", session_id: activeSession.id });
     try {
       await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/stop`, {
         method: "POST",
       });
       refreshSessions();
     } catch {
-      // ignore if local-only
+      // ignore if local-only or remote relay
     }
   };
 
@@ -1701,11 +1922,6 @@ export function App() {
       delete next[sessionId];
       return next;
     });
-    setPtyOutputBySession((prev) => {
-      const next = { ...prev };
-      delete next[sessionId];
-      return next;
-    });
     try {
       await fetch(`${daemonUrl}/api/sessions/${sessionId}?cleanup_worktree=true`, {
         method: "DELETE",
@@ -1779,101 +1995,229 @@ export function App() {
     [daemonUrl, activeSession, refreshSessionDiffAndFiles, refreshSessions]
   );
 
-  // Human-in-the-Loop Permission Approval Actions
+  // Real Bidirectional Permission Approval Resolution (`PreToolUse` / `velo_request_approval` / ACP)
   const handleResolveApproval = async (action: "approve" | "always" | "deny") => {
-    const pending = pendingApprovals[activeSession.id];
+    const sid = activeSession.id;
+    const pending = pendingApprovals[sid];
     if (!pending) return;
 
     setPendingApprovals((prev) => {
       const next = { ...prev };
-      delete next[activeSession.id];
+      delete next[sid];
       return next;
     });
 
     setSessions((prev) =>
       prev.map((s) =>
-        s.id === activeSession.id
+        s.id === sid
           ? {
               ...s,
-              status: action === "deny" ? "idle" : "running",
+              status: "running",
               approval_mode: action === "always" ? "auto_edit" : s.approval_mode,
             }
           : s
       )
     );
 
-    const now = new Date().toLocaleTimeString([], { hour12: false });
-    if (action === "deny") {
-      setEventsBySession((prev) => ({
-        ...prev,
-        [activeSession.id]: [
-          ...(prev[activeSession.id] || []),
-          {
-            id: `perm-deny-${Date.now()}`,
-            session_id: activeSession.id,
-            timestamp: now,
-            kind: "assistant",
-            content: `Skipped command \`${pending.command}\` per user decision.`,
-          },
-        ],
-      }));
+    sendE2eeCommand({
+      cmd: "resolve_approval",
+      session_id: sid,
+      request_id: pending.id,
+      decision: action,
+    });
+
+    try {
+      await fetch(
+        `${daemonUrl}/api/sessions/${sid}/approvals/${encodeURIComponent(pending.id)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision: action }),
+        }
+      );
+    } catch {
+      // handled via E2EE relay if remote
+    }
+  };
+
+  // Real Bidirectional `AskUserQuestion` Resolution (`velo_ask_user`)
+  const handleAnswerQuestion = async (answers: string[]) => {
+    const sid = activeSession.id;
+    const pendingQ = pendingQuestions[sid];
+    if (!pendingQ) return;
+
+    setPendingQuestions((prev) => {
+      const next = { ...prev };
+      delete next[sid];
+      return next;
+    });
+
+    sendE2eeCommand({
+      cmd: "answer_question",
+      session_id: sid,
+      question_id: pendingQ.id,
+      answers,
+    });
+
+    try {
+      await fetch(
+        `${daemonUrl}/api/sessions/${sid}/questions/${encodeURIComponent(pendingQ.id)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ answers }),
+        }
+      );
+    } catch {
+      // handled via E2EE relay if remote
+    }
+  };
+
+  // Cycle Session Approval Mode (`auto_edit` -> `ask_before_edit` -> `bypass`)
+  const handleToggleApprovalMode = () => {
+    const nextMode: ApprovalMode =
+      activeSession.approval_mode === "auto_edit"
+        ? "ask_before_edit"
+        : activeSession.approval_mode === "ask_before_edit"
+        ? "bypass"
+        : "auto_edit";
+    setSessions((prev) =>
+      prev.map((s) => (s.id === activeSession.id ? { ...s, approval_mode: nextMode } : s))
+    );
+    fetch(`${daemonUrl}/api/sessions/${activeSession.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approval_mode: nextMode }),
+    }).catch(() => {});
+  };
+
+  // Hands-Free Voice Dictation Input (Web Speech API + MediaRecorder `/api/transcribe` fallback)
+  const handleToggleVoiceDictation = async () => {
+    if (isDictating) {
+      setIsDictating(false);
+      speechRecRef.current?.stop();
+      speechRecRef.current = null;
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
       return;
     }
 
-    const result = await executeInWorktree(pending.command);
-    const output = (result.stdout || result.stderr || "Command completed (exit 0)").trim();
-    setEventsBySession((prev) => ({
-      ...prev,
-      [activeSession.id]: [
-        ...(prev[activeSession.id] || []),
-        {
-          id: `perm-tool-${Date.now()}`,
-          session_id: activeSession.id,
-          timestamp: now,
-          kind: "tool_call",
-          tool_name: "Bash",
-          tool_args: pending.command,
-          content: output,
-          duration_ms: 64,
-        },
-        {
-          id: `perm-ok-${Date.now() + 1}`,
-          session_id: activeSession.id,
-          timestamp: now,
-          kind: "assistant",
-          content: `Approved and executed \`${pending.command}\`${
-            action === "always" ? " (Auto-edit enabled for this worktree)" : ""
-          }.`,
-        },
-      ],
-    }));
+    const w = window as unknown as {
+      SpeechRecognition?: new () => {
+        lang: string;
+        continuous: boolean;
+        interimResults: boolean;
+        onresult: ((ev: { results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal?: boolean }> }) => void) | null;
+        onerror: (() => void) | null;
+        onend: (() => void) | null;
+        start: () => void;
+        stop: () => void;
+      };
+      webkitSpeechRecognition?: new () => {
+        lang: string;
+        continuous: boolean;
+        interimResults: boolean;
+        onresult: ((ev: { results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal?: boolean }> }) => void) | null;
+        onerror: (() => void) | null;
+        onend: (() => void) | null;
+        start: () => void;
+        stop: () => void;
+      };
+    };
+
+    const SpeechCtor = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (SpeechCtor) {
+      try {
+        const rec = new SpeechCtor();
+        rec.lang = navigator.language || "zh-CN";
+        rec.continuous = true;
+        rec.interimResults = false;
+        rec.onresult = (ev) => {
+          let finalChunk = "";
+          for (let i = 0; i < ev.results.length; i++) {
+            const resItem = ev.results[i];
+            if (resItem.isFinal !== false && resItem[0]?.transcript) {
+              finalChunk = resItem[0].transcript;
+            }
+          }
+          if (finalChunk.trim()) {
+            setPrompt((prev) => (prev ? `${prev} ${finalChunk.trim()}` : finalChunk.trim()));
+          }
+        };
+        rec.onerror = () => setIsDictating(false);
+        rec.onend = () => setIsDictating(false);
+        speechRecRef.current = rec;
+        setIsDictating(true);
+        rec.start();
+        return;
+      } catch {
+        // fallback to MediaRecorder below
+      }
+    }
+
+    if (navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const chunks: BlobPart[] = [];
+        const mr = new MediaRecorder(stream);
+        mr.ondataavailable = (e) => {
+          if (e.data.size > 0) chunks.push(e.data);
+        };
+        mr.onstop = async () => {
+          stream.getTracks().forEach((t) => t.stop());
+          const blob = new Blob(chunks, { type: mr.mimeType || "audio/webm" });
+          const b64 = await new Promise<string>((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(String(reader.result || ""));
+            reader.readAsDataURL(blob);
+          });
+          const res = await fetch(`${daemonUrl}/api/transcribe`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              audio_base64: b64,
+              mime_type: blob.type || "audio/webm",
+              language: "zh",
+            }),
+          });
+          if (res.ok) {
+            const d = (await res.json()) as { ok?: boolean; text?: string };
+            if (d.ok && d.text?.trim()) {
+              setPrompt((prev) => (prev ? `${prev} ${d.text!.trim()}` : d.text!.trim()));
+            }
+          }
+          setIsDictating(false);
+        };
+        mediaRecorderRef.current = mr;
+        setIsDictating(true);
+        mr.start();
+      } catch {
+        setIsDictating(false);
+      }
+    }
   };
 
-  // Toggle approval mode or simulate permission prompt
-  const handleToggleApprovalMode = () => {
-    const nextMode: ApprovalMode =
-      activeSession.approval_mode === "auto_edit" ? "ask_before_edit" : "auto_edit";
-    setSessions((prev) =>
-      prev.map((s) =>
-        s.id === activeSession.id
-          ? {
-              ...s,
-              approval_mode: nextMode,
-              status: nextMode === "ask_before_edit" ? "waiting_approval" : s.status,
-            }
-          : s
-      )
-    );
-    if (nextMode === "ask_before_edit" && !pendingApprovals[activeSession.id]) {
-      setPendingApprovals((prev) => ({
-        ...prev,
-        [activeSession.id]: {
-          id: `perm-${Date.now()}`,
-          command: "cargo check --workspace --all-targets",
-          reason: `Verify compilation across isolated worktree ${activeSession.branch_name}`,
-        },
-      }));
-    }
+  const handleSaveRepoHook = async (repoPath: string, cmd: string) => {
+    setRepoHooks((prev) => ({ ...prev, [repoPath]: cmd }));
+    await fetch(`${daemonUrl}/api/hooks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo_path: repoPath, setup_command: cmd }),
+    }).catch(() => {});
+  };
+
+  const handleDispatchBatchDiffComments = async () => {
+    if (draftDiffComments.length === 0) return;
+    const formatted = [
+      `Please address the following ${draftDiffComments.length} inline code review comment(s) in this worktree:`,
+      ...draftDiffComments.map(
+        (c, i) =>
+          `${i + 1}. \`${c.filePath}:L${c.lineNum}\` (\`${c.codeContent}\`)\n   - Review request: ${c.comment}`
+      ),
+    ].join("\n\n");
+    setDraftDiffComments([]);
+    await handleSendPrompt(formatted);
   };
 
   // Create real isolated Git worktree (Single / Committee Race / TDD Loop)
@@ -1886,7 +2230,12 @@ export function App() {
         : `feat/${clean}`;
     const title = newTaskDesc.trim() || branch;
     const chosenModel = modelCatalog.find((m) => m.id === newModelId) || modelCatalog[0];
-    const providerName = chosenModel.runtimeId === "codex" ? "codex" : "claude";
+    const providerName = chosenModel.agentKind || "claude";
+    const setupCmd = newSetupCommand.trim() || undefined;
+
+    if (setupCmd) {
+      void handleSaveRepoHook(targetRepo.path, setupCmd);
+    }
 
     try {
       if (dispatchMode === "committee") {
@@ -1957,6 +2306,8 @@ export function App() {
           use_pty: false,
           model: chosenModel.id,
           effort: "medium",
+          approval_mode: newApproval,
+          setup_command: setupCmd,
         }),
       });
       if (res.ok) {
@@ -2051,60 +2402,6 @@ export function App() {
     } catch {
       // ignore
     }
-  };
-
-  // Interactive Persistent PTY Terminal Controls (Real zsh / $SHELL PTY per Session)
-  const handleSendPtyRaw = async (data: string) => {
-    const sid = activeSession.id;
-    try {
-      const res = await fetch(`${daemonUrl}/api/sessions/${sid}/terminal/input`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ data }),
-      });
-      if (res.ok) return;
-    } catch {
-      // fallback below if session is local draft
-    }
-    const cleanCmd = data.trim();
-    if (cleanCmd && cleanCmd !== "\x03") {
-      const res = await executeInWorktree(cleanCmd);
-      const out = [res.stdout, res.stderr].filter(Boolean).join("\n");
-      setPtyOutputBySession((prev) => ({
-        ...prev,
-        [sid]: `${prev[sid] || ""}$ ${cleanCmd}\n${out || `(exit ${res.exit_code})`}\n`,
-      }));
-    }
-  };
-
-  const handleRestartPty = async () => {
-    const sid = activeSession.id;
-    setPtyOutputBySession((prev) => ({ ...prev, [sid]: "" }));
-    try {
-      const res = await fetch(`${daemonUrl}/api/sessions/${sid}/terminal/restart`, {
-        method: "POST",
-      });
-      if (res.ok) {
-        const data = (await res.json()) as { pid?: number | null };
-        setPtyPidBySession((prev) => ({ ...prev, [sid]: data.pid ?? null }));
-      }
-    } catch {
-      // ignore
-    }
-  };
-
-  const handleRunTermCommand = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const cmd = termInput;
-    if (!cmd.trim()) {
-      await handleSendPtyRaw("\n");
-      return;
-    }
-    setTermInput("");
-    if (cmd.trim() === "clear") {
-      setPtyOutputBySession((prev) => ({ ...prev, [activeSession.id]: "" }));
-    }
-    await handleSendPtyRaw(`${cmd}\n`);
   };
 
   // One-click Commit inside isolated worktree via POST /api/sessions/{id}/git/commit
@@ -2214,6 +2511,7 @@ export function App() {
   );
 
   const activePendingApproval = pendingApprovals[activeSession.id];
+  const activePendingQuestion = pendingQuestions[activeSession.id];
 
   return (
     <div
@@ -2221,17 +2519,27 @@ export function App() {
       data-tone={tone}
       className={`velo-variant-${variant} flex h-screen w-screen overflow-hidden select-none bg-[var(--v-bg-canvas)] text-[var(--v-fg-primary)]`}
     >
+      {/* Mobile Sidebar Backdrop (<768px) */}
+      {sidebarOpen && (
+        <div
+          onClick={() => setSidebarOpen(false)}
+          className="fixed inset-0 z-30 bg-black/50 backdrop-blur-[1px] md:hidden"
+        />
+      )}
+
       {/* =====================================================================
           1. AUTHENTIC CODEX / CLAUDE CODE / PASEO LEFT SIDEBAR
              - Seamless matte surface (#0c0c0e), ZERO boxed cards or heavy lines
-             - Top: quiet nav rows (New thread, Search, Automations)
+             - Top: quiet nav rows (New thread, Search, Velo Hub Automations, Skills)
              - Body: Workspaces section -> clean Project rows -> borderless Thread rows
              - Idle rows keep empty leading slot; only active/waiting rows show indicator
              - Bottom: single icon-only footer bar
          ===================================================================== */}
       <aside
         className={`flex shrink-0 flex-col justify-between bg-[var(--v-bg-sidebar)] border-r border-[var(--v-border-subtle)] transition-all duration-200 overflow-hidden ${
-          sidebarOpen ? "w-[252px]" : "w-0 border-r-0"
+          sidebarOpen
+            ? "w-[252px] max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:shadow-2xl"
+            : "w-0 border-r-0"
         }`}
       >
         <div className="flex flex-1 flex-col overflow-hidden">
@@ -2258,6 +2566,7 @@ export function App() {
             <button
               onClick={() => {
                 setTargetRepoIdForNewWt(activeRepo.id);
+                setNewSetupCommand(repoHooks[activeRepo.path] || "");
                 setActiveModal("new-worktree");
               }}
               title="New thread (⌘N)"
@@ -2272,6 +2581,7 @@ export function App() {
             <button
               onClick={() => {
                 setTargetRepoIdForNewWt(activeRepo.id);
+                setNewSetupCommand(repoHooks[activeRepo.path] || "");
                 setActiveModal("new-worktree");
               }}
               className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -2290,11 +2600,18 @@ export function App() {
               <span className="font-mono text-[11px] text-[var(--v-fg-faint)]">⌘K</span>
             </button>
             <button
+              onClick={() => setActiveModal("automations")}
+              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+            >
+              <CalendarClock className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+              <span>Cron &amp; Webhooks</span>
+            </button>
+            <button
               onClick={() => setActiveModal("skills")}
               className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
               <Layers className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
-              <span>Automations & Skills</span>
+              <span>Skills &amp; Commands</span>
             </button>
           </div>
 
@@ -2337,6 +2654,7 @@ export function App() {
                       <button
                         onClick={() => {
                           setTargetRepoIdForNewWt(repo.id);
+                          setNewSetupCommand(repoHooks[repo.path] || "");
                           setActiveModal("new-worktree");
                         }}
                         title={`New thread in ${repo.name}`}
@@ -2361,11 +2679,16 @@ export function App() {
                     <div className="space-y-0.5">
                       {repoItems.map((w) => {
                         const isSelected = w.id === activeSession.id;
-                        const hasPending = !!pendingApprovals[w.id];
+                        const hasPending = !!pendingApprovals[w.id] || !!pendingQuestions[w.id];
                         return (
                           <div
                             key={w.id}
-                            onClick={() => setActiveId(w.id)}
+                            onClick={() => {
+                              setActiveId(w.id);
+                              if (typeof window !== "undefined" && window.innerWidth < 768) {
+                                setSidebarOpen(false);
+                              }
+                            }}
                             role="button"
                             tabIndex={0}
                             onKeyDown={(e) => {
@@ -2385,7 +2708,7 @@ export function App() {
                               {hasPending || w.status === "waiting_approval" ? (
                                 <span
                                   className="h-2 w-2 rounded-full bg-[#fbbf24]"
-                                  title="Waiting for permission approval"
+                                  title="Waiting for permission approval or user answer"
                                 />
                               ) : w.status === "running" ? (
                                 <span
@@ -2492,6 +2815,13 @@ export function App() {
               <FolderPlus className="h-4 w-4" />
             </button>
             <button
+              onClick={() => setActiveModal("automations")}
+              title="Velo Hub: Cron Schedules & GitHub Webhooks"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+            >
+              <CalendarClock className="h-4 w-4" />
+            </button>
+            <button
               onClick={() => setActiveModal("skills")}
               title={`Usage: ${tokenPercent}% context window`}
               className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -2506,7 +2836,7 @@ export function App() {
               <Server className="h-4 w-4" />
               <span
                 className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full"
-                style={{ background: connected ? "#34d399" : "#fbbf24" }}
+                style={{ background: connected || e2eeConnected ? "#34d399" : "#fbbf24" }}
               />
             </button>
           </div>
@@ -2539,7 +2869,10 @@ export function App() {
             </div>
 
             <button
-              onClick={() => setActiveModal("settings")}
+              onClick={() => {
+                setHookEditCmd(repoHooks[activeRepo.path] || "");
+                setActiveModal("settings");
+              }}
               title="Appearance & Settings (⌘,)"
               className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
@@ -2575,25 +2908,35 @@ export function App() {
             </span>
             <span
               title={activeSession.worktree_path}
-              className="inline-flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-secondary)]"
+              className="hidden sm:inline-flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-secondary)]"
             >
               <GitBranch className="h-3 w-3 text-[var(--v-fg-muted)]" />
               {activeSession.branch_name}
             </span>
           </div>
 
-          {/* Right Header Controls: Open in IDE, Diff Stat Trigger & Terminal Toggle */}
+          {/* Right Header Controls: E2EE Badge, Open in IDE, Diff, PR, Preview & xterm Terminal */}
           <div className="relative flex items-center gap-1.5">
-            {mobileMode && (
+            {e2eeConnected && (
+              <span
+                title="End-to-End Encrypted Relay Active (X25519 + ChaCha20-Poly1305)"
+                className="inline-flex items-center gap-1 rounded-md bg-[#34d399]/15 px-2 py-1 font-mono text-[10.5px] font-medium text-[#34d399]"
+              >
+                <Lock className="h-3 w-3" />
+                <span className="hidden sm:inline">E2EE ChaCha20</span>
+              </span>
+            )}
+
+            {mobileMode && !e2eeRelayConfig && (
               <button
                 onClick={() => setMobileMode(false)}
                 className="rounded-md bg-[#34d399]/15 px-2 py-1 font-mono text-[11px] font-medium text-[#34d399]"
               >
-                Mobile Remote Active · Exit
+                Mobile Preview · Exit
               </button>
             )}
 
-            <div className="relative">
+            <div className="relative hidden sm:block">
               <button
                 onClick={() => setOpenInMenuOpen((o) => !o)}
                 title="Open isolated worktree in external IDE or Finder"
@@ -2634,6 +2977,7 @@ export function App() {
                   setDrawerOpen(true);
                 }
               }}
+              title="Worktree Changes & Inline Code Review"
               className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11.5px] transition-colors ${
                 drawerOpen && drawerTab === "diff"
                   ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
@@ -2646,13 +2990,52 @@ export function App() {
 
             <button
               onClick={() => {
+                if (drawerOpen && drawerTab === "pr") setDrawerOpen(false);
+                else {
+                  setDrawerTab("pr");
+                  setDrawerOpen(true);
+                }
+              }}
+              title="GitHub Pull Request Lifecycle & CI Checks"
+              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                drawerOpen && drawerTab === "pr"
+                  ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                  : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              }`}
+            >
+              <GitPullRequest className="h-4 w-4" />
+            </button>
+
+            <button
+              onClick={() => {
+                if (drawerOpen && drawerTab === "browser") setDrawerOpen(false);
+                else {
+                  setDrawerTab("browser");
+                  setDrawerOpen(true);
+                }
+              }}
+              title="Live Browser Preview & Agent DOM Inspection"
+              className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                drawerOpen && drawerTab === "browser"
+                  ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                  : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              }`}
+            >
+              <Globe className="h-4 w-4" />
+              {activeSession.preview_url && (
+                <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-[#34d399]" />
+              )}
+            </button>
+
+            <button
+              onClick={() => {
                 if (drawerOpen && drawerTab === "terminal") setDrawerOpen(false);
                 else {
                   setDrawerTab("terminal");
                   setDrawerOpen(true);
                 }
               }}
-              title="Toggle Worktree Terminal (⌘J)"
+              title="Toggle Full-Color xterm.js Terminal (⌘J)"
               className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
                 drawerOpen && drawerTab === "terminal"
                   ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
@@ -3009,15 +3392,29 @@ export function App() {
                    - Direct Model Picker (Claude Fable 5.2, Opus 5.5, GPT-6.1-Sol...)
                    - Effort Picker (Low / Medium / High / Max) + Permission Mode
                =============================================================== */}
-            <div className="w-full px-6 pb-5 pt-1">
+            <div className="w-full px-4 sm:px-6 pb-5 pt-1">
               <div className="mx-auto max-w-[680px]">
-                {/* Human-in-the-Loop Permission Approval Card using BeautifulApprovalCard */}
+                {/* Live Bidirectional Permission Approval Card (`PreToolUse` / `velo_request_approval` / ACP) */}
                 {activePendingApproval && (
                   <BeautifulApprovalCard
-                    toolName="Bash"
+                    key={activePendingApproval.id}
+                    toolName={activePendingApproval.toolName || "Bash"}
                     commandPreview={activePendingApproval.command}
+                    reason={activePendingApproval.reason}
                     onApprove={() => handleResolveApproval("approve")}
+                    onAlwaysAllow={() => handleResolveApproval("always")}
                     onDeny={() => handleResolveApproval("deny")}
+                  />
+                )}
+
+                {/* Live Bidirectional `AskUserQuestion` Card (`velo_ask_user`) */}
+                {activePendingQuestion && (
+                  <BeautifulQuestionCard
+                    key={activePendingQuestion.id}
+                    question={activePendingQuestion.question}
+                    options={activePendingQuestion.options}
+                    allowMultiple={activePendingQuestion.allowMultiple}
+                    onSubmit={handleAnswerQuestion}
                   />
                 )}
 
@@ -3139,22 +3536,25 @@ export function App() {
                     placeholder={`Ask ${
                       modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                       activeSession.model_short
-                    } anything... (/ for commands, ⌘V paste screenshot)`}
+                    } anything... (/ for commands, ⌘V paste screenshot, or click mic to dictate)`}
                     className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                   />
 
-                  {/* Composer Bottom Toolbar: Concrete Model Picker + Effort + Permission Mode */}
-                  <div className="relative mt-1.5 flex items-center justify-between">
-                    {/* 1. Concrete Model Picker Popover (Grouped by Model Family, dynamically synced from ~/.claude.json & ~/.codex/codex-models.json) */}
+                  {/* Composer Bottom Toolbar: Concrete Model Picker (Claude / Codex / ACP) + Effort + Permission Mode + Voice */}
+                  <div className="relative mt-1.5 flex flex-wrap items-center justify-between gap-2">
+                    {/* 1. Concrete Model & ACP Provider Picker Popover */}
                     {modelPickerOpen && (
-                      <div className="absolute bottom-9 left-0 z-30 w-[340px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                      <div className="absolute bottom-9 left-0 z-30 w-[348px] max-w-[calc(100vw-32px)] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
                         <div className="max-h-[340px] overflow-y-auto pr-0.5">
-                          {(["Anthropic", "OpenAI", "Google"] as const).map((family) => {
+                          {Array.from(new Set(modelCatalog.map((m) => m.family))).map((family) => {
                             const familyModels = modelCatalog.filter((m) => m.family === family);
                             if (familyModels.length === 0) return null;
                             const runtimeId = familyModels[0].runtimeId;
                             const rt = runtimes.find((r) => r.id === runtimeId);
-                            const isConnected = rt ? rt.available : runtimeId !== "gemini";
+                            const isAcpFamily = String(family).startsWith("ACP");
+                            const isConnected = rt
+                              ? rt.available
+                              : familyModels[0].installed !== false;
                             return (
                               <div key={family} className="mb-1.5 last:mb-0">
                                 <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
@@ -3166,15 +3566,20 @@ export function App() {
                                       : family}
                                   </span>
                                   <span className="font-mono text-[10px]">
-                                    {isConnected ? "Connected" : "Not configured"}
+                                    {isConnected
+                                      ? "Connected"
+                                      : isAcpFamily
+                                      ? "ACP JSON-RPC"
+                                      : "Not configured"}
                                   </span>
                                 </div>
                                 {familyModels.map((m) => {
                                   const isCurrent = activeSession.model === m.id;
+                                  const canSelect = isConnected || isAcpFamily;
                                   return (
                                     <button
                                       key={m.id}
-                                      disabled={!isConnected}
+                                      disabled={!canSelect}
                                       onClick={() => {
                                         setSessions((prev) =>
                                           prev.map((s) =>
@@ -3198,7 +3603,7 @@ export function App() {
                                       className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
                                         isCurrent
                                           ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                                          : isConnected
+                                          : canSelect
                                           ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
                                           : "cursor-not-allowed text-[var(--v-fg-muted)] opacity-40"
                                       }`}
@@ -3209,6 +3614,11 @@ export function App() {
                                           {m.isDefault && (
                                             <span className="rounded bg-[var(--v-bg-active)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
                                               default
+                                            </span>
+                                          )}
+                                          {!isConnected && isAcpFamily && (
+                                            <span className="rounded bg-[var(--v-bg-hover)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-faint)]">
+                                              install CLI
                                             </span>
                                           )}
                                         </div>
@@ -3227,15 +3637,56 @@ export function App() {
                           })}
                         </div>
 
+                        {/* Custom ACP Command Quick-Bind (`acp:<cmd>`) */}
+                        <div className="mt-1.5 border-t border-[var(--v-border-subtle)] px-1.5 pt-2">
+                          <div className="mb-1 text-[10px] font-medium text-[var(--v-fg-muted)]">
+                            Custom ACP Stdio Agent (JSON-RPC 2.0)
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <input
+                              value={customAcpCmd}
+                              onChange={(e) => setCustomAcpCmd(e.target.value)}
+                              placeholder="e.g. opencode acp or goose acp"
+                              className="flex-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2 py-1 font-mono text-[11px] text-[var(--v-fg-primary)] focus:outline-none"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const cmd = customAcpCmd.trim();
+                                if (!cmd) return;
+                                const acpSpec = cmd.startsWith("acp:") ? cmd : `acp:${cmd}`;
+                                const short = cmd.split(/\s+/)[0] || "ACP";
+                                setSessions((prev) =>
+                                  prev.map((s) =>
+                                    s.id === activeSession.id
+                                      ? {
+                                          ...s,
+                                          agent_kind: acpSpec,
+                                          model: acpSpec,
+                                          model_short: `ACP · ${short}`,
+                                        }
+                                      : s
+                                  )
+                                );
+                                setModelPickerOpen(false);
+                              }}
+                              className="rounded-md bg-[var(--v-bg-active)] px-2 py-1 text-[11px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
+                            >
+                              Bind
+                            </button>
+                          </div>
+                        </div>
+
                         <div className="mt-1 border-t border-[var(--v-border-subtle)] pt-1">
                           <button
                             onClick={() => {
                               setModelPickerOpen(false);
+                              setHookEditCmd(repoHooks[activeRepo.path] || "");
                               setActiveModal("settings");
                             }}
                             className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
                           >
-                            <span>Manage CLI & Provider Connections...</span>
+                            <span>Manage CLI, ACP &amp; Worktree Hooks...</span>
                             <Settings className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
                           </button>
                         </div>
@@ -3296,7 +3747,7 @@ export function App() {
                       </div>
                     )}
 
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       {/* Pill 1: Concrete Model Name */}
                       <button
                         onClick={() => {
@@ -3327,15 +3778,23 @@ export function App() {
                         <ChevronDown className="h-3 w-3 opacity-60" />
                       </button>
 
-                      {/* Pill 3: Worktree Permission Mode */}
+                      {/* Pill 3: Worktree Permission Mode (`auto_edit` / `ask_before_edit` / `bypass`) */}
                       <button
                         onClick={handleToggleApprovalMode}
-                        title="Click to toggle Auto-edit / Ask permissions"
-                        className="rounded-full px-2.5 py-1 text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
+                        title="Click to cycle: Auto-edit → Ask permissions (live PreToolUse gate) → Bypass"
+                        className={`rounded-full px-2.5 py-1 text-[11.5px] transition-colors ${
+                          activeSession.approval_mode === "ask_before_edit"
+                            ? "bg-[#fbbf24]/15 font-medium text-[#fbbf24] hover:bg-[#fbbf24]/25"
+                            : activeSession.approval_mode === "bypass"
+                            ? "bg-[#34d399]/15 text-[#34d399] hover:bg-[#34d399]/25"
+                            : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
+                        }`}
                       >
-                        {activeSession.approval_mode === "auto_edit"
-                          ? "Auto-edit"
-                          : "Ask permissions"}
+                        {activeSession.approval_mode === "ask_before_edit"
+                          ? "Ask permissions"
+                          : activeSession.approval_mode === "bypass"
+                          ? "Bypass"
+                          : "Auto-edit"}
                       </button>
 
                       {/* Pill 4: Attach Screenshot / Image (Cmd+V or Drag & Drop) */}
@@ -3346,6 +3805,31 @@ export function App() {
                         className="flex h-6 w-6 items-center justify-center rounded-full text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                       >
                         <ImagePlus className="h-3.5 w-3.5" />
+                      </button>
+
+                      {/* Pill 5: Hands-Free Voice Dictation Input (WebKit SpeechRecognition + Whisper STT Fallback) */}
+                      <button
+                        type="button"
+                        onClick={handleToggleVoiceDictation}
+                        title={
+                          isDictating
+                            ? "Stop voice dictation"
+                            : "Hands-free voice dictation (Web Speech / Whisper STT)"
+                        }
+                        className={`flex h-6 items-center gap-1 rounded-full px-1.5 transition-colors cursor-pointer ${
+                          isDictating
+                            ? "bg-[#f87171]/20 text-[#f87171] animate-pulse"
+                            : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
+                        }`}
+                      >
+                        {isDictating ? (
+                          <>
+                            <Square className="h-3 w-3 fill-current" />
+                            <span className="font-mono text-[10px]">Listening…</span>
+                          </>
+                        ) : (
+                          <Mic className="h-3.5 w-3.5" />
+                        )}
                       </button>
                     </div>
 
@@ -3385,18 +3869,21 @@ export function App() {
           </main>
 
           {/* =================================================================
-              5. ON-DEMAND SLIDE-OVER DIFF & TERMINAL DRAWER (Right Side)
+              5. ON-DEMAND SLIDE-OVER DRAWER (Changes / PR / Browser / Terminal)
+                 - Strictly NO File Explorer or Inline Code Editor per user design
              ================================================================= */}
           <aside
             className={`flex flex-col overflow-hidden bg-[var(--v-bg-sidebar)] border-l border-[var(--v-border-subtle)] transition-all duration-200 ease-out ${
-              drawerOpen ? "w-[460px] opacity-100" : "w-0 border-l-0 opacity-0"
+              drawerOpen
+                ? "w-full md:w-[500px] opacity-100 max-md:fixed max-md:inset-0 max-md:z-40"
+                : "w-0 border-l-0 opacity-0"
             }`}
           >
-            <div className="flex h-[42px] shrink-0 items-center justify-between border-b border-[var(--v-border-subtle)] px-3.5">
-              <div className="flex items-center gap-1">
+            <div className="flex h-[42px] shrink-0 items-center justify-between border-b border-[var(--v-border-subtle)] px-3">
+              <div className="flex items-center gap-0.5 overflow-x-auto">
                 <button
                   onClick={() => setDrawerTab("diff")}
-                  className={`rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
+                  className={`shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
                     drawerTab === "diff"
                       ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                       : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
@@ -3405,8 +3892,28 @@ export function App() {
                   Changes ({activeDiffFiles.length})
                 </button>
                 <button
+                  onClick={() => setDrawerTab("pr")}
+                  className={`shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
+                    drawerTab === "pr"
+                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
+                  }`}
+                >
+                  PR
+                </button>
+                <button
+                  onClick={() => setDrawerTab("browser")}
+                  className={`shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
+                    drawerTab === "browser"
+                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
+                  }`}
+                >
+                  Preview
+                </button>
+                <button
                   onClick={() => setDrawerTab("terminal")}
-                  className={`rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
+                  className={`shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
                     drawerTab === "terminal"
                       ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                       : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
@@ -3417,7 +3924,7 @@ export function App() {
               </div>
 
               {/* One-Click Git Worktree Actions + Close */}
-              <div className="flex items-center gap-1">
+              <div className="flex shrink-0 items-center gap-1">
                 {drawerTab === "diff" && (
                   <>
                     <button
@@ -3439,41 +3946,11 @@ export function App() {
                     </button>
                     <button
                       onClick={handleMergeWorktree}
-                      title="Check branch readiness for merge"
+                      title="Check branch readiness & merge"
                       className="flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
                     >
                       <GitMerge className="h-3.5 w-3.5 text-[var(--v-fg-secondary)]" />
                       <span>Merge</span>
-                    </button>
-                  </>
-                )}
-                {drawerTab === "terminal" && (
-                  <>
-                    <button
-                      onClick={() => handleSendPtyRaw("\x03")}
-                      title="Send SIGINT (Ctrl+C) to interactive PTY"
-                      className="rounded-md bg-[var(--v-bg-hover)] px-2 py-1 font-mono text-[10.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171]"
-                    >
-                      ^C
-                    </button>
-                    <button
-                      onClick={() =>
-                        setPtyOutputBySession((prev) => ({
-                          ...prev,
-                          [activeSession.id]: "",
-                        }))
-                      }
-                      title="Clear terminal buffer"
-                      className="rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-active)]"
-                    >
-                      Clear
-                    </button>
-                    <button
-                      onClick={handleRestartPty}
-                      title="Restart interactive zsh PTY in worktree"
-                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                    >
-                      <RotateCcw className="h-3.5 w-3.5" />
                     </button>
                   </>
                 )}
@@ -3571,7 +4048,7 @@ export function App() {
                     </div>
                   </div>
 
-                  {/* Dual-Line-Number Unified Diff Viewer (Click any line to add inline review comment for Agent) */}
+                  {/* Dual-Line-Number Unified Diff Viewer + Multi-Line Batch Code Review */}
                   <div className="flex-1 overflow-y-auto py-2 font-mono text-[11.5px] leading-[1.65]">
                     {currentDiffFile.hunks.map((line, idx) => {
                       const isHunkHeader = line.content.startsWith("@@");
@@ -3591,6 +4068,9 @@ export function App() {
                         : " ";
                       const lineNum = line.newLine ?? line.oldLine ?? idx + 1;
                       const isCommenting = diffCommentIdx === idx;
+                      const lineDrafts = draftDiffComments.filter(
+                        (c) => c.filePath === currentDiffFile.path && c.lineNum === lineNum
+                      );
                       return (
                         <div key={idx}>
                           <div
@@ -3603,7 +4083,7 @@ export function App() {
                             title={
                               isHunkHeader
                                 ? undefined
-                                : "Click line to send inline review comment to Agent"
+                                : "Click + to add inline review comment (single or batch)"
                             }
                             className={`group flex cursor-pointer items-center px-3 py-0.5 hover:brightness-110 ${rowClass}`}
                           >
@@ -3620,11 +4100,39 @@ export function App() {
                                 sign
                               )}
                               {!isHunkHeader && (
-                                <span className="hidden text-[#38bdf8] group-hover:inline">+</span>
+                                <span className="hidden font-bold text-[#38bdf8] group-hover:inline">
+                                  +
+                                </span>
                               )}
                             </span>
                             <span className="whitespace-pre">{line.content}</span>
                           </div>
+
+                          {/* Pinned Draft Batch Comments on this line */}
+                          {lineDrafts.map((dc) => (
+                            <div
+                              key={dc.id}
+                              className="mx-3 my-1 flex items-center justify-between gap-2 rounded-lg border border-[#38bdf8]/40 bg-[var(--v-bg-surface)] px-2.5 py-1.5 font-sans text-[11.5px]"
+                            >
+                              <div className="min-w-0">
+                                <span className="mr-1.5 rounded bg-[#38bdf8]/15 px-1.5 py-0.5 font-mono text-[10px] text-[#38bdf8]">
+                                  L{dc.lineNum} queued
+                                </span>
+                                <span className="text-[var(--v-fg-primary)]">{dc.comment}</span>
+                              </div>
+                              <button
+                                onClick={() =>
+                                  setDraftDiffComments((prev) =>
+                                    prev.filter((item) => item.id !== dc.id)
+                                  )
+                                }
+                                title="Remove queued comment"
+                                className="shrink-0 text-[var(--v-fg-muted)] hover:text-[#f87171]"
+                              >
+                                <Trash2 className="h-3 w-3" />
+                              </button>
+                            </div>
+                          ))}
 
                           {isCommenting && (
                             <div className="mx-3 my-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-2.5 font-sans shadow-lg">
@@ -3639,34 +4147,65 @@ export function App() {
                                   <X className="h-3 w-3" />
                                 </button>
                               </div>
-                              <div className="flex items-center gap-1.5">
+                              <div className="flex flex-col gap-1.5">
                                 <input
                                   autoFocus
                                   value={diffCommentText}
                                   onChange={(e) => setDiffCommentText(e.target.value)}
                                   onKeyDown={(e) => {
                                     if (e.key === "Enter" && diffCommentText.trim()) {
+                                      setDraftDiffComments((prev) => [
+                                        ...prev,
+                                        {
+                                          id: `dc-${Date.now()}`,
+                                          filePath: currentDiffFile.path,
+                                          lineNum,
+                                          codeContent: line.content.trim(),
+                                          comment: diffCommentText.trim(),
+                                        },
+                                      ]);
+                                      setDiffCommentIdx(null);
+                                      setDiffCommentText("");
+                                    }
+                                  }}
+                                  placeholder="Write review feedback (Enter to queue in batch)..."
+                                  className="w-full rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1.5 text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
+                                />
+                                <div className="flex items-center justify-end gap-1.5">
+                                  <button
+                                    onClick={() => {
+                                      if (!diffCommentText.trim()) return;
+                                      setDraftDiffComments((prev) => [
+                                        ...prev,
+                                        {
+                                          id: `dc-${Date.now()}`,
+                                          filePath: currentDiffFile.path,
+                                          lineNum,
+                                          codeContent: line.content.trim(),
+                                          comment: diffCommentText.trim(),
+                                        },
+                                      ]);
+                                      setDiffCommentIdx(null);
+                                      setDiffCommentText("");
+                                    }}
+                                    className="flex items-center gap-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-hover)] px-2.5 py-1 text-[11px] font-medium text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
+                                  >
+                                    <MessageSquarePlus className="h-3 w-3" />
+                                    <span>Add to Batch</span>
+                                  </button>
+                                  <button
+                                    onClick={() => {
+                                      if (!diffCommentText.trim()) return;
                                       const reviewPrompt = `In \`${currentDiffFile.path}\` at line ${lineNum} (\`${line.content.trim()}\`), please make this change: ${diffCommentText.trim()}`;
                                       setDiffCommentIdx(null);
                                       setDiffCommentText("");
                                       handleSendPrompt(reviewPrompt);
-                                    }
-                                  }}
-                                  placeholder="Ask Agent to change this line..."
-                                  className="flex-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1 text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
-                                />
-                                <button
-                                  onClick={() => {
-                                    if (!diffCommentText.trim()) return;
-                                    const reviewPrompt = `In \`${currentDiffFile.path}\` at line ${lineNum} (\`${line.content.trim()}\`), please make this change: ${diffCommentText.trim()}`;
-                                    setDiffCommentIdx(null);
-                                    setDiffCommentText("");
-                                    handleSendPrompt(reviewPrompt);
-                                  }}
-                                  className="rounded-md bg-[var(--v-btn-bg)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)]"
-                                >
-                                  Ask Agent
-                                </button>
+                                    }}
+                                    className="rounded-md bg-[var(--v-btn-bg)] px-2.5 py-1 text-[11px] font-medium text-[var(--v-btn-fg)]"
+                                  >
+                                    Ask Now
+                                  </button>
+                                </div>
                               </div>
                             </div>
                           )}
@@ -3674,66 +4213,90 @@ export function App() {
                       );
                     })}
                   </div>
-                </div>
-              )
-            ) : (
-              <div className="flex flex-1 flex-col overflow-hidden p-3.5 font-mono text-[11.5px]">
-                <div className="mb-2 flex items-center justify-between text-[10.5px] text-[var(--v-fg-faint)]">
-                  <span className="truncate">{activeSession.worktree_path}</span>
-                  <span className="shrink-0">
-                    {ptyPidBySession[activeSession.id]
-                      ? `zsh PTY · PID ${ptyPidBySession[activeSession.id]}`
-                      : activeSession.branch_name}
-                  </span>
-                </div>
-                <div
-                  ref={terminalScrollRef}
-                  className="flex-1 overflow-y-auto whitespace-pre-wrap break-all rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)] p-2.5 leading-[1.55] text-[var(--v-fg-body)] select-text"
-                >
-                  {ptyOutputBySession[activeSession.id] ? (
-                    stripAnsiSequences(ptyOutputBySession[activeSession.id])
-                  ) : (
-                    <span className="text-[var(--v-fg-faint)]">
-                      Interactive persistent zsh PTY attached to {activeSession.worktree_path} (cd,
-                      env, dev servers &amp; Ctrl+C supported).
-                    </span>
+
+                  {/* Sticky Batch Review Dispatch Bar */}
+                  {draftDiffComments.length > 0 && (
+                    <div className="flex items-center justify-between gap-2 border-t border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-3.5 py-2.5">
+                      <span className="text-[11.5px] font-medium text-[var(--v-fg-primary)]">
+                        {draftDiffComments.length} review comment
+                        {draftDiffComments.length > 1 ? "s" : ""} queued
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => setDraftDiffComments([])}
+                          className="rounded-md px-2 py-1 text-[11px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                        >
+                          Clear
+                        </button>
+                        <button
+                          onClick={handleDispatchBatchDiffComments}
+                          className="rounded-md bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90"
+                        >
+                          Send Batch to Agent →
+                        </button>
+                      </div>
+                    </div>
                   )}
                 </div>
-                <form
-                  onSubmit={handleRunTermCommand}
-                  className="mt-2 flex items-center gap-2 border-t border-[var(--v-border-subtle)] pt-2.5"
-                >
-                  <span className="text-[#34d399]">❯</span>
-                  <input
-                    value={termInput}
-                    onChange={(e) => setTermInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.ctrlKey && e.key.toLowerCase() === "c") {
-                        e.preventDefault();
-                        handleSendPtyRaw("\x03");
-                      }
-                    }}
-                    placeholder="Interactive shell command (preserves cd & env, Ctrl+C interrupts)..."
-                    className="flex-1 bg-transparent text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
-                  />
-                </form>
-              </div>
+              )
+            ) : drawerTab === "pr" ? (
+              <PullRequestDrawer
+                daemonUrl={daemonUrl}
+                sessionId={activeSession.id}
+                branchName={activeSession.branch_name}
+                sessionTitle={activeSession.title}
+                onDispatchAgentPrompt={(p) => handleSendPrompt(p)}
+              />
+            ) : drawerTab === "browser" ? (
+              <BrowserPreviewDrawer
+                daemonUrl={daemonUrl}
+                sessionId={activeSession.id}
+                initialUrl={activeSession.preview_url}
+                onDispatchAgentPrompt={(p) => handleSendPrompt(p)}
+              />
+            ) : (
+              <XtermTerminalDrawer
+                daemonUrl={daemonUrl}
+                sessionId={activeSession.id}
+                worktreePath={activeSession.worktree_path}
+                resolvedTheme={resolvedTheme}
+                latestChunk={latestTerminalChunk}
+                onDetectedLocalUrl={(url) => {
+                  setSessions((prev) =>
+                    prev.map((s) =>
+                      s.id === activeSession.id && !s.preview_url ? { ...s, preview_url: url } : s
+                    )
+                  );
+                }}
+              />
             )}
           </aside>
         </div>
       </div>
 
       {/* =====================================================================
-          6. MODALS (New Thread, New Repo, Command Palette, Pairing QR, Settings)
+          6. MODALS (Velo Hub Automations, New Thread, New Repo, Command, Pairing QR, Settings)
          ===================================================================== */}
-      {activeModal && (
+      {activeModal === "automations" && (
+        <AutomationsModal
+          daemonUrl={daemonUrl}
+          defaultRepoPath={activeRepo.path}
+          onClose={() => setActiveModal(null)}
+          onJumpToSession={(sid) => {
+            refreshSessions();
+            setActiveId(sid);
+          }}
+        />
+      )}
+
+      {activeModal && activeModal !== "automations" && (
         <div
           onClick={() => setActiveModal(null)}
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs"
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[480px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-5 shadow-2xl"
+            className="w-full max-w-[496px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-5 shadow-2xl"
           >
             {activeModal === "new-worktree" && (
               <div>
@@ -3748,7 +4311,7 @@ export function App() {
                     <X className="h-4 w-4" />
                   </button>
                 </div>
-                <div className="space-y-3 text-[12.5px]">
+                <div className="max-h-[78vh] space-y-3 overflow-y-auto pr-1 text-[12.5px]">
                   <div>
                     <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
                       Project
@@ -3757,7 +4320,10 @@ export function App() {
                       {repos.map((r) => (
                         <button
                           key={r.id}
-                          onClick={() => setTargetRepoIdForNewWt(r.id)}
+                          onClick={() => {
+                            setTargetRepoIdForNewWt(r.id);
+                            setNewSetupCommand(repoHooks[r.path] || "");
+                          }}
                           className={`truncate rounded-lg border px-2.5 py-1.5 text-[12px] ${
                             targetRepoIdForNewWt === r.id
                               ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
@@ -3798,26 +4364,55 @@ export function App() {
                   {dispatchMode !== "committee" && (
                     <div>
                       <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                        Model
+                        Model / ACP Provider
                       </label>
-                      <div className="max-h-[180px] overflow-y-auto grid grid-cols-2 gap-1.5 pr-1">
-                        {modelCatalog.filter((m) => m.family !== "Google").map((m) => (
+                      <div className="max-h-[164px] overflow-y-auto grid grid-cols-2 gap-1.5 pr-1">
+                        {modelCatalog.map((m) => (
                           <button
                             key={m.id}
                             onClick={() => setNewModelId(m.id)}
-                            className={`flex items-center justify-between rounded-lg border px-2.5 py-1.5 text-left text-[12px] ${
+                            className={`flex items-center justify-between gap-1 rounded-lg border px-2.5 py-1.5 text-left text-[12px] ${
                               newModelId === m.id
                                 ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
                                 : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)]"
                             }`}
                           >
                             <span className="truncate">{m.label}</span>
-                            <span className="font-mono text-[10px] opacity-60">{m.family}</span>
+                            <span className="shrink-0 font-mono text-[9.5px] opacity-60">
+                              {m.family.replace("ACP · ", "")}
+                            </span>
                           </button>
                         ))}
                       </div>
                     </div>
                   )}
+                  <div>
+                    <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                      Permission Gate
+                    </label>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(
+                        [
+                          { id: "auto_edit", label: "Auto-edit" },
+                          { id: "ask_before_edit", label: "Ask permissions" },
+                          { id: "bypass", label: "Bypass" },
+                        ] as { id: ApprovalMode; label: string }[]
+                      ).map((pm) => (
+                        <button
+                          key={pm.id}
+                          type="button"
+                          onClick={() => setNewApproval(pm.id)}
+                          className={`rounded-lg border px-2 py-1.5 text-[11.5px] ${
+                            newApproval === pm.id
+                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                              : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)]"
+                          }`}
+                        >
+                          {pm.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                   {dispatchMode === "loop" && (
                     <div>
                       <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
@@ -3837,18 +4432,35 @@ export function App() {
                     <input
                       value={newTaskDesc}
                       onChange={(e) => setNewTaskDesc(e.target.value)}
+                      placeholder="Describe what to build or fix..."
                       className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 text-[12.5px] text-[var(--v-fg-primary)] focus:border-[var(--v-fg-muted)] focus:outline-none"
                     />
                   </div>
-                  <div>
-                    <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                      Git Worktree branch
-                    </label>
-                    <input
-                      value={newTaskName}
-                      onChange={(e) => setNewTaskName(e.target.value)}
-                      className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:border-[var(--v-fg-muted)] focus:outline-none"
-                    />
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                        Git Worktree branch
+                      </label>
+                      <input
+                        value={newTaskName}
+                        onChange={(e) => setNewTaskName(e.target.value)}
+                        className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:border-[var(--v-fg-muted)] focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label
+                        title="Runs automatically after git worktree add + smart node_modules/.venv symlink"
+                        className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]"
+                      >
+                        Setup Hook (optional)
+                      </label>
+                      <input
+                        value={newSetupCommand}
+                        onChange={(e) => setNewSetupCommand(e.target.value)}
+                        placeholder=".velo/setup.sh or pnpm i"
+                        className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:border-[var(--v-fg-muted)] focus:outline-none"
+                      />
+                    </div>
                   </div>
                   <div className="flex justify-end gap-2 pt-2">
                     <button
@@ -3956,7 +4568,7 @@ export function App() {
               <div>
                 <div className="mb-4 flex items-center justify-between">
                   <h3 className="text-[14px] font-semibold text-[var(--v-fg-primary)]">
-                    Settings · 模型服务连接与外观设置
+                    Settings · 模型服务、Worktree Hooks 与外观
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
@@ -3967,11 +4579,11 @@ export function App() {
                 </div>
 
                 <div className="max-h-[75vh] space-y-5 overflow-y-auto pr-1 text-[12.5px]">
-                  {/* Section 1: CLI & Model Providers (Paseo / Conductor Style) */}
+                  {/* Section 1: CLI & ACP Model Providers */}
                   <div>
                     <div className="mb-2 flex items-center justify-between">
                       <label className="text-[11.5px] font-medium text-[var(--v-fg-secondary)]">
-                        CLI & Model Providers (本地订阅 CLI 接入 — 解锁对应模型池)
+                        CLI &amp; ACP Providers (Claude, Codex, Gemini ACP, OpenCode, Copilot, Qwen)
                       </label>
                       <button
                         onClick={refreshSessions}
@@ -4034,7 +4646,42 @@ export function App() {
                     </div>
                   </div>
 
-                  {/* Section 2: Appearance & Theme */}
+                  {/* Section 2: Worktree Setup Hooks & Smart Dependency Symlinking */}
+                  <div className="border-t border-[var(--v-border-subtle)] pt-4">
+                    <div className="mb-1 flex items-center justify-between">
+                      <label className="text-[11.5px] font-medium text-[var(--v-fg-secondary)]">
+                        Worktree Initialization Hook ({activeRepo.name})
+                      </label>
+                      <span className="font-mono text-[10.5px] text-[#34d399]">
+                        node_modules / .venv auto-symlinked
+                      </span>
+                    </div>
+                    <p className="mb-2 text-[11px] text-[var(--v-fg-muted)]">
+                      新建隔离 Worktree 时自动软链主仓库依赖，并优先执行下方命令或仓库内的{" "}
+                      <code className="font-mono">.velo/setup.sh</code> /{" "}
+                      <code className="font-mono">.worktreesetup</code>。
+                    </p>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        value={hookEditCmd}
+                        onChange={(e) => setHookEditCmd(e.target.value)}
+                        placeholder="e.g. cp ../../.env.local .env.local && pnpm build:proto"
+                        className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1.5 font-mono text-[11.5px] text-[var(--v-fg-primary)] focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleSaveRepoHook(activeRepo.path, hookEditCmd.trim());
+                          copyText("saved-hook", hookEditCmd.trim());
+                        }}
+                        className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1.5 text-[11.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90"
+                      >
+                        {copiedKey === "saved-hook" ? "Saved ✓" : "Save Hook"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Section 3: Appearance & Theme */}
                   <div className="border-t border-[var(--v-border-subtle)] pt-4">
                     <div className="mb-1.5 flex items-center justify-between">
                       <label className="text-[11.5px] text-[var(--v-fg-secondary)]">
@@ -4129,7 +4776,9 @@ export function App() {
               <div>
                 <div className="mb-3 flex items-center justify-between">
                   <h3 className="text-[13.5px] font-semibold text-[var(--v-fg-primary)]">
-                    {activeModal === "qr" ? "Mobile E2EE Pairing" : "Automations & Skills"}
+                    {activeModal === "qr"
+                      ? "True E2EE Remote Relay Pairing (X25519 + ChaCha20)"
+                      : "Skills & Slash Commands"}
                   </h3>
                   <button
                     onClick={() => setActiveModal(null)}
@@ -4140,31 +4789,67 @@ export function App() {
                 </div>
                 {activeModal === "qr" ? (
                   <div className="space-y-3 font-mono text-[11.5px] text-[var(--v-fg-secondary)]">
-                    <p>X25519 + ChaCha20-Poly1305 E2EE Relay:</p>
+                    <div className="flex items-center justify-between rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-2 text-[11px]">
+                      <span className="flex items-center gap-1.5 text-[#34d399]">
+                        <Lock className="h-3.5 w-3.5" />
+                        <span>RFC 8439 ChaCha20-Poly1305</span>
+                      </span>
+                      <span className="text-[var(--v-fg-muted)]">
+                        Room: {pairTicket?.room_id?.slice(0, 14) || "initializing…"}
+                      </span>
+                    </div>
                     {pairTicket?.qr_svg && (
                       <div
                         className="mx-auto flex h-44 w-44 items-center justify-center rounded-xl bg-white p-2"
                         dangerouslySetInnerHTML={{ __html: pairTicket.qr_svg }}
                       />
                     )}
-                    <div className="break-all rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] p-3 text-[var(--v-fg-primary)]">
-                      {pairTicket?.uri ||
-                        "velo://pair?daemon=127.0.0.1:6767&fp=9F8B-441A-E2EE"}
-                    </div>
-                    <div className="flex items-center justify-between pt-1 font-sans">
-                      <span className="text-[11.5px] text-[var(--v-fg-muted)]">
-                        Scan on iOS/Android over LAN Wi-Fi
+                    {pairTicket?.daemon_pubkey_hex && (
+                      <div className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
+                        X25519 Pubkey: {pairTicket.daemon_pubkey_hex}
+                      </div>
+                    )}
+                    <div className="flex items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] p-2.5 text-[11px] text-[var(--v-fg-primary)]">
+                      <span className="flex-1 break-all">
+                        {pairTicket?.uri ||
+                          "http://127.0.0.1:6767/?mobile=1&relay=ws://127.0.0.1:6768"}
                       </span>
                       <button
-                        onClick={() => {
-                          setMobileMode(true);
-                          setSidebarOpen(false);
-                          setActiveModal(null);
-                        }}
-                        className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1.5 text-[12px] font-medium text-[var(--v-btn-fg)]"
+                        type="button"
+                        onClick={() =>
+                          copyText("e2ee-uri", pairTicket?.uri || "")
+                        }
+                        title="Copy E2EE Mobile Web URL"
+                        className="shrink-0 rounded-md bg-[var(--v-bg-active)] px-2 py-1 text-[10.5px] hover:bg-[var(--v-bg-hover)]"
                       >
-                        Preview Mobile Remote UI
+                        {copiedKey === "e2ee-uri" ? "Copied" : "Copy"}
                       </button>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1 font-sans">
+                      <span className="text-[11px] text-[var(--v-fg-muted)]">
+                        Zero-knowledge Relay (`{pairTicket?.relay_url || "ws://127.0.0.1:6768"}`)
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {pairTicket?.uri && (
+                          <button
+                            type="button"
+                            onClick={() => window.open(pairTicket.uri, "_blank")}
+                            className="rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-2.5 py-1.5 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
+                          >
+                            Open E2EE Tab ↗
+                          </button>
+                        )}
+                        <button
+                          onClick={() => {
+                            setMobileMode(true);
+                            setSidebarOpen(false);
+                            setActiveModal(null);
+                          }}
+                          className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1.5 text-[11.5px] font-medium text-[var(--v-btn-fg)]"
+                        >
+                          Preview Mobile UI
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ) : (

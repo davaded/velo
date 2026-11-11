@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -13,6 +13,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info};
 use uuid::Uuid;
 use velo_protocol::{AgentEvent, AgentProvider, SessionStatus};
+
+pub mod acp;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalRuntimeInfo {
@@ -163,8 +165,10 @@ pub async fn detect_local_runtimes() -> Vec<LocalRuntimeInfo> {
     let specs = [
         ("claude", "Claude Code"),
         ("codex", "OpenAI Codex"),
-        ("gemini", "Gemini CLI"),
-        ("opencode", "OpenCode"),
+        ("gemini", "Gemini CLI (ACP)"),
+        ("opencode", "OpenCode (ACP)"),
+        ("copilot", "GitHub Copilot CLI"),
+        ("qwen", "Qwen Code (ACP)"),
     ];
 
     let mut out = Vec::new();
@@ -316,6 +320,51 @@ impl AgentSpawner {
         images: Vec<String>,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
+        Self::spawn_agent_turn_configured(
+            session_id,
+            provider,
+            prompt,
+            worktree_path,
+            use_pty,
+            model,
+            effort,
+            resume_session_id,
+            images,
+            "auto_edit".to_string(),
+            None,
+            event_tx,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_agent_turn_configured(
+        session_id: Uuid,
+        provider: AgentProvider,
+        prompt: String,
+        worktree_path: PathBuf,
+        use_pty: bool,
+        model: Option<String>,
+        effort: Option<String>,
+        resume_session_id: Option<String>,
+        images: Vec<String>,
+        approval_mode: String,
+        daemon_http_base: Option<String>,
+        event_tx: broadcast::Sender<AgentEvent>,
+    ) -> Result<AgentHandle> {
+        if let AgentProvider::Acp(ref spec) = provider {
+            return acp::spawn_acp_agent(
+                session_id,
+                spec,
+                prompt,
+                worktree_path,
+                resume_session_id,
+                images,
+                daemon_http_base,
+                event_tx,
+            )
+            .await;
+        }
         if use_pty {
             Self::spawn_pty_agent(session_id, provider, prompt, worktree_path, event_tx).await
         } else {
@@ -328,6 +377,8 @@ impl AgentSpawner {
                 effort,
                 resume_session_id,
                 images,
+                approval_mode,
+                daemon_http_base,
                 event_tx,
             )
             .await
@@ -345,9 +396,12 @@ impl AgentSpawner {
         effort: Option<String>,
         resume_session_id: Option<String>,
         images: Vec<String>,
+        approval_mode: String,
+        daemon_http_base: Option<String>,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
         let mut cmd = Self::build_tokio_command(
+            session_id,
             &provider,
             &prompt,
             &worktree_path,
@@ -355,6 +409,8 @@ impl AgentSpawner {
             effort.as_deref(),
             resume_session_id.as_deref(),
             &images,
+            &approval_mode,
+            daemon_http_base.as_deref(),
         );
         cmd.current_dir(&worktree_path)
             .stdin(Stdio::null())
@@ -630,7 +686,9 @@ impl AgentSpawner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_tokio_command(
+        session_id: Uuid,
         provider: &AgentProvider,
         prompt: &str,
         _cwd: &Path,
@@ -638,6 +696,8 @@ impl AgentSpawner {
         effort: Option<&str>,
         resume_session_id: Option<&str>,
         images: &[String],
+        approval_mode: &str,
+        daemon_http_base: Option<&str>,
     ) -> Command {
         let aug_path = discover_augmented_path();
         let mut cmd = match provider {
@@ -659,6 +719,11 @@ impl AgentSpawner {
                         images.join(", ")
                     )
                 };
+                let perm_mode = if approval_mode == "bypass" {
+                    "bypassPermissions"
+                } else {
+                    "acceptEdits"
+                };
                 c.args([
                     "-p",
                     &effective_prompt,
@@ -667,8 +732,45 @@ impl AgentSpawner {
                     "--include-partial-messages",
                     "--verbose",
                     "--permission-mode",
-                    "acceptEdits",
+                    perm_mode,
                 ]);
+                if let Some(base) = daemon_http_base.filter(|b| !b.trim().is_empty()) {
+                    let clean_base = base.trim_end_matches('/');
+                    let mcp_cfg = json!({
+                        "mcpServers": {
+                            "velo": {
+                                "type": "http",
+                                "url": format!("{}/mcp?session_id={}", clean_base, session_id)
+                            }
+                        }
+                    })
+                    .to_string();
+                    c.args(["--mcp-config", &mcp_cfg]);
+
+                    if approval_mode != "bypass" {
+                        let hook_cmd = format!(
+                            "curl -sS --max-time 600 -X POST \"{}/api/sessions/{}/hooks/pre-tool-use\" -H \"Content-Type: application/json\" --data-binary @- || true",
+                            clean_base, session_id
+                        );
+                        let settings_json = json!({
+                            "hooks": {
+                                "PreToolUse": [
+                                    {
+                                        "matcher": "Bash|Edit|Write|MultiEdit",
+                                        "hooks": [
+                                            {
+                                                "type": "command",
+                                                "command": hook_cmd
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        })
+                        .to_string();
+                        c.args(["--settings", &settings_json]);
+                    }
+                }
                 if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
                     let cli_model = if m.starts_with("claude-fable") {
                         "fable"
@@ -685,6 +787,31 @@ impl AgentSpawner {
             AgentProvider::Codex => {
                 let bin = resolve_cli_binary("codex").unwrap_or_else(|| PathBuf::from("codex"));
                 let mut c = Command::new(bin);
+                let sandbox = if approval_mode == "bypass" {
+                    "danger-full-access"
+                } else {
+                    "workspace-write"
+                };
+                let mcp_toml = if let Some(base) = daemon_http_base.filter(|b| !b.trim().is_empty())
+                {
+                    format!(
+                        "mcp_servers={{velo={{url=\"{}/mcp?session_id={}\"}}}}",
+                        base.trim_end_matches('/'),
+                        session_id
+                    )
+                } else {
+                    "mcp_servers={}".to_string()
+                };
+                let effective_prompt = if approval_mode == "ask_before_edit"
+                    && daemon_http_base.is_some()
+                {
+                    format!(
+                        "{}\n\n[Permission policy: Before editing files or running mutating shell commands, call MCP tool `velo_request_approval` to obtain user confirmation.]",
+                        prompt
+                    )
+                } else {
+                    prompt.to_string()
+                };
                 if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
                     c.args([
                         "exec",
@@ -692,9 +819,9 @@ impl AgentSpawner {
                         "--json",
                         "--skip-git-repo-check",
                         "-c",
-                        "mcp_servers={}",
+                        &mcp_toml,
                         "-c",
-                        "sandbox_mode=\"workspace-write\"",
+                        &format!("sandbox_mode=\"{}\"", sandbox),
                         "-c",
                         "model_reasoning_summary=\"detailed\"",
                         "-c",
@@ -712,16 +839,16 @@ impl AgentSpawner {
                         }
                     }
                     c.arg(rid);
-                    c.arg(prompt);
+                    c.arg(&effective_prompt);
                 } else {
                     c.args([
                         "exec",
                         "--json",
                         "-s",
-                        "workspace-write",
+                        sandbox,
                         "--skip-git-repo-check",
                         "-c",
-                        "mcp_servers={}",
+                        &mcp_toml,
                         "-c",
                         "model_reasoning_summary=\"detailed\"",
                         "-c",
@@ -738,7 +865,7 @@ impl AgentSpawner {
                             c.args(["-i", img.trim()]);
                         }
                     }
-                    c.arg(prompt);
+                    c.arg(&effective_prompt);
                 }
                 c
             }
@@ -746,10 +873,45 @@ impl AgentSpawner {
                 let bin =
                     resolve_cli_binary("opencode").unwrap_or_else(|| PathBuf::from("opencode"));
                 let mut c = Command::new(bin);
-                c.args(["run", prompt]);
+                c.args(["run", "--format", "json"]);
+                if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+                    c.args(["-m", m]);
+                }
+                if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
+                    c.args(["--session", rid]);
+                }
+                c.arg(prompt);
                 c
             }
-            AgentProvider::Custom(cmd_str) => {
+            AgentProvider::Gemini => {
+                let bin = resolve_cli_binary("gemini").unwrap_or_else(|| PathBuf::from("gemini"));
+                let mut c = Command::new(bin);
+                c.args(["-p", prompt, "--output-format", "stream-json"]);
+                if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+                    c.args(["-m", m]);
+                }
+                if approval_mode == "auto_edit" || approval_mode == "bypass" {
+                    c.arg("--yolo");
+                }
+                c
+            }
+            AgentProvider::Copilot => {
+                let bin =
+                    resolve_cli_binary("copilot").unwrap_or_else(|| PathBuf::from("copilot"));
+                let mut c = Command::new(bin);
+                c.args(["-p", prompt]);
+                c
+            }
+            AgentProvider::Qwen => {
+                let bin = resolve_cli_binary("qwen").unwrap_or_else(|| PathBuf::from("qwen"));
+                let mut c = Command::new(bin);
+                c.args(["-p", prompt, "--output-format", "stream-json"]);
+                if approval_mode == "auto_edit" || approval_mode == "bypass" {
+                    c.arg("--yolo");
+                }
+                c
+            }
+            AgentProvider::Acp(cmd_str) | AgentProvider::Custom(cmd_str) => {
                 let mut c = Command::new("sh");
                 let full_cmd = if prompt.trim().is_empty() {
                     cmd_str.clone()
@@ -801,7 +963,37 @@ impl AgentSpawner {
                 }
                 c
             }
-            AgentProvider::Custom(raw) => {
+            AgentProvider::Gemini => {
+                let bin = resolve_cli_binary("gemini")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "gemini".to_string());
+                let mut c = CommandBuilder::new(bin);
+                if !prompt.trim().is_empty() {
+                    c.args(["-p", prompt]);
+                }
+                c
+            }
+            AgentProvider::Copilot => {
+                let bin = resolve_cli_binary("copilot")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "copilot".to_string());
+                let mut c = CommandBuilder::new(bin);
+                if !prompt.trim().is_empty() {
+                    c.args(["-p", prompt]);
+                }
+                c
+            }
+            AgentProvider::Qwen => {
+                let bin = resolve_cli_binary("qwen")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "qwen".to_string());
+                let mut c = CommandBuilder::new(bin);
+                if !prompt.trim().is_empty() {
+                    c.args(["-p", prompt]);
+                }
+                c
+            }
+            AgentProvider::Acp(raw) | AgentProvider::Custom(raw) => {
                 let mut c = CommandBuilder::new("sh");
                 let full = if prompt.trim().is_empty() {
                     raw.clone()
@@ -1210,14 +1402,54 @@ pub fn parse_agent_stdout_line(
                     }
                     return events;
                 }
-                "thread.started" => {
-                    if let Some(tid) = json.get("thread_id").and_then(|v| v.as_str()) {
+                "thread.started" | "init" | "step_start" => {
+                    if let Some(tid) = json
+                        .get("thread_id")
+                        .or_else(|| json.get("session_id"))
+                        .or_else(|| json.get("sessionID"))
+                        .and_then(|v| v.as_str())
+                    {
                         if !tid.trim().is_empty() {
                             events.push(AgentEvent::ProviderSessionBound {
                                 session_id,
                                 provider_session_id: tid.trim().to_string(),
                                 timestamp: Utc::now(),
                             });
+                        }
+                    }
+                    return events;
+                }
+                // OpenCode (`--format json`) & Gemini CLI (`--output-format stream-json`) text/tool events
+                "text" | "message" => {
+                    if let Some(sid) = json.get("sessionID").and_then(|v| v.as_str()) {
+                        events.push(AgentEvent::ProviderSessionBound {
+                            session_id,
+                            provider_session_id: sid.to_string(),
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    let role = json.get("role").and_then(|v| v.as_str()).unwrap_or("assistant");
+                    if role == "assistant" {
+                        if let Some(t) = json
+                            .pointer("/part/text")
+                            .or_else(|| json.get("content"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !t.is_empty() {
+                                if json.get("delta").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                    events.push(AgentEvent::MessageChunk {
+                                        session_id,
+                                        delta: t.to_string(),
+                                        timestamp: Utc::now(),
+                                    });
+                                } else {
+                                    events.push(AgentEvent::MessageDelta {
+                                        session_id,
+                                        text: t.to_string(),
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                            }
                         }
                     }
                     return events;

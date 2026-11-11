@@ -1,15 +1,23 @@
-export type AgentKind = "claude" | "codex" | "gemini";
-export type ApprovalMode = "auto_edit" | "ask_before_edit" | "full_auto";
+export type AgentKind =
+  | "claude"
+  | "codex"
+  | "opencode"
+  | "gemini"
+  | "copilot"
+  | "qwen"
+  | string;
+export type ApprovalMode = "auto_edit" | "ask_before_edit" | "bypass";
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "ultra" | "max";
 
 export interface ModelOption {
   id: string;
   label: string;
   shortLabel: string;
-  family: "Anthropic" | "OpenAI" | "Google";
-  runtimeId: "claude" | "codex" | "gemini";
+  family: "Anthropic" | "OpenAI" | "Google" | string;
+  runtimeId: "claude" | "codex" | "gemini" | "opencode" | "copilot" | "qwen" | string;
   agentKind: AgentKind;
   desc: string;
+  installed?: boolean;
   isDefault?: boolean;
 }
 
@@ -180,6 +188,43 @@ export const MODEL_CATALOG: ModelOption[] = [
     agentKind: "codex",
     desc: "Grok 4.6 coding and reasoning model via Codex CLI",
   },
+  // ACP (Agent Client Protocol) & Multi-Provider Ecosystem
+  {
+    id: "acp-gemini-cli",
+    label: "Gemini CLI (ACP)",
+    shortLabel: "Gemini ACP",
+    family: "ACP · Google",
+    runtimeId: "gemini",
+    agentKind: "acp:gemini --experimental-acp",
+    desc: "Agent Client Protocol JSON-RPC stdio integration for Gemini CLI",
+  },
+  {
+    id: "acp-opencode",
+    label: "OpenCode (ACP)",
+    shortLabel: "OpenCode",
+    family: "ACP · OpenCode",
+    runtimeId: "opencode",
+    agentKind: "acp:opencode acp",
+    desc: "Agent Client Protocol JSON-RPC stdio integration for OpenCode",
+  },
+  {
+    id: "acp-copilot",
+    label: "GitHub Copilot CLI",
+    shortLabel: "Copilot",
+    family: "ACP · GitHub",
+    runtimeId: "copilot",
+    agentKind: "copilot",
+    desc: "GitHub Copilot coding agent CLI adapter",
+  },
+  {
+    id: "acp-qwen-code",
+    label: "Qwen Code (ACP)",
+    shortLabel: "Qwen Code",
+    family: "ACP · Qwen",
+    runtimeId: "qwen",
+    agentKind: "acp:qwen --acp",
+    desc: "Agent Client Protocol JSON-RPC stdio integration for Qwen Code",
+  },
 ];
 
 export interface VeloRepo {
@@ -203,6 +248,7 @@ export interface VeloSession {
   worktree_path: string;
   project_path: string;
   approval_mode: ApprovalMode;
+  preview_url?: string | null;
   tokens_used: number;
   tokens_limit: number;
   cost_usd: number;
@@ -312,6 +358,21 @@ export const SLASH_SKILLS: SlashSkillItem[] = [
     label: "Prune Worktrees",
     desc: "清理已合并的孤立 Git Worktree 目录与锁文件",
   },
+  {
+    cmd: "/automations",
+    label: "Velo Hub Automations",
+    desc: "管理 Cron 定时任务与 GitHub / 通用 Webhook 自动工作流",
+  },
+  {
+    cmd: "/pr",
+    label: "GitHub Pull Request",
+    desc: "打开右侧 PR 面板查看 CI 状态、一键创建或合并 PR",
+  },
+  {
+    cmd: "/browser",
+    label: "Workspace Browser Preview",
+    desc: "打开内置浏览器预览面板并允许 Agent 检查 DOM 与运行态",
+  },
 ];
 
 export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
@@ -321,21 +382,37 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     unknown
   >;
   const branch = String(r.branch_name ?? r.branch ?? `feat/worktree-${idx + 1}`);
-  const agentKind: AgentKind =
-    r.agent_kind === "codex" || r.provider === "codex"
-      ? "codex"
-      : r.agent_kind === "gemini"
-      ? "gemini"
-      : "claude";
+  let agentKind: AgentKind = "claude";
+  if (typeof r.agent_kind === "string" && r.agent_kind.trim()) {
+    agentKind = r.agent_kind.trim();
+  } else if (typeof r.provider === "string" && r.provider.trim()) {
+    agentKind = r.provider.trim();
+  } else if (r.provider && typeof r.provider === "object") {
+    const provObj = r.provider as Record<string, unknown>;
+    if (typeof provObj.acp === "string") {
+      agentKind = `acp:${provObj.acp}`;
+    }
+  }
   const modelId = String(
-    r.model ?? (agentKind === "codex" ? "gpt-6.1-sol" : "claude-fable-5-2")
+    r.model ??
+      (agentKind === "codex"
+        ? "gpt-6.1-sol"
+        : agentKind.includes("opencode")
+        ? "acp-opencode"
+        : agentKind.includes("gemini")
+        ? "acp-gemini-cli"
+        : agentKind.includes("copilot")
+        ? "acp-copilot"
+        : agentKind.includes("qwen")
+        ? "acp-qwen-code"
+        : "claude-fable-5-2")
   );
   const foundModel = MODEL_CATALOG.find((m) => m.id === modelId);
   const rawStatus = String(r.status ?? "idle");
   const status: VeloSession["status"] =
     rawStatus === "running" || rawStatus === "starting"
       ? "running"
-      : rawStatus === "waiting_for_permission"
+      : rawStatus === "waiting_for_permission" || rawStatus === "waiting_permission"
       ? "waiting_approval"
       : "idle";
   const rawEff = String(r.effort ?? "");
@@ -348,6 +425,9 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     rawEff === "max"
       ? rawEff
       : "medium";
+  const rawMode = String(r.approval_mode ?? "auto_edit");
+  const approvalMode: ApprovalMode =
+    rawMode === "ask_before_edit" || rawMode === "bypass" ? rawMode : "auto_edit";
   return {
     id: String(r.id ?? `daemon-${idx}`),
     repo_id: String(r.repo_id ?? "repo-velo"),
@@ -358,15 +438,18 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
       foundModel?.shortLabel ??
       (agentKind === "codex"
         ? "GPT-6.1-Sol"
-        : agentKind === "gemini"
-        ? "Gemini 2.5 Pro"
+        : agentKind.includes("gemini")
+        ? "Gemini ACP"
+        : agentKind.includes("opencode")
+        ? "OpenCode"
         : "Claude Fable 5.2"),
     effort,
     status,
     branch_name: branch,
     worktree_path: String(r.worktree_path ?? `/Users/daiyudai/code/velo`),
     project_path: String(r.project_path ?? r.repo_root ?? "/Users/daiyudai/code/velo"),
-    approval_mode: "auto_edit",
+    approval_mode: approvalMode,
+    preview_url: typeof r.preview_url === "string" ? r.preview_url : null,
     tokens_used: Number(r.tokens_used ?? 0),
     tokens_limit: Number(r.tokens_limit ?? 200000),
     cost_usd: Number(r.cost_usd ?? 0),

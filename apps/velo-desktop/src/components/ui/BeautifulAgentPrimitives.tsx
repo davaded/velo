@@ -1207,15 +1207,17 @@ export const PaseoMarkdown: React.FC<{
 export const BeautifulApprovalCard: React.FC<{
   toolName: string;
   commandPreview: string;
+  reason?: string;
   onApprove: () => void;
+  onAlwaysAllow?: () => void;
   onDeny: () => void;
-}> = ({ toolName, commandPreview, onApprove, onDeny }) => {
+}> = ({ toolName, commandPreview, reason, onApprove, onAlwaysAllow, onDeny }) => {
   const [resolved, setResolved] = useState<"approved" | "denied" | null>(null);
 
   if (resolved) {
     return (
       <div
-        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-[7px] border text-[11.5px] font-mono-code"
+        className="mb-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-[7px] border text-[11.5px] font-mono-code"
         style={{
           backgroundColor: "var(--surface-1)",
           borderColor: "var(--border-subtle)",
@@ -1233,24 +1235,24 @@ export const BeautifulApprovalCard: React.FC<{
 
   return (
     <div
-      className="rounded-[10px] border p-3.5 space-y-2.5 rare-specular-surface t-modal-scale"
+      className="mb-2.5 rounded-[12px] border p-3.5 space-y-2.5 rare-specular-surface t-modal-scale"
       style={{
         backgroundColor: "var(--surface-1)",
         borderColor: "var(--status-warning)",
       }}
     >
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
           <ShieldAlert
-            className="w-4 h-4"
+            className="w-4 h-4 shrink-0"
             style={{ color: "var(--status-warning)" }}
           />
-          <span className="text-[12.5px] font-semibold">
-            Human-in-the-Loop Approval Required
+          <span className="text-[12.5px] font-semibold truncate">
+            Live Tool Permission Approval
           </span>
         </div>
         <span
-          className="font-mono-code text-[10px] px-2 py-0.5 rounded-full"
+          className="font-mono-code text-[10px] px-2 py-0.5 rounded-full shrink-0"
           style={{
             backgroundColor: "rgba(192, 150, 100, 0.16)",
             color: "var(--status-warning)",
@@ -1259,6 +1261,12 @@ export const BeautifulApprovalCard: React.FC<{
           {toolName}
         </span>
       </div>
+
+      {reason && (
+        <div className="text-[11.5px]" style={{ color: "var(--fg-muted)" }}>
+          {reason}
+        </div>
+      )}
 
       <pre
         className="font-mono-code text-[11.5px] px-3 py-2 rounded-[6px] border overflow-x-auto"
@@ -1271,7 +1279,7 @@ export const BeautifulApprovalCard: React.FC<{
         $ {commandPreview}
       </pre>
 
-      <div className="flex items-center justify-end gap-2 pt-0.5">
+      <div className="flex flex-wrap items-center justify-end gap-2 pt-0.5">
         <button
           type="button"
           onClick={() => {
@@ -1287,6 +1295,23 @@ export const BeautifulApprovalCard: React.FC<{
           <X className="w-3 h-3" />
           Deny
         </button>
+        {onAlwaysAllow && (
+          <button
+            type="button"
+            onClick={() => {
+              setResolved("approved");
+              onAlwaysAllow();
+            }}
+            className="h-[27px] px-2.5 rounded-[6px] border text-[11.5px] font-medium flex items-center gap-1 cursor-pointer hover:bg-[var(--surface-2)]"
+            style={{
+              borderColor: "var(--border-accent)",
+              color: "var(--fg)",
+            }}
+          >
+            <Check className="w-3 h-3" />
+            Always Allow in Session
+          </button>
+        )}
         <button
           type="button"
           onClick={() => {
@@ -1300,7 +1325,126 @@ export const BeautifulApprovalCard: React.FC<{
           }}
         >
           <Check className="w-3 h-3" />
-          Approve Execution
+          Allow Once
+        </button>
+      </div>
+    </div>
+  );
+};
+
+/**
+ * Interactive Bidirectional `AskUserQuestion` Card (`velo_ask_user`)
+ */
+export const BeautifulQuestionCard: React.FC<{
+  question: string;
+  options: string[];
+  allowMultiple?: boolean;
+  onSubmit: (answers: string[]) => void;
+}> = ({ question, options, allowMultiple = false, onSubmit }) => {
+  const [selected, setSelected] = useState<string[]>([]);
+  const [customAnswer, setCustomAnswer] = useState<string>("");
+
+  const toggleOption = (opt: string) => {
+    if (allowMultiple) {
+      setSelected((prev) =>
+        prev.includes(opt) ? prev.filter((x) => x !== opt) : [...prev, opt]
+      );
+    } else {
+      setSelected([opt]);
+    }
+  };
+
+  const handleConfirm = () => {
+    const combined = [...selected];
+    if (customAnswer.trim()) {
+      combined.push(customAnswer.trim());
+    }
+    if (combined.length === 0) return;
+    onSubmit(combined);
+  };
+
+  return (
+    <div
+      className="mb-2.5 rounded-[12px] border p-3.5 space-y-2.5"
+      style={{
+        backgroundColor: "var(--surface-1)",
+        borderColor: "var(--accent)",
+      }}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[12.5px] font-semibold" style={{ color: "var(--fg)" }}>
+          {question}
+        </span>
+        <span
+          className="font-mono-code text-[10px] px-2 py-0.5 rounded-full shrink-0"
+          style={{
+            backgroundColor: "var(--surface-3)",
+            color: "var(--accent-bright)",
+          }}
+        >
+          {allowMultiple ? "Multi-select" : "Agent Question"}
+        </span>
+      </div>
+
+      {options.length > 0 && (
+        <div className="grid grid-cols-1 gap-1.5">
+          {options.map((opt) => {
+            const isChosen = selected.includes(opt);
+            return (
+              <button
+                key={opt}
+                type="button"
+                onClick={() => toggleOption(opt)}
+                className="flex items-center justify-between rounded-[8px] border px-3 py-1.5 text-left text-[12px] transition-colors cursor-pointer"
+                style={{
+                  backgroundColor: isChosen ? "var(--surface-3)" : "var(--surface-0)",
+                  borderColor: isChosen ? "var(--accent)" : "var(--border-subtle)",
+                  color: "var(--fg)",
+                }}
+              >
+                <span>{opt}</span>
+                {isChosen && (
+                  <Check className="w-3.5 h-3.5 shrink-0" style={{ color: "var(--status-success)" }} />
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2 pt-0.5">
+        <input
+          value={customAnswer}
+          onChange={(e) => setCustomAnswer(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              handleConfirm();
+            }
+          }}
+          placeholder={
+            options.length > 0
+              ? "Or type a custom answer..."
+              : "Type your answer for the agent..."
+          }
+          className="flex-1 rounded-[7px] border px-2.5 py-1.5 text-[12px] outline-none"
+          style={{
+            backgroundColor: "var(--surface-0)",
+            borderColor: "var(--border-subtle)",
+            color: "var(--fg)",
+          }}
+        />
+        <button
+          type="button"
+          onClick={handleConfirm}
+          disabled={selected.length === 0 && !customAnswer.trim()}
+          className="h-[30px] px-3 rounded-[7px] text-[11.5px] font-medium cursor-pointer disabled:opacity-40"
+          style={{
+            backgroundColor: "var(--accent)",
+            color: "#ffffff",
+          }}
+        >
+          Reply
         </button>
       </div>
     </div>

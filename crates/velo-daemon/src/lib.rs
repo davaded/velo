@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::{
     process::Command,
-    sync::{RwLock, broadcast},
+    sync::{RwLock, broadcast, oneshot},
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -29,15 +29,24 @@ use velo_agent::{AgentHandle, AgentSpawner, InteractiveShellHandle};
 use velo_protocol::{
     AdvisorSessionRequest, AgentEvent, AgentProvider, CommitteeRequest, CreateSessionRequest,
     HandoffSessionRequest, LoopSessionRequest, SessionInfo, SessionInputRequest, SessionStatus,
-    WsClientMessage, WsServerMessage,
+    WsClientMessage, WsServerMessage, default_approval_mode,
 };
 use velo_worktree::{WorktreeManager, default_velo_home};
+
+pub mod automations;
+pub mod pr;
+pub mod relay_bridge;
+pub mod voice;
 
 pub struct DaemonInner {
     pub sessions: HashMap<Uuid, SessionInfo>,
     pub event_history: HashMap<Uuid, Vec<AgentEvent>>,
     pub handles: HashMap<Uuid, AgentHandle>,
     pub shells: HashMap<Uuid, InteractiveShellHandle>,
+    pub pending_approvals: HashMap<String, oneshot::Sender<String>>,
+    pub pending_questions: HashMap<String, oneshot::Sender<Vec<String>>>,
+    pub automations: Vec<automations::AutomationRule>,
+    pub repo_hooks: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -48,6 +57,9 @@ pub struct DaemonState {
     pub state_file: PathBuf,
     pub events_dir: PathBuf,
     pub attachments_dir: PathBuf,
+    pub automations_file: PathBuf,
+    pub hooks_file: PathBuf,
+    pub daemon_http_base: Option<String>,
 }
 
 impl DaemonState {
@@ -57,6 +69,8 @@ impl DaemonState {
         let state_file = velo_home.join("sessions.json");
         let events_dir = velo_home.join("events");
         let attachments_dir = velo_home.join("attachments");
+        let automations_file = velo_home.join("automations.json");
+        let hooks_file = velo_home.join("repo_hooks.json");
         tokio::fs::create_dir_all(&events_dir).await?;
         tokio::fs::create_dir_all(&attachments_dir).await?;
 
@@ -66,7 +80,12 @@ impl DaemonState {
             if let Ok(raw) = tokio::fs::read_to_string(&state_file).await {
                 if let Ok(saved) = serde_json::from_str::<Vec<SessionInfo>>(&raw) {
                     for mut s in saved {
-                        if matches!(s.status, SessionStatus::Starting | SessionStatus::Running) {
+                        if matches!(
+                            s.status,
+                            SessionStatus::Starting
+                                | SessionStatus::Running
+                                | SessionStatus::WaitingForPermission
+                        ) {
                             s.status = SessionStatus::Stopped;
                         }
                         let ev_path = events_dir.join(format!("{}.json", s.id));
@@ -81,6 +100,18 @@ impl DaemonState {
             }
         }
 
+        let automations_list = if let Ok(raw) = tokio::fs::read_to_string(&automations_file).await {
+            serde_json::from_str::<Vec<automations::AutomationRule>>(&raw).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let repo_hooks_map = if let Ok(raw) = tokio::fs::read_to_string(&hooks_file).await {
+            serde_json::from_str::<HashMap<String, String>>(&raw).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
         let (event_tx, _) = broadcast::channel(2048);
         let state = Self {
             inner: Arc::new(RwLock::new(DaemonInner {
@@ -88,15 +119,26 @@ impl DaemonState {
                 event_history,
                 handles: HashMap::new(),
                 shells: HashMap::new(),
+                pending_approvals: HashMap::new(),
+                pending_questions: HashMap::new(),
+                automations: automations_list,
+                repo_hooks: repo_hooks_map,
             })),
             event_tx,
             worktree_mgr: WorktreeManager::default(),
             state_file,
             events_dir,
             attachments_dir,
+            automations_file,
+            hooks_file,
+            daemon_http_base: Some(format!(
+                "http://127.0.0.1:{}",
+                velo_protocol::DEFAULT_DAEMON_PORT
+            )),
         };
 
         state.spawn_event_supervisor();
+        state.spawn_cron_scheduler();
         Ok(state)
     }
 
@@ -223,6 +265,278 @@ impl DaemonState {
         Ok(())
     }
 
+    pub async fn persist_automations(&self) -> Result<()> {
+        let list = {
+            let guard = self.inner.read().await;
+            guard.automations.clone()
+        };
+        let json_str = serde_json::to_string_pretty(&list)?;
+        tokio::fs::write(&self.automations_file, json_str).await?;
+        Ok(())
+    }
+
+    pub async fn persist_repo_hooks(&self) -> Result<()> {
+        let map = {
+            let guard = self.inner.read().await;
+            guard.repo_hooks.clone()
+        };
+        let json_str = serde_json::to_string_pretty(&map)?;
+        tokio::fs::write(&self.hooks_file, json_str).await?;
+        Ok(())
+    }
+
+    pub async fn await_permission_gate(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        command_preview: Option<String>,
+        description: &str,
+    ) -> String {
+        let request_id = format!("perm-{}", Uuid::new_v4());
+        let (tx, rx) = oneshot::channel::<String>();
+        {
+            let mut guard = self.inner.write().await;
+            guard.pending_approvals.insert(request_id.clone(), tx);
+            if let Some(s) = guard.sessions.get_mut(&session_id) {
+                s.status = SessionStatus::WaitingForPermission;
+                s.updated_at = Utc::now();
+            }
+        }
+        let _ = self.event_tx.send(AgentEvent::StatusChanged {
+            session_id,
+            status: SessionStatus::WaitingForPermission,
+            message: Some(format!("Waiting for approval: {}", tool_name)),
+            timestamp: Utc::now(),
+        });
+        let _ = self.event_tx.send(AgentEvent::PermissionRequested {
+            session_id,
+            request_id: request_id.clone(),
+            tool_name: tool_name.to_string(),
+            description: description.to_string(),
+            command_preview,
+            timestamp: Utc::now(),
+        });
+
+        let decision = match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+            Ok(Ok(d)) => d,
+            _ => {
+                let mut guard = self.inner.write().await;
+                guard.pending_approvals.remove(&request_id);
+                "deny".to_string()
+            }
+        };
+        decision
+    }
+
+    pub async fn resolve_permission(&self, session_id: Uuid, request_id: &str, decision: &str) -> bool {
+        let tx = {
+            let mut guard = self.inner.write().await;
+            if let Some(s) = guard.sessions.get_mut(&session_id) {
+                if decision == "always" {
+                    s.approval_mode = "auto_edit".to_string();
+                }
+                s.status = SessionStatus::Running;
+                s.updated_at = Utc::now();
+            }
+            guard.pending_approvals.remove(request_id)
+        };
+        let _ = self.persist_sessions().await;
+        let _ = self.event_tx.send(AgentEvent::PermissionResolved {
+            session_id,
+            request_id: request_id.to_string(),
+            decision: decision.to_string(),
+            timestamp: Utc::now(),
+        });
+        let _ = self.event_tx.send(AgentEvent::StatusChanged {
+            session_id,
+            status: SessionStatus::Running,
+            message: Some(format!("Permission {}", decision)),
+            timestamp: Utc::now(),
+        });
+        if let Some(sender) = tx {
+            let _ = sender.send(decision.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn await_user_question(
+        &self,
+        session_id: Uuid,
+        question: String,
+        options: Vec<String>,
+        allow_multiple: bool,
+    ) -> Vec<String> {
+        let question_id = format!("ask-{}", Uuid::new_v4());
+        let (tx, rx) = oneshot::channel::<Vec<String>>();
+        {
+            let mut guard = self.inner.write().await;
+            guard.pending_questions.insert(question_id.clone(), tx);
+            if let Some(s) = guard.sessions.get_mut(&session_id) {
+                s.status = SessionStatus::WaitingForPermission;
+                s.updated_at = Utc::now();
+            }
+        }
+        let _ = self.event_tx.send(AgentEvent::StatusChanged {
+            session_id,
+            status: SessionStatus::WaitingForPermission,
+            message: Some("Waiting for user answer".to_string()),
+            timestamp: Utc::now(),
+        });
+        let _ = self.event_tx.send(AgentEvent::UserQuestionRequested {
+            session_id,
+            question_id: question_id.clone(),
+            question,
+            options,
+            allow_multiple,
+            timestamp: Utc::now(),
+        });
+
+        match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+            Ok(Ok(ans)) => ans,
+            _ => {
+                let mut guard = self.inner.write().await;
+                guard.pending_questions.remove(&question_id);
+                vec!["(No response — timed out)".to_string()]
+            }
+        }
+    }
+
+    pub async fn resolve_question(
+        &self,
+        session_id: Uuid,
+        question_id: &str,
+        answers: Vec<String>,
+    ) -> bool {
+        let tx = {
+            let mut guard = self.inner.write().await;
+            if let Some(s) = guard.sessions.get_mut(&session_id) {
+                s.status = SessionStatus::Running;
+                s.updated_at = Utc::now();
+            }
+            guard.pending_questions.remove(question_id)
+        };
+        let _ = self.event_tx.send(AgentEvent::UserQuestionAnswered {
+            session_id,
+            question_id: question_id.to_string(),
+            answers: answers.clone(),
+            timestamp: Utc::now(),
+        });
+        let _ = self.event_tx.send(AgentEvent::StatusChanged {
+            session_id,
+            status: SessionStatus::Running,
+            message: Some("User answered question".to_string()),
+            timestamp: Utc::now(),
+        });
+        if let Some(sender) = tx {
+            let _ = sender.send(answers);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn stop_session_by_id(&self, id: Uuid) {
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(mut handle) = guard.handles.remove(&id) {
+                handle.stop();
+            }
+            if let Some(session) = guard.sessions.get_mut(&id) {
+                session.status = SessionStatus::Stopped;
+                session.updated_at = Utc::now();
+            }
+        }
+        let _ = self.persist_sessions().await;
+    }
+
+    fn spawn_cron_scheduler(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut last_minute_key = String::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                let now = Utc::now();
+                let key = now.format("%Y-%m-%d %H:%M").to_string();
+                if key == last_minute_key {
+                    continue;
+                }
+                last_minute_key = key;
+
+                let due_ids: Vec<Uuid> = {
+                    let guard = state.inner.read().await;
+                    guard
+                        .automations
+                        .iter()
+                        .filter(|r| {
+                            r.enabled
+                                && r.trigger_type == "cron"
+                                && r.cron_expr
+                                    .as_deref()
+                                    .map(|c| automations::matches_cron_minute(c, &now))
+                                    .unwrap_or(false)
+                        })
+                        .map(|r| r.id)
+                        .collect()
+                };
+
+                for rule_id in due_ids {
+                    let _ = state.trigger_automation_rule(rule_id, "cron", &json!({})).await;
+                }
+            }
+        });
+    }
+
+    pub async fn trigger_automation_rule(
+        &self,
+        rule_id: Uuid,
+        event_name: &str,
+        payload: &Value,
+    ) -> Result<SessionInfo> {
+        let rule = {
+            let guard = self.inner.read().await;
+            guard
+                .automations
+                .iter()
+                .find(|r| r.id == rule_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Automation rule not found"))?
+        };
+
+        let rendered_prompt =
+            automations::render_webhook_prompt(&rule.prompt_template, event_name, payload);
+        let stamp = Utc::now().format("%m%d-%H%M%S").to_string();
+        let branch = format!("{}-{}", rule.branch_prefix.trim_end_matches('/'), stamp);
+        let sess = self
+            .create_session(CreateSessionRequest {
+                name: Some(format!("{}-{}", rule.name, stamp)),
+                provider: rule.provider.clone(),
+                prompt: rendered_prompt,
+                repo_path: rule.repo_path.clone(),
+                branch: Some(branch),
+                use_pty: false,
+                parent_session_id: None,
+                model: rule.model.clone(),
+                effort: None,
+                images: Vec::new(),
+                approval_mode: Some("auto_edit".to_string()),
+                setup_command: None,
+            })
+            .await?;
+
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(r) = guard.automations.iter_mut().find(|r| r.id == rule_id) {
+                r.last_run_at = Some(Utc::now());
+                r.last_session_id = Some(sess.id);
+                r.run_count += 1;
+            }
+        }
+        let _ = self.persist_automations().await;
+        Ok(sess)
+    }
+
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<SessionInfo> {
         let session_id = Uuid::new_v4();
         let repo_path = PathBuf::from(&req.repo_path);
@@ -232,21 +546,58 @@ impl DaemonState {
             .provision_worktree(&repo_path, session_id, req.branch.as_deref())
             .await?;
 
-        self.spawn_in_existing_worktree(
-            session_id,
-            req.name,
-            req.provider,
-            req.prompt,
-            provision.repo_root,
-            provision.worktree_path,
-            provision.branch,
-            req.use_pty,
-            req.parent_session_id,
-            req.model,
-            req.effort,
-            req.images,
-        )
-        .await
+        // Run per-repo setup hook or `.velo/setup.sh` if isolated worktree was provisioned
+        let configured_hook = if req.setup_command.is_some() {
+            req.setup_command.clone()
+        } else {
+            let guard = self.inner.read().await;
+            guard
+                .repo_hooks
+                .get(&provision.repo_root.to_string_lossy().to_string())
+                .cloned()
+        };
+
+        let hook_outcome = if provision.is_isolated_worktree {
+            WorktreeManager::run_setup_hook(
+                &provision.repo_root,
+                &provision.worktree_path,
+                &provision.branch,
+                configured_hook.as_deref(),
+            )
+            .await
+        } else {
+            None
+        };
+
+        let sess = self
+            .spawn_in_existing_worktree_with_mode(
+                session_id,
+                req.name,
+                req.provider,
+                req.prompt,
+                provision.repo_root,
+                provision.worktree_path,
+                provision.branch,
+                req.use_pty,
+                req.parent_session_id,
+                req.model,
+                req.effort,
+                req.images,
+                req.approval_mode.unwrap_or_else(default_approval_mode),
+            )
+            .await?;
+
+        if let Some(hook_res) = hook_outcome {
+            let _ = self.event_tx.send(AgentEvent::SetupHookOutput {
+                session_id: sess.id,
+                command: hook_res.command,
+                output: hook_res.output,
+                exit_code: hook_res.exit_code,
+                timestamp: Utc::now(),
+            });
+        }
+
+        Ok(sess)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -264,6 +615,41 @@ impl DaemonState {
         model: Option<String>,
         effort: Option<String>,
         images: Vec<String>,
+    ) -> Result<SessionInfo> {
+        self.spawn_in_existing_worktree_with_mode(
+            session_id,
+            custom_name,
+            provider,
+            prompt,
+            repo_root,
+            worktree_path,
+            branch,
+            use_pty,
+            parent_session_id,
+            model,
+            effort,
+            images,
+            default_approval_mode(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_in_existing_worktree_with_mode(
+        &self,
+        session_id: Uuid,
+        custom_name: Option<String>,
+        provider: AgentProvider,
+        prompt: String,
+        repo_root: PathBuf,
+        worktree_path: PathBuf,
+        branch: String,
+        use_pty: bool,
+        parent_session_id: Option<Uuid>,
+        model: Option<String>,
+        effort: Option<String>,
+        images: Vec<String>,
+        approval_mode: String,
     ) -> Result<SessionInfo> {
         let short_id = &session_id.to_string()[..8];
         let name = custom_name
@@ -294,6 +680,8 @@ impl DaemonState {
             effort: effort.clone(),
             tokens_used: 0,
             cost_usd: 0.0,
+            approval_mode: approval_mode.clone(),
+            preview_url: None,
         };
 
         {
@@ -314,7 +702,7 @@ impl DaemonState {
         }
         let _ = self.persist_session_events(session_id).await;
 
-        let handle = AgentSpawner::spawn_agent_turn_with_images(
+        let handle = AgentSpawner::spawn_agent_turn_configured(
             session_id,
             provider,
             prompt,
@@ -324,6 +712,8 @@ impl DaemonState {
             effort,
             None,
             images,
+            approval_mode,
+            self.daemon_http_base.clone(),
             self.event_tx.clone(),
         )
         .await?;
@@ -423,9 +813,54 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/sessions/{id}/git/merge", post(git_merge_handler))
         .route("/api/sessions/{id}/handoff", post(handoff_session_handler))
         .route("/api/sessions/{id}/advisor", post(advisor_session_handler))
+        .route(
+            "/api/sessions/{id}/hooks/pre-tool-use",
+            post(pre_tool_use_hook_handler),
+        )
+        .route(
+            "/api/sessions/{id}/approvals/{request_id}",
+            post(resolve_approval_handler),
+        )
+        .route(
+            "/api/sessions/{id}/questions/{question_id}",
+            post(answer_question_handler),
+        )
+        .route("/api/sessions/{id}/pr", get(get_pr_handler))
+        .route("/api/sessions/{id}/pr/create", post(create_pr_handler))
+        .route("/api/sessions/{id}/pr/merge", post(merge_pr_handler))
+        .route("/api/sessions/{id}/pr/checks", get(get_pr_checks_handler))
+        .route(
+            "/api/hooks",
+            get(list_repo_hooks_handler).post(set_repo_hook_handler),
+        )
+        .route("/api/browser/inspect", post(browser_inspect_handler))
+        .route("/api/transcribe", post(transcribe_audio_handler))
+        .route(
+            "/api/automations",
+            get(list_automations_handler).post(create_automation_handler),
+        )
+        .route(
+            "/api/automations/{id}",
+            axum::routing::patch(update_automation_handler).delete(delete_automation_handler),
+        )
+        .route(
+            "/api/automations/{id}/trigger",
+            post(trigger_automation_handler),
+        )
+        .route(
+            "/api/webhooks/github/{id}",
+            post(github_webhook_handler),
+        )
+        .route(
+            "/api/webhooks/trigger/{id}",
+            post(generic_webhook_handler),
+        )
         .route("/api/committee", post(committee_handler))
         .route("/api/loop", post(loop_handler))
-        .route("/mcp", post(mcp_jsonrpc_handler))
+        .route(
+            "/mcp",
+            post(mcp_jsonrpc_handler).get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+        )
         .route("/ws", get(ws_handler))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         .layer(middleware::from_fn(cors_middleware))
@@ -624,6 +1059,62 @@ async fn list_models_handler() -> impl IntoResponse {
         }
     }
 
+    // 3. ACP & Multi-Provider Catalog (Gemini CLI, OpenCode, GitHub Copilot CLI, Qwen Code)
+    let acp_catalog = [
+        (
+            "acp-gemini-cli",
+            "Gemini CLI (ACP)",
+            "Gemini ACP",
+            "ACP · Google",
+            "acp:gemini --experimental-acp",
+            "gemini",
+            "Agent Client Protocol stdio integration for Gemini CLI",
+        ),
+        (
+            "acp-opencode",
+            "OpenCode (ACP)",
+            "OpenCode",
+            "ACP · OpenCode",
+            "acp:opencode acp",
+            "opencode",
+            "Agent Client Protocol stdio integration for OpenCode",
+        ),
+        (
+            "acp-copilot",
+            "GitHub Copilot CLI",
+            "Copilot",
+            "ACP · GitHub",
+            "copilot",
+            "copilot",
+            "GitHub Copilot coding agent CLI adapter",
+        ),
+        (
+            "acp-qwen-code",
+            "Qwen Code (ACP)",
+            "Qwen Code",
+            "ACP · Qwen",
+            "acp:qwen --acp",
+            "qwen",
+            "Agent Client Protocol stdio integration for Qwen Code",
+        ),
+    ];
+    for (id, label, short_lbl, family, agent_kind, runtime_id, desc) in acp_catalog {
+        let installed = velo_agent::resolve_cli_binary(runtime_id).is_some();
+        if seen_ids.insert(id.to_string()) {
+            models.push(json!({
+                "id": id,
+                "label": label,
+                "shortLabel": short_lbl,
+                "family": family,
+                "agentKind": agent_kind,
+                "runtimeId": runtime_id,
+                "installed": installed,
+                "desc": if installed { format!("Installed · {}", desc) } else { format!("Install `{}` CLI to enable · {}", runtime_id, desc) },
+                "isDefault": false,
+            }));
+        }
+    }
+
     Json(json!({
         "models": models,
         "defaultCodexModel": default_codex_model,
@@ -811,6 +1302,8 @@ struct UpdateSessionRequest {
     name: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    approval_mode: Option<String>,
+    preview_url: Option<String>,
 }
 
 async fn update_session_handler(
@@ -836,6 +1329,16 @@ async fn update_session_handler(
                     None
                 } else {
                     Some(effort)
+                };
+            }
+            if let Some(mode) = req.approval_mode.filter(|m| !m.trim().is_empty()) {
+                s.approval_mode = mode;
+            }
+            if let Some(purl) = req.preview_url {
+                s.preview_url = if purl.trim().is_empty() {
+                    None
+                } else {
+                    Some(purl)
                 };
             }
             s.updated_at = Utc::now();
@@ -1398,138 +1901,145 @@ fn build_conversation_transcript_prefix(
     }
 }
 
+impl DaemonState {
+    pub async fn dispatch_session_input(
+        &self,
+        id: Uuid,
+        req: SessionInputRequest,
+    ) -> Result<Value> {
+        let (existing_session, prior_transcript) = {
+            let mut guard = self.inner.write().await;
+            if let Some(mut old_handle) = guard.handles.remove(&id) {
+                old_handle.stop();
+            }
+            if let Some(turn_idx) = req.truncate_to_user_turn {
+                if let Some(ev_list) = guard.event_history.get_mut(&id) {
+                    truncate_events_at_user_turn(ev_list, turn_idx);
+                }
+                if let Some(s) = guard.sessions.get_mut(&id) {
+                    s.provider_session_id = None;
+                }
+            } else if req.reset_thread {
+                if let Some(s) = guard.sessions.get_mut(&id) {
+                    s.provider_session_id = None;
+                }
+            }
+            let sess = guard.sessions.get(&id).cloned();
+            let transcript = sess.as_ref().and_then(|s| {
+                let evs = guard.event_history.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
+                build_conversation_transcript_prefix(evs, &s.prompt)
+            });
+            (sess, transcript)
+        };
+
+        let Some(session) = existing_session else {
+            anyhow::bail!("Session not found");
+        };
+
+        let target_provider = req.provider.clone().unwrap_or_else(|| session.provider.clone());
+        let can_resume_native = req.truncate_to_user_turn.is_none()
+            && !req.reset_thread
+            && target_provider == session.provider;
+        let resume_session_id = if can_resume_native {
+            session.provider_session_id.clone()
+        } else {
+            None
+        };
+
+        {
+            let mut guard = self.inner.write().await;
+            guard
+                .event_history
+                .entry(id)
+                .or_default()
+                .push(AgentEvent::UserMessage {
+                    session_id: id,
+                    text: req.input.clone(),
+                    images: req.images.clone(),
+                    timestamp: Utc::now(),
+                });
+        }
+        let _ = self.persist_session_events(id).await;
+
+        let effective_prompt = if resume_session_id.is_some() {
+            req.input.clone()
+        } else if let Some(history) = prior_transcript {
+            format!(
+                "<conversation_history>\n{}\n</conversation_history>\n\nUser: {}",
+                history, req.input
+            )
+        } else {
+            req.input.clone()
+        };
+
+        let effective_approval = req
+            .approval_mode
+            .clone()
+            .unwrap_or_else(|| session.approval_mode.clone());
+        let wt_path = PathBuf::from(&session.worktree_path);
+
+        let new_handle = AgentSpawner::spawn_agent_turn_configured(
+            id,
+            target_provider.clone(),
+            effective_prompt,
+            wt_path,
+            false,
+            req.model.clone().or_else(|| session.model.clone()),
+            req.effort.clone().or_else(|| session.effort.clone()),
+            resume_session_id.clone(),
+            req.images.clone(),
+            effective_approval.clone(),
+            self.daemon_http_base.clone(),
+            self.event_tx.clone(),
+        )
+        .await?;
+
+        let pid = new_handle.pid;
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(s) = guard.sessions.get_mut(&id) {
+                if s.provider != target_provider {
+                    s.provider_session_id = None;
+                }
+                s.provider = target_provider;
+                if req.model.is_some() {
+                    s.model = req.model.clone();
+                }
+                if req.effort.is_some() {
+                    s.effort = req.effort.clone();
+                }
+                s.approval_mode = effective_approval;
+                s.status = SessionStatus::Running;
+                s.pid = pid;
+                s.updated_at = Utc::now();
+            }
+            guard.handles.insert(id, new_handle);
+        }
+        let _ = self.persist_sessions().await;
+        Ok(json!({
+            "ok": true,
+            "mode": if resume_session_id.is_some() { "resumed_turn" } else { "spawned_turn" },
+            "pid": pid,
+            "resumed_thread_id": resume_session_id,
+        }))
+    }
+}
+
 async fn send_input_handler(
     State(state): State<DaemonState>,
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<SessionInputRequest>,
 ) -> impl IntoResponse {
-    // 1. Stop any previous running process handle for this session before spawning the new turn
-    let (existing_session, prior_transcript) = {
-        let mut guard = state.inner.write().await;
-        if let Some(mut old_handle) = guard.handles.remove(&id) {
-            old_handle.stop();
+    match state.dispatch_session_input(id, req).await {
+        Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+        Err(err) => {
+            let code = if err.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (code, Json(json!({ "error": err.to_string() }))).into_response()
         }
-        if let Some(turn_idx) = req.truncate_to_user_turn {
-            if let Some(ev_list) = guard.event_history.get_mut(&id) {
-                truncate_events_at_user_turn(ev_list, turn_idx);
-            }
-            if let Some(s) = guard.sessions.get_mut(&id) {
-                s.provider_session_id = None;
-            }
-        } else if req.reset_thread {
-            if let Some(s) = guard.sessions.get_mut(&id) {
-                s.provider_session_id = None;
-            }
-        }
-        let sess = guard.sessions.get(&id).cloned();
-        let transcript = sess.as_ref().and_then(|s| {
-            let evs = guard.event_history.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
-            build_conversation_transcript_prefix(evs, &s.prompt)
-        });
-        (sess, transcript)
-    };
-
-    // 2. Spawn a new real CLI turn (claude / codex) in the session's isolated worktree
-    let Some(session) = existing_session else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Session not found" })),
-        )
-            .into_response();
-    };
-
-    let target_provider = req.provider.clone().unwrap_or_else(|| session.provider.clone());
-    let can_resume_native = req.truncate_to_user_turn.is_none()
-        && !req.reset_thread
-        && target_provider == session.provider;
-    let resume_session_id = if can_resume_native {
-        session.provider_session_id.clone()
-    } else {
-        None
-    };
-
-    // Record the user message into event_history and persist
-    {
-        let mut guard = state.inner.write().await;
-        guard
-            .event_history
-            .entry(id)
-            .or_default()
-            .push(AgentEvent::UserMessage {
-                session_id: id,
-                text: req.input.clone(),
-                images: req.images.clone(),
-                timestamp: Utc::now(),
-            });
-    }
-    let _ = state.persist_session_events(id).await;
-
-    // If native thread resume is unavailable (e.g. after Rewind/Edit or provider switch) and prior turns exist,
-    // prepend the surviving conversation history so multi-turn memory is still preserved.
-    let effective_prompt = if resume_session_id.is_some() {
-        req.input.clone()
-    } else if let Some(history) = prior_transcript {
-        format!(
-            "<conversation_history>\n{}\n</conversation_history>\n\nUser: {}",
-            history, req.input
-        )
-    } else {
-        req.input.clone()
-    };
-
-    let wt_path = PathBuf::from(&session.worktree_path);
-    match AgentSpawner::spawn_agent_turn_with_images(
-        id,
-        target_provider.clone(),
-        effective_prompt,
-        wt_path,
-        false,
-        req.model.clone().or_else(|| session.model.clone()),
-        req.effort.clone().or_else(|| session.effort.clone()),
-        resume_session_id.clone(),
-        req.images.clone(),
-        state.event_tx.clone(),
-    )
-    .await
-    {
-        Ok(new_handle) => {
-            let pid = new_handle.pid;
-            {
-                let mut guard = state.inner.write().await;
-                if let Some(s) = guard.sessions.get_mut(&id) {
-                    if s.provider != target_provider {
-                        s.provider_session_id = None;
-                    }
-                    s.provider = target_provider;
-                    if req.model.is_some() {
-                        s.model = req.model.clone();
-                    }
-                    if req.effort.is_some() {
-                        s.effort = req.effort.clone();
-                    }
-                    s.status = SessionStatus::Running;
-                    s.pid = pid;
-                    s.updated_at = Utc::now();
-                }
-                guard.handles.insert(id, new_handle);
-            }
-            let _ = state.persist_sessions().await;
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "mode": if resume_session_id.is_some() { "resumed_turn" } else { "spawned_turn" },
-                    "pid": pid,
-                    "resumed_thread_id": resume_session_id,
-                })),
-            )
-                .into_response()
-        }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": err.to_string() })),
-        )
-            .into_response(),
     }
 }
 
@@ -1990,6 +2500,8 @@ async fn committee_handler(
             model: None,
             effort: None,
             images: Vec::new(),
+            approval_mode: None,
+            setup_command: None,
         };
         match state.create_session(create_req).await {
             Ok(s) => spawned.push(s),
@@ -2035,6 +2547,8 @@ async fn loop_handler(
         model: None,
         effort: None,
         images: Vec::new(),
+        approval_mode: None,
+        setup_command: None,
     };
 
     let initial_session = match state.create_session(create_req).await {
@@ -2176,18 +2690,525 @@ async fn loop_handler(
     (StatusCode::CREATED, Json(json!(initial_session))).into_response()
 }
 
+fn is_destructive_shell_command(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    lower.contains("rm -rf /")
+        || lower.contains("rm -rf ~")
+        || lower.contains("git reset --hard")
+        || lower.contains("git push --force")
+        || lower.contains("git push -f ")
+        || lower.contains("sudo ")
+        || lower.contains("drop table ")
+}
+
+/// Real Claude Code & ACP `PreToolUse` live permission interceptor.
+async fn pre_tool_use_hook_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let tool_name = payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Tool");
+    let tool_input = payload.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+
+    let approval_mode = {
+        let guard = state.inner.read().await;
+        guard
+            .sessions
+            .get(&id)
+            .map(|s| s.approval_mode.clone())
+            .unwrap_or_else(default_approval_mode)
+    };
+
+    let cmd_preview = tool_input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            tool_input
+                .get("file_path")
+                .or_else(|| tool_input.get("path"))
+                .and_then(|v| v.as_str())
+                .map(|p| format!("{} {}", tool_name, p))
+        })
+        .unwrap_or_else(|| format!("{} {}", tool_name, tool_input));
+
+    let requires_gate = match approval_mode.as_str() {
+        "bypass" => false,
+        "ask_before_edit" => matches!(
+            tool_name,
+            "Bash" | "Edit" | "Write" | "MultiEdit" | "ACP Tool" | "execute"
+        ) || !tool_name.starts_with("Read"),
+        _ => {
+            // In `auto_edit`, normal workspace edits/commands proceed immediately;
+            // high-risk destructive commands trigger interactive confirmation!
+            tool_name == "Bash" && is_destructive_shell_command(&cmd_preview)
+        }
+    };
+
+    if !requires_gate {
+        return Json(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
+        }));
+    }
+
+    let desc = format!(
+        "Agent requested `{}` in mode `{}`",
+        tool_name, approval_mode
+    );
+    let decision = state
+        .await_permission_gate(id, tool_name, Some(cmd_preview), &desc)
+        .await;
+
+    if decision == "deny" {
+        Json(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "User denied permission in Velo control plane."
+            }
+        }))
+    } else {
+        Json(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
+        }))
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ResolveApprovalBody {
+    decision: String,
+}
+
+async fn resolve_approval_handler(
+    State(state): State<DaemonState>,
+    AxumPath((id, request_id)): AxumPath<(Uuid, String)>,
+    Json(body): Json<ResolveApprovalBody>,
+) -> impl IntoResponse {
+    let resolved = state
+        .resolve_permission(id, &request_id, body.decision.trim())
+        .await;
+    Json(json!({ "ok": true, "resolved_live": resolved, "decision": body.decision }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AnswerQuestionBody {
+    answers: Vec<String>,
+}
+
+async fn answer_question_handler(
+    State(state): State<DaemonState>,
+    AxumPath((id, question_id)): AxumPath<(Uuid, String)>,
+    Json(body): Json<AnswerQuestionBody>,
+) -> impl IntoResponse {
+    let resolved = state
+        .resolve_question(id, &question_id, body.answers.clone())
+        .await;
+    Json(json!({ "ok": true, "resolved_live": resolved, "answers": body.answers }))
+}
+
+async fn get_pr_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> impl IntoResponse {
+    let wt = {
+        let guard = state.inner.read().await;
+        guard
+            .sessions
+            .get(&id)
+            .map(|s| PathBuf::from(&s.worktree_path))
+            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"))
+    };
+    Json(pr::get_pr_status(&wt).await)
+}
+
+async fn create_pr_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<pr::CreatePrRequest>,
+) -> impl IntoResponse {
+    let wt = {
+        let guard = state.inner.read().await;
+        guard
+            .sessions
+            .get(&id)
+            .map(|s| PathBuf::from(&s.worktree_path))
+            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"))
+    };
+    Json(pr::create_pull_request(&wt, req).await)
+}
+
+async fn merge_pr_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<pr::MergePrRequest>,
+) -> impl IntoResponse {
+    let wt = {
+        let guard = state.inner.read().await;
+        guard
+            .sessions
+            .get(&id)
+            .map(|s| PathBuf::from(&s.worktree_path))
+            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"))
+    };
+    Json(pr::merge_pull_request(&wt, req).await)
+}
+
+async fn get_pr_checks_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> impl IntoResponse {
+    let wt = {
+        let guard = state.inner.read().await;
+        guard
+            .sessions
+            .get(&id)
+            .map(|s| PathBuf::from(&s.worktree_path))
+            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"))
+    };
+    Json(pr::get_pr_checks_report(&wt).await)
+}
+
+async fn list_repo_hooks_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    let guard = state.inner.read().await;
+    Json(json!({ "hooks": guard.repo_hooks }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetRepoHookBody {
+    repo_path: String,
+    setup_command: String,
+}
+
+async fn set_repo_hook_handler(
+    State(state): State<DaemonState>,
+    Json(body): Json<SetRepoHookBody>,
+) -> impl IntoResponse {
+    let repo_key = WorktreeManager::resolve_repo_root(Path::new(&body.repo_path))
+        .await
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| body.repo_path.trim().to_string());
+    {
+        let mut guard = state.inner.write().await;
+        if body.setup_command.trim().is_empty() {
+            guard.repo_hooks.remove(&repo_key);
+        } else {
+            guard
+                .repo_hooks
+                .insert(repo_key.clone(), body.setup_command.trim().to_string());
+        }
+    }
+    let _ = state.persist_repo_hooks().await;
+    Json(json!({ "ok": true, "repo_root": repo_key }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BrowserInspectRequest {
+    url: String,
+    session_id: Option<Uuid>,
+}
+
+async fn inspect_url_summary(url: &str) -> Value {
+    let out = Command::new("curl")
+        .args(["-sSL", "--max-time", "8", "-i", url])
+        .output()
+        .await;
+    match out {
+        Ok(res) if res.status.success() => {
+            let raw = String::from_utf8_lossy(&res.stdout);
+            let status_line = raw.lines().next().unwrap_or("HTTP/1.1 200 OK").to_string();
+            let title = raw
+                .find("<title>")
+                .and_then(|s| {
+                    let after = &raw[s + 7..];
+                    after.find("</title>").map(|e| after[..e].trim().to_string())
+                })
+                .unwrap_or_default();
+            let has_error_overlay = raw.contains("vite-error-overlay")
+                || raw.contains("__next_error__")
+                || raw.contains("Runtime Error");
+            let body_excerpt: String = raw.chars().take(3500).collect();
+            json!({
+                "ok": true,
+                "url": url,
+                "status_line": status_line,
+                "title": title,
+                "has_error_overlay": has_error_overlay,
+                "html_excerpt": body_excerpt,
+            })
+        }
+        Ok(res) => json!({
+            "ok": false,
+            "url": url,
+            "error": String::from_utf8_lossy(&res.stderr).trim().to_string()
+        }),
+        Err(err) => json!({
+            "ok": false,
+            "url": url,
+            "error": err.to_string()
+        }),
+    }
+}
+
+async fn browser_inspect_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<BrowserInspectRequest>,
+) -> impl IntoResponse {
+    if let Some(sid) = req.session_id {
+        let _ = state.event_tx.send(AgentEvent::BrowserCommand {
+            session_id: sid,
+            action: "open".to_string(),
+            url: Some(req.url.clone()),
+            selector: None,
+            script: None,
+            timestamp: Utc::now(),
+        });
+    }
+    Json(inspect_url_summary(&req.url).await)
+}
+
+async fn transcribe_audio_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<voice::TranscribeRequest>,
+) -> impl IntoResponse {
+    let bytes = match decode_base64_payload(&req.audio_base64) {
+        Ok(b) if !b.is_empty() => b,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "Invalid or empty audio payload" })),
+            )
+                .into_response();
+        }
+    };
+    let temp_dir = state.attachments_dir.join("voice-tmp");
+    let res = voice::transcribe_audio(
+        &temp_dir,
+        &bytes,
+        &req.mime_type,
+        req.language.as_deref(),
+    )
+    .await;
+    (StatusCode::OK, Json(res)).into_response()
+}
+
+async fn list_automations_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    let guard = state.inner.read().await;
+    Json(json!({ "automations": guard.automations }))
+}
+
+async fn create_automation_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<automations::CreateAutomationRequest>,
+) -> impl IntoResponse {
+    let rule = automations::AutomationRule {
+        id: Uuid::new_v4(),
+        name: req.name.trim().to_string(),
+        enabled: req.enabled,
+        trigger_type: req.trigger_type,
+        cron_expr: req.cron_expr,
+        webhook_secret: req.webhook_secret,
+        github_events: req.github_events,
+        repo_path: req.repo_path,
+        branch_prefix: req
+            .branch_prefix
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "auto/hub".to_string()),
+        provider: req.provider,
+        model: req.model,
+        prompt_template: req.prompt_template,
+        created_at: Utc::now(),
+        last_run_at: None,
+        last_session_id: None,
+        run_count: 0,
+    };
+    {
+        let mut guard = state.inner.write().await;
+        guard.automations.push(rule.clone());
+    }
+    let _ = state.persist_automations().await;
+    (StatusCode::CREATED, Json(json!(rule)))
+}
+
+async fn update_automation_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<automations::UpdateAutomationRequest>,
+) -> impl IntoResponse {
+    let updated = {
+        let mut guard = state.inner.write().await;
+        if let Some(r) = guard.automations.iter_mut().find(|r| r.id == id) {
+            if let Some(n) = req.name.filter(|s| !s.trim().is_empty()) {
+                r.name = n;
+            }
+            if let Some(en) = req.enabled {
+                r.enabled = en;
+            }
+            if let Some(c) = req.cron_expr {
+                r.cron_expr = if c.trim().is_empty() { None } else { Some(c) };
+            }
+            if let Some(pt) = req.prompt_template.filter(|s| !s.trim().is_empty()) {
+                r.prompt_template = pt;
+            }
+            Some(r.clone())
+        } else {
+            None
+        }
+    };
+    match updated {
+        Some(r) => {
+            let _ = state.persist_automations().await;
+            (StatusCode::OK, Json(json!(r))).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Automation not found" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_automation_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> impl IntoResponse {
+    {
+        let mut guard = state.inner.write().await;
+        guard.automations.retain(|r| r.id != id);
+    }
+    let _ = state.persist_automations().await;
+    Json(json!({ "ok": true, "deleted_id": id }))
+}
+
+async fn trigger_automation_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .trigger_automation_rule(id, "manual_run", &json!({ "title": "Manual trigger" }))
+        .await
+    {
+        Ok(sess) => (StatusCode::CREATED, Json(json!({ "ok": true, "session": sess }))).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn github_webhook_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let rule_opt = {
+        let guard = state.inner.read().await;
+        guard.automations.iter().find(|r| r.id == id).cloned()
+    };
+    let Some(rule) = rule_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Automation rule not found" })),
+        )
+            .into_response();
+    };
+    if !rule.enabled {
+        return (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "skipped": "rule disabled" })),
+        )
+            .into_response();
+    }
+
+    if let Some(secret) = rule.webhook_secret.as_deref() {
+        let sig_hdr = headers
+            .get("x-hub-signature-256")
+            .and_then(|v| v.to_str().ok());
+        if !automations::verify_github_signature(secret, &body, sig_hdr) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid X-Hub-Signature-256" })),
+            )
+                .into_response();
+        }
+    }
+
+    let gh_event = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("push");
+    if gh_event == "ping" {
+        return (StatusCode::OK, Json(json!({ "ok": true, "pong": true }))).into_response();
+    }
+    if !rule.github_events.is_empty() && !rule.github_events.iter().any(|e| e == gh_event) {
+        return (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "skipped": format!("event {} not matched", gh_event) })),
+        )
+            .into_response();
+    }
+
+    let payload: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    match state.trigger_automation_rule(id, gh_event, &payload).await {
+        Ok(sess) => (StatusCode::CREATED, Json(json!({ "ok": true, "session_id": sess.id }))).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn generic_webhook_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match state.trigger_automation_rule(id, "webhook", &payload).await {
+        Ok(sess) => (StatusCode::CREATED, Json(json!({ "ok": true, "session_id": sess.id }))).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// Phase 3 Built-in MCP Server JSON-RPC 2.0 endpoint (`POST /mcp`).
-/// Allows any MCP-capable coding agent to list sessions, inspect diffs, or spawn/handoff peer agents.
+/// Allows any MCP-capable coding agent to list sessions, inspect diffs, ask the user questions,
+/// request approvals, inspect local browser apps, or spawn/handoff peer agents.
 pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
+    handle_mcp_request_for_session(state, None, payload).await
+}
+
+pub async fn handle_mcp_request_for_session(
+    state: &DaemonState,
+    default_session_id: Option<Uuid>,
+    payload: Value,
+) -> Value {
     let id = payload.get("id").cloned().unwrap_or(Value::Null);
     let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let requested_proto = payload
+        .pointer("/params/protocolVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("2024-11-05");
 
     match method {
         "initialize" => json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": requested_proto,
                 "serverInfo": {
                     "name": "velo-mcp-server",
                     "version": env!("CARGO_PKG_VERSION"),
@@ -2196,6 +3217,11 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                     "tools": {}
                 }
             }
+        }),
+        "ping" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
         }),
         "tools/list" => json!({
             "jsonrpc": "2.0",
@@ -2212,11 +3238,11 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                     },
                     {
                         "name": "velo_spawn_agent",
-                        "description": "Spawn a new coding agent (claude, codex, opencode) inside an isolated Git worktree",
+                        "description": "Spawn a new coding agent (claude, codex, opencode, gemini, acp:...) inside an isolated Git worktree",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "provider": { "type": "string", "description": "claude, codex, or opencode" },
+                                "provider": { "type": "string", "description": "claude, codex, opencode, gemini, or acp:<cmd>" },
                                 "prompt": { "type": "string", "description": "Task instructions" },
                                 "repo_path": { "type": "string", "description": "Repository root path" },
                                 "branch": { "type": "string", "description": "Branch name" }
@@ -2230,9 +3256,56 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "session_id": { "type": "string", "description": "Session UUID" }
+                                "session_id": { "type": "string", "description": "Session UUID (optional if bound)" }
+                            }
+                        }
+                    },
+                    {
+                        "name": "velo_ask_user",
+                        "description": "Ask the human user a clarifying multiple-choice or freeform question in the Velo UI and wait for their answer",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "question": { "type": "string", "description": "Clear question to show the user" },
+                                "options": { "type": "array", "items": { "type": "string" }, "description": "Suggested choices" },
+                                "allow_multiple": { "type": "boolean", "description": "Whether user can pick multiple options" }
                             },
-                            "required": ["session_id"]
+                            "required": ["question"]
+                        }
+                    },
+                    {
+                        "name": "velo_request_approval",
+                        "description": "Request interactive human approval in Velo UI before executing a sensitive command or file edit",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "tool_name": { "type": "string", "description": "Tool or action name (e.g. Bash, Edit)" },
+                                "command_preview": { "type": "string", "description": "Exact command or file path to preview" },
+                                "reason": { "type": "string", "description": "Why this action is needed" }
+                            },
+                            "required": ["tool_name", "command_preview"]
+                        }
+                    },
+                    {
+                        "name": "velo_browser_open",
+                        "description": "Open or navigate Velo's built-in workspace Browser Preview drawer to a local dev server URL",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "url": { "type": "string", "description": "Target URL (e.g. http://localhost:5173)" }
+                            },
+                            "required": ["url"]
+                        }
+                    },
+                    {
+                        "name": "velo_browser_inspect",
+                        "description": "Fetch & inspect a local dev server URL (HTTP status, <title>, runtime/Vite error overlays, HTML excerpt) to verify frontend changes",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "url": { "type": "string", "description": "Target URL (e.g. http://localhost:5173)" }
+                            },
+                            "required": ["url"]
                         }
                     }
                 ]
@@ -2247,6 +3320,13 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+
+            let resolve_sid = || -> Option<Uuid> {
+                args.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .or(default_session_id)
+            };
 
             match tool_name {
                 "velo_list_sessions" => {
@@ -2288,10 +3368,12 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                         repo_path,
                         branch,
                         use_pty: false,
-                        parent_session_id: None,
+                        parent_session_id: default_session_id,
                         model: None,
                         effort: None,
                         images: Vec::new(),
+                        approval_mode: None,
+                        setup_command: None,
                     };
                     match state.create_session(req).await {
                         Ok(s) => json!({
@@ -2312,11 +3394,7 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                     }
                 }
                 "velo_get_diff" => {
-                    let sid_str = args
-                        .get("session_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if let Ok(sid) = Uuid::parse_str(sid_str) {
+                    if let Some(sid) = resolve_sid() {
                         let wt = {
                             let guard = state.inner.read().await;
                             guard.sessions.get(&sid).map(|s| PathBuf::from(&s.worktree_path))
@@ -2343,6 +3421,119 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                         }
                     })
                 }
+                "velo_ask_user" => {
+                    let Some(sid) = resolve_sid() else {
+                        return json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "isError": true, "content": [{ "type": "text", "text": "Missing session_id" }] }
+                        });
+                    };
+                    let q = args
+                        .get("question")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Please choose an option:")
+                        .to_string();
+                    let opts: Vec<String> = args
+                        .get("options")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let multi = args
+                        .get("allow_multiple")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let answers = state.await_user_question(sid, q, opts, multi).await;
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": format!("User answered: {}", answers.join(", ")) }]
+                        }
+                    })
+                }
+                "velo_request_approval" => {
+                    let Some(sid) = resolve_sid() else {
+                        return json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "isError": true, "content": [{ "type": "text", "text": "Missing session_id" }] }
+                        });
+                    };
+                    let t_name = args
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Bash");
+                    let preview = args
+                        .get("command_preview")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let reason = args
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Agent requested explicit confirmation");
+                    let decision = state
+                        .await_permission_gate(sid, t_name, Some(preview), reason)
+                        .await;
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "isError": decision == "deny",
+                            "content": [{ "type": "text", "text": format!("Permission decision: {}", decision) }]
+                        }
+                    })
+                }
+                "velo_browser_open" => {
+                    let url = args
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("http://localhost:5173")
+                        .to_string();
+                    if let Some(sid) = resolve_sid() {
+                        {
+                            let mut guard = state.inner.write().await;
+                            if let Some(s) = guard.sessions.get_mut(&sid) {
+                                s.preview_url = Some(url.clone());
+                            }
+                        }
+                        let _ = state.event_tx.send(AgentEvent::BrowserCommand {
+                            session_id: sid,
+                            action: "open".to_string(),
+                            url: Some(url.clone()),
+                            selector: None,
+                            script: None,
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    let summary = inspect_url_summary(&url).await;
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&summary).unwrap_or_default() }]
+                        }
+                    })
+                }
+                "velo_browser_inspect" => {
+                    let url = args
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("http://localhost:5173");
+                    let summary = inspect_url_summary(url).await;
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&summary).unwrap_or_default() }]
+                        }
+                    })
+                }
                 _ => json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -2358,12 +3549,22 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct McpQuery {
+    session_id: Option<Uuid>,
+}
+
 async fn mcp_jsonrpc_handler(
     State(state): State<DaemonState>,
+    Query(query): Query<McpQuery>,
     Json(payload): Json<Value>,
-) -> impl IntoResponse {
-    let resp = handle_mcp_request(&state, payload).await;
-    Json(resp)
+) -> Response {
+    // Streamable HTTP MCP 2025-03-26 compliance: JSON-RPC notifications (no `id`) return 202 Accepted
+    if payload.get("id").is_none() {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    let resp = handle_mcp_request_for_session(&state, query.session_id, payload).await;
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 async fn ws_handler(
@@ -2410,6 +3611,32 @@ async fn handle_ws_client(socket: WebSocket, state: DaemonState) {
                                 if let Some(h) = guard.handles.get(&session_id) {
                                     let _ = h.send_input(data);
                                 }
+                            }
+                            WsClientMessage::ApprovePermission {
+                                session_id,
+                                request_id,
+                                approved,
+                                always,
+                            } => {
+                                let decision = if !approved {
+                                    "deny"
+                                } else if always {
+                                    "always"
+                                } else {
+                                    "approve"
+                                };
+                                state_for_recv
+                                    .resolve_permission(session_id, &request_id, decision)
+                                    .await;
+                            }
+                            WsClientMessage::AnswerQuestion {
+                                session_id,
+                                question_id,
+                                answers,
+                            } => {
+                                state_for_recv
+                                    .resolve_question(session_id, &question_id, answers)
+                                    .await;
                             }
                             _ => {}
                         }
@@ -2556,12 +3783,19 @@ mod tests {
                 event_history: HashMap::new(),
                 handles: HashMap::new(),
                 shells: HashMap::new(),
+                pending_approvals: HashMap::new(),
+                pending_questions: HashMap::new(),
+                automations: Vec::new(),
+                repo_hooks: HashMap::new(),
             })),
             event_tx,
             worktree_mgr: WorktreeManager::new(wt_dir),
             state_file: temp_base.join("sessions.json"),
             events_dir: temp_base.join("events"),
             attachments_dir: temp_base.join("attachments"),
+            automations_file: temp_base.join("automations.json"),
+            hooks_file: temp_base.join("repo_hooks.json"),
+            daemon_http_base: None,
         };
         state.spawn_event_supervisor();
 
@@ -2578,6 +3812,8 @@ mod tests {
             model: None,
             effort: None,
             images: Vec::new(),
+            approval_mode: None,
+            setup_command: None,
         };
 
         let session = state.create_session(req).await?;
@@ -2617,7 +3853,7 @@ mod tests {
     }
 }
 
-async fn pair_ticket_handler() -> impl IntoResponse {
+async fn pair_ticket_handler(State(state): State<DaemonState>) -> impl IntoResponse {
     let lan_ip = Command::new("ipconfig")
         .args(["getifaddr", "en0"])
         .output()
@@ -2629,15 +3865,14 @@ async fn pair_ticket_handler() -> impl IntoResponse {
         })
         .unwrap_or_else(|| velo_protocol::DEFAULT_DAEMON_HOST.to_string());
 
+    relay_bridge::ensure_local_relay_running().await;
+
     let relay_url = format!("ws://{}:{}", lan_ip, velo_relay::DEFAULT_RELAY_PORT);
     let daemon_addr = format!("{}:{}", lan_ip, velo_protocol::DEFAULT_DAEMON_PORT);
     let ticket = velo_relay::PairingTicket::generate(&relay_url, &daemon_addr);
-    let mobile_url = format!(
-        "http://{}/?mobile=1&room={}&key={}",
-        daemon_addr,
-        &ticket.room_id[..8],
-        &ticket.shared_key_hex[..16]
-    );
+    let mobile_url = ticket.mobile_web_url.clone();
+
+    relay_bridge::spawn_daemon_e2ee_bridge(state, ticket.clone());
 
     // Render crisp SVG matrix for the QR modal
     let bytes = mobile_url.as_bytes();
@@ -2673,6 +3908,7 @@ async fn pair_ticket_handler() -> impl IntoResponse {
     Json(json!({
         "room_id": ticket.room_id,
         "shared_key_hex": ticket.shared_key_hex,
+        "daemon_pubkey_hex": ticket.daemon_pubkey_hex,
         "relay_url": ticket.relay_url,
         "daemon_addr": ticket.daemon_addr,
         "pairing_uri": ticket.pairing_uri,

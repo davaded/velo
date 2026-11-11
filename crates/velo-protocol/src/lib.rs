@@ -6,23 +6,64 @@ use uuid::Uuid;
 pub const DEFAULT_DAEMON_PORT: u16 = 6767;
 pub const DEFAULT_DAEMON_HOST: &str = "127.0.0.1";
 
-/// Supported coding agent providers wrapped natively by Velo.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Supported coding agent providers wrapped natively or via ACP by Velo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentProvider {
     Claude,
     Codex,
     OpenCode,
+    Gemini,
+    Copilot,
+    Qwen,
+    Acp(String),
     Custom(String),
+}
+
+impl<'de> Deserialize<'de> for AgentProvider {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Plain(String),
+            Tagged(std::collections::HashMap<String, String>),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Plain(s) => Ok(Self::from_str_loose(&s)),
+            Repr::Tagged(map) => {
+                if let Some(cmd) = map.get("acp") {
+                    Ok(Self::Acp(cmd.clone()))
+                } else if let Some(cmd) = map.get("custom") {
+                    Ok(Self::Custom(cmd.clone()))
+                } else {
+                    Err(serde::de::Error::custom(
+                        "expected AgentProvider string or {acp|custom: string}",
+                    ))
+                }
+            }
+        }
+    }
 }
 
 impl AgentProvider {
     pub fn from_str_loose(s: &str) -> Self {
-        match s.trim().to_lowercase().as_str() {
+        let trimmed = s.trim();
+        let lower = trimmed.to_lowercase();
+        if let Some(rest) = trimmed.strip_prefix("acp:").or_else(|| trimmed.strip_prefix("ACP:")) {
+            return Self::Acp(rest.trim().to_string());
+        }
+        match lower.as_str() {
             "claude" | "claude-code" => Self::Claude,
             "codex" | "openai" => Self::Codex,
             "opencode" | "open-code" => Self::OpenCode,
-            other => Self::Custom(other.to_string()),
+            "gemini" | "gemini-cli" => Self::Gemini,
+            "copilot" | "github-copilot" | "gh-copilot" => Self::Copilot,
+            "qwen" | "qwen-code" => Self::Qwen,
+            _ => Self::Custom(trimmed.to_string()),
         }
     }
 
@@ -31,7 +72,11 @@ impl AgentProvider {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
-            Self::Custom(cmd) => cmd.as_str(),
+            Self::Gemini => "gemini",
+            Self::Copilot => "copilot",
+            Self::Qwen => "qwen",
+            Self::Acp(cmd) => cmd.split_whitespace().next().unwrap_or(cmd.as_str()),
+            Self::Custom(cmd) => cmd.split_whitespace().next().unwrap_or(cmd.as_str()),
         }
     }
 }
@@ -42,9 +87,17 @@ impl fmt::Display for AgentProvider {
             Self::Claude => write!(f, "claude"),
             Self::Codex => write!(f, "codex"),
             Self::OpenCode => write!(f, "opencode"),
+            Self::Gemini => write!(f, "gemini"),
+            Self::Copilot => write!(f, "copilot"),
+            Self::Qwen => write!(f, "qwen"),
+            Self::Acp(name) => write!(f, "acp:{}", name),
             Self::Custom(name) => write!(f, "custom({})", name),
         }
     }
+}
+
+pub fn default_approval_mode() -> String {
+    "auto_edit".to_string()
 }
 
 /// Lifecycle state of an orchestrated agent session.
@@ -108,6 +161,10 @@ pub struct SessionInfo {
     pub tokens_used: u64,
     #[serde(default)]
     pub cost_usd: f64,
+    #[serde(default = "default_approval_mode")]
+    pub approval_mode: String,
+    #[serde(default)]
+    pub preview_url: Option<String>,
 }
 
 /// Unified event stream emitted by `velo-agent` drivers and broadcasted to connected clients.
@@ -182,6 +239,43 @@ pub enum AgentEvent {
         command_preview: Option<String>,
         timestamp: DateTime<Utc>,
     },
+    PermissionResolved {
+        session_id: Uuid,
+        request_id: String,
+        decision: String,
+        timestamp: DateTime<Utc>,
+    },
+    UserQuestionRequested {
+        session_id: Uuid,
+        question_id: String,
+        question: String,
+        #[serde(default)]
+        options: Vec<String>,
+        #[serde(default)]
+        allow_multiple: bool,
+        timestamp: DateTime<Utc>,
+    },
+    UserQuestionAnswered {
+        session_id: Uuid,
+        question_id: String,
+        answers: Vec<String>,
+        timestamp: DateTime<Utc>,
+    },
+    BrowserCommand {
+        session_id: Uuid,
+        action: String,
+        url: Option<String>,
+        selector: Option<String>,
+        script: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
+    SetupHookOutput {
+        session_id: Uuid,
+        command: String,
+        output: String,
+        exit_code: i32,
+        timestamp: DateTime<Utc>,
+    },
     PtyOutput {
         session_id: Uuid,
         line: String,
@@ -213,6 +307,11 @@ impl AgentEvent {
             | Self::ToolCallRequested { session_id, .. }
             | Self::ToolCallCompleted { session_id, .. }
             | Self::PermissionRequested { session_id, .. }
+            | Self::PermissionResolved { session_id, .. }
+            | Self::UserQuestionRequested { session_id, .. }
+            | Self::UserQuestionAnswered { session_id, .. }
+            | Self::BrowserCommand { session_id, .. }
+            | Self::SetupHookOutput { session_id, .. }
             | Self::PtyOutput { session_id, .. }
             | Self::DiffUpdated { session_id, .. }
             | Self::Error { session_id, .. } => *session_id,
@@ -236,6 +335,10 @@ pub struct CreateSessionRequest {
     pub effort: Option<String>,
     #[serde(default)]
     pub images: Vec<String>,
+    #[serde(default)]
+    pub approval_mode: Option<String>,
+    #[serde(default)]
+    pub setup_command: Option<String>,
 }
 
 /// Request payload to hand off an existing session's worktree & context to another agent.
@@ -261,6 +364,8 @@ pub struct SessionInputRequest {
     pub truncate_to_user_turn: Option<usize>,
     #[serde(default)]
     pub images: Vec<String>,
+    #[serde(default)]
+    pub approval_mode: Option<String>,
 }
 
 /// Client-to-daemon WebSocket command envelope.
@@ -273,6 +378,13 @@ pub enum WsClientMessage {
         session_id: Uuid,
         request_id: String,
         approved: bool,
+        #[serde(default)]
+        always: bool,
+    },
+    AnswerQuestion {
+        session_id: Uuid,
+        question_id: String,
+        answers: Vec<String>,
     },
     Ping,
 }
@@ -312,4 +424,25 @@ pub struct LoopSessionRequest {
     pub max_iterations: u32,
     pub repo_path: String,
     pub branch: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_provider_serde_plain_and_tagged_roundtrip() {
+        let p1: AgentProvider = serde_json::from_str("\"claude\"").unwrap();
+        assert_eq!(p1, AgentProvider::Claude);
+
+        let p2: AgentProvider = serde_json::from_str("\"acp:opencode acp\"").unwrap();
+        assert_eq!(p2, AgentProvider::Acp("opencode acp".to_string()));
+
+        let serialized = serde_json::to_string(&p2).unwrap();
+        let roundtripped: AgentProvider = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(roundtripped, p2);
+
+        let p3: AgentProvider = serde_json::from_str("\"gemini\"").unwrap();
+        assert_eq!(p3, AgentProvider::Gemini);
+    }
 }

@@ -6,6 +6,14 @@ use uuid::Uuid;
 use velo_protocol::GitDiffStats;
 
 const DEFAULT_ENV_FILES: &[&str] = &[".env", ".env.local", ".env.development", ".env.test"];
+const SHARED_DEP_DIRS: &[&str] = &["node_modules", ".venv", "venv"];
+
+#[derive(Debug, Clone)]
+pub struct SetupHookResult {
+    pub command: String,
+    pub output: String,
+    pub exit_code: i32,
+}
 
 #[derive(Debug, Clone)]
 pub struct WorktreeProvision {
@@ -183,6 +191,8 @@ impl WorktreeManager {
 
         self.sync_worktree_include_files(&repo_root, &worktree_dir)
             .await?;
+        self.symlink_shared_dependencies(&repo_root, &worktree_dir)
+            .await;
 
         Ok(WorktreeProvision {
             repo_root,
@@ -190,6 +200,111 @@ impl WorktreeManager {
             branch,
             is_isolated_worktree: true,
         })
+    }
+
+    /// Symlinks heavy untracked dependency directories (`node_modules`, `.venv`, `venv`)
+    /// from `repo_root` into `worktree_dir` so newly created worktrees can run tests & dev servers immediately.
+    async fn symlink_shared_dependencies(&self, repo_root: &Path, worktree_dir: &Path) {
+        for dir_name in SHARED_DEP_DIRS {
+            let src = repo_root.join(dir_name);
+            let dst = worktree_dir.join(dir_name);
+            if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
+                continue;
+            }
+            if tokio::fs::symlink_metadata(&dst).await.is_ok() {
+                continue;
+            }
+            // Only symlink if the directory is untracked/ignored by git
+            let tracked = Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .args(["ls-files", "--error-unmatch", dir_name])
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if tracked {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                if let Err(err) = std::os::unix::fs::symlink(&src, &dst) {
+                    warn!("Failed to symlink {} into worktree: {}", dir_name, err);
+                } else {
+                    info!("Symlinked shared {} into worktree {}", dir_name, worktree_dir.display());
+                }
+            }
+        }
+    }
+
+    /// Discovers (`.velo/setup.sh`, `.worktreesetup`, `.paseo/setup.sh`) or runs an explicit setup hook
+    /// inside an isolated worktree after provisioning.
+    pub async fn run_setup_hook(
+        repo_root: &Path,
+        worktree_path: &Path,
+        branch: &str,
+        explicit_command: Option<&str>,
+    ) -> Option<SetupHookResult> {
+        let cmd_str = if let Some(cmd) = explicit_command.map(str::trim).filter(|s| !s.is_empty()) {
+            cmd.to_string()
+        } else {
+            let candidates = [".velo/setup.sh", ".worktreesetup", ".paseo/setup.sh"];
+            let mut found = None;
+            for rel in candidates {
+                let candidate_in_wt = worktree_path.join(rel);
+                let candidate_in_root = repo_root.join(rel);
+                if tokio::fs::try_exists(&candidate_in_wt).await.unwrap_or(false) {
+                    found = Some(format!("sh \"{}\"", candidate_in_wt.display()));
+                    break;
+                } else if tokio::fs::try_exists(&candidate_in_root).await.unwrap_or(false) {
+                    found = Some(format!("sh \"{}\"", candidate_in_root.display()));
+                    break;
+                }
+            }
+            found?
+        };
+
+        info!(
+            "Running worktree setup hook `{}` in {}",
+            cmd_str,
+            worktree_path.display()
+        );
+        let aug_path = format!(
+            "/opt/homebrew/bin:/usr/local/bin:{}",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string())
+        );
+        match Command::new("sh")
+            .args(["-c", &cmd_str])
+            .current_dir(worktree_path)
+            .env("PATH", aug_path)
+            .env("VELO_REPO_ROOT", repo_root.as_os_str())
+            .env("VELO_WORKTREE_PATH", worktree_path.as_os_str())
+            .env("VELO_BRANCH", branch)
+            .output()
+            .await
+        {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let combined = if stderr.trim().is_empty() {
+                    stdout.trim().to_string()
+                } else if stdout.trim().is_empty() {
+                    stderr.trim().to_string()
+                } else {
+                    format!("{}\n{}", stdout.trim(), stderr.trim())
+                };
+                Some(SetupHookResult {
+                    command: cmd_str,
+                    output: combined,
+                    exit_code: out.status.code().unwrap_or(-1),
+                })
+            }
+            Err(err) => Some(SetupHookResult {
+                command: cmd_str,
+                output: format!("Failed to spawn setup hook: {}", err),
+                exit_code: -1,
+            }),
+        }
     }
 
     /// Copies untracked environment files specified in `.worktreeinclude` or defaults (`.env*`)
@@ -373,6 +488,70 @@ mod tests {
 
         let diff_text = WorktreeManager::get_unified_diff(&prov.worktree_path).await?;
         assert!(diff_text.contains("+Added by Velo agent"));
+
+        mgr.remove_worktree(&prov.repo_root, &prov.worktree_path).await?;
+        let _ = tokio::fs::remove_dir_all(&temp_base).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_worktree_node_modules_symlink_and_setup_hook() -> Result<()> {
+        let temp_base = std::env::temp_dir().join(format!("velo-wt-hook-{}", Uuid::new_v4()));
+        let repo_dir = temp_base.join("app-repo");
+        let wt_store = temp_base.join("worktrees");
+        tokio::fs::create_dir_all(repo_dir.join("node_modules/pkg")).await?;
+        tokio::fs::create_dir_all(repo_dir.join(".velo")).await?;
+        tokio::fs::write(repo_dir.join("node_modules/pkg/index.js"), "module.exports = 42;\n").await?;
+        tokio::fs::write(
+            repo_dir.join(".velo/setup.sh"),
+            "#!/bin/sh\necho \"bootstrapped:$VELO_BRANCH\" > .setup_done\n",
+        )
+        .await?;
+
+        Command::new("git").arg("init").current_dir(&repo_dir).output().await?;
+        Command::new("git")
+            .args(["config", "user.email", "test@velo.dev"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        Command::new("git")
+            .args(["config", "user.name", "Velo Test"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        tokio::fs::write(repo_dir.join(".gitignore"), "node_modules/\n.setup_done\n").await?;
+        Command::new("git")
+            .args(["add", ".gitignore", ".velo/setup.sh"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+
+        let mgr = WorktreeManager::new(wt_store);
+        let prov = mgr
+            .provision_worktree(&repo_dir, Uuid::new_v4(), Some("feat/hook-test"))
+            .await?;
+
+        // Verify node_modules was symlinked automatically
+        let nm_meta = tokio::fs::symlink_metadata(prov.worktree_path.join("node_modules")).await?;
+        assert!(nm_meta.file_type().is_symlink());
+
+        // Verify .velo/setup.sh auto-discovery & execution
+        let hook_res = WorktreeManager::run_setup_hook(
+            &prov.repo_root,
+            &prov.worktree_path,
+            &prov.branch,
+            None,
+        )
+        .await
+        .expect("setup hook discovered");
+        assert_eq!(hook_res.exit_code, 0);
+        let marker = tokio::fs::read_to_string(prov.worktree_path.join(".setup_done")).await?;
+        assert_eq!(marker.trim(), "bootstrapped:feat/hook-test");
 
         mgr.remove_worktree(&prov.repo_root, &prov.worktree_path).await?;
         let _ = tokio::fs::remove_dir_all(&temp_base).await;

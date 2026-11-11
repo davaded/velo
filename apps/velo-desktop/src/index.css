@@ -43,6 +43,17 @@
   --status-danger: var(--sem-danger);
   --status-warning: var(--sem-warning);
 
+  /* Drawer & Modal component adaptive token bridges */
+  --velo-border: var(--v-border-subtle);
+  --velo-border-strong: var(--v-border-strong);
+  --velo-bg-panel: var(--v-bg-sidebar);
+  --velo-bg-card: var(--v-bg-surface);
+  --velo-bg-app: var(--v-bg-canvas);
+  --velo-bg-hover: var(--v-bg-hover);
+  --velo-text-primary: var(--v-fg-primary);
+  --velo-text-secondary: var(--v-fg-secondary);
+  --velo-text-muted: var(--v-fg-muted);
+
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", "Geist Mono", Menlo, monospace;
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
