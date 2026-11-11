@@ -40,6 +40,7 @@ import {
   GitBranch,
   GitCommitHorizontal,
   GitMerge,
+  ImagePlus,
   Layers,
   Monitor,
   Moon,
@@ -92,6 +93,29 @@ interface PendingApprovalItem {
   id: string;
   command: string;
   reason: string;
+}
+
+interface PendingAttachmentItem {
+  filename: string;
+  path: string;
+  url: string;
+}
+
+function stripAnsiSequences(raw: string): string {
+  // Strip OSC (e.g. window title) and CSI/ANSI color & cursor control codes cleanly
+  const withoutOsc = raw.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+  const withoutCsi = withoutOsc.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+  const withoutEsc = withoutCsi.replace(/\x1b[@-_]/g, "");
+  // Normalize CRLF -> LF and process carriage-return overwrites per line
+  return withoutEsc
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => {
+      if (!line.includes("\r")) return line;
+      const segments = line.split("\r");
+      return segments[segments.length - 1];
+    })
+    .join("\n");
 }
 
 const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {};
@@ -158,7 +182,8 @@ export function App() {
   const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
   const [repos, setRepos] = useState<VeloRepo[]>(() => {
     try {
-      const saved = localStorage.getItem("velo.repos.v2");
+      const saved =
+        localStorage.getItem("velo.repos.v3") || localStorage.getItem("velo.repos.v2");
       if (saved) {
         const parsed = JSON.parse(saved) as VeloRepo[];
         if (Array.isArray(parsed) && parsed.length > 0) return parsed;
@@ -291,10 +316,15 @@ export function App() {
     DEFAULT_PENDING_BY_SESSION
   );
 
-  // Clean Composer State (Natural language + slash skills; Agent explores worktree autonomously)
+  // Clean Composer State (Natural language + slash skills + multimodal image attachments)
   const [prompt, setPrompt] = useState<string>("");
   const [slashFilter, setSlashFilter] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachmentItem[]>([]);
+  const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
+  const [composerDragOver, setComposerDragOver] = useState<boolean>(false);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renamingTitle, setRenamingTitle] = useState<string>("");
 
   // Modals & E2EE Pairing Ticket
   const [activeModal, setActiveModal] = useState<ModalKind>(null);
@@ -306,11 +336,9 @@ export function App() {
   const [newApproval] = useState<ApprovalMode>("auto_edit");
   const [newRepoPath, setNewRepoPath] = useState<string>("/Users/daiyudai/code/velo");
 
-  // Terminal State inside Drawer
-  const [termLines, setTermLines] = useState<string[]>([
-    "$ velo status --worktrees",
-    "  Ready to execute commands inside the active isolated Git worktree.",
-  ]);
+  // Interactive Persistent PTY Terminal State inside Drawer
+  const [ptyOutputBySession, setPtyOutputBySession] = useState<Record<string, string>>({});
+  const [ptyPidBySession, setPtyPidBySession] = useState<Record<string, number | null>>({});
   const [termInput, setTermInput] = useState<string>("");
   const [turnTimingBySession, setTurnTimingBySession] = useState<
     Record<string, { startedAtMs: number; durationMs?: number; completedAtLabel?: string }>
@@ -318,6 +346,8 @@ export function App() {
 
   const streamEndRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const terminalScrollRef = useRef<HTMLDivElement | null>(null);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeId) || sessions[0] || DEMO_SESSIONS[0],
@@ -377,14 +407,18 @@ export function App() {
             });
             const mergedIds = new Set(merged.map((s) => s.id));
             const remainingLocal = prev
-              .filter((d) => !mergedIds.has(d.id))
+              .filter(
+                (d) =>
+                  !mergedIds.has(d.id) &&
+                  (d.id.startsWith("sess-") || d.id.startsWith("wt-"))
+              )
               .map((d) =>
                 d.status === "running" && !runningDaemonIds.has(d.id)
                   ? { ...d, status: "idle" as const, updated_at: "now" }
                   : d
               );
             const combined = [...merged, ...remainingLocal];
-            return combined.length > 0 ? combined : prev;
+            return combined.length > 0 ? combined : DEMO_SESSIONS;
           });
         }
       })
@@ -481,13 +515,15 @@ export function App() {
 
           if (evType === "user_message") {
             const text = String(ev.text ?? "").trim();
-            if (text) {
+            const imgs = Array.isArray(ev.images) ? ev.images.map(String).filter(Boolean) : [];
+            if (text || imgs.length > 0) {
               reconstructed.push({
                 id: `u-hist-${i}`,
                 session_id: sid,
                 timestamp: ts,
                 kind: "user",
                 content: text,
+                images: imgs.length > 0 ? imgs : undefined,
               });
             }
           } else if (evType === "thinking_delta") {
@@ -588,6 +624,37 @@ export function App() {
       })
       .catch(() => {});
   }, [activeSession.id, daemonUrl, eventsBySession]);
+
+  // Attach / spawn persistent interactive PTY shell when Terminal drawer opens
+  useEffect(() => {
+    if (!drawerOpen || drawerTab !== "terminal") return;
+    const sid = activeSession.id;
+    if (!sid || sid.startsWith("sess-") || sid.startsWith("wt-")) return;
+
+    fetch(`${daemonUrl}/api/sessions/${sid}/terminal/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cols: 96, rows: 28 }),
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data: { pid?: number | null; scrollback?: string }) => {
+        if (typeof data.pid === "number") {
+          setPtyPidBySession((prev) => ({ ...prev, [sid]: data.pid ?? null }));
+        }
+        if (typeof data.scrollback === "string" && data.scrollback.length > 0) {
+          setPtyOutputBySession((prev) => ({
+            ...prev,
+            [sid]: prev[sid] ? prev[sid] : data.scrollback!,
+          }));
+        }
+        setTimeout(() => {
+          if (terminalScrollRef.current) {
+            terminalScrollRef.current.scrollTop = terminalScrollRef.current.scrollHeight;
+          }
+        }, 40);
+      })
+      .catch(() => {});
+  }, [drawerOpen, drawerTab, activeSession.id, daemonUrl]);
 
   // Fetch E2EE Pairing Ticket when QR modal opens
   useEffect(() => {
@@ -881,6 +948,73 @@ export function App() {
             return;
           }
 
+          if (evType === "usage_updated") {
+            const totalTok = Number(evObj.total_tokens ?? 0);
+            const costDelta = Number(evObj.cost_usd ?? 0);
+            setSessions((prev) =>
+              prev.map((s) =>
+                s.id === sid
+                  ? {
+                      ...s,
+                      tokens_used: totalTok > 0 ? totalTok : s.tokens_used,
+                      cost_usd: costDelta > 0 ? (s.cost_usd || 0) + costDelta : s.cost_usd,
+                    }
+                  : s
+              )
+            );
+            return;
+          }
+
+          if (evType === "terminal_output") {
+            const chunk = String(evObj.data ?? "");
+            if (!chunk) return;
+            setPtyOutputBySession((prev) => {
+              const combined = (prev[sid] || "") + chunk;
+              const trimmed = combined.length > 49152 ? combined.slice(-49152) : combined;
+              return { ...prev, [sid]: trimmed };
+            });
+            setTimeout(() => {
+              if (terminalScrollRef.current) {
+                terminalScrollRef.current.scrollTop = terminalScrollRef.current.scrollHeight;
+              }
+            }, 15);
+            return;
+          }
+
+          if (evType === "message_chunk") {
+            const delta = String(evObj.delta ?? "");
+            if (!delta) return;
+            setEventsBySession((prev) => {
+              const list = prev[sid] || [];
+              const last = list[list.length - 1];
+              if (last && last.kind === "assistant" && last.is_streaming_chunk) {
+                const updatedLast: AgentEvent = {
+                  ...last,
+                  content: `${last.content}${delta}`,
+                };
+                return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
+              }
+              return {
+                ...prev,
+                [sid]: [
+                  ...list,
+                  {
+                    id: `as-stream-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                    session_id: sid,
+                    timestamp: now,
+                    kind: "assistant",
+                    content: delta,
+                    is_streaming_chunk: true,
+                  },
+                ],
+              };
+            });
+            setTimeout(() => {
+              streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
+            }, 25);
+            return;
+          }
+
           if (evType === "message_delta") {
             const text = String(evObj.text ?? "");
             if (!text.trim()) return;
@@ -888,6 +1022,15 @@ export function App() {
               const list = prev[sid] || [];
               const last = list[list.length - 1];
               if (last && last.kind === "assistant") {
+                if (last.is_streaming_chunk) {
+                  return {
+                    ...prev,
+                    [sid]: [
+                      ...list.slice(0, -1),
+                      { ...last, content: text, is_streaming_chunk: false },
+                    ],
+                  };
+                }
                 const updatedLast = {
                   ...last,
                   content: last.content.includes(text)
@@ -906,6 +1049,7 @@ export function App() {
                     timestamp: now,
                     kind: "assistant",
                     content: text,
+                    is_streaming_chunk: false,
                   },
                 ],
               };
@@ -994,18 +1138,87 @@ export function App() {
     setSlashFilter(null);
   };
 
+  const resolveAttachmentUrl = useCallback(
+    (imgRef: string): string => {
+      if (!imgRef) return "";
+      if (imgRef.startsWith("http://") || imgRef.startsWith("https://") || imgRef.startsWith("data:")) {
+        return imgRef;
+      }
+      if (imgRef.startsWith("/api/attachments/")) {
+        return `${daemonUrl}${imgRef}`;
+      }
+      const basename = imgRef.split("/").pop() || imgRef;
+      return `${daemonUrl}/api/attachments/${basename}`;
+    },
+    [daemonUrl]
+  );
+
+  const handleUploadImageFiles = useCallback(
+    async (fileList: FileList | File[]) => {
+      const files = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
+      if (files.length === 0) return;
+      setUploadingAttachment(true);
+      try {
+        for (const file of files) {
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ""));
+            reader.onerror = () => reject(new Error("read failed"));
+            reader.readAsDataURL(file);
+          });
+          const res = await fetch(`${daemonUrl}/api/attachments`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              filename: file.name || "pasted-image.png",
+              mime_type: file.type || "image/png",
+              data_base64: dataUrl,
+            }),
+          });
+          if (res.ok) {
+            const data = (await res.json()) as {
+              filename: string;
+              path: string;
+              url: string;
+            };
+            setPendingAttachments((prev) => [
+              ...prev,
+              {
+                filename: data.filename,
+                path: data.path,
+                url: `${daemonUrl}${data.url}`,
+              },
+            ]);
+          }
+        }
+      } catch {
+        // ignore upload failure
+      } finally {
+        setUploadingAttachment(false);
+      }
+    },
+    [daemonUrl]
+  );
+
   const handleSendPrompt = async (
     customText?: string,
     overridePriorEvents?: AgentEvent[],
-    truncateToUserTurn?: number
+    truncateToUserTurn?: number,
+    overrideImages?: string[]
   ) => {
-    const rawText = (customText ?? prompt).trim();
-    if (!rawText) return;
+    const attachedPaths =
+      overrideImages !== undefined ? overrideImages : pendingAttachments.map((a) => a.path);
+    const rawTyped = (customText ?? prompt).trim();
+    if (!rawTyped && attachedPaths.length === 0) return;
 
+    const rawText = rawTyped || "Please inspect the attached image(s).";
     const text = rawText;
 
     setPrompt("");
     setSlashFilter(null);
+    if (overrideImages === undefined) {
+      setPendingAttachments([]);
+    }
 
     const now = new Date().toLocaleTimeString([], { hour12: false });
     const baseEvents = overridePriorEvents ?? (eventsBySession[activeSession.id] || []);
@@ -1015,6 +1228,7 @@ export function App() {
       timestamp: now,
       kind: "user",
       content: text,
+      images: attachedPaths.length > 0 ? attachedPaths : undefined,
     };
 
     const startedAtMs = Date.now();
@@ -1027,6 +1241,42 @@ export function App() {
       ...prev,
       [activeSession.id]: [...baseEvents, userEv],
     }));
+
+    // Real Daemon /worktree-GC endpoint (Prune orphaned Git worktrees & stale locks)
+    if (rawText.toLowerCase().startsWith("/worktree-gc")) {
+      try {
+        const res = await fetch(`${daemonUrl}/api/worktrees/prune`, { method: "POST" });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            pruned_count?: number;
+            pruned_paths?: string[];
+          };
+          const count = data.pruned_count ?? 0;
+          const details =
+            data.pruned_paths && data.pruned_paths.length > 0
+              ? `\n\n${data.pruned_paths.map((p) => `- \`${p}\``).join("\n")}`
+              : "";
+          const replyEv: AgentEvent = {
+            id: `gc-${Date.now()}`,
+            session_id: activeSession.id,
+            timestamp: now,
+            kind: "assistant",
+            content:
+              count > 0
+                ? `Pruned **${count}** orphaned Git worktree(s) and cleaned repository worktree locks:${details}`
+                : "All isolated Git worktrees under `~/.velo/worktrees` are clean — 0 orphaned directories found.",
+          };
+          setEventsBySession((prev) => ({
+            ...prev,
+            [activeSession.id]: [...(prev[activeSession.id] || []), replyEv],
+          }));
+          refreshSessions();
+          return;
+        }
+      } catch {
+        // fallback below
+      }
+    }
 
     // Real Daemon /handoff endpoint
     if (rawText.startsWith("/handoff")) {
@@ -1202,6 +1452,7 @@ export function App() {
           provider: providerName,
           truncate_to_user_turn: truncateToUserTurn,
           reset_thread: truncateToUserTurn !== undefined,
+          images: attachedPaths,
         }),
       });
 
@@ -1225,6 +1476,7 @@ export function App() {
           use_pty: false,
           model: activeSession.model,
           effort: activeSession.effort || "medium",
+          images: attachedPaths,
         }),
       });
 
@@ -1370,7 +1622,7 @@ export function App() {
       ...prev,
       [activeSession.id]: truncated,
     }));
-    await handleSendPrompt(trimmed, truncated, userTurnIdx);
+    await handleSendPrompt(trimmed, truncated, userTurnIdx, ev.images || []);
   };
 
   const handleRetryUserMessage = async (ev: AgentEvent) => {
@@ -1387,7 +1639,7 @@ export function App() {
       ...prev,
       [activeSession.id]: truncated,
     }));
-    await handleSendPrompt(ev.content, truncated, userTurnIdx);
+    await handleSendPrompt(ev.content, truncated, userTurnIdx, ev.images || []);
   };
 
   // Paseo Rewind Flow (packages/app/src/components/rewind/rewind-menu.tsx):
@@ -1410,12 +1662,21 @@ export function App() {
       body: JSON.stringify({ truncate_to_user_turn: userTurnIdx }),
     }).catch(() => {});
     setPrompt(ev.content);
+    if (ev.images && ev.images.length > 0) {
+      setPendingAttachments(
+        ev.images.map((p) => ({
+          filename: p.split("/").pop() || "image.png",
+          path: p,
+          url: resolveAttachmentUrl(p),
+        }))
+      );
+    }
     setTimeout(() => {
       composerTextareaRef.current?.focus();
     }, 30);
   };
 
-  // Delete / archive a thread from sidebar and daemon
+  // Delete / archive a thread from sidebar, daemon state, events history & isolated Git worktree
   const handleDeleteSession = async (sessionId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const target = sessions.find((s) => s.id === sessionId);
@@ -1440,9 +1701,33 @@ export function App() {
       delete next[sessionId];
       return next;
     });
+    setPtyOutputBySession((prev) => {
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
     try {
-      await fetch(`${daemonUrl}/api/sessions/${sessionId}?cleanup_worktree=false`, {
+      await fetch(`${daemonUrl}/api/sessions/${sessionId}?cleanup_worktree=true`, {
         method: "DELETE",
+      });
+    } catch {
+      // ignore if local-only
+    }
+  };
+
+  // Rename session title inline and persist via PATCH /api/sessions/{id}
+  const handleCommitRenameSession = async (sessionId: string) => {
+    const clean = renamingTitle.trim();
+    setRenamingSessionId(null);
+    if (!clean) return;
+    setSessions((prev) =>
+      prev.map((s) => (s.id === sessionId ? { ...s, title: clean } : s))
+    );
+    try {
+      await fetch(`${daemonUrl}/api/sessions/${sessionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: clean }),
       });
     } catch {
       // ignore if local-only
@@ -1768,19 +2053,58 @@ export function App() {
     }
   };
 
-  // Terminal Drawer Command Execution (Real Worktree Shell)
+  // Interactive Persistent PTY Terminal Controls (Real zsh / $SHELL PTY per Session)
+  const handleSendPtyRaw = async (data: string) => {
+    const sid = activeSession.id;
+    try {
+      const res = await fetch(`${daemonUrl}/api/sessions/${sid}/terminal/input`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data }),
+      });
+      if (res.ok) return;
+    } catch {
+      // fallback below if session is local draft
+    }
+    const cleanCmd = data.trim();
+    if (cleanCmd && cleanCmd !== "\x03") {
+      const res = await executeInWorktree(cleanCmd);
+      const out = [res.stdout, res.stderr].filter(Boolean).join("\n");
+      setPtyOutputBySession((prev) => ({
+        ...prev,
+        [sid]: `${prev[sid] || ""}$ ${cleanCmd}\n${out || `(exit ${res.exit_code})`}\n`,
+      }));
+    }
+  };
+
+  const handleRestartPty = async () => {
+    const sid = activeSession.id;
+    setPtyOutputBySession((prev) => ({ ...prev, [sid]: "" }));
+    try {
+      const res = await fetch(`${daemonUrl}/api/sessions/${sid}/terminal/restart`, {
+        method: "POST",
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { pid?: number | null };
+        setPtyPidBySession((prev) => ({ ...prev, [sid]: data.pid ?? null }));
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   const handleRunTermCommand = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cmd = termInput.trim();
-    if (!cmd) return;
+    const cmd = termInput;
+    if (!cmd.trim()) {
+      await handleSendPtyRaw("\n");
+      return;
+    }
     setTermInput("");
-    setTermLines((prev) => [...prev, `$ ${cmd}`]);
-    const res = await executeInWorktree(cmd);
-    const out = [res.stdout.trim(), res.stderr.trim()].filter(Boolean).join("\n");
-    setTermLines((prev) => [
-      ...prev,
-      ...(out ? out.split("\n") : [`(exit ${res.exit_code})`]),
-    ]);
+    if (cmd.trim() === "clear") {
+      setPtyOutputBySession((prev) => ({ ...prev, [activeSession.id]: "" }));
+    }
+    await handleSendPtyRaw(`${cmd}\n`);
   };
 
   // One-click Commit inside isolated worktree via POST /api/sessions/{id}/git/commit
@@ -2074,17 +2398,56 @@ export function App() {
                             {/* Thread Content Column */}
                             <div className="min-w-0 flex-1">
                               <div className="flex items-baseline justify-between gap-1.5">
-                                <span
-                                  className={`truncate text-[13px] leading-snug ${
-                                    isSelected ? "font-medium text-[var(--v-fg-primary)]" : "font-normal"
-                                  }`}
-                                >
-                                  {w.title}
-                                </span>
+                                {renamingSessionId === w.id ? (
+                                  <input
+                                    autoFocus
+                                    value={renamingTitle}
+                                    onClick={(e) => e.stopPropagation()}
+                                    onChange={(e) => setRenamingTitle(e.target.value)}
+                                    onBlur={() => handleCommitRenameSession(w.id)}
+                                    onKeyDown={(e) => {
+                                      e.stopPropagation();
+                                      if (e.key === "Enter") {
+                                        handleCommitRenameSession(w.id);
+                                      } else if (e.key === "Escape") {
+                                        setRenamingSessionId(null);
+                                      }
+                                    }}
+                                    className="w-full rounded border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-1.5 py-0.5 text-[12.5px] text-[var(--v-fg-primary)] focus:outline-none"
+                                  />
+                                ) : (
+                                  <span
+                                    onDoubleClick={(e) => {
+                                      e.stopPropagation();
+                                      setRenamingSessionId(w.id);
+                                      setRenamingTitle(w.title);
+                                    }}
+                                    title="Double-click to rename thread"
+                                    className={`truncate text-[13px] leading-snug ${
+                                      isSelected
+                                        ? "font-medium text-[var(--v-fg-primary)]"
+                                        : "font-normal"
+                                    }`}
+                                  >
+                                    {w.title}
+                                  </span>
+                                )}
                                 <div className="flex shrink-0 items-center gap-1">
                                   <span className="font-mono text-[11px] text-[var(--v-fg-faint)] group-hover:hidden">
                                     {w.updated_at}
                                   </span>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setRenamingSessionId(w.id);
+                                      setRenamingTitle(w.title);
+                                    }}
+                                    title="Rename thread"
+                                    className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] group-hover:flex"
+                                  >
+                                    <SquarePen className="h-2.5 w-2.5" />
+                                  </button>
                                   <button
                                     type="button"
                                     onClick={(e) => handleDeleteSession(w.id, e)}
@@ -2456,6 +2819,18 @@ export function App() {
                                     : ""
                                 }`}
                               >
+                                {ev.images && ev.images.length > 0 && (
+                                  <div className="mb-2 flex flex-wrap gap-2">
+                                    {ev.images.map((imgRef, imgIdx) => (
+                                      <img
+                                        key={`${imgRef}-${imgIdx}`}
+                                        src={resolveAttachmentUrl(imgRef)}
+                                        alt="Attached screenshot"
+                                        className="max-h-[180px] max-w-[260px] rounded-xl border border-[var(--v-border-subtle)] object-cover"
+                                      />
+                                    ))}
+                                  </div>
+                                )}
                                 {ev.content}
                               </div>
                               {/* Paseo Trailing Row: Timestamp + Rewind (Undo2) + Inline Edit + Copy */}
@@ -2666,12 +3041,95 @@ export function App() {
                   </div>
                 )}
 
-                <div className="rounded-[18px] border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)]">
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setComposerDragOver(true);
+                  }}
+                  onDragLeave={() => setComposerDragOver(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setComposerDragOver(false);
+                    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                      handleUploadImageFiles(e.dataTransfer.files);
+                    }
+                  }}
+                  className={`rounded-[18px] border bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)] ${
+                    composerDragOver
+                      ? "border-[#34d399] ring-1 ring-[#34d399]/40"
+                      : "border-[var(--v-border-strong)]"
+                  }`}
+                >
+                  {/* Hidden file input for ImagePlus picker */}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files.length > 0) {
+                        handleUploadImageFiles(e.target.files);
+                        e.target.value = "";
+                      }
+                    }}
+                  />
+
+                  {/* Pending Multimodal Image Attachments Strip */}
+                  {(pendingAttachments.length > 0 || uploadingAttachment) && (
+                    <div className="mb-2.5 flex flex-wrap items-center gap-2">
+                      {pendingAttachments.map((att, attIdx) => (
+                        <div
+                          key={`${att.filename}-${attIdx}`}
+                          className="group/att relative overflow-hidden rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)]"
+                        >
+                          <img
+                            src={att.url}
+                            alt={att.filename}
+                            className="h-14 w-14 object-cover"
+                          />
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setPendingAttachments((prev) =>
+                                prev.filter((_, i) => i !== attIdx)
+                              )
+                            }
+                            title="Remove attachment"
+                            className="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full bg-black/75 text-white opacity-0 transition-opacity group-hover/att:opacity-100 cursor-pointer"
+                          >
+                            <X className="h-2.5 w-2.5" />
+                          </button>
+                        </div>
+                      ))}
+                      {uploadingAttachment && (
+                        <div className="flex h-14 items-center rounded-xl border border-dashed border-[var(--v-border-strong)] px-3 font-mono text-[11px] text-[var(--v-fg-muted)]">
+                          Uploading image…
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <textarea
                     ref={composerTextareaRef}
                     rows={2}
                     value={prompt}
                     onChange={(e) => handlePromptChange(e.target.value)}
+                    onPaste={(e) => {
+                      const items = e.clipboardData?.items;
+                      if (!items) return;
+                      const imgFiles: File[] = [];
+                      for (let i = 0; i < items.length; i++) {
+                        if (items[i].type.startsWith("image/")) {
+                          const file = items[i].getAsFile();
+                          if (file) imgFiles.push(file);
+                        }
+                      }
+                      if (imgFiles.length > 0) {
+                        e.preventDefault();
+                        handleUploadImageFiles(imgFiles);
+                      }
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
@@ -2681,7 +3139,7 @@ export function App() {
                     placeholder={`Ask ${
                       modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                       activeSession.model_short
-                    } anything... (/ for commands)`}
+                    } anything... (/ for commands, ⌘V paste screenshot)`}
                     className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                   />
 
@@ -2730,6 +3188,11 @@ export function App() {
                                               : s
                                           )
                                         );
+                                        fetch(`${daemonUrl}/api/sessions/${activeSession.id}`, {
+                                          method: "PATCH",
+                                          headers: { "Content-Type": "application/json" },
+                                          body: JSON.stringify({ model: m.id }),
+                                        }).catch(() => {});
                                         setModelPickerOpen(false);
                                       }}
                                       className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
@@ -2812,6 +3275,11 @@ export function App() {
                                     s.id === activeSession.id ? { ...s, effort: eff.id } : s
                                   )
                                 );
+                                fetch(`${daemonUrl}/api/sessions/${activeSession.id}`, {
+                                  method: "PATCH",
+                                  headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify({ effort: eff.id }),
+                                }).catch(() => {});
                                 setEffortPickerOpen(false);
                               }}
                               className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] ${
@@ -2869,13 +3337,24 @@ export function App() {
                           ? "Auto-edit"
                           : "Ask permissions"}
                       </button>
+
+                      {/* Pill 4: Attach Screenshot / Image (Cmd+V or Drag & Drop) */}
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        title="Attach screenshot or image (or paste with ⌘V)"
+                        className="flex h-6 w-6 items-center justify-center rounded-full text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                      >
+                        <ImagePlus className="h-3.5 w-3.5" />
+                      </button>
                     </div>
 
-                    {/* Right Controls: BeautifulContextMeter + Signature Circular Submit / Stop Disc */}
+                    {/* Right Controls: BeautifulContextMeter (Real Token & USD Telemetry) + Submit / Stop Disc */}
                     <div className="flex items-center gap-2">
                       <BeautifulContextMeter
-                        usedTokens={activeSession.tokens_used || 14200}
+                        usedTokens={activeSession.tokens_used || 0}
                         maxTokens={activeSession.tokens_limit || 200000}
+                        costUsd={activeSession.cost_usd || 0}
                       />
                       {activeSession.status === "running" ? (
                         <button
@@ -2888,9 +3367,9 @@ export function App() {
                       ) : (
                         <button
                           onClick={() => handleSendPrompt()}
-                          disabled={!prompt.trim()}
+                          disabled={!prompt.trim() && pendingAttachments.length === 0}
                           className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
-                            prompt.trim()
+                            prompt.trim() || pendingAttachments.length > 0
                               ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
                               : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
                           }`}
@@ -2965,6 +3444,36 @@ export function App() {
                     >
                       <GitMerge className="h-3.5 w-3.5 text-[var(--v-fg-secondary)]" />
                       <span>Merge</span>
+                    </button>
+                  </>
+                )}
+                {drawerTab === "terminal" && (
+                  <>
+                    <button
+                      onClick={() => handleSendPtyRaw("\x03")}
+                      title="Send SIGINT (Ctrl+C) to interactive PTY"
+                      className="rounded-md bg-[var(--v-bg-hover)] px-2 py-1 font-mono text-[10.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171]"
+                    >
+                      ^C
+                    </button>
+                    <button
+                      onClick={() =>
+                        setPtyOutputBySession((prev) => ({
+                          ...prev,
+                          [activeSession.id]: "",
+                        }))
+                      }
+                      title="Clear terminal buffer"
+                      className="rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-active)]"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      onClick={handleRestartPty}
+                      title="Restart interactive zsh PTY in worktree"
+                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
                     </button>
                   </>
                 )}
@@ -3171,29 +3680,40 @@ export function App() {
               <div className="flex flex-1 flex-col overflow-hidden p-3.5 font-mono text-[11.5px]">
                 <div className="mb-2 flex items-center justify-between text-[10.5px] text-[var(--v-fg-faint)]">
                   <span className="truncate">{activeSession.worktree_path}</span>
-                  <span>{activeSession.branch_name}</span>
+                  <span className="shrink-0">
+                    {ptyPidBySession[activeSession.id]
+                      ? `zsh PTY · PID ${ptyPidBySession[activeSession.id]}`
+                      : activeSession.branch_name}
+                  </span>
                 </div>
-                <div className="flex-1 space-y-1.5 overflow-y-auto text-[var(--v-fg-body)]">
-                  {termLines.map((line, i) => (
-                    <div
-                      key={i}
-                      className={
-                        line.startsWith("$") ? "font-medium text-[var(--v-fg-primary)]" : "text-[var(--v-fg-muted)]"
-                      }
-                    >
-                      {line}
-                    </div>
-                  ))}
+                <div
+                  ref={terminalScrollRef}
+                  className="flex-1 overflow-y-auto whitespace-pre-wrap break-all rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)] p-2.5 leading-[1.55] text-[var(--v-fg-body)] select-text"
+                >
+                  {ptyOutputBySession[activeSession.id] ? (
+                    stripAnsiSequences(ptyOutputBySession[activeSession.id])
+                  ) : (
+                    <span className="text-[var(--v-fg-faint)]">
+                      Interactive persistent zsh PTY attached to {activeSession.worktree_path} (cd,
+                      env, dev servers &amp; Ctrl+C supported).
+                    </span>
+                  )}
                 </div>
                 <form
                   onSubmit={handleRunTermCommand}
                   className="mt-2 flex items-center gap-2 border-t border-[var(--v-border-subtle)] pt-2.5"
                 >
-                  <span className="text-[var(--v-fg-muted)]">$</span>
+                  <span className="text-[#34d399]">❯</span>
                   <input
                     value={termInput}
                     onChange={(e) => setTermInput(e.target.value)}
-                    placeholder="Run real git / cargo command in worktree..."
+                    onKeyDown={(e) => {
+                      if (e.ctrlKey && e.key.toLowerCase() === "c") {
+                        e.preventDefault();
+                        handleSendPtyRaw("\x03");
+                      }
+                    }}
+                    placeholder="Interactive shell command (preserves cd & env, Ctrl+C interrupts)..."
                     className="flex-1 bg-transparent text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                   />
                 </form>

@@ -3,7 +3,7 @@ use chrono::Utc;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -288,6 +288,34 @@ impl AgentSpawner {
         resume_session_id: Option<String>,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
+        Self::spawn_agent_turn_with_images(
+            session_id,
+            provider,
+            prompt,
+            worktree_path,
+            use_pty,
+            model,
+            effort,
+            resume_session_id,
+            Vec::new(),
+            event_tx,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_agent_turn_with_images(
+        session_id: Uuid,
+        provider: AgentProvider,
+        prompt: String,
+        worktree_path: PathBuf,
+        use_pty: bool,
+        model: Option<String>,
+        effort: Option<String>,
+        resume_session_id: Option<String>,
+        images: Vec<String>,
+        event_tx: broadcast::Sender<AgentEvent>,
+    ) -> Result<AgentHandle> {
         if use_pty {
             Self::spawn_pty_agent(session_id, provider, prompt, worktree_path, event_tx).await
         } else {
@@ -299,6 +327,7 @@ impl AgentSpawner {
                 model,
                 effort,
                 resume_session_id,
+                images,
                 event_tx,
             )
             .await
@@ -315,6 +344,7 @@ impl AgentSpawner {
         model: Option<String>,
         effort: Option<String>,
         resume_session_id: Option<String>,
+        images: Vec<String>,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
         let mut cmd = Self::build_tokio_command(
@@ -324,6 +354,7 @@ impl AgentSpawner {
             model.as_deref(),
             effort.as_deref(),
             resume_session_id.as_deref(),
+            &images,
         );
         cmd.current_dir(&worktree_path)
             .stdin(Stdio::null())
@@ -606,6 +637,7 @@ impl AgentSpawner {
         model: Option<&str>,
         effort: Option<&str>,
         resume_session_id: Option<&str>,
+        images: &[String],
     ) -> Command {
         let aug_path = discover_augmented_path();
         let mut cmd = match provider {
@@ -618,11 +650,21 @@ impl AgentSpawner {
                 if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
                     c.args(["--resume", rid]);
                 }
+                let effective_prompt = if images.is_empty() {
+                    prompt.to_string()
+                } else {
+                    format!(
+                        "{}\n\n[Attached local image(s) — inspect directly with Read tool: {}]",
+                        prompt,
+                        images.join(", ")
+                    )
+                };
                 c.args([
                     "-p",
-                    prompt,
+                    &effective_prompt,
                     "--output-format",
                     "stream-json",
+                    "--include-partial-messages",
                     "--verbose",
                     "--permission-mode",
                     "acceptEdits",
@@ -664,6 +706,11 @@ impl AgentSpawner {
                     if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
                         c.args(["-c", &format!("model_reasoning_effort=\"{}\"", eff)]);
                     }
+                    for img in images {
+                        if !img.trim().is_empty() {
+                            c.args(["-i", img.trim()]);
+                        }
+                    }
                     c.arg(rid);
                     c.arg(prompt);
                 } else {
@@ -685,6 +732,11 @@ impl AgentSpawner {
                     }
                     if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
                         c.args(["-c", &format!("model_reasoning_effort=\"{}\"", eff)]);
+                    }
+                    for img in images {
+                        if !img.trim().is_empty() {
+                            c.args(["-i", img.trim()]);
+                        }
                     }
                     c.arg(prompt);
                 }
@@ -797,10 +849,87 @@ pub fn parse_agent_stdout_line(
                             });
                         }
                     }
+                    if msg_type == "turn.completed" {
+                        if let Some(usage) = json.get("usage") {
+                            let input_tokens = usage
+                                .get("input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let output_tokens = usage
+                                .get("output_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let total_tokens = input_tokens.saturating_add(output_tokens);
+                            if total_tokens > 0 {
+                                let cost_usd = (input_tokens as f64 * 0.000_0025)
+                                    + (output_tokens as f64 * 0.000_01);
+                                events.push(AgentEvent::UsageUpdated {
+                                    session_id,
+                                    input_tokens,
+                                    output_tokens,
+                                    total_tokens,
+                                    cost_usd,
+                                    timestamp: Utc::now(),
+                                });
+                            }
+                        }
+                    }
+                    return events;
+                }
+                // Claude Code `--include-partial-messages` token-by-token streaming
+                "stream_event" => {
+                    if let Some(ev) = json.get("event") {
+                        let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if ev_type == "content_block_delta" {
+                            if let Some(delta) = ev.get("delta") {
+                                let delta_type =
+                                    delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                if delta_type == "text_delta" {
+                                    if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                        if !t.is_empty() {
+                                            events.push(AgentEvent::MessageChunk {
+                                                session_id,
+                                                delta: t.to_string(),
+                                                timestamp: Utc::now(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     return events;
                 }
                 // 1. Claude Code stream-json events
                 "assistant" => {
+                    if let Some(usage) = json.pointer("/message/usage") {
+                        let in_tok = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            + usage
+                                .get("cache_read_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                            + usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                        let out_tok = usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if in_tok + out_tok > 0 {
+                            events.push(AgentEvent::UsageUpdated {
+                                session_id,
+                                input_tokens: in_tok,
+                                output_tokens: out_tok,
+                                total_tokens: in_tok + out_tok,
+                                cost_usd: 0.0,
+                                timestamp: Utc::now(),
+                            });
+                        }
+                    }
                     if let Some(content_arr) = json
                         .pointer("/message/content")
                         .and_then(|v| v.as_array())
@@ -897,6 +1026,39 @@ pub fn parse_agent_stdout_line(
                             events.push(AgentEvent::ProviderSessionBound {
                                 session_id,
                                 provider_session_id: sid.trim().to_string(),
+                                timestamp: Utc::now(),
+                            });
+                        }
+                    }
+                    let cost_usd = json
+                        .get("total_cost_usd")
+                        .or_else(|| json.get("cost_usd"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    if let Some(usage) = json.get("usage") {
+                        let in_tok = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            + usage
+                                .get("cache_read_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                            + usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                        let out_tok = usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if in_tok + out_tok > 0 || cost_usd > 0.0 {
+                            events.push(AgentEvent::UsageUpdated {
+                                session_id,
+                                input_tokens: in_tok,
+                                output_tokens: out_tok,
+                                total_tokens: in_tok + out_tok,
+                                cost_usd,
                                 timestamp: Utc::now(),
                             });
                         }
@@ -1073,6 +1235,152 @@ pub fn parse_agent_stdout_line(
         text: line.to_string(),
         timestamp: Utc::now(),
     }]
+}
+
+/// Persistent interactive PTY shell bound to an isolated Git worktree (for the right-hand Terminal drawer).
+pub struct InteractiveShellHandle {
+    pub pid: Option<u32>,
+    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    scrollback: Arc<Mutex<String>>,
+    kill_tx: Option<oneshot::Sender<()>>,
+}
+
+impl InteractiveShellHandle {
+    pub fn write_input(&self, data: &str) -> Result<()> {
+        if let Ok(mut guard) = self.writer.lock() {
+            guard.write_all(data.as_bytes())?;
+            guard.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        if let Ok(guard) = self.master.lock() {
+            let _ = guard.resize(PtySize {
+                rows: rows.max(10),
+                cols: cols.max(40),
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn scrollback(&self) -> String {
+        self.scrollback
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.kill_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+pub fn spawn_interactive_shell(
+    session_id: Uuid,
+    worktree_path: PathBuf,
+    cols: u16,
+    rows: u16,
+    event_tx: broadcast::Sender<AgentEvent>,
+) -> Result<InteractiveShellHandle> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: rows.max(16),
+            cols: cols.max(60),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("Failed to open interactive terminal PTY")?;
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.arg("-i");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("PATH", discover_augmented_path());
+    if worktree_path.is_dir() {
+        cmd.cwd(&worktree_path);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .with_context(|| format!("Failed to spawn interactive shell `{}`", shell))?;
+
+    let pid = child.process_id();
+    let mut killer = child.clone_killer();
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("Failed to clone shell PTY reader")?;
+    let writer = Arc::new(Mutex::new(
+        pair.master
+            .take_writer()
+            .context("Failed to take shell PTY writer")?,
+    ));
+    let master = Arc::new(Mutex::new(pair.master));
+    let scrollback = Arc::new(Mutex::new(String::new()));
+    let scrollback_reader = Arc::clone(&scrollback);
+
+    let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+
+    tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if let Ok(mut sb) = scrollback_reader.lock() {
+                        sb.push_str(&chunk);
+                        if sb.len() > 65_536 {
+                            let drain_to = sb.len() - 49_152;
+                            let safe_idx = sb
+                                .char_indices()
+                                .find(|(i, _)| *i >= drain_to)
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            sb.drain(..safe_idx);
+                        }
+                    }
+                    let _ = event_tx.send(AgentEvent::TerminalOutput {
+                        session_id,
+                        data: chunk,
+                        timestamp: Utc::now(),
+                    });
+                }
+            }
+        }
+    });
+
+    let mut wait_handle = tokio::task::spawn_blocking(move || child.wait());
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut kill_rx => {
+                let _ = killer.kill();
+            }
+            _ = &mut wait_handle => {}
+        }
+    });
+
+    Ok(InteractiveShellHandle {
+        pid,
+        master,
+        writer,
+        scrollback,
+        kill_tx: Some(kill_rx_guard_noop(kill_tx)),
+    })
+}
+
+#[inline]
+fn kill_rx_guard_noop(tx: oneshot::Sender<()>) -> oneshot::Sender<()> {
+    tx
 }
 
 #[cfg(test)]

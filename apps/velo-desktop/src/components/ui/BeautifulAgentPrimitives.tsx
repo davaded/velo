@@ -1313,11 +1313,14 @@ export const BeautifulApprovalCard: React.FC<{
 export const BeautifulContextMeter: React.FC<{
   usedTokens: number;
   maxTokens?: number;
-}> = ({ usedTokens, maxTokens = 200000 }) => {
-  const pct = Math.min(100, Math.max(4, Math.round((usedTokens / maxTokens) * 100)));
+  costUsd?: number;
+}> = ({ usedTokens, maxTokens = 200000, costUsd = 0 }) => {
+  const rawPct = Math.round((usedTokens / maxTokens) * 100);
+  const pct = usedTokens <= 0 ? 0 : Math.min(100, Math.max(1, rawPct));
+  const arcPct = usedTokens <= 0 ? 0 : Math.min(100, Math.max(4, rawPct));
   const radius = 6.5;
   const circumference = 2 * Math.PI * radius;
-  const dashOffset = circumference - (pct / 100) * circumference;
+  const dashOffset = circumference - (arcPct / 100) * circumference;
 
   const strokeColor =
     pct > 80
@@ -1325,6 +1328,15 @@ export const BeautifulContextMeter: React.FC<{
       : pct > 55
       ? "var(--status-warning)"
       : "var(--accent-bright)";
+
+  const formattedTokens =
+    usedTokens <= 0
+      ? "0k"
+      : usedTokens < 1000
+      ? `${usedTokens}`
+      : `${(usedTokens / 1000).toFixed(1)}k`;
+
+  const costSuffix = costUsd > 0 ? ` · $${costUsd.toFixed(4)}` : "";
 
   return (
     <div
@@ -1334,9 +1346,9 @@ export const BeautifulContextMeter: React.FC<{
         borderColor: "var(--border-subtle)",
         color: "var(--fg-muted)",
       }}
-      title={`Context Window: ${(usedTokens / 1000).toFixed(1)}k / ${(
-        maxTokens / 1000
-      ).toFixed(0)}k tokens (${pct}%)`}
+      title={`Context Window: ${formattedTokens} / ${(maxTokens / 1000).toFixed(
+        0
+      )}k tokens (${pct}%)${costSuffix}`}
     >
       <svg width="16" height="16" className="-rotate-90">
         <circle
@@ -1347,22 +1359,22 @@ export const BeautifulContextMeter: React.FC<{
           stroke="var(--surface-3)"
           strokeWidth="2"
         />
-        <circle
-          cx="8"
-          cy="8"
-          r={radius}
-          fill="transparent"
-          stroke={strokeColor}
-          strokeWidth="2"
-          strokeDasharray={circumference}
-          strokeDashoffset={dashOffset}
-          strokeLinecap="round"
-        />
+        {usedTokens > 0 && (
+          <circle
+            cx="8"
+            cy="8"
+            r={radius}
+            fill="transparent"
+            stroke={strokeColor}
+            strokeWidth="2"
+            strokeDasharray={circumference}
+            strokeDashoffset={dashOffset}
+            strokeLinecap="round"
+          />
+        )}
       </svg>
       <span>{pct}%</span>
-      <span style={{ color: "var(--fg-extra-muted)" }}>
-        {(usedTokens / 1000).toFixed(1)}k
-      </span>
+      <span style={{ color: "var(--fg-extra-muted)" }}>{formattedTokens}</span>
     </div>
   );
 };

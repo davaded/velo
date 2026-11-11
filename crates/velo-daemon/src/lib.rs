@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::{
-        Path as AxumPath, Request, State,
+        DefaultBodyLimit, Path as AxumPath, Query, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderValue, Method, StatusCode, header},
@@ -14,7 +14,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -25,7 +25,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use velo_agent::{AgentHandle, AgentSpawner};
+use velo_agent::{AgentHandle, AgentSpawner, InteractiveShellHandle};
 use velo_protocol::{
     AdvisorSessionRequest, AgentEvent, AgentProvider, CommitteeRequest, CreateSessionRequest,
     HandoffSessionRequest, LoopSessionRequest, SessionInfo, SessionInputRequest, SessionStatus,
@@ -37,6 +37,7 @@ pub struct DaemonInner {
     pub sessions: HashMap<Uuid, SessionInfo>,
     pub event_history: HashMap<Uuid, Vec<AgentEvent>>,
     pub handles: HashMap<Uuid, AgentHandle>,
+    pub shells: HashMap<Uuid, InteractiveShellHandle>,
 }
 
 #[derive(Clone)]
@@ -46,6 +47,7 @@ pub struct DaemonState {
     pub worktree_mgr: WorktreeManager,
     pub state_file: PathBuf,
     pub events_dir: PathBuf,
+    pub attachments_dir: PathBuf,
 }
 
 impl DaemonState {
@@ -54,7 +56,9 @@ impl DaemonState {
         tokio::fs::create_dir_all(&velo_home).await?;
         let state_file = velo_home.join("sessions.json");
         let events_dir = velo_home.join("events");
+        let attachments_dir = velo_home.join("attachments");
         tokio::fs::create_dir_all(&events_dir).await?;
+        tokio::fs::create_dir_all(&attachments_dir).await?;
 
         let mut sessions = HashMap::new();
         let mut event_history = HashMap::new();
@@ -83,11 +87,13 @@ impl DaemonState {
                 sessions,
                 event_history,
                 handles: HashMap::new(),
+                shells: HashMap::new(),
             })),
             event_tx,
             worktree_mgr: WorktreeManager::default(),
             state_file,
             events_dir,
+            attachments_dir,
         };
 
         state.spawn_event_supervisor();
@@ -107,7 +113,13 @@ impl DaemonState {
 
                 {
                     let mut guard = state.inner.write().await;
-                    if !matches!(event, AgentEvent::ProviderSessionBound { .. }) {
+                    if !matches!(
+                        event,
+                        AgentEvent::ProviderSessionBound { .. }
+                            | AgentEvent::MessageChunk { .. }
+                            | AgentEvent::TerminalOutput { .. }
+                            | AgentEvent::UsageUpdated { .. }
+                    ) {
                         guard
                             .event_history
                             .entry(session_id)
@@ -129,6 +141,19 @@ impl DaemonState {
                                 ..
                             } => {
                                 session.provider_session_id = Some(provider_session_id.clone());
+                                should_persist_sessions = true;
+                            }
+                            AgentEvent::UsageUpdated {
+                                total_tokens,
+                                cost_usd,
+                                ..
+                            } => {
+                                if *total_tokens > 0 {
+                                    session.tokens_used = *total_tokens;
+                                }
+                                if *cost_usd > 0.0 {
+                                    session.cost_usd += *cost_usd;
+                                }
                                 should_persist_sessions = true;
                             }
                             AgentEvent::ToolCallCompleted { .. } => {
@@ -219,6 +244,7 @@ impl DaemonState {
             req.parent_session_id,
             req.model,
             req.effort,
+            req.images,
         )
         .await
     }
@@ -237,6 +263,7 @@ impl DaemonState {
         parent_session_id: Option<Uuid>,
         model: Option<String>,
         effort: Option<String>,
+        images: Vec<String>,
     ) -> Result<SessionInfo> {
         let short_id = &session_id.to_string()[..8];
         let name = custom_name
@@ -265,12 +292,14 @@ impl DaemonState {
             provider_session_id: None,
             model: model.clone(),
             effort: effort.clone(),
+            tokens_used: 0,
+            cost_usd: 0.0,
         };
 
         {
             let mut guard = self.inner.write().await;
             guard.sessions.insert(session_id, session.clone());
-            if !prompt.trim().is_empty() {
+            if !prompt.trim().is_empty() || !images.is_empty() {
                 guard
                     .event_history
                     .entry(session_id)
@@ -278,13 +307,14 @@ impl DaemonState {
                     .push(AgentEvent::UserMessage {
                         session_id,
                         text: prompt.clone(),
+                        images: images.clone(),
                         timestamp: now,
                     });
             }
         }
         let _ = self.persist_session_events(session_id).await;
 
-        let handle = AgentSpawner::spawn_agent_turn(
+        let handle = AgentSpawner::spawn_agent_turn_with_images(
             session_id,
             provider,
             prompt,
@@ -293,6 +323,7 @@ impl DaemonState {
             model,
             effort,
             None,
+            images,
             self.event_tx.clone(),
         )
         .await?;
@@ -333,7 +364,7 @@ fn add_cors_headers(res: &mut Response) {
     );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+        HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
     );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
@@ -351,15 +382,39 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/pair", get(pair_ticket_handler))
         .route("/api/pick-folder", post(pick_folder_handler))
         .route("/api/open-editor", post(open_editor_handler))
+        .route("/api/worktrees/prune", post(prune_worktrees_handler))
+        .route("/api/attachments", post(upload_attachment_handler))
+        .route("/api/attachments/{file}", get(get_attachment_handler))
         .route(
             "/api/sessions",
             get(list_sessions_handler).post(create_session_handler),
         )
-        .route("/api/sessions/{id}", get(get_session_handler))
+        .route(
+            "/api/sessions/{id}",
+            get(get_session_handler)
+                .delete(delete_session_handler)
+                .patch(update_session_handler),
+        )
         .route("/api/sessions/{id}/events", get(get_session_events_handler))
         .route("/api/sessions/{id}/diff", get(get_session_diff_handler))
         .route("/api/sessions/{id}/files", get(list_worktree_files_handler))
         .route("/api/sessions/{id}/exec", post(exec_in_worktree_handler))
+        .route(
+            "/api/sessions/{id}/terminal/start",
+            post(terminal_start_handler),
+        )
+        .route(
+            "/api/sessions/{id}/terminal/input",
+            post(terminal_input_handler),
+        )
+        .route(
+            "/api/sessions/{id}/terminal/resize",
+            post(terminal_resize_handler),
+        )
+        .route(
+            "/api/sessions/{id}/terminal/restart",
+            post(terminal_restart_handler),
+        )
         .route("/api/sessions/{id}/input", post(send_input_handler))
         .route("/api/sessions/{id}/rewind", post(rewind_session_handler))
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
@@ -372,6 +427,7 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/loop", post(loop_handler))
         .route("/mcp", post(mcp_jsonrpc_handler))
         .route("/ws", get(ws_handler))
+        .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         .layer(middleware::from_fn(cors_middleware))
         .with_state(state)
 }
@@ -683,6 +739,480 @@ async fn get_session_handler(
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct DeleteSessionQuery {
+    cleanup_worktree: Option<bool>,
+}
+
+async fn delete_session_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Query(query): Query<DeleteSessionQuery>,
+) -> impl IntoResponse {
+    let cleanup_wt = query.cleanup_worktree.unwrap_or(true);
+    let (removed_session, wt_still_in_use) = {
+        let mut guard = state.inner.write().await;
+        if let Some(mut handle) = guard.handles.remove(&id) {
+            handle.stop();
+        }
+        if let Some(mut shell) = guard.shells.remove(&id) {
+            shell.stop();
+        }
+        guard.event_history.remove(&id);
+        let removed = guard.sessions.remove(&id);
+        let in_use = removed
+            .as_ref()
+            .map(|rem| {
+                guard
+                    .sessions
+                    .values()
+                    .any(|other| other.worktree_path == rem.worktree_path)
+            })
+            .unwrap_or(false);
+        (removed, in_use)
+    };
+
+    let ev_file = state.events_dir.join(format!("{}.json", id));
+    let _ = tokio::fs::remove_file(&ev_file).await;
+
+    let mut worktree_removed = false;
+    if let Some(ref s) = removed_session {
+        if cleanup_wt && !wt_still_in_use && s.worktree_path != s.repo_root {
+            let repo_root = PathBuf::from(&s.repo_root);
+            let wt_path = PathBuf::from(&s.worktree_path);
+            if state
+                .worktree_mgr
+                .remove_worktree(&repo_root, &wt_path)
+                .await
+                .is_ok()
+            {
+                worktree_removed = true;
+            }
+            if wt_path.starts_with(state.worktree_mgr.base_dir()) {
+                let _ = tokio::fs::remove_dir_all(&wt_path).await;
+            }
+        }
+    }
+
+    let _ = state.persist_sessions().await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "deleted_id": id,
+            "worktree_removed": worktree_removed,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateSessionRequest {
+    name: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+async fn update_session_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<UpdateSessionRequest>,
+) -> impl IntoResponse {
+    let updated = {
+        let mut guard = state.inner.write().await;
+        if let Some(s) = guard.sessions.get_mut(&id) {
+            if let Some(name) = req.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+                s.name = name;
+            }
+            if let Some(model) = req.model {
+                s.model = if model.trim().is_empty() {
+                    None
+                } else {
+                    Some(model)
+                };
+            }
+            if let Some(effort) = req.effort {
+                s.effort = if effort.trim().is_empty() {
+                    None
+                } else {
+                    Some(effort)
+                };
+            }
+            s.updated_at = Utc::now();
+            Some(s.clone())
+        } else {
+            None
+        }
+    };
+
+    match updated {
+        Some(s) => {
+            let _ = state.persist_sessions().await;
+            (StatusCode::OK, Json(json!(s))).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Session not found" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn prune_worktrees_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    let (active_wt_paths, repo_roots): (HashSet<PathBuf>, HashSet<PathBuf>) = {
+        let guard = state.inner.read().await;
+        let wts = guard
+            .sessions
+            .values()
+            .map(|s| PathBuf::from(&s.worktree_path))
+            .collect();
+        let repos = guard
+            .sessions
+            .values()
+            .map(|s| PathBuf::from(&s.repo_root))
+            .collect();
+        (wts, repos)
+    };
+
+    let mut pruned_paths: Vec<String> = Vec::new();
+    let base_dir = state.worktree_mgr.base_dir().to_path_buf();
+    if let Ok(mut repo_entries) = tokio::fs::read_dir(&base_dir).await {
+        while let Ok(Some(repo_entry)) = repo_entries.next_entry().await {
+            let repo_sub = repo_entry.path();
+            if !repo_sub.is_dir() {
+                continue;
+            }
+            if let Ok(mut wt_entries) = tokio::fs::read_dir(&repo_sub).await {
+                while let Ok(Some(wt_entry)) = wt_entries.next_entry().await {
+                    let wt_path = wt_entry.path();
+                    if wt_path.is_dir() && !active_wt_paths.contains(&wt_path) {
+                        for repo_root in &repo_roots {
+                            let _ = Command::new("git")
+                                .arg("-C")
+                                .arg(repo_root)
+                                .args(["worktree", "remove", "--force"])
+                                .arg(&wt_path)
+                                .output()
+                                .await;
+                        }
+                        if tokio::fs::remove_dir_all(&wt_path).await.is_ok() {
+                            pruned_paths.push(wt_path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for repo_root in &repo_roots {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["worktree", "prune"])
+            .output()
+            .await;
+    }
+
+    Json(json!({
+        "ok": true,
+        "pruned_count": pruned_paths.len(),
+        "pruned_paths": pruned_paths,
+    }))
+}
+
+fn decode_base64_payload(input: &str) -> Result<Vec<u8>> {
+    let raw = match input.find(";base64,") {
+        Some(idx) => &input[idx + 8..],
+        None => input,
+    };
+    let mut out = Vec::with_capacity(raw.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in raw.bytes() {
+        if b.is_ascii_whitespace() || b == b'=' {
+            continue;
+        }
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => anyhow::bail!("Invalid base64 byte"),
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UploadAttachmentRequest {
+    filename: Option<String>,
+    mime_type: Option<String>,
+    data_base64: String,
+}
+
+async fn upload_attachment_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<UploadAttachmentRequest>,
+) -> impl IntoResponse {
+    let bytes = match decode_base64_payload(&req.data_base64) {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Empty attachment payload" })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Invalid base64 image: {}", err) })),
+            )
+                .into_response();
+        }
+    };
+
+    let ext = req
+        .filename
+        .as_deref()
+        .and_then(|f| Path::new(f).extension().and_then(|e| e.to_str()))
+        .or_else(|| match req.mime_type.as_deref() {
+            Some("image/jpeg") | Some("image/jpg") => Some("jpg"),
+            Some("image/webp") => Some("webp"),
+            Some("image/gif") => Some("gif"),
+            Some("image/svg+xml") => Some("svg"),
+            _ => Some("png"),
+        })
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+
+    let clean_ext: String = ext
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let final_ext = if clean_ext.is_empty() { "png" } else { &clean_ext };
+    let saved_name = format!("{}.{}", Uuid::new_v4(), final_ext);
+    let _ = tokio::fs::create_dir_all(&state.attachments_dir).await;
+    let dest_path = state.attachments_dir.join(&saved_name);
+
+    match tokio::fs::write(&dest_path, &bytes).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "ok": true,
+                "filename": saved_name,
+                "path": dest_path.to_string_lossy().to_string(),
+                "url": format!("/api/attachments/{}", saved_name),
+                "size": bytes.len(),
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to write attachment: {}", err) })),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_attachment_handler(
+    State(state): State<DaemonState>,
+    AxumPath(file): AxumPath<String>,
+) -> impl IntoResponse {
+    let clean_name = Path::new(&file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if clean_name.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let full_path = state.attachments_dir.join(clean_name);
+    let content_type = if clean_name.ends_with(".jpg") || clean_name.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if clean_name.ends_with(".webp") {
+        "image/webp"
+    } else if clean_name.ends_with(".gif") {
+        "image/gif"
+    } else if clean_name.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "image/png"
+    };
+
+    match tokio::fs::read(&full_path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct TerminalStartRequest {
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+async fn terminal_start_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    payload: Option<Json<TerminalStartRequest>>,
+) -> impl IntoResponse {
+    let cols = payload.as_ref().and_then(|p| p.cols).unwrap_or(96);
+    let rows = payload.as_ref().and_then(|p| p.rows).unwrap_or(28);
+
+    let mut guard = state.inner.write().await;
+    let wt_path = guard
+        .sessions
+        .get(&id)
+        .map(|s| PathBuf::from(&s.worktree_path))
+        .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"));
+
+    if let Some(existing) = guard.shells.get(&id) {
+        let _ = existing.resize(cols, rows);
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "pid": existing.pid,
+                "scrollback": existing.scrollback(),
+                "worktree_path": wt_path,
+            })),
+        )
+            .into_response();
+    }
+
+    match velo_agent::spawn_interactive_shell(id, wt_path.clone(), cols, rows, state.event_tx.clone())
+    {
+        Ok(shell) => {
+            let pid = shell.pid;
+            let scrollback = shell.scrollback();
+            guard.shells.insert(id, shell);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "pid": pid,
+                    "scrollback": scrollback,
+                    "worktree_path": wt_path,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TerminalInputRequest {
+    data: String,
+}
+
+async fn terminal_input_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<TerminalInputRequest>,
+) -> impl IntoResponse {
+    let mut guard = state.inner.write().await;
+    if !guard.shells.contains_key(&id) {
+        let wt_path = guard
+            .sessions
+            .get(&id)
+            .map(|s| PathBuf::from(&s.worktree_path))
+            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"));
+        if let Ok(shell) =
+            velo_agent::spawn_interactive_shell(id, wt_path, 96, 28, state.event_tx.clone())
+        {
+            guard.shells.insert(id, shell);
+        }
+    }
+
+    if let Some(shell) = guard.shells.get(&id) {
+        match shell.write_input(&req.data) {
+            Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+            Err(err) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": err.to_string() })),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "Interactive shell unavailable" })),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TerminalResizeRequest {
+    cols: u16,
+    rows: u16,
+}
+
+async fn terminal_resize_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<TerminalResizeRequest>,
+) -> impl IntoResponse {
+    let guard = state.inner.read().await;
+    if let Some(shell) = guard.shells.get(&id) {
+        let _ = shell.resize(req.cols, req.rows);
+    }
+    Json(json!({ "ok": true }))
+}
+
+async fn terminal_restart_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> impl IntoResponse {
+    let mut guard = state.inner.write().await;
+    if let Some(mut old_shell) = guard.shells.remove(&id) {
+        old_shell.stop();
+    }
+    let wt_path = guard
+        .sessions
+        .get(&id)
+        .map(|s| PathBuf::from(&s.worktree_path))
+        .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"));
+
+    match velo_agent::spawn_interactive_shell(id, wt_path.clone(), 96, 28, state.event_tx.clone()) {
+        Ok(shell) => {
+            let pid = shell.pid;
+            guard.shells.insert(id, shell);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "pid": pid, "worktree_path": wt_path })),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn get_session_events_handler(
     State(state): State<DaemonState>,
     AxumPath(id): AxumPath<Uuid>,
@@ -928,6 +1458,7 @@ async fn send_input_handler(
             .push(AgentEvent::UserMessage {
                 session_id: id,
                 text: req.input.clone(),
+                images: req.images.clone(),
                 timestamp: Utc::now(),
             });
     }
@@ -947,7 +1478,7 @@ async fn send_input_handler(
     };
 
     let wt_path = PathBuf::from(&session.worktree_path);
-    match AgentSpawner::spawn_agent_turn(
+    match AgentSpawner::spawn_agent_turn_with_images(
         id,
         target_provider.clone(),
         effective_prompt,
@@ -956,6 +1487,7 @@ async fn send_input_handler(
         req.model.clone().or_else(|| session.model.clone()),
         req.effort.clone().or_else(|| session.effort.clone()),
         resume_session_id.clone(),
+        req.images.clone(),
         state.event_tx.clone(),
     )
     .await
@@ -1339,6 +1871,7 @@ async fn handoff_session_handler(
             Some(source_session.id),
             None,
             None,
+            Vec::new(),
         )
         .await
     {
@@ -1409,6 +1942,7 @@ async fn advisor_session_handler(
             Some(source_session.id),
             None,
             None,
+            Vec::new(),
         )
         .await
     {
@@ -1455,6 +1989,7 @@ async fn committee_handler(
             parent_session_id: None,
             model: None,
             effort: None,
+            images: Vec::new(),
         };
         match state.create_session(create_req).await {
             Ok(s) => spawned.push(s),
@@ -1499,6 +2034,7 @@ async fn loop_handler(
         parent_session_id: None,
         model: None,
         effort: None,
+        images: Vec::new(),
     };
 
     let initial_session = match state.create_session(create_req).await {
@@ -1622,6 +2158,7 @@ async fn loop_handler(
                             Some(current_session_id),
                             None,
                             None,
+                            Vec::new(),
                         )
                         .await
                     {
@@ -1754,6 +2291,7 @@ pub async fn handle_mcp_request(state: &DaemonState, payload: Value) -> Value {
                         parent_session_id: None,
                         model: None,
                         effort: None,
+                        images: Vec::new(),
                     };
                     match state.create_session(req).await {
                         Ok(s) => json!({
@@ -1885,8 +2423,38 @@ async fn handle_ws_client(socket: WebSocket, state: DaemonState) {
     }
 }
 
+fn resolve_ui_dist_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("VELO_UI_DIR") {
+        let p = PathBuf::from(custom);
+        if p.join("index.html").is_file() {
+            return p;
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // Standalone macOS bundle: Velo.app/Contents/MacOS/velo-daemon -> ../Resources/dist
+            let bundle_dist = exe_dir.join("../Resources/dist");
+            if bundle_dist.join("index.html").is_file() {
+                return bundle_dist;
+            }
+            let sibling_dist = exe_dir.join("dist");
+            if sibling_dist.join("index.html").is_file() {
+                return sibling_dist;
+            }
+        }
+    }
+
+    let user_dist = default_velo_home().join("ui/dist");
+    if user_dist.join("index.html").is_file() {
+        return user_dist;
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/velo-desktop/dist")
+}
+
 async fn ui_index_handler() -> impl IntoResponse {
-    let dist_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/velo-desktop/dist");
+    let dist_dir = resolve_ui_dist_dir();
     let index_path = dist_dir.join("index.html");
     match tokio::fs::read_to_string(&index_path).await {
         Ok(html) => (
@@ -1901,7 +2469,7 @@ async fn ui_index_handler() -> impl IntoResponse {
         Err(_) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "Velo Daemon is running. Build UI with `pnpm --dir apps/velo-desktop build`."
+            "Velo Daemon is running. Build UI with `npm --prefix apps/velo-desktop run build`."
                 .to_string(),
         )
             .into_response(),
@@ -1909,8 +2477,7 @@ async fn ui_index_handler() -> impl IntoResponse {
 }
 
 async fn ui_asset_handler(AxumPath(file): AxumPath<String>) -> impl IntoResponse {
-    let dist_assets = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../apps/velo-desktop/dist/assets");
+    let dist_assets = resolve_ui_dist_dir().join("assets");
     let clean_name = Path::new(&file)
         .file_name()
         .and_then(|s| s.to_str())
@@ -1923,6 +2490,12 @@ async fn ui_asset_handler(AxumPath(file): AxumPath<String>) -> impl IntoResponse
         "text/css; charset=utf-8"
     } else if clean_name.ends_with(".svg") {
         "image/svg+xml"
+    } else if clean_name.ends_with(".png") {
+        "image/png"
+    } else if clean_name.ends_with(".jpg") || clean_name.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if clean_name.ends_with(".woff2") {
+        "font/woff2"
     } else {
         "application/octet-stream"
     };
@@ -1982,11 +2555,13 @@ mod tests {
                 sessions: HashMap::new(),
                 event_history: HashMap::new(),
                 handles: HashMap::new(),
+                shells: HashMap::new(),
             })),
             event_tx,
             worktree_mgr: WorktreeManager::new(wt_dir),
             state_file: temp_base.join("sessions.json"),
             events_dir: temp_base.join("events"),
+            attachments_dir: temp_base.join("attachments"),
         };
         state.spawn_event_supervisor();
 
@@ -2002,6 +2577,7 @@ mod tests {
             parent_session_id: None,
             model: None,
             effort: None,
+            images: Vec::new(),
         };
 
         let session = state.create_session(req).await?;

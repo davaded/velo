@@ -266,6 +266,7 @@ async fn main() -> Result<()> {
                 parent_session_id: None,
                 model: None,
                 effort: None,
+                images: Vec::new(),
             };
 
             let session: SessionInfo = http_post_json(addr, "/api/sessions", &req).await?;
@@ -582,8 +583,12 @@ fn print_agent_event(ev: &AgentEvent) {
                 message.as_deref().unwrap_or("")
             );
         }
-        AgentEvent::UserMessage { text, .. } => {
-            println!("👤 {}", text);
+        AgentEvent::UserMessage { text, images, .. } => {
+            if images.is_empty() {
+                println!("👤 {}", text);
+            } else {
+                println!("👤 {} [{} image(s)]", text, images.len());
+            }
         }
         AgentEvent::ProviderSessionBound {
             provider_session_id,
@@ -594,8 +599,25 @@ fn print_agent_event(ev: &AgentEvent) {
         AgentEvent::ThinkingDelta { text, .. } => {
             println!("💭 {}", text);
         }
+        AgentEvent::MessageChunk { delta, .. } => {
+            print!("{}", delta);
+        }
         AgentEvent::MessageDelta { text, .. } => {
             println!("{}", text);
+        }
+        AgentEvent::UsageUpdated {
+            total_tokens,
+            cost_usd,
+            ..
+        } => {
+            if *cost_usd > 0.0 {
+                println!("📈 [usage] {} tokens (${:.4})", total_tokens, cost_usd);
+            } else {
+                println!("📈 [usage] {} tokens", total_tokens);
+            }
+        }
+        AgentEvent::TerminalOutput { data, .. } => {
+            print!("{}", data);
         }
         AgentEvent::ToolCallRequested {
             tool_name,

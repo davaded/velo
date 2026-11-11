@@ -104,6 +104,10 @@ pub struct SessionInfo {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// Unified event stream emitted by `velo-agent` drivers and broadcasted to connected clients.
@@ -119,6 +123,8 @@ pub enum AgentEvent {
     UserMessage {
         session_id: Uuid,
         text: String,
+        #[serde(default)]
+        images: Vec<String>,
         timestamp: DateTime<Utc>,
     },
     ProviderSessionBound {
@@ -131,9 +137,27 @@ pub enum AgentEvent {
         text: String,
         timestamp: DateTime<Utc>,
     },
+    MessageChunk {
+        session_id: Uuid,
+        delta: String,
+        timestamp: DateTime<Utc>,
+    },
     MessageDelta {
         session_id: Uuid,
         text: String,
+        timestamp: DateTime<Utc>,
+    },
+    UsageUpdated {
+        session_id: Uuid,
+        input_tokens: u64,
+        output_tokens: u64,
+        total_tokens: u64,
+        cost_usd: f64,
+        timestamp: DateTime<Utc>,
+    },
+    TerminalOutput {
+        session_id: Uuid,
+        data: String,
         timestamp: DateTime<Utc>,
     },
     ToolCallRequested {
@@ -182,7 +206,10 @@ impl AgentEvent {
             | Self::UserMessage { session_id, .. }
             | Self::ProviderSessionBound { session_id, .. }
             | Self::ThinkingDelta { session_id, .. }
+            | Self::MessageChunk { session_id, .. }
             | Self::MessageDelta { session_id, .. }
+            | Self::UsageUpdated { session_id, .. }
+            | Self::TerminalOutput { session_id, .. }
             | Self::ToolCallRequested { session_id, .. }
             | Self::ToolCallCompleted { session_id, .. }
             | Self::PermissionRequested { session_id, .. }
@@ -207,6 +234,8 @@ pub struct CreateSessionRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 /// Request payload to hand off an existing session's worktree & context to another agent.
@@ -230,6 +259,8 @@ pub struct SessionInputRequest {
     pub reset_thread: bool,
     #[serde(default)]
     pub truncate_to_user_turn: Option<usize>,
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 /// Client-to-daemon WebSocket command envelope.

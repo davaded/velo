@@ -6,18 +6,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     var webView: WKWebView!
     var daemonProcess: Process?
 
-    func ensureDaemonRunning() {
-        let bundledBin = Bundle.main.bundlePath + "/Contents/MacOS/velo-daemon"
-        let devBin = "/Users/daiyudai/code/velo/target/debug/velo"
-        let daemonBin: String
-        if FileManager.default.isExecutableFile(atPath: bundledBin) {
-            daemonBin = bundledBin
-        } else if FileManager.default.isExecutableFile(atPath: devBin) {
-            daemonBin = devBin
-        } else {
-            return
-        }
-
+    func isDaemonPortListening() -> Bool {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
@@ -25,24 +14,53 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
 
         let sock = socket(AF_INET, SOCK_STREAM, 0)
-        if sock >= 0 {
-            let connected = withUnsafePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
+        guard sock >= 0 else { return false }
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
-            close(sock)
-            if connected == 0 {
-                return
-            }
+        }
+        close(sock)
+        return connected == 0
+    }
+
+    func ensureDaemonRunning() {
+        if isDaemonPortListening() {
+            return
+        }
+
+        let bundledBin = Bundle.main.bundlePath + "/Contents/MacOS/velo-daemon"
+        let bundledUiDir = Bundle.main.bundlePath + "/Contents/Resources/dist"
+        let devReleaseBin = "/Users/daiyudai/code/velo/target/release/velo"
+        let devDebugBin = "/Users/daiyudai/code/velo/target/debug/velo"
+        let daemonBin: String
+        if FileManager.default.isExecutableFile(atPath: bundledBin) {
+            daemonBin = bundledBin
+        } else if FileManager.default.isExecutableFile(atPath: devReleaseBin) {
+            daemonBin = devReleaseBin
+        } else if FileManager.default.isExecutableFile(atPath: devDebugBin) {
+            daemonBin = devDebugBin
+        } else {
+            return
         }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: daemonBin)
         proc.arguments = ["--addr", "0.0.0.0:6767", "up", "--foreground"]
+        var env = ProcessInfo.processInfo.environment
+        if FileManager.default.fileExists(atPath: bundledUiDir + "/index.html") {
+            env["VELO_UI_DIR"] = bundledUiDir
+        }
+        proc.environment = env
         try? proc.run()
         self.daemonProcess = proc
-        Thread.sleep(forTimeInterval: 0.45)
+
+        for _ in 0..<35 {
+            if isDaemonPortListening() {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.08)
+        }
     }
 
     func setupMenu() {
@@ -154,6 +172,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runOpenPanelWith parameters: WKOpenPanelParameters,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping ([URL]?) -> Void
+    ) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.beginSheetModal(for: window) { response in
+            if response == .OK {
+                completionHandler(panel.urls)
+            } else {
+                completionHandler(nil)
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

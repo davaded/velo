@@ -218,6 +218,8 @@ export interface AgentEvent {
   timestamp: string;
   kind: "user" | "thinking" | "tool_call" | "assistant";
   content: string;
+  images?: string[];
+  is_streaming_chunk?: boolean;
   tool_name?: string;
   tool_args?: string;
   tool_input?: unknown;
@@ -336,6 +338,16 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
       : rawStatus === "waiting_for_permission"
       ? "waiting_approval"
       : "idle";
+  const rawEff = String(r.effort ?? "");
+  const effort: EffortLevel =
+    rawEff === "low" ||
+    rawEff === "medium" ||
+    rawEff === "high" ||
+    rawEff === "xhigh" ||
+    rawEff === "ultra" ||
+    rawEff === "max"
+      ? rawEff
+      : "medium";
   return {
     id: String(r.id ?? `daemon-${idx}`),
     repo_id: String(r.repo_id ?? "repo-velo"),
@@ -344,8 +356,12 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     model: modelId,
     model_short:
       foundModel?.shortLabel ??
-      (agentKind === "codex" ? "o3" : agentKind === "gemini" ? "Gemini 2.5 Pro" : "Claude Sonnet 4.5"),
-    effort: "medium",
+      (agentKind === "codex"
+        ? "GPT-6.1-Sol"
+        : agentKind === "gemini"
+        ? "Gemini 2.5 Pro"
+        : "Claude Fable 5.2"),
+    effort,
     status,
     branch_name: branch,
     worktree_path: String(r.worktree_path ?? `/Users/daiyudai/code/velo`),
