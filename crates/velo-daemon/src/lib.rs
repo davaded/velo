@@ -158,6 +158,7 @@ impl DaemonState {
                     if !matches!(
                         event,
                         AgentEvent::ProviderSessionBound { .. }
+                            | AgentEvent::ThinkingChunk { .. }
                             | AgentEvent::MessageChunk { .. }
                             | AgentEvent::TerminalOutput { .. }
                             | AgentEvent::UsageUpdated { .. }
@@ -701,6 +702,21 @@ impl DaemonState {
             }
         }
         let _ = self.persist_session_events(session_id).await;
+
+        // If the user created an empty worktree thread (e.g. via New Thread / Advanced Worktree)
+        // without typing an initial prompt yet, prepare the isolated worktree in an idle state
+        // without wasting tokens on a fake prompt.
+        if prompt.trim().is_empty() && images.is_empty() && !use_pty {
+            session.status = SessionStatus::Completed;
+            {
+                let mut guard = self.inner.write().await;
+                if let Some(s) = guard.sessions.get_mut(&session_id) {
+                    s.status = SessionStatus::Completed;
+                }
+            }
+            self.persist_sessions().await?;
+            return Ok(session);
+        }
 
         let handle = AgentSpawner::spawn_agent_turn_configured(
             session_id,

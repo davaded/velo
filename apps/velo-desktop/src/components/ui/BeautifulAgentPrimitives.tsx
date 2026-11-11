@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
   Brain,
@@ -143,6 +143,7 @@ export const PaseoLiveElapsed: React.FC<{
 
 export const PaseoTurnFooter: React.FC<{
   isRunning: boolean;
+  activePhaseLabel?: string;
   startedAtMs?: number;
   durationMs?: number;
   completedAtLabel?: string;
@@ -150,6 +151,7 @@ export const PaseoTurnFooter: React.FC<{
   onRetry?: () => void;
 }> = ({
   isRunning,
+  activePhaseLabel,
   startedAtMs,
   durationMs,
   completedAtLabel,
@@ -173,10 +175,23 @@ export const PaseoTurnFooter: React.FC<{
   if (isRunning) {
     return (
       <div
-        className="mt-2 flex min-h-[24px] items-center gap-3"
+        className="mt-2 flex min-h-[26px] items-center gap-2.5"
         data-testid="turn-footer"
       >
         <PaseoSyncedLoader size={14} color="var(--fg)" />
+        {activePhaseLabel && (
+          <>
+            <span className="beautiful-shimmer-text max-w-[440px] truncate text-[12.5px] font-normal select-none">
+              {activePhaseLabel}
+            </span>
+            <span
+              className="text-[12px] select-none"
+              style={{ color: "var(--fg-muted)" }}
+            >
+              ·
+            </span>
+          </>
+        )}
         <PaseoLiveElapsed startedAtMs={startedAtMs || Date.now()} />
       </div>
     );
@@ -498,27 +513,46 @@ export const BeautifulThinkingBlock: React.FC<{
   defaultExpanded?: boolean;
 }> = ({ text, isStreaming = false, defaultExpanded = false }) => {
   const { summary, cleanedLines } = useMemo(() => parseReasoningContent(text), [text]);
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(
+    defaultExpanded ? true : null
+  );
+  const scrollBoxRef = useRef<HTMLDivElement | null>(null);
 
-  // If the only line is a single short **Summary** headline, showing it in secondaryLabel
-  // is already 100% visible inline, and clicking expands the card just like Paseo.
   const hasDetail = cleanedLines.length > 0;
+  const effectiveExpanded =
+    userExpanded !== null ? userExpanded : isStreaming && cleanedLines.length > 1;
+
+  useEffect(() => {
+    if (isStreaming && effectiveExpanded && scrollBoxRef.current) {
+      scrollBoxRef.current.scrollTop = scrollBoxRef.current.scrollHeight;
+    }
+  }, [text, isStreaming, effectiveExpanded]);
 
   if (!hasDetail && !isStreaming) {
     return null;
   }
 
+  const displaySecondary =
+    summary || (isStreaming ? "分析工作区上下文与执行路径…" : undefined);
+
   return (
     <PaseoExpandableBadge
       label="Thinking"
-      secondaryLabel={summary || undefined}
+      secondaryLabel={displaySecondary}
       icon={Brain}
-      isExpanded={expanded && hasDetail}
-      onToggle={hasDetail ? () => setExpanded((v) => !v) : undefined}
+      isExpanded={effectiveExpanded && hasDetail}
+      onToggle={
+        hasDetail
+          ? () => setUserExpanded((prev) => !(prev ?? effectiveExpanded))
+          : undefined
+      }
       isLoading={isStreaming}
     >
       {hasDetail && (
-        <div className="max-h-[280px] overflow-y-auto px-3.5 py-2.5 space-y-1">
+        <div
+          ref={scrollBoxRef}
+          className="max-h-[240px] overflow-y-auto px-3.5 py-2.5 space-y-1"
+        >
           {cleanedLines.map((line, i) => renderFormattedLine(line, i))}
         </div>
       )}
@@ -949,8 +983,9 @@ function renderInlineMarkdown(text: string): React.ReactNode[] {
 
 export const PaseoMarkdown: React.FC<{
   content: string;
+  isStreaming?: boolean;
   className?: string;
-}> = ({ content, className = "" }) => {
+}> = ({ content, isStreaming = false, className = "" }) => {
   const blocks = useMemo(() => {
     const result: Array<
       | { type: "code"; lang: string; code: string }
@@ -977,10 +1012,27 @@ export const PaseoMarkdown: React.FC<{
     }
 
     if (lastIndex < content.length) {
-      result.push({
-        type: "prose",
-        text: content.slice(lastIndex),
-      });
+      const tail = content.slice(lastIndex);
+      // Handle an unclosed fenced code block while tokens are actively streaming
+      const unclosedMatch = tail.match(/([\s\S]*?)```([a-zA-Z0-9_-]*)\n([\s\S]*)$/);
+      if (unclosedMatch) {
+        if (unclosedMatch[1]) {
+          result.push({
+            type: "prose",
+            text: unclosedMatch[1],
+          });
+        }
+        result.push({
+          type: "code",
+          lang: unclosedMatch[2] || "",
+          code: unclosedMatch[3],
+        });
+      } else {
+        result.push({
+          type: "prose",
+          text: tail,
+        });
+      }
     }
 
     return result;
@@ -1196,6 +1248,13 @@ export const PaseoMarkdown: React.FC<{
         ) : (
           <React.Fragment key={idx}>{renderProseSegment(b.text, idx)}</React.Fragment>
         )
+      )}
+      {isStreaming && (
+        <span
+          aria-hidden="true"
+          className="inline-block h-[14px] w-[6px] translate-y-[2px] rounded-[1px] animate-pulse"
+          style={{ backgroundColor: "var(--fg-muted)" }}
+        />
       )}
     </div>
   );

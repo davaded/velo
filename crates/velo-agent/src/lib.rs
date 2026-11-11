@@ -747,7 +747,7 @@ impl AgentSpawner {
                     .to_string();
                     c.args(["--mcp-config", &mcp_cfg]);
 
-                    if approval_mode != "bypass" {
+                    if approval_mode == "ask_before_edit" {
                         let hook_cmd = format!(
                             "curl -sS --max-time 600 -X POST \"{}/api/sessions/{}/hooks/pre-tool-use\" -H \"Content-Type: application/json\" --data-binary @- || true",
                             clean_base, session_id
@@ -1068,26 +1068,84 @@ pub fn parse_agent_stdout_line(
                     }
                     return events;
                 }
-                // Claude Code `--include-partial-messages` token-by-token streaming
+                // Claude Code `--include-partial-messages` token-by-token streaming (thinking + tool start + text)
                 "stream_event" => {
                     if let Some(ev) = json.get("event") {
                         let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        if ev_type == "content_block_delta" {
-                            if let Some(delta) = ev.get("delta") {
-                                let delta_type =
-                                    delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                if delta_type == "text_delta" {
-                                    if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-                                        if !t.is_empty() {
-                                            events.push(AgentEvent::MessageChunk {
-                                                session_id,
-                                                delta: t.to_string(),
-                                                timestamp: Utc::now(),
-                                            });
+                        match ev_type {
+                            "content_block_start" => {
+                                if let Some(cb) = ev.get("content_block") {
+                                    let cb_type =
+                                        cb.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    if cb_type == "tool_use" {
+                                        let tool_id = cb
+                                            .get("id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("tool")
+                                            .to_string();
+                                        let tool_name = cb
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("Tool")
+                                            .to_string();
+                                        let arguments = cb
+                                            .get("input")
+                                            .cloned()
+                                            .unwrap_or_else(|| json!({}));
+                                        events.push(AgentEvent::ToolCallRequested {
+                                            session_id,
+                                            tool_id,
+                                            tool_name,
+                                            arguments,
+                                            timestamp: Utc::now(),
+                                        });
+                                    } else if cb_type == "thinking" {
+                                        let initial = cb
+                                            .get("thinking")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        events.push(AgentEvent::ThinkingChunk {
+                                            session_id,
+                                            delta: initial.to_string(),
+                                            replace: false,
+                                            timestamp: Utc::now(),
+                                        });
+                                    }
+                                }
+                            }
+                            "content_block_delta" => {
+                                if let Some(delta) = ev.get("delta") {
+                                    let delta_type =
+                                        delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    if delta_type == "text_delta" {
+                                        if let Some(t) = delta.get("text").and_then(|v| v.as_str())
+                                        {
+                                            if !t.is_empty() {
+                                                events.push(AgentEvent::MessageChunk {
+                                                    session_id,
+                                                    delta: t.to_string(),
+                                                    replace: false,
+                                                    timestamp: Utc::now(),
+                                                });
+                                            }
+                                        }
+                                    } else if delta_type == "thinking_delta" {
+                                        if let Some(th) =
+                                            delta.get("thinking").and_then(|v| v.as_str())
+                                        {
+                                            if !th.is_empty() {
+                                                events.push(AgentEvent::ThinkingChunk {
+                                                    session_id,
+                                                    delta: th.to_string(),
+                                                    replace: false,
+                                                    timestamp: Utc::now(),
+                                                });
+                                            }
                                         }
                                     }
                                 }
                             }
+                            _ => {}
                         }
                     }
                     return events;
@@ -1270,49 +1328,71 @@ pub fn parse_agent_stdout_line(
                     }
                     return events;
                 }
-                // 2. OpenAI Codex `--json` JSONL events
+                // 2. OpenAI Codex `--json` JSONL events (live `item.started` / `item.updated` / `item.completed`)
                 "item.completed" | "item.started" | "item.updated" => {
                     if let Some(item) = json.get("item") {
                         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         match item_type {
-                            "reasoning" if msg_type == "item.completed" => {
+                            "reasoning" => {
+                                let mut extracted = String::new();
                                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                                     if !text.trim().is_empty() {
-                                        events.push(AgentEvent::ThinkingDelta {
-                                            session_id,
-                                            text: format!("{}\n", text.trim()),
-                                            timestamp: Utc::now(),
-                                        });
+                                        extracted = format!("{}\n", text.trim());
                                     }
                                 } else if let Some(summary_arr) =
                                     item.get("summary").and_then(|v| v.as_array())
                                 {
-                                    let mut combined = String::new();
                                     for s in summary_arr {
                                         if let Some(t) = s.get("text").and_then(|v| v.as_str()) {
                                             if !t.trim().is_empty() {
-                                                combined.push_str(t.trim());
-                                                combined.push('\n');
+                                                extracted.push_str(t.trim());
+                                                extracted.push('\n');
                                             }
                                         }
                                     }
-                                    if !combined.is_empty() {
+                                }
+                                if msg_type == "item.started" {
+                                    // Immediately surface live Thinking shimmer badge when Codex begins reasoning
+                                    events.push(AgentEvent::ThinkingChunk {
+                                        session_id,
+                                        delta: extracted,
+                                        replace: true,
+                                        timestamp: Utc::now(),
+                                    });
+                                } else if !extracted.is_empty() {
+                                    if msg_type == "item.updated" {
+                                        events.push(AgentEvent::ThinkingChunk {
+                                            session_id,
+                                            delta: extracted,
+                                            replace: true,
+                                            timestamp: Utc::now(),
+                                        });
+                                    } else {
                                         events.push(AgentEvent::ThinkingDelta {
                                             session_id,
-                                            text: combined,
+                                            text: extracted,
                                             timestamp: Utc::now(),
                                         });
                                     }
                                 }
                             }
-                            "agent_message" if msg_type == "item.completed" => {
+                            "agent_message" => {
                                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                                     if !text.trim().is_empty() {
-                                        events.push(AgentEvent::MessageDelta {
-                                            session_id,
-                                            text: text.to_string(),
-                                            timestamp: Utc::now(),
-                                        });
+                                        if msg_type == "item.completed" {
+                                            events.push(AgentEvent::MessageDelta {
+                                                session_id,
+                                                text: text.to_string(),
+                                                timestamp: Utc::now(),
+                                            });
+                                        } else if msg_type == "item.updated" {
+                                            events.push(AgentEvent::MessageChunk {
+                                                session_id,
+                                                delta: text.to_string(),
+                                                replace: true,
+                                                timestamp: Utc::now(),
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -1387,6 +1467,88 @@ pub fn parse_agent_stdout_line(
                                     });
                                 }
                             }
+                            "mcp_tool_call" => {
+                                let tool_id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("mcp")
+                                    .to_string();
+                                let tool_label = item
+                                    .get("tool")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("mcp_tool");
+                                let server = item
+                                    .get("server")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("mcp");
+                                let args = item
+                                    .get("arguments")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                if msg_type == "item.started" {
+                                    events.push(AgentEvent::ToolCallRequested {
+                                        session_id,
+                                        tool_id,
+                                        tool_name: format!("MCP · {}:{}", server, tool_label),
+                                        arguments: args,
+                                        timestamp: Utc::now(),
+                                    });
+                                } else if msg_type == "item.completed" {
+                                    let err_val = item.get("error").filter(|v| !v.is_null());
+                                    let is_error = err_val.is_some();
+                                    let output = if let Some(e) = err_val {
+                                        e.to_string()
+                                    } else if let Some(res) = item.get("result") {
+                                        if let Some(s) = res.as_str() {
+                                            s.to_string()
+                                        } else {
+                                            res.to_string()
+                                        }
+                                    } else {
+                                        "(completed)".to_string()
+                                    };
+                                    events.push(AgentEvent::ToolCallCompleted {
+                                        session_id,
+                                        tool_id,
+                                        output,
+                                        is_error,
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                            }
+                            "web_search" => {
+                                let tool_id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("search")
+                                    .to_string();
+                                let query = item
+                                    .get("query")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if msg_type == "item.started" {
+                                    events.push(AgentEvent::ToolCallRequested {
+                                        session_id,
+                                        tool_id,
+                                        tool_name: "Search".to_string(),
+                                        arguments: serde_json::json!({ "query": query }),
+                                        timestamp: Utc::now(),
+                                    });
+                                } else if msg_type == "item.completed" {
+                                    events.push(AgentEvent::ToolCallCompleted {
+                                        session_id,
+                                        tool_id,
+                                        output: if query.is_empty() {
+                                            "Web search completed".to_string()
+                                        } else {
+                                            format!("Searched: {}", query)
+                                        },
+                                        is_error: false,
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1440,6 +1602,7 @@ pub fn parse_agent_stdout_line(
                                     events.push(AgentEvent::MessageChunk {
                                         session_id,
                                         delta: t.to_string(),
+                                        replace: false,
                                         timestamp: Utc::now(),
                                     });
                                 } else {
@@ -1628,5 +1791,62 @@ mod tests {
         assert!(matches!(events[0], AgentEvent::ThinkingDelta { .. }));
         assert!(matches!(events[1], AgentEvent::MessageDelta { .. }));
         assert!(matches!(events[2], AgentEvent::ToolCallRequested { .. }));
+    }
+
+    #[test]
+    fn test_parse_claude_partial_stream_events() {
+        let sid = Uuid::new_v4();
+        let th = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"Inspecting handlers..."}}}"#;
+        let tl = r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_99","name":"Read","input":{}}}}"#;
+        let tx = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Done!"}}}"#;
+
+        let ev_th = parse_agent_stdout_line(sid, &AgentProvider::Claude, th);
+        assert!(matches!(
+            ev_th.first(),
+            Some(AgentEvent::ThinkingChunk { replace: false, .. })
+        ));
+
+        let ev_tl = parse_agent_stdout_line(sid, &AgentProvider::Claude, tl);
+        assert!(matches!(
+            ev_tl.first(),
+            Some(AgentEvent::ToolCallRequested { tool_name, .. }) if tool_name == "Read"
+        ));
+
+        let ev_tx = parse_agent_stdout_line(sid, &AgentProvider::Claude, tx);
+        assert!(matches!(
+            ev_tx.first(),
+            Some(AgentEvent::MessageChunk { replace: false, .. })
+        ));
+    }
+
+    #[test]
+    fn test_parse_codex_live_lifecycle_events() {
+        let sid = Uuid::new_v4();
+        let r_start = r#"{"type":"item.started","item":{"id":"item_0","type":"reasoning","text":""}}"#;
+        let r_upd = r#"{"type":"item.updated","item":{"id":"item_0","type":"reasoning","text":"**Checking git status**"}}"#;
+        let mcp_start = r#"{"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"velo","tool":"velo_list_sessions","arguments":{}}}"#;
+        let msg_upd = r#"{"type":"item.updated","item":{"id":"item_2","type":"agent_message","text":"Working on"}}"#;
+        let msg_done = r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Working on it now."}}"#;
+
+        assert!(matches!(
+            parse_agent_stdout_line(sid, &AgentProvider::Codex, r_start).first(),
+            Some(AgentEvent::ThinkingChunk { replace: true, .. })
+        ));
+        assert!(matches!(
+            parse_agent_stdout_line(sid, &AgentProvider::Codex, r_upd).first(),
+            Some(AgentEvent::ThinkingChunk { replace: true, .. })
+        ));
+        assert!(matches!(
+            parse_agent_stdout_line(sid, &AgentProvider::Codex, mcp_start).first(),
+            Some(AgentEvent::ToolCallRequested { .. })
+        ));
+        assert!(matches!(
+            parse_agent_stdout_line(sid, &AgentProvider::Codex, msg_upd).first(),
+            Some(AgentEvent::MessageChunk { replace: true, .. })
+        ));
+        assert!(matches!(
+            parse_agent_stdout_line(sid, &AgentProvider::Codex, msg_done).first(),
+            Some(AgentEvent::MessageDelta { .. })
+        ));
     }
 }

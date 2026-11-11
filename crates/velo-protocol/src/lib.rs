@@ -189,6 +189,13 @@ pub enum AgentEvent {
         provider_session_id: String,
         timestamp: DateTime<Utc>,
     },
+    ThinkingChunk {
+        session_id: Uuid,
+        delta: String,
+        #[serde(default)]
+        replace: bool,
+        timestamp: DateTime<Utc>,
+    },
     ThinkingDelta {
         session_id: Uuid,
         text: String,
@@ -197,6 +204,8 @@ pub enum AgentEvent {
     MessageChunk {
         session_id: Uuid,
         delta: String,
+        #[serde(default)]
+        replace: bool,
         timestamp: DateTime<Utc>,
     },
     MessageDelta {
@@ -299,6 +308,7 @@ impl AgentEvent {
             Self::StatusChanged { session_id, .. }
             | Self::UserMessage { session_id, .. }
             | Self::ProviderSessionBound { session_id, .. }
+            | Self::ThinkingChunk { session_id, .. }
             | Self::ThinkingDelta { session_id, .. }
             | Self::MessageChunk { session_id, .. }
             | Self::MessageDelta { session_id, .. }

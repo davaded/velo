@@ -598,6 +598,9 @@ fn print_agent_event(ev: &AgentEvent) {
         } => {
             println!("🔗 [thread bound] {}", provider_session_id);
         }
+        AgentEvent::ThinkingChunk { delta, .. } => {
+            print!("{}", delta);
+        }
         AgentEvent::ThinkingDelta { text, .. } => {
             println!("💭 {}", text);
         }

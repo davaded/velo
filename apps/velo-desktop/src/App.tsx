@@ -34,6 +34,7 @@ import { BrowserPreviewDrawer } from "./components/BrowserPreviewDrawer";
 import { AutomationsModal } from "./components/AutomationsModal";
 import { e2eeOpenFrame, e2eeSealJson } from "./utils/e2eeRelayClient";
 import {
+  ArrowDown,
   ArrowUp,
   CalendarClock,
   Check,
@@ -390,8 +391,34 @@ export function App() {
   >({});
 
   const streamEndRef = useRef<HTMLDivElement | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const isPinnedToBottomRef = useRef<boolean>(true);
+  const [showJumpToBottom, setShowJumpToBottom] = useState<boolean>(false);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const scrollChatToBottom = useCallback((smooth = false) => {
+    if (smooth) {
+      isPinnedToBottomRef.current = true;
+      setShowJumpToBottom(false);
+      requestAnimationFrame(() => {
+        const el = chatScrollRef.current;
+        if (el) {
+          el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        } else {
+          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        }
+      });
+      return;
+    }
+    if (!isPinnedToBottomRef.current) return;
+    requestAnimationFrame(() => {
+      const el = chatScrollRef.current;
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+  }, []);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeId) || sessions[0] || DEMO_SESSIONS[0],
@@ -544,7 +571,14 @@ export function App() {
   );
 
   useEffect(() => {
+    isPinnedToBottomRef.current = true;
+    setShowJumpToBottom(false);
     refreshSessionDiffAndFiles(activeSession.id);
+    requestAnimationFrame(() => {
+      if (chatScrollRef.current) {
+        chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+      }
+    });
   }, [activeSession.id, refreshSessionDiffAndFiles]);
 
   // Load persisted event history from ~/.velo/events/<session-id>.json on startup or session switch
@@ -607,20 +641,36 @@ export function App() {
                 argsObj.path ??
                 argsObj.command ??
                 argsObj.pattern ??
-                JSON.stringify(argsObj).slice(0, 80)
+                argsObj.query ??
+                (Object.keys(argsObj).length > 0 ? JSON.stringify(argsObj).slice(0, 80) : "")
             );
-            reconstructed.push({
-              id: toolId,
-              session_id: sid,
-              timestamp: ts,
-              kind: "tool_call",
-              tool_name: toolName,
-              tool_args: argSummary,
-              tool_input: argsObj,
-              tool_output: undefined,
-              tool_is_error: false,
-              content: JSON.stringify(argsObj, null, 2),
-            });
+            const existingIdx = reconstructed.findIndex(
+              (item) => item.kind === "tool_call" && item.id === toolId
+            );
+            if (existingIdx !== -1) {
+              reconstructed[existingIdx] = {
+                ...reconstructed[existingIdx],
+                tool_name: toolName,
+                tool_args: argSummary || reconstructed[existingIdx].tool_args,
+                tool_input:
+                  Object.keys(argsObj).length > 0
+                    ? argsObj
+                    : reconstructed[existingIdx].tool_input,
+              };
+            } else {
+              reconstructed.push({
+                id: toolId,
+                session_id: sid,
+                timestamp: ts,
+                kind: "tool_call",
+                tool_name: toolName,
+                tool_args: argSummary,
+                tool_input: argsObj,
+                tool_output: undefined,
+                tool_is_error: false,
+                content: JSON.stringify(argsObj, null, 2),
+              });
+            }
           } else if (evType === "tool_call_completed") {
             const toolId = String(ev.tool_id ?? "");
             const output = String(ev.output ?? "(completed)");
@@ -724,6 +774,36 @@ export function App() {
       const sid = String(evObj.session_id ?? "");
       if (!sid) return;
 
+      if (evType === "user_message") {
+        const text = String(evObj.text ?? "").trim();
+        const imgs = Array.isArray(evObj.images) ? evObj.images.map(String).filter(Boolean) : [];
+        if (!text && imgs.length === 0) return;
+        setEventsBySession((prev) => {
+          const list = prev[sid] || [];
+          // Deduplicate against optimistic user bubble already appended locally
+          const alreadyRendered = list
+            .slice(-3)
+            .some((item) => item.kind === "user" && item.content.trim() === text);
+          if (alreadyRendered) return prev;
+          return {
+            ...prev,
+            [sid]: [
+              ...list,
+              {
+                id: `u-ws-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                session_id: sid,
+                timestamp: now,
+                kind: "user",
+                content: text,
+                images: imgs.length > 0 ? imgs : undefined,
+              },
+            ],
+          };
+        });
+        scrollChatToBottom(true);
+        return;
+      }
+
       if (evType === "permission_requested") {
         const reqId = String(evObj.request_id ?? `perm-${Date.now()}`);
         const toolName = String(evObj.tool_name ?? "Bash");
@@ -741,9 +821,7 @@ export function App() {
         setSessions((prev) =>
           prev.map((s) => (s.id === sid ? { ...s, status: "waiting_approval" } : s))
         );
-        setTimeout(() => {
-          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
-        }, 25);
+        scrollChatToBottom(true);
         return;
       }
 
@@ -770,9 +848,7 @@ export function App() {
             allowMultiple,
           },
         }));
-        setTimeout(() => {
-          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
-        }, 25);
+        scrollChatToBottom(true);
         return;
       }
 
@@ -843,6 +919,17 @@ export function App() {
               },
             };
           });
+          // Finalize any active streaming indicators cleanly
+          setEventsBySession((prev) => {
+            const list = prev[sid];
+            if (!list || !list.some((item) => item.is_streaming_chunk)) return prev;
+            return {
+              ...prev,
+              [sid]: list.map((item) =>
+                item.is_streaming_chunk ? { ...item, is_streaming_chunk: false } : item
+              ),
+            };
+          });
         }
         setSessions((prev) =>
           prev.map((s) =>
@@ -862,6 +949,7 @@ export function App() {
         );
         if (st === "completed") {
           refreshSessionDiffAndFiles(sid);
+          // Fallback sync ONLY if WebSocket missed the final assistant message in this turn
           fetch(`${daemonUrl}/api/sessions/${sid}/events`)
             .then((r) => (r.ok ? r.json() : Promise.reject()))
             .then((evList: Array<Record<string, unknown>>) => {
@@ -874,73 +962,40 @@ export function App() {
                 }
               }
               const latestTurnEvents = evList.slice(lastRunStart);
-              const thinkingTexts = latestTurnEvents
-                .filter((e) => e.type === "thinking_delta" && typeof e.text === "string")
-                .map((e) => String(e.text).trim())
-                .filter(Boolean);
               const texts = latestTurnEvents
                 .filter((e) => e.type === "message_delta" && typeof e.text === "string")
                 .map((e) => String(e.text).trim())
                 .filter(Boolean);
-              setEventsBySession((prev) => {
-                let list = [...(prev[sid] || [])];
-                if (thinkingTexts.length > 0) {
-                  const combinedThinking = Array.from(new Set(thinkingTexts)).join("\n");
-                  let lastUserIdx = -1;
-                  for (let i = list.length - 1; i >= 0; i--) {
-                    if (list[i].kind === "user") {
-                      lastUserIdx = i;
-                      break;
-                    }
-                  }
-                  let thIdx = -1;
-                  for (let i = list.length - 1; i > lastUserIdx; i--) {
-                    if (list[i].kind === "thinking") {
-                      thIdx = i;
-                      break;
-                    }
-                  }
-                  if (thIdx !== -1) {
-                    list[thIdx] = { ...list[thIdx], content: combinedThinking };
-                  } else {
-                    const thEv: AgentEvent = {
-                      id: `th-sync-${Date.now()}`,
-                      session_id: sid,
-                      timestamp: now,
-                      kind: "thinking",
-                      content: combinedThinking,
-                    };
-                    if (lastUserIdx !== -1) {
-                      list = [
-                        ...list.slice(0, lastUserIdx + 1),
-                        thEv,
-                        ...list.slice(lastUserIdx + 1),
-                      ];
-                    } else {
-                      list = [thEv, ...list];
-                    }
-                  }
-                }
+              if (texts.length === 0) return;
 
-                if (texts.length > 0) {
-                  const lastText = texts[texts.length - 1];
-                  const lastEv = list[list.length - 1];
-                  if (!lastEv || lastEv.kind !== "assistant" || !lastEv.content.includes(lastText)) {
-                    list = [
-                      ...list,
-                      {
-                        id: `as-sync-${Date.now()}`,
-                        session_id: sid,
-                        timestamp: now,
-                        kind: "assistant",
-                        content: lastText,
-                      },
-                    ];
+              setEventsBySession((prev) => {
+                const list = prev[sid] || [];
+                let lastUserIdx = -1;
+                for (let i = list.length - 1; i >= 0; i--) {
+                  if (list[i].kind === "user") {
+                    lastUserIdx = i;
+                    break;
                   }
                 }
+                const hasAssistantInTurn = list
+                  .slice(lastUserIdx + 1)
+                  .some((item) => item.kind === "assistant" && item.content.trim().length > 0);
+                if (hasAssistantInTurn) return prev;
+
+                const lastText = texts[texts.length - 1];
                 return {
                   ...prev,
-                  [sid]: list,
+                  [sid]: [
+                    ...list,
+                    {
+                      id: `as-sync-${Date.now()}`,
+                      session_id: sid,
+                      timestamp: now,
+                      kind: "assistant",
+                      content: lastText,
+                      is_streaming_chunk: false,
+                    },
+                  ],
                 };
               });
             })
@@ -967,57 +1022,85 @@ export function App() {
         return;
       }
 
-      if (evType === "thinking_delta") {
-        const text = String(evObj.text ?? "").trim();
-        if (!text) return;
+      if (evType === "thinking_chunk") {
+        const delta = String(evObj.delta ?? "");
+        const replace = Boolean(evObj.replace);
         setEventsBySession((prev) => {
-          const list = [...(prev[sid] || [])];
-          let lastUserIdx = -1;
-          for (let i = list.length - 1; i >= 0; i--) {
-            if (list[i].kind === "user") {
-              lastUserIdx = i;
-              break;
-            }
-          }
-          let thIdx = -1;
-          for (let i = list.length - 1; i > lastUserIdx; i--) {
-            if (list[i].kind === "thinking") {
-              thIdx = i;
-              break;
-            }
-          }
-          if (thIdx !== -1) {
-            const existing = list[thIdx].content;
-            const nextContent = existing.includes(text) ? existing : `${existing}\n${text}`;
-            list[thIdx] = { ...list[thIdx], content: nextContent };
-            return { ...prev, [sid]: list };
-          }
-          const newTh: AgentEvent = {
-            id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-            session_id: sid,
-            timestamp: now,
-            kind: "thinking",
-            content: text,
-          };
-          if (lastUserIdx !== -1) {
+          const list = prev[sid] || [];
+          const last = list[list.length - 1];
+          if (last && last.kind === "thinking") {
+            const nextContent = replace
+              ? delta || last.content
+              : `${last.content}${delta}`;
             return {
               ...prev,
               [sid]: [
-                ...list.slice(0, lastUserIdx + 1),
-                newTh,
-                ...list.slice(lastUserIdx + 1),
+                ...list.slice(0, -1),
+                { ...last, content: nextContent, is_streaming_chunk: true },
               ],
             };
           }
           return {
             ...prev,
-            [sid]: [...list, newTh],
+            [sid]: [
+              ...list,
+              {
+                id: `th-stream-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                session_id: sid,
+                timestamp: now,
+                kind: "thinking",
+                content: delta,
+                is_streaming_chunk: true,
+              },
+            ],
           };
         });
+        scrollChatToBottom(false);
+        return;
+      }
+
+      if (evType === "thinking_delta") {
+        const text = String(evObj.text ?? "").trim();
+        if (!text) return;
+        setEventsBySession((prev) => {
+          const list = prev[sid] || [];
+          const last = list[list.length - 1];
+          // Strictly chronological: update trailing thinking block or push at tail (never jump above earlier tools/messages)
+          if (last && last.kind === "thinking") {
+            const nextContent = last.is_streaming_chunk
+              ? text
+              : last.content.trim() === text || last.content.endsWith(text)
+              ? last.content
+              : `${last.content}\n${text}`.trim();
+            return {
+              ...prev,
+              [sid]: [
+                ...list.slice(0, -1),
+                { ...last, content: nextContent, is_streaming_chunk: false },
+              ],
+            };
+          }
+          return {
+            ...prev,
+            [sid]: [
+              ...list,
+              {
+                id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                session_id: sid,
+                timestamp: now,
+                kind: "thinking",
+                content: text,
+                is_streaming_chunk: false,
+              },
+            ],
+          };
+        });
+        scrollChatToBottom(false);
         return;
       }
 
       if (evType === "tool_call_requested") {
+        const toolId = String(evObj.tool_id ?? `tl-${Date.now()}`);
         const toolName = String(evObj.tool_name ?? "Tool");
         const argsObj = (
           evObj.arguments && typeof evObj.arguments === "object" ? evObj.arguments : {}
@@ -1027,24 +1110,53 @@ export function App() {
             argsObj.path ??
             argsObj.command ??
             argsObj.pattern ??
-            JSON.stringify(argsObj).slice(0, 80)
+            argsObj.query ??
+            (Object.keys(argsObj).length > 0 ? JSON.stringify(argsObj).slice(0, 80) : "")
         );
-        const toolEv: AgentEvent = {
-          id: String(evObj.tool_id ?? `tl-${Date.now()}`),
-          session_id: sid,
-          timestamp: now,
-          kind: "tool_call",
-          tool_name: toolName,
-          tool_args: argSummary,
-          tool_input: argsObj,
-          tool_output: undefined,
-          tool_is_error: false,
-          content: JSON.stringify(argsObj, null, 2),
-        };
-        setEventsBySession((prev) => ({
-          ...prev,
-          [sid]: [...(prev[sid] || []), toolEv],
-        }));
+        setEventsBySession((prev) => {
+          const rawList = prev[sid] || [];
+          // Finalize any preceding streaming block cleanly before running tool
+          const list = rawList.map((item, idx) =>
+            idx === rawList.length - 1 && item.is_streaming_chunk
+              ? { ...item, is_streaming_chunk: false }
+              : item
+          );
+          const existingIdx = list.findIndex(
+            (item) => item.kind === "tool_call" && item.id === toolId
+          );
+          if (existingIdx !== -1) {
+            const next = [...list];
+            next[existingIdx] = {
+              ...next[existingIdx],
+              tool_name: toolName,
+              tool_args: argSummary || next[existingIdx].tool_args,
+              tool_input:
+                Object.keys(argsObj).length > 0 ? argsObj : next[existingIdx].tool_input,
+              content:
+                next[existingIdx].tool_output !== undefined
+                  ? next[existingIdx].content
+                  : JSON.stringify(argsObj, null, 2),
+            };
+            return { ...prev, [sid]: next };
+          }
+          const toolEv: AgentEvent = {
+            id: toolId,
+            session_id: sid,
+            timestamp: now,
+            kind: "tool_call",
+            tool_name: toolName,
+            tool_args: argSummary,
+            tool_input: argsObj,
+            tool_output: undefined,
+            tool_is_error: false,
+            content: JSON.stringify(argsObj, null, 2),
+          };
+          return {
+            ...prev,
+            [sid]: [...list, toolEv],
+          };
+        });
+        scrollChatToBottom(false);
         return;
       }
 
@@ -1075,6 +1187,7 @@ export function App() {
           }
           return prev;
         });
+        scrollChatToBottom(false);
         return;
       }
 
@@ -1109,6 +1222,7 @@ export function App() {
 
       if (evType === "message_chunk") {
         const delta = String(evObj.delta ?? "");
+        const replace = Boolean(evObj.replace);
         if (!delta) return;
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
@@ -1116,14 +1230,18 @@ export function App() {
           if (last && last.kind === "assistant" && last.is_streaming_chunk) {
             const updatedLast: AgentEvent = {
               ...last,
-              content: `${last.content}${delta}`,
+              content: replace ? delta : `${last.content}${delta}`,
             };
             return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
           }
+          const cleanedPrev =
+            last && last.kind === "thinking" && last.is_streaming_chunk
+              ? [...list.slice(0, -1), { ...last, is_streaming_chunk: false }]
+              : list;
           return {
             ...prev,
             [sid]: [
-              ...list,
+              ...cleanedPrev,
               {
                 id: `as-stream-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
                 session_id: sid,
@@ -1135,9 +1253,7 @@ export function App() {
             ],
           };
         });
-        setTimeout(() => {
-          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
-        }, 25);
+        scrollChatToBottom(false);
         return;
       }
 
@@ -1146,29 +1262,41 @@ export function App() {
         if (!text.trim()) return;
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
-          const last = list[list.length - 1];
-          if (last && last.kind === "assistant") {
-            if (last.is_streaming_chunk) {
-              return {
-                ...prev,
-                [sid]: [
-                  ...list.slice(0, -1),
-                  { ...last, content: text, is_streaming_chunk: false },
-                ],
-              };
+          // Search current post-tool / post-user segment for a streaming assistant block
+          let targetIdx = -1;
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].kind === "user" || list[i].kind === "tool_call") break;
+            if (list[i].kind === "assistant") {
+              targetIdx = i;
+              break;
             }
-            const updatedLast = {
-              ...last,
-              content: last.content.includes(text)
-                ? last.content
-                : `${last.content}\n${text}`.trim(),
-            };
-            return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
           }
+          if (targetIdx !== -1) {
+            const existing = list[targetIdx];
+            const nextContent = existing.is_streaming_chunk
+              ? text
+              : existing.content.trim() === text.trim()
+              ? existing.content
+              : text.startsWith(existing.content)
+              ? text
+              : `${existing.content}\n\n${text}`.trim();
+            const next = [...list];
+            next[targetIdx] = {
+              ...existing,
+              content: nextContent,
+              is_streaming_chunk: false,
+            };
+            return { ...prev, [sid]: next };
+          }
+          const last = list[list.length - 1];
+          const cleanedPrev =
+            last && last.kind === "thinking" && last.is_streaming_chunk
+              ? [...list.slice(0, -1), { ...last, is_streaming_chunk: false }]
+              : list;
           return {
             ...prev,
             [sid]: [
-              ...list,
+              ...cleanedPrev,
               {
                 id: `as-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
                 session_id: sid,
@@ -1180,9 +1308,7 @@ export function App() {
             ],
           };
         });
-        setTimeout(() => {
-          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
-        }, 30);
+        scrollChatToBottom(false);
         return;
       }
 
@@ -1201,9 +1327,10 @@ export function App() {
             },
           ],
         }));
+        scrollChatToBottom(false);
       }
     },
-    [daemonUrl, refreshSessionDiffAndFiles]
+    [daemonUrl, refreshSessionDiffAndFiles, scrollChatToBottom]
   );
 
   // Subscribe to live WebSocket events from real Claude Code / Codex / ACP turns
@@ -1285,10 +1412,67 @@ export function App() {
     [e2eeRelayConfig]
   );
 
+  // Frictionless 1-click "New thread" (Paseo / Codex / Claude Desktop feel):
+  // Immediately switches to a clean idle thread and focuses the Composer without modal friction
+  const handleQuickNewThread = useCallback(
+    (targetRepoOverride?: VeloRepo) => {
+      const targetRepo = targetRepoOverride || activeRepo;
+      const existingEmpty = sessions.find(
+        (s) =>
+          s.repo_id === targetRepo.id &&
+          s.title === "New thread" &&
+          s.status === "idle" &&
+          (eventsBySession[s.id]?.length ?? 0) === 0
+      );
+      if (existingEmpty) {
+        setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+        setActiveId(existingEmpty.id);
+        setActiveModal(null);
+        setTimeout(() => composerTextareaRef.current?.focus(), 20);
+        return;
+      }
+
+      const shortRand = Math.random().toString(36).slice(2, 6);
+      const branch = `feat/thread-${shortRand}`;
+      const newId = `wt-${Date.now()}`;
+      const freshSession: VeloSession = {
+        id: newId,
+        repo_id: targetRepo.id,
+        title: "New thread",
+        agent_kind: activeSession.agent_kind || "claude",
+        model: activeSession.model || "claude-fable-5-2",
+        model_short: activeSession.model_short || "Fable 5.2",
+        effort: activeSession.effort || "medium",
+        status: "idle",
+        branch_name: branch,
+        worktree_path: `${targetRepo.path}/.velo/worktrees/feat-thread-${shortRand}`,
+        project_path: targetRepo.path,
+        approval_mode: activeSession.approval_mode || "auto_edit",
+        tokens_used: 0,
+        tokens_limit: 200000,
+        cost_usd: 0,
+        files_changed: 0,
+        insertions: 0,
+        deletions: 0,
+        updated_at: "now",
+      };
+      setSessions((prev) => [freshSession, ...prev]);
+      setEventsBySession((prev) => ({ ...prev, [newId]: [] }));
+      setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+      setActiveId(newId);
+      setActiveModal(null);
+      setTimeout(() => composerTextareaRef.current?.focus(), 20);
+    },
+    [activeRepo, activeSession, eventsBySession, sessions]
+  );
+
   // Global Shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
+        e.preventDefault();
+        handleQuickNewThread();
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setActiveModal((m) => (m === "command" ? null : "command"));
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
@@ -1310,7 +1494,14 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeModal, drawerOpen, slashFilter, modelPickerOpen, effortPickerOpen]);
+  }, [
+    activeModal,
+    drawerOpen,
+    slashFilter,
+    modelPickerOpen,
+    effortPickerOpen,
+    handleQuickNewThread,
+  ]);
 
   const openDiffForFile = (filePath?: string) => {
     if (filePath) {
@@ -1451,6 +1642,7 @@ export function App() {
       ...prev,
       [activeSession.id]: [...baseEvents, userEv],
     }));
+    scrollChatToBottom(true);
 
     // Real Daemon /worktree-GC endpoint (Prune orphaned Git worktrees & stale locks)
     if (rawText.toLowerCase().startsWith("/worktree-gc")) {
@@ -1668,9 +1860,7 @@ export function App() {
       });
 
       if (inputRes.ok) {
-        setTimeout(() => {
-          streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
-        }, 50);
+        scrollChatToBottom(true);
         return;
       }
 
@@ -1681,7 +1871,7 @@ export function App() {
         body: JSON.stringify({
           name: nextTitle,
           provider: providerName,
-          prompt: promptWithContext,
+          prompt: priorHistory.length > 0 ? promptWithContext : text,
           repo_path: activeRepo.path || "/Users/daiyudai/code/velo",
           branch: activeSession.branch_name,
           use_pty: false,
@@ -1719,11 +1909,21 @@ export function App() {
           const fromNew = prev[realSess.id] || [];
           const mergedList: AgentEvent[] = [];
           for (const item of [...fromOld, ...fromNew]) {
+            if (
+              item.kind === "user" &&
+              mergedList.some(
+                (existing) =>
+                  existing.kind === "user" &&
+                  existing.content.trim() === item.content.trim()
+              )
+            ) {
+              continue;
+            }
             const last = mergedList[mergedList.length - 1];
             if (last && last.kind === "thinking" && item.kind === "thinking") {
               mergedList[mergedList.length - 1] = {
                 ...last,
-                content: `${last.content}\n${item.content}`,
+                content: `${last.content}\n${item.content}`.trim(),
               };
             } else {
               mergedList.push(item);
@@ -1735,6 +1935,7 @@ export function App() {
           };
         });
         setActiveId(realSess.id);
+        scrollChatToBottom(true);
         return;
       } else {
         const errData = (await createRes.json().catch(() => ({}))) as { error?: string };
@@ -2228,7 +2429,11 @@ export function App() {
       clean.startsWith("feat/") || clean.startsWith("fix/") || clean.startsWith("chore/")
         ? clean
         : `feat/${clean}`;
-    const title = newTaskDesc.trim() || branch;
+    const rawPrompt = newTaskDesc.trim();
+    if (dispatchMode !== "single" && !rawPrompt) {
+      return;
+    }
+    const displayTitle = rawPrompt ? rawPrompt.slice(0, 44) : "New thread";
     const chosenModel = modelCatalog.find((m) => m.id === newModelId) || modelCatalog[0];
     const providerName = chosenModel.agentKind || "claude";
     const setupCmd = newSetupCommand.trim() || undefined;
@@ -2245,7 +2450,7 @@ export function App() {
           body: JSON.stringify({
             name_prefix: clean.replace(/\//g, "-"),
             providers: ["claude", "codex"],
-            prompt: title,
+            prompt: rawPrompt,
             repo_path: targetRepo.path,
           }),
         });
@@ -2260,6 +2465,7 @@ export function App() {
             setSessions((prev) => [...createdList, ...prev]);
             setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
             setActiveId(createdList[0].id);
+            setNewTaskDesc("");
             setActiveModal(null);
             return;
           }
@@ -2269,9 +2475,9 @@ export function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            name: title,
+            name: displayTitle,
             provider: providerName,
-            prompt: title,
+            prompt: rawPrompt,
             check_command: loopCheckCmd,
             max_iterations: 3,
             repo_path: targetRepo.path,
@@ -2282,13 +2488,14 @@ export function App() {
           const rawSession = await res.json();
           const created = normalizeToVeloSession(rawSession, 0);
           created.repo_id = targetRepo.id;
-          created.title = `[Loop] ${title}`;
+          created.title = `[Loop] ${displayTitle}`;
           created.agent_kind = chosenModel.agentKind;
           created.model = chosenModel.id;
           created.model_short = chosenModel.shortLabel;
           setSessions((prev) => [created, ...prev]);
           setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
           setActiveId(created.id);
+          setNewTaskDesc("");
           setActiveModal(null);
           return;
         }
@@ -2298,9 +2505,9 @@ export function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: title,
+          name: displayTitle,
           provider: providerName,
-          prompt: title,
+          prompt: rawPrompt,
           repo_path: targetRepo.path,
           branch,
           use_pty: false,
@@ -2314,14 +2521,20 @@ export function App() {
         const rawSession = await res.json();
         const created = normalizeToVeloSession(rawSession, 0);
         created.repo_id = targetRepo.id;
-        created.title = title;
+        created.title = displayTitle;
         created.agent_kind = chosenModel.agentKind;
         created.model = chosenModel.id;
         created.model_short = chosenModel.shortLabel;
+        if (!rawPrompt) {
+          created.status = "idle";
+          created.updated_at = "now";
+        }
         setSessions((prev) => [created, ...prev]);
         setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
         setActiveId(created.id);
+        setNewTaskDesc("");
         setActiveModal(null);
+        setTimeout(() => composerTextareaRef.current?.focus(), 30);
         return;
       }
     } catch {
@@ -2333,7 +2546,7 @@ export function App() {
     const fallbackCreated: VeloSession = {
       id: newId,
       repo_id: targetRepo.id,
-      title,
+      title: displayTitle,
       agent_kind: chosenModel.agentKind,
       model: chosenModel.id,
       model_short: chosenModel.shortLabel,
@@ -2564,11 +2777,7 @@ export function App() {
             </div>
 
             <button
-              onClick={() => {
-                setTargetRepoIdForNewWt(activeRepo.id);
-                setNewSetupCommand(repoHooks[activeRepo.path] || "");
-                setActiveModal("new-worktree");
-              }}
+              onClick={() => handleQuickNewThread()}
               title="New thread (⌘N)"
               className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
@@ -2578,17 +2787,29 @@ export function App() {
 
           {/* Top Navigation Rows (Codex / Claude Code / Paseo SidebarNavRows) */}
           <div className="space-y-0.5 px-2 pb-3">
-            <button
-              onClick={() => {
-                setTargetRepoIdForNewWt(activeRepo.id);
-                setNewSetupCommand(repoHooks[activeRepo.path] || "");
-                setActiveModal("new-worktree");
-              }}
-              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-            >
-              <Plus className="h-4 w-4 text-[var(--v-fg-muted)]" />
-              <span>New thread</span>
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => handleQuickNewThread()}
+                className="flex h-[30px] flex-1 items-center justify-between rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              >
+                <span className="flex items-center gap-2.5">
+                  <Plus className="h-4 w-4 text-[var(--v-fg-muted)]" />
+                  <span>New thread</span>
+                </span>
+                <span className="font-mono text-[11px] text-[var(--v-fg-faint)]">⌘N</span>
+              </button>
+              <button
+                onClick={() => {
+                  setTargetRepoIdForNewWt(activeRepo.id);
+                  setNewSetupCommand(repoHooks[activeRepo.path] || "");
+                  setActiveModal("new-worktree");
+                }}
+                title="Advanced Worktree / Committee Race / TDD Auto-Loop"
+                className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              >
+                <GitBranch className="h-3.5 w-3.5" />
+              </button>
+            </div>
             <button
               onClick={() => setActiveModal("command")}
               className="flex h-[30px] w-full items-center justify-between rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -2652,11 +2873,7 @@ export function App() {
 
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
-                        onClick={() => {
-                          setTargetRepoIdForNewWt(repo.id);
-                          setNewSetupCommand(repoHooks[repo.path] || "");
-                          setActiveModal("new-worktree");
-                        }}
+                        onClick={() => handleQuickNewThread(repo)}
                         title={`New thread in ${repo.name}`}
                         className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
                       >
@@ -3078,15 +3295,38 @@ export function App() {
 
         {/* Body Area: Centered Conversation Stream + On-Demand Right Drawer */}
         <div className="relative flex flex-1 overflow-hidden">
-          <main className="flex flex-1 flex-col items-center overflow-hidden">
+          <main className="relative flex flex-1 flex-col items-center overflow-hidden">
             {/* Scrollable Stream (Authentic Paseo Stream Layout) */}
-            <div className="w-full flex-1 overflow-y-auto px-6 py-6" data-testid="agent-chat-scroll">
+            <div
+              ref={chatScrollRef}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+                isPinnedToBottomRef.current = nearBottom;
+                setShowJumpToBottom(!nearBottom);
+              }}
+              className="w-full flex-1 overflow-y-auto px-6 py-6"
+              data-testid="agent-chat-scroll"
+            >
               <div className="mx-auto flex max-w-[680px] flex-col gap-1.5">
                 {activeEvents.length === 0 && (
-                  <div className="my-12 flex flex-col items-start gap-2.5 rounded-2xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] p-5">
-                    <div className="flex items-center gap-2 text-[13.5px] font-medium text-[var(--v-fg-primary)]">
-                      <GitBranch className="h-4 w-4 text-[var(--v-fg-muted)]" />
-                      <span>{activeSession.title}</span>
+                  <div className="my-12 flex flex-col items-start gap-3 rounded-2xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] p-5">
+                    <div className="flex w-full items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-[13.5px] font-medium text-[var(--v-fg-primary)]">
+                        <GitBranch className="h-4 w-4 text-[var(--v-fg-muted)]" />
+                        <span>{activeSession.title}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTargetRepoIdForNewWt(activeRepo.id);
+                          setNewSetupCommand(repoHooks[activeRepo.path] || "");
+                          setActiveModal("new-worktree");
+                        }}
+                        className="rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-hover)] px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                      >
+                        自定义分支 / Committee 竞速 / TDD 循环…
+                      </button>
                     </div>
                     <p className="text-[12.5px] leading-relaxed text-[var(--v-fg-muted)]">
                       当前会话绑定于隔离工作区{" "}
@@ -3097,12 +3337,12 @@ export function App() {
                       <span className="font-mono text-[var(--v-fg-secondary)]">
                         {activeSession.worktree_path}
                       </span>
-                      )。直接输入自然语言指令，
+                      )。在下方直接输入你的任务并回车，
                       <span className="font-medium text-[var(--v-fg-body)]">
-                        {MODEL_CATALOG.find((m) => m.id === activeSession.model)?.label ||
+                        {modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                           activeSession.model_short}
                       </span>{" "}
-                      会自动在当前代码库中检索、读取并修改相关文件，无需手动挂载文件。
+                      将实时展示思考轨迹、工具调用与流式回答。
                     </p>
                   </div>
                 )}
@@ -3116,11 +3356,39 @@ export function App() {
                     }
                   }
                   const lastUserEv = lastUserIdx >= 0 ? activeEvents[lastUserIdx] : null;
-                  const lastAssistantAfterUser = [...activeEvents.slice(Math.max(0, lastUserIdx))]
+                  const turnSlice =
+                    lastUserIdx >= 0 ? activeEvents.slice(lastUserIdx + 1) : activeEvents;
+                  const lastAssistantAfterUser = [...turnSlice]
                     .reverse()
                     .find((e) => e.kind === "assistant");
                   const activeTurnTiming = turnTimingBySession[activeSession.id];
                   const lastEvent = activeEvents[activeEvents.length - 1];
+
+                  const activeModelLabel =
+                    modelCatalog.find((m) => m.id === activeSession.model)?.label ||
+                    activeSession.model_short ||
+                    "Agent";
+                  const runningToolEv = [...turnSlice]
+                    .reverse()
+                    .find((e) => e.kind === "tool_call" && e.tool_output === undefined);
+
+                  let activePhaseLabel = `正在连接 ${activeModelLabel} · 准备隔离工作区上下文…`;
+                  if (activePendingApproval) {
+                    activePhaseLabel = `等待你的权限确认 (${activePendingApproval.toolName || "Tool"})…`;
+                  } else if (activePendingQuestion) {
+                    activePhaseLabel = "等待你回答澄清问题…";
+                  } else if (runningToolEv) {
+                    const shortArg = runningToolEv.tool_args
+                      ? ` · ${runningToolEv.tool_args.slice(0, 38)}`
+                      : "";
+                    activePhaseLabel = `正在执行 ${runningToolEv.tool_name || "Tool"}${shortArg}…`;
+                  } else if (lastEvent?.kind === "thinking") {
+                    activePhaseLabel = "正在深度思考与分析…";
+                  } else if (lastEvent?.kind === "assistant" && lastEvent.is_streaming_chunk) {
+                    activePhaseLabel = "正在流式输出回答…";
+                  } else if (turnSlice.length > 0) {
+                    activePhaseLabel = "正在整合执行结果并生成回答…";
+                  }
 
                   return (
                     <>
@@ -3334,7 +3602,14 @@ export function App() {
                             data-testid="assistant-message"
                             className="flex flex-col items-start gap-2.5 py-2"
                           >
-                            <PaseoMarkdown content={ev.content} />
+                            <PaseoMarkdown
+                              content={ev.content}
+                              isStreaming={Boolean(
+                                ev.is_streaming_chunk &&
+                                  activeSession.status === "running" &&
+                                  isLastEvent
+                              )}
+                            />
 
                             {/* Worktree Verification & Diff Card when files were modified */}
                             {isLastEvent && activeDiffFiles.length > 0 && (
@@ -3367,7 +3642,11 @@ export function App() {
                          - When completed: swaps in-place in the same 24px slot to Copy + Retry + "Worked for Xs" */}
                       {activeEvents.length > 0 && (
                         <PaseoTurnFooter
-                          isRunning={activeSession.status === "running"}
+                          isRunning={
+                            activeSession.status === "running" ||
+                            activeSession.status === "waiting_approval"
+                          }
+                          activePhaseLabel={activePhaseLabel}
                           startedAtMs={activeTurnTiming?.startedAtMs}
                           durationMs={activeTurnTiming?.durationMs}
                           completedAtLabel={
@@ -3385,6 +3664,22 @@ export function App() {
                 <div ref={streamEndRef} />
               </div>
             </div>
+
+            {/* Floating "Jump to Latest Output" Pill when user scrolls up */}
+            {showJumpToBottom && activeEvents.length > 0 && (
+              <div className="pointer-events-none z-20 -mt-9 mb-1 flex w-full justify-center">
+                <button
+                  type="button"
+                  onClick={() => scrollChatToBottom(true)}
+                  className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] shadow-lg transition-transform hover:scale-[1.02] cursor-pointer"
+                >
+                  <ArrowDown className="h-3.5 w-3.5 text-[#34d399]" />
+                  <span>
+                    {activeSession.status === "running" ? "回到最新实时输出" : "回到底部"}
+                  </span>
+                </button>
+              </div>
+            )}
 
             {/* ===============================================================
                 4. AUTHENTIC PASEO / CODEX / CLAUDE CODE COMPOSER DOCK
@@ -4471,9 +4766,14 @@ export function App() {
                     </button>
                     <button
                       onClick={handleCreateWorktree}
-                      className="rounded-lg bg-[var(--v-btn-bg)] px-4 py-1.5 text-[12.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90"
+                      disabled={dispatchMode !== "single" && !newTaskDesc.trim()}
+                      className="rounded-lg bg-[var(--v-btn-bg)] px-4 py-1.5 text-[12.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90 disabled:opacity-40"
                     >
-                      Start thread
+                      {newTaskDesc.trim()
+                        ? "Start thread"
+                        : dispatchMode === "single"
+                        ? "Create idle worktree"
+                        : "Enter prompt to start"}
                     </button>
                   </div>
                 </div>

@@ -123,6 +123,7 @@ pub async fn spawn_acp_agent(
 
         let mut acp_session_id: Option<String> = resume_session_id.clone();
         let mut prompt_dispatched = false;
+        let mut accumulated_thought = String::new();
         let mut accumulated_text = String::new();
 
         let mcp_servers = if let Some(base) = &daemon_http_base {
@@ -236,6 +237,13 @@ pub async fn spawn_acp_agent(
 
                     // Response to `session/prompt` (id == 3) -> turn complete!
                     if msg.get("id") == Some(&json!(3)) {
+                        if !accumulated_thought.trim().is_empty() {
+                            let _ = event_tx.send(AgentEvent::ThinkingDelta {
+                                session_id,
+                                text: std::mem::take(&mut accumulated_thought),
+                                timestamp: Utc::now(),
+                            });
+                        }
                         if !accumulated_text.trim().is_empty() {
                             let _ = event_tx.send(AgentEvent::MessageDelta {
                                 session_id,
@@ -275,6 +283,7 @@ pub async fn spawn_acp_agent(
                                 handle_acp_session_update(
                                     session_id,
                                     upd,
+                                    &mut accumulated_thought,
                                     &mut accumulated_text,
                                     &event_tx,
                                 );
@@ -426,6 +435,7 @@ fn resolve_in_worktree(worktree: &Path, path_str: &str) -> PathBuf {
 fn handle_acp_session_update(
     session_id: Uuid,
     upd: &Value,
+    accumulated_thought: &mut String,
     accumulated_text: &mut String,
     event_tx: &broadcast::Sender<AgentEvent>,
 ) {
@@ -437,27 +447,44 @@ fn handle_acp_session_update(
         "agent_thought_chunk" => {
             if let Some(text) = upd.pointer("/content/text").and_then(|v| v.as_str()) {
                 if !text.is_empty() {
-                    let _ = event_tx.send(AgentEvent::ThinkingDelta {
+                    accumulated_thought.push_str(text);
+                    let _ = event_tx.send(AgentEvent::ThinkingChunk {
                         session_id,
-                        text: text.to_string(),
+                        delta: text.to_string(),
+                        replace: false,
                         timestamp: Utc::now(),
                     });
                 }
             }
         }
         "agent_message_chunk" => {
+            if !accumulated_thought.trim().is_empty() {
+                let _ = event_tx.send(AgentEvent::ThinkingDelta {
+                    session_id,
+                    text: std::mem::take(accumulated_thought),
+                    timestamp: Utc::now(),
+                });
+            }
             if let Some(delta) = upd.pointer("/content/text").and_then(|v| v.as_str()) {
                 if !delta.is_empty() {
                     accumulated_text.push_str(delta);
                     let _ = event_tx.send(AgentEvent::MessageChunk {
                         session_id,
                         delta: delta.to_string(),
+                        replace: false,
                         timestamp: Utc::now(),
                     });
                 }
             }
         }
         "tool_call" => {
+            if !accumulated_thought.trim().is_empty() {
+                let _ = event_tx.send(AgentEvent::ThinkingDelta {
+                    session_id,
+                    text: std::mem::take(accumulated_thought),
+                    timestamp: Utc::now(),
+                });
+            }
             let tool_id = upd
                 .get("toolCallId")
                 .and_then(|v| v.as_str())
