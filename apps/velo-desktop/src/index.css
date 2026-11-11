@@ -312,3 +312,18 @@ body,
   color: transparent;
   animation: veloShimmer 2.2s linear infinite;
 }
+
+@keyframes veloPhaseSlideIn {
+  0% {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.velo-phase-morph {
+  animation: veloPhaseSlideIn 190ms var(--ease-spring) both;
+}

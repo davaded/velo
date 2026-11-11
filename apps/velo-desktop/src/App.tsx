@@ -27,6 +27,7 @@ import {
   PaseoToolCallGroup,
   PaseoToolGroupItem,
   PaseoTurnFooter,
+  PaseoTurnTelemetry,
 } from "./components/ui/BeautifulAgentPrimitives";
 import { XtermTerminalDrawer, TerminalChunkPacket } from "./components/XtermTerminalDrawer";
 import { PullRequestDrawer } from "./components/PullRequestDrawer";
@@ -387,7 +388,18 @@ export function App() {
   const [latestTerminalChunk, setLatestTerminalChunk] = useState<TerminalChunkPacket | null>(null);
   const termSeqRef = useRef<number>(0);
   const [turnTimingBySession, setTurnTimingBySession] = useState<
-    Record<string, { startedAtMs: number; durationMs?: number; completedAtLabel?: string }>
+    Record<
+      string,
+      {
+        startedAtMs: number;
+        ttftMs?: number;
+        durationMs?: number;
+        completedAtLabel?: string;
+        bootStage?: "provisioning" | "spawned" | "bound";
+        agentPid?: number;
+        providerThreadShort?: string;
+      }
+    >
   >({});
 
   const streamEndRef = useRef<HTMLDivElement | null>(null);
@@ -898,23 +910,72 @@ export function App() {
         return;
       }
 
-      if (evType === "status_changed") {
-        const st = String(evObj.status ?? "");
-        if (st === "running") {
-          setTurnTimingBySession((prev) => ({
+      if (evType === "provider_session_bound") {
+        const providerThread = String(evObj.provider_session_id ?? "").trim();
+        setTurnTimingBySession((prev) => {
+          const cur = prev[sid] || { startedAtMs: Date.now() };
+          return {
             ...prev,
             [sid]: {
-              startedAtMs: prev[sid]?.startedAtMs || Date.now(),
+              ...cur,
+              bootStage: "bound",
+              providerThreadShort: providerThread ? providerThread.slice(0, 8) : undefined,
             },
-          }));
-        } else if (st === "completed" || st === "failed" || st === "stopped") {
+          };
+        });
+        return;
+      }
+
+      // Record Time-To-First-Token (TTFT) on the earliest reasoning / tool / text packet in the turn
+      if (
+        evType === "thinking_chunk" ||
+        evType === "thinking_delta" ||
+        evType === "tool_call_requested" ||
+        evType === "message_chunk" ||
+        evType === "message_delta"
+      ) {
+        setTurnTimingBySession((prev) => {
+          const cur = prev[sid];
+          if (!cur || cur.ttftMs !== undefined) return prev;
+          return {
+            ...prev,
+            [sid]: {
+              ...cur,
+              ttftMs: Math.max(80, Date.now() - cur.startedAtMs),
+            },
+          };
+        });
+      }
+
+      if (evType === "status_changed") {
+        const st = String(evObj.status ?? "");
+        const statusMsg = String(evObj.message ?? "");
+        if (st === "running") {
+          const pidMatch = statusMsg.match(/PID\s+(?:Some\()?(\d+)/i);
+          const parsedPid = pidMatch ? Number(pidMatch[1]) : undefined;
           setTurnTimingBySession((prev) => {
-            const startedAtMs = prev[sid]?.startedAtMs || Date.now() - 1000;
+            const cur = prev[sid];
             return {
               ...prev,
               [sid]: {
+                startedAtMs: cur?.startedAtMs || Date.now(),
+                ttftMs: cur?.ttftMs,
+                bootStage: cur?.bootStage === "bound" ? "bound" : "spawned",
+                agentPid: parsedPid ?? cur?.agentPid,
+                providerThreadShort: cur?.providerThreadShort,
+              },
+            };
+          });
+        } else if (st === "completed" || st === "failed" || st === "stopped") {
+          setTurnTimingBySession((prev) => {
+            const cur = prev[sid];
+            const startedAtMs = cur?.startedAtMs || Date.now() - 1000;
+            return {
+              ...prev,
+              [sid]: {
+                ...cur,
                 startedAtMs,
-                durationMs: Math.max(500, Date.now() - startedAtMs),
+                durationMs: Math.max(300, Date.now() - startedAtMs),
                 completedAtLabel: now,
               },
             };
@@ -1466,12 +1527,22 @@ export function App() {
     [activeRepo, activeSession, eventsBySession, sessions]
   );
 
+  const stopSessionRef = useRef<() => void>(() => {});
+
   // Global Shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
         e.preventDefault();
         handleQuickNewThread();
+      } else if ((e.metaKey || e.ctrlKey) && e.key === ".") {
+        if (
+          activeSession.status === "running" ||
+          activeSession.status === "waiting_approval"
+        ) {
+          e.preventDefault();
+          stopSessionRef.current();
+        }
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setActiveModal((m) => (m === "command" ? null : "command"));
@@ -1496,6 +1567,7 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     activeModal,
+    activeSession.status,
     drawerOpen,
     slashFilter,
     modelPickerOpen,
@@ -1635,7 +1707,10 @@ export function App() {
     const startedAtMs = Date.now();
     setTurnTimingBySession((prev) => ({
       ...prev,
-      [activeSession.id]: { startedAtMs },
+      [activeSession.id]: {
+        startedAtMs,
+        bootStage: "provisioning",
+      },
     }));
 
     setEventsBySession((prev) => ({
@@ -1994,30 +2069,54 @@ export function App() {
   };
 
   // Stop currently running agent turn via POST /api/sessions/{id}/stop (or E2EE Relay)
-  const handleStopSession = async () => {
+  const handleStopSession = useCallback(async () => {
+    const sid = activeSession.id;
+    const stopNow = new Date().toLocaleTimeString([], { hour12: false });
+    setTurnTimingBySession((prev) => {
+      const cur = prev[sid];
+      if (!cur) return prev;
+      return {
+        ...prev,
+        [sid]: {
+          ...cur,
+          durationMs: Math.max(300, Date.now() - cur.startedAtMs),
+          completedAtLabel: stopNow,
+        },
+      };
+    });
     setSessions((prev) =>
-      prev.map((s) =>
-        s.id === activeSession.id ? { ...s, status: "idle", updated_at: "now" } : s
-      )
+      prev.map((s) => (s.id === sid ? { ...s, status: "idle", updated_at: "now" } : s))
     );
     setEventsBySession((prev) => {
-      const list = prev[activeSession.id] || [];
-      const updated = list.map((item) =>
-        item.kind === "tool_call" && item.tool_output === undefined
-          ? { ...item, tool_output: "(interrupted by user)", content: "(interrupted by user)" }
-          : item
-      );
-      return { ...prev, [activeSession.id]: updated };
+      const list = prev[sid] || [];
+      const updated = list.map((item) => {
+        if (item.kind === "tool_call" && item.tool_output === undefined) {
+          return {
+            ...item,
+            tool_output: "(interrupted by user)",
+            content: "(interrupted by user)",
+            is_streaming_chunk: false,
+          };
+        }
+        if (item.is_streaming_chunk) {
+          return { ...item, is_streaming_chunk: false };
+        }
+        return item;
+      });
+      return { ...prev, [sid]: updated };
     });
-    sendE2eeCommand({ cmd: "stop_session", session_id: activeSession.id });
+    sendE2eeCommand({ cmd: "stop_session", session_id: sid });
     try {
-      await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/stop`, {
+      await fetch(`${daemonUrl}/api/sessions/${sid}/stop`, {
         method: "POST",
       });
       refreshSessions();
     } catch {
       // ignore if local-only or remote relay
     }
+  }, [activeSession.id, daemonUrl, refreshSessions, sendE2eeCommand]);
+  stopSessionRef.current = () => {
+    void handleStopSession();
   };
 
   // User Message Actions: Click-to-edit & Resend, Retry from turn (Cursor / Claude Desktop / Codex standard)
@@ -3368,27 +3467,82 @@ export function App() {
                     modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                     activeSession.model_short ||
                     "Agent";
-                  const runningToolEv = [...turnSlice]
-                    .reverse()
-                    .find((e) => e.kind === "tool_call" && e.tool_output === undefined);
 
-                  let activePhaseLabel = `正在连接 ${activeModelLabel} · 准备隔离工作区上下文…`;
+                  const turnTools = turnSlice.filter((e) => e.kind === "tool_call");
+                  const runningTools = turnTools.filter(
+                    (e) => e.tool_output === undefined && e.tool_input !== undefined
+                  );
+                  const completedTools = turnTools.filter(
+                    (e) => e.tool_output !== undefined || e.tool_input === undefined
+                  );
+                  const toolCounts = new Map<string, number>();
+                  for (const t of completedTools) {
+                    const shortName = (t.tool_name || "Tool")
+                      .replace(/^mcp__[^_]+__/, "")
+                      .slice(0, 16);
+                    toolCounts.set(shortName, (toolCounts.get(shortName) || 0) + 1);
+                  }
+                  const toolBreakdownSummary =
+                    toolCounts.size > 0
+                      ? Array.from(toolCounts.entries())
+                          .slice(0, 3)
+                          .map(([name, count]) => `${name} ×${count}`)
+                          .join(", ")
+                      : undefined;
+
+                  const isWaitingUser = Boolean(
+                    activePendingApproval ||
+                      activePendingQuestion ||
+                      activeSession.status === "waiting_approval"
+                  );
+
+                  const isTrailingThinkingStreaming =
+                    lastEvent?.kind === "thinking" && Boolean(lastEvent.is_streaming_chunk);
+                  const isTrailingToolRunning =
+                    lastEvent?.kind === "tool_call" && runningTools.length > 0;
+                  const isTrailingAssistantStreaming =
+                    lastEvent?.kind === "assistant" && Boolean(lastEvent.is_streaming_chunk);
+
+                  const isInlineBlockAnimating =
+                    !isWaitingUser &&
+                    activeSession.status === "running" &&
+                    (isTrailingThinkingStreaming ||
+                      isTrailingToolRunning ||
+                      isTrailingAssistantStreaming);
+
+                  const bootStage = activeTurnTiming?.bootStage;
+                  const agentPid = activeTurnTiming?.agentPid;
+                  const providerThreadShort = activeTurnTiming?.providerThreadShort;
+
+                  let activePhaseLabel: string;
                   if (activePendingApproval) {
                     activePhaseLabel = `等待你的权限确认 (${activePendingApproval.toolName || "Tool"})…`;
                   } else if (activePendingQuestion) {
                     activePhaseLabel = "等待你回答澄清问题…";
-                  } else if (runningToolEv) {
-                    const shortArg = runningToolEv.tool_args
-                      ? ` · ${runningToolEv.tool_args.slice(0, 38)}`
-                      : "";
-                    activePhaseLabel = `正在执行 ${runningToolEv.tool_name || "Tool"}${shortArg}…`;
-                  } else if (lastEvent?.kind === "thinking") {
-                    activePhaseLabel = "正在深度思考与分析…";
-                  } else if (lastEvent?.kind === "assistant" && lastEvent.is_streaming_chunk) {
-                    activePhaseLabel = "正在流式输出回答…";
-                  } else if (turnSlice.length > 0) {
-                    activePhaseLabel = "正在整合执行结果并生成回答…";
+                  } else if (turnSlice.length === 0) {
+                    if (bootStage === "bound") {
+                      activePhaseLabel = `已建立模型会话${providerThreadShort ? ` #${providerThreadShort}` : ""} · 等待 ${activeModelLabel} 首包推理…`;
+                    } else if (bootStage === "spawned") {
+                      activePhaseLabel = `已拉起 ${activeModelLabel} 进程${agentPid ? ` (PID ${agentPid})` : ""} · 握手 MCP 工具链…`;
+                    } else {
+                      activePhaseLabel = `准备隔离工作区 (${activeSession.branch_name}) · 连接 ${activeModelLabel}…`;
+                    }
+                  } else if (completedTools.length > 0) {
+                    activePhaseLabel = `已完成 ${completedTools.length} 项工具执行 · ${activeModelLabel} 正在整合结果生成回复…`;
+                  } else {
+                    activePhaseLabel = `已完成思考规划 · ${activeModelLabel} 正在生成下一步响应…`;
                   }
+
+                  const turnTelemetry: PaseoTurnTelemetry = {
+                    ttftMs: activeTurnTiming?.ttftMs,
+                    completedToolsCount: completedTools.length,
+                    runningToolsCount: runningTools.length,
+                    toolBreakdownSummary,
+                    tokensUsed: activeSession.tokens_used,
+                    costUsd: activeSession.cost_usd,
+                    insertions: activeSession.insertions,
+                    deletions: activeSession.deletions,
+                  };
 
                   return (
                     <>
@@ -3529,8 +3683,11 @@ export function App() {
 
                         // 2. Thinking Trace: Paseo ExpandableBadge (Brain -> ChevronRight on hover + clean step summary)
                         if (ev.kind === "thinking") {
-                          const isStreamingThinking =
-                            activeSession.status === "running" && isLastEvent;
+                          const isStreamingThinking = Boolean(
+                            ev.is_streaming_chunk &&
+                              activeSession.status === "running" &&
+                              isLastEvent
+                          );
                           return (
                             <BeautifulThinkingBlock
                               key={ev.id}
@@ -3637,9 +3794,9 @@ export function App() {
                         );
                       })}
 
-                      {/* 5. Authentic Paseo TurnFooter:
-                         - While running: 2x3 6-dot PaseoSyncedLoader + live elapsed timer (0s, 1s, 2s...)
-                         - When completed: swaps in-place in the same 24px slot to Copy + Retry + "Worked for Xs" */}
+                      {/* 5. PaseoTurnFooter 2.0:
+                         - Smart De-duplication: Calm Telemetry Mode when trailing inline block is animating; Gap Illumination Mode during silent lifecycle gaps
+                         - Completed Turn: Swaps in-place to Copy + Retry + "Worked for Xs · N tools" (with Execution Breakdown popover) + "+ins −del" Diff jump */}
                       {activeEvents.length > 0 && (
                         <PaseoTurnFooter
                           isRunning={
@@ -3647,12 +3804,17 @@ export function App() {
                             activeSession.status === "waiting_approval"
                           }
                           activePhaseLabel={activePhaseLabel}
+                          isInlineBlockAnimating={isInlineBlockAnimating}
+                          isWaitingUser={isWaitingUser}
                           startedAtMs={activeTurnTiming?.startedAtMs}
                           durationMs={activeTurnTiming?.durationMs}
                           completedAtLabel={
                             activeTurnTiming?.completedAtLabel || lastEvent?.timestamp
                           }
                           assistantContent={lastAssistantAfterUser?.content}
+                          telemetry={turnTelemetry}
+                          onStop={handleStopSession}
+                          onOpenDiff={() => openDiffForFile()}
                           onRetry={
                             lastUserEv ? () => handleRetryUserMessage(lastUserEv) : undefined
                           }
