@@ -27,7 +27,7 @@ pub struct LocalRuntimeInfo {
 }
 
 /// Discovers local Node/fnm/nvm/Homebrew/Cargo binary directories so macOS `.app` bundles
-/// can invoke `claude`, `codex`, `gemini`, `opencode`, and `node` without manual PATH configuration.
+/// can invoke `claude`, `codex`, `agy`, `opencode`, and `node` without manual PATH configuration.
 pub fn discover_augmented_path() -> String {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
@@ -166,7 +166,7 @@ pub async fn detect_local_runtimes() -> Vec<LocalRuntimeInfo> {
     let specs = [
         ("claude", "Claude Code"),
         ("codex", "OpenAI Codex"),
-        ("gemini", "Gemini CLI (ACP)"),
+        ("agy", "Google Antigravity CLI (agy)"),
         ("opencode", "OpenCode (ACP)"),
         ("copilot", "GitHub Copilot CLI"),
         ("qwen", "Qwen Code (ACP)"),
@@ -898,15 +898,40 @@ impl AgentSpawner {
                 c.arg(prompt);
                 c
             }
-            AgentProvider::Gemini => {
-                let bin = resolve_cli_binary("gemini").unwrap_or_else(|| PathBuf::from("gemini"));
+            AgentProvider::Antigravity => {
+                let bin = resolve_cli_binary("agy").unwrap_or_else(|| PathBuf::from("agy"));
                 let mut c = Command::new(bin);
-                c.args(["-p", prompt, "--output-format", "stream-json"]);
-                if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-                    c.args(["-m", m]);
+                if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
+                    c.args(["--conversation", rid]);
+                }
+                let effective_prompt = if images.is_empty() {
+                    prompt.to_string()
+                } else {
+                    format!(
+                        "{}\n\n[Attached local image(s) — inspect directly with view_file: {}]",
+                        prompt,
+                        images.join(", ")
+                    )
+                };
+                c.args(["-p", &effective_prompt, "--output-format", "stream-json"]);
+                if let Some(m) = model.filter(|s| {
+                    let t = s.trim();
+                    !t.is_empty() && t != "agy" && t != "agy-default" && t != "acp-gemini-cli"
+                }) {
+                    c.args(["--model", m]);
+                }
+                if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
+                    let mapped_eff = match eff.trim() {
+                        "low" => "low",
+                        "medium" => "medium",
+                        _ => "high",
+                    };
+                    c.args(["--effort", mapped_eff]);
                 }
                 if approval_mode == "auto_edit" || approval_mode == "bypass" {
-                    c.arg("--yolo");
+                    c.arg("--dangerously-skip-permissions");
+                } else {
+                    c.args(["--mode", "accept-edits"]);
                 }
                 c
             }
@@ -978,13 +1003,13 @@ impl AgentSpawner {
                 }
                 c
             }
-            AgentProvider::Gemini => {
-                let bin = resolve_cli_binary("gemini")
+            AgentProvider::Antigravity => {
+                let bin = resolve_cli_binary("agy")
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "gemini".to_string());
+                    .unwrap_or_else(|| "agy".to_string());
                 let mut c = CommandBuilder::new(bin);
                 if !prompt.trim().is_empty() {
-                    c.args(["-p", prompt]);
+                    c.args(["-i", prompt]);
                 }
                 c
             }
@@ -1029,7 +1054,7 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Parses a single stdout line from Claude Code (`stream-json`), OpenAI Codex (`--json`), or other agents into `AgentEvent`s.
+/// Parses a single stdout line from Claude Code (`stream-json`), OpenAI Codex (`--json`), Google Antigravity (`agy --output-format stream-json`), or other agents into `AgentEvent`s.
 pub fn parse_agent_stdout_line(
     session_id: Uuid,
     provider: &AgentProvider,
@@ -1042,6 +1067,232 @@ pub fn parse_agent_stdout_line(
 
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         if let Ok(json) = serde_json::from_str::<Value>(trimmed) {
+            // Google Antigravity CLI (`agy --output-format stream-json`) uses top-level `"event": "init" | "step_update" | "result"`.
+            if json.get("type").is_none() {
+                if let Some(agy_ev) = json.get("event").and_then(|v| v.as_str()) {
+                    let mut events = Vec::new();
+                    match agy_ev {
+                        "init" => {
+                            if let Some(cid) = json
+                                .get("conversation_id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.trim().is_empty())
+                            {
+                                events.push(AgentEvent::ProviderSessionBound {
+                                    session_id,
+                                    provider_session_id: cid.trim().to_string(),
+                                    timestamp: Utc::now(),
+                                });
+                            }
+                            events.push(AgentEvent::ThinkingChunk {
+                                session_id,
+                                delta: String::new(),
+                                replace: false,
+                                timestamp: Utc::now(),
+                            });
+                            return events;
+                        }
+                        "step_update" => {
+                            if let Some(su) = json.get("step_update") {
+                                if let Some(cid) = su
+                                    .get("conversation_id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.trim().is_empty())
+                                {
+                                    events.push(AgentEvent::ProviderSessionBound {
+                                        session_id,
+                                        provider_session_id: cid.trim().to_string(),
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                                let state = su.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                                let step_type =
+                                    su.get("step_type").and_then(|v| v.as_str()).unwrap_or("");
+                                let step_idx =
+                                    su.get("step_index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                                match step_type {
+                                    "user_input" => {}
+                                    "tool" => {
+                                        let tool_id = format!("agy-step-{}", step_idx);
+                                        let tool_name = su
+                                            .get("tool_name")
+                                            .or_else(|| su.pointer("/tool_info/name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("tool")
+                                            .to_string();
+                                        let params = su
+                                            .pointer("/tool_info/parameters")
+                                            .cloned()
+                                            .unwrap_or_else(|| json!({}));
+
+                                        if state == "ACTIVE" {
+                                            events.push(AgentEvent::ToolCallRequested {
+                                                session_id,
+                                                tool_id,
+                                                tool_name,
+                                                arguments: params,
+                                                timestamp: Utc::now(),
+                                            });
+                                        } else if state == "DONE" {
+                                            let out = su
+                                                .pointer("/tool_info/output")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("(completed)")
+                                                .to_string();
+                                            events.push(AgentEvent::ToolCallCompleted {
+                                                session_id,
+                                                tool_id,
+                                                output: out,
+                                                is_error: false,
+                                                timestamp: Utc::now(),
+                                            });
+                                        } else if state == "ERROR" {
+                                            let err_msg = su
+                                                .pointer("/tool_info/error/message")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Tool execution failed")
+                                                .to_string();
+                                            events.push(AgentEvent::ToolCallCompleted {
+                                                session_id,
+                                                tool_id,
+                                                output: err_msg,
+                                                is_error: true,
+                                                timestamp: Utc::now(),
+                                            });
+                                        }
+                                    }
+                                    "agent_response" | "thinking" => {
+                                        if let Some(th) = su
+                                            .get("thinking_delta")
+                                            .or_else(|| su.get("thinking"))
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                        {
+                                            if state == "DONE" && su.get("thinking").is_some() {
+                                                events.push(AgentEvent::ThinkingDelta {
+                                                    session_id,
+                                                    text: th.to_string(),
+                                                    timestamp: Utc::now(),
+                                                });
+                                            } else {
+                                                events.push(AgentEvent::ThinkingChunk {
+                                                    session_id,
+                                                    delta: th.to_string(),
+                                                    replace: false,
+                                                    timestamp: Utc::now(),
+                                                });
+                                            }
+                                        }
+
+                                        let text_delta =
+                                            su.get("text_delta").and_then(|v| v.as_str());
+                                        if let Some(td) = text_delta.filter(|s| !s.is_empty()) {
+                                            events.push(AgentEvent::MessageChunk {
+                                                session_id,
+                                                delta: td.to_string(),
+                                                replace: false,
+                                                timestamp: Utc::now(),
+                                            });
+                                        } else if state == "DONE" && text_delta.is_none() {
+                                            let think_toks = su
+                                                .pointer("/usage/thinking_tokens")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0);
+                                            if think_toks > 0 {
+                                                events.push(AgentEvent::ThinkingDelta {
+                                                    session_id,
+                                                    text: format!(
+                                                        "**Reasoning completed ({} thinking tokens)**",
+                                                        think_toks
+                                                    ),
+                                                    timestamp: Utc::now(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            return events;
+                        }
+                        "result" => {
+                            if let Some(res) = json.get("result") {
+                                if let Some(cid) = res
+                                    .get("conversation_id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.trim().is_empty())
+                                {
+                                    events.push(AgentEvent::ProviderSessionBound {
+                                        session_id,
+                                        provider_session_id: cid.trim().to_string(),
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                                if let Some(usage) = res.get("usage") {
+                                    let in_tok = usage
+                                        .get("input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                        + usage
+                                            .get("cache_read_tokens")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                    let out_tok = usage
+                                        .get("output_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let total_tok = usage
+                                        .get("total_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(in_tok + out_tok);
+                                    if total_tok > 0 {
+                                        events.push(AgentEvent::UsageUpdated {
+                                            session_id,
+                                            input_tokens: in_tok,
+                                            output_tokens: out_tok,
+                                            total_tokens: total_tok,
+                                            cost_usd: 0.0,
+                                            timestamp: Utc::now(),
+                                        });
+                                    }
+                                }
+                                let status =
+                                    res.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                if status == "SUCCESS" {
+                                    if let Some(resp) = res
+                                        .get("response")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.trim().is_empty())
+                                    {
+                                        events.push(AgentEvent::MessageDelta {
+                                            session_id,
+                                            text: resp.to_string(),
+                                            timestamp: Utc::now(),
+                                        });
+                                    }
+                                } else if let Some(err_str) = res
+                                    .get("error")
+                                    .or_else(|| res.get("message"))
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.trim().is_empty())
+                                {
+                                    events.push(AgentEvent::Error {
+                                        session_id,
+                                        error: err_str.to_string(),
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                            }
+                            return events;
+                        }
+                        _ => {
+                            return events;
+                        }
+                    }
+                }
+            }
+
             let mut events = Vec::new();
             let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -1596,7 +1847,7 @@ pub fn parse_agent_stdout_line(
                     }
                     return events;
                 }
-                // OpenCode (`--format json`) & Gemini CLI (`--output-format stream-json`) text/tool events
+                // OpenCode (`--format json`) text/tool events
                 "text" | "message" => {
                     if let Some(sid) = json.get("sessionID").and_then(|v| v.as_str()) {
                         events.push(AgentEvent::ProviderSessionBound {
@@ -1638,6 +1889,14 @@ pub fn parse_agent_stdout_line(
                 }
             }
         }
+    }
+
+    if matches!(provider, AgentProvider::Antigravity) && trimmed.starts_with("jetski:") {
+        return vec![AgentEvent::Error {
+            session_id,
+            error: trimmed.to_string(),
+            timestamp: Utc::now(),
+        }];
     }
 
     vec![AgentEvent::MessageDelta {
@@ -1863,5 +2122,52 @@ mod tests {
             parse_agent_stdout_line(sid, &AgentProvider::Codex, msg_done).first(),
             Some(AgentEvent::MessageDelta { .. })
         ));
+    }
+
+    #[test]
+    fn test_parse_antigravity_agy_stream_json_events() {
+        let sid = Uuid::new_v4();
+        let init_line = r#"{"event":"init","conversation_id":"4f4a7797-aeea-40fe-952c-e2a6643fa38a","init":{"cwd":"/Users/daiyudai/code/velo","permission_mode":"always-proceed"}}"#;
+        let think_done = r#"{"event":"step_update","step_update":{"conversation_id":"4f4a7797-aeea-40fe-952c-e2a6643fa38a","step_index":1,"state":"DONE","step_type":"agent_response","usage":{"thinking_tokens":228,"total_tokens":8468}}}"#;
+        let tool_active = r#"{"event":"step_update","step_update":{"conversation_id":"4f4a7797-aeea-40fe-952c-e2a6643fa38a","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls -la"}}}}"#;
+        let tool_done = r#"{"event":"step_update","step_update":{"conversation_id":"4f4a7797-aeea-40fe-952c-e2a6643fa38a","step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls -la"},"output":"Cargo.toml\n"}}}"#;
+        let text_chunk = r#"{"event":"step_update","step_update":{"conversation_id":"4f4a7797-aeea-40fe-952c-e2a6643fa38a","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"6"}}"#;
+        let result_line = r#"{"event":"result","result":{"conversation_id":"4f4a7797-aeea-40fe-952c-e2a6643fa38a","status":"SUCCESS","response":"6\n","usage":{"input_tokens":100,"output_tokens":10,"cache_read_tokens":50,"total_tokens":160}}}"#;
+
+        let ev_init = parse_agent_stdout_line(sid, &AgentProvider::Antigravity, init_line);
+        assert!(ev_init
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ProviderSessionBound { provider_session_id, .. } if provider_session_id == "4f4a7797-aeea-40fe-952c-e2a6643fa38a")));
+        assert!(ev_init
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ThinkingChunk { .. })));
+
+        let ev_think = parse_agent_stdout_line(sid, &AgentProvider::Antigravity, think_done);
+        assert!(ev_think
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ThinkingDelta { .. })));
+
+        let ev_t_act = parse_agent_stdout_line(sid, &AgentProvider::Antigravity, tool_active);
+        assert!(ev_t_act
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCallRequested { tool_id, tool_name, .. } if tool_id == "agy-step-2" && tool_name == "run_command")));
+
+        let ev_t_done = parse_agent_stdout_line(sid, &AgentProvider::Antigravity, tool_done);
+        assert!(ev_t_done
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCallCompleted { tool_id, is_error: false, .. } if tool_id == "agy-step-2")));
+
+        let ev_chunk = parse_agent_stdout_line(sid, &AgentProvider::Antigravity, text_chunk);
+        assert!(ev_chunk
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageChunk { delta, .. } if delta == "6")));
+
+        let ev_res = parse_agent_stdout_line(sid, &AgentProvider::Antigravity, result_line);
+        assert!(ev_res
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UsageUpdated { total_tokens: 160, .. })));
+        assert!(ev_res
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageDelta { text, .. } if text == "6\n")));
     }
 }

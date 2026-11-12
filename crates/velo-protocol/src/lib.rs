@@ -13,7 +13,8 @@ pub enum AgentProvider {
     Claude,
     Codex,
     OpenCode,
-    Gemini,
+    #[serde(rename = "agy")]
+    Antigravity,
     Copilot,
     Qwen,
     Acp(String),
@@ -60,7 +61,9 @@ impl AgentProvider {
             "claude" | "claude-code" => Self::Claude,
             "codex" | "openai" => Self::Codex,
             "opencode" | "open-code" => Self::OpenCode,
-            "gemini" | "gemini-cli" => Self::Gemini,
+            "agy" | "antigravity" | "antigravity-cli" | "gemini" | "gemini-cli" => {
+                Self::Antigravity
+            }
             "copilot" | "github-copilot" | "gh-copilot" => Self::Copilot,
             "qwen" | "qwen-code" => Self::Qwen,
             _ => Self::Custom(trimmed.to_string()),
@@ -72,7 +75,7 @@ impl AgentProvider {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
-            Self::Gemini => "gemini",
+            Self::Antigravity => "agy",
             Self::Copilot => "copilot",
             Self::Qwen => "qwen",
             Self::Acp(cmd) => cmd.split_whitespace().next().unwrap_or(cmd.as_str()),
@@ -87,7 +90,7 @@ impl fmt::Display for AgentProvider {
             Self::Claude => write!(f, "claude"),
             Self::Codex => write!(f, "codex"),
             Self::OpenCode => write!(f, "opencode"),
-            Self::Gemini => write!(f, "gemini"),
+            Self::Antigravity => write!(f, "agy"),
             Self::Copilot => write!(f, "copilot"),
             Self::Qwen => write!(f, "qwen"),
             Self::Acp(name) => write!(f, "acp:{}", name),
@@ -452,7 +455,12 @@ mod tests {
         let roundtripped: AgentProvider = serde_json::from_str(&serialized).unwrap();
         assert_eq!(roundtripped, p2);
 
-        let p3: AgentProvider = serde_json::from_str("\"gemini\"").unwrap();
-        assert_eq!(p3, AgentProvider::Gemini);
+        let p3: AgentProvider = serde_json::from_str("\"agy\"").unwrap();
+        assert_eq!(p3, AgentProvider::Antigravity);
+        assert_eq!(serde_json::to_string(&p3).unwrap(), "\"agy\"");
+
+        // Legacy persisted sessions with `"gemini"` cleanly map to `AgentProvider::Antigravity`
+        let p_legacy: AgentProvider = serde_json::from_str("\"gemini\"").unwrap();
+        assert_eq!(p_legacy, AgentProvider::Antigravity);
     }
 }

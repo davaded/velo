@@ -201,8 +201,8 @@ export const AutomationsModal: React.FC<AutomationsModalProps> = ({
                 >
                   <option value="claude">Claude Code</option>
                   <option value="codex">OpenAI Codex</option>
+                  <option value="agy">Google Antigravity CLI (agy)</option>
                   <option value="acp:opencode acp">OpenCode (ACP)</option>
-                  <option value="acp:gemini --experimental-acp">Gemini CLI (ACP)</option>
                 </select>
               </div>
             </div>

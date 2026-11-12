@@ -4311,6 +4311,8 @@ export function App() {
                                       ? "Anthropic (Claude Code)"
                                       : family === "OpenAI"
                                       ? "OpenAI / Codex (~/.codex)"
+                                      : family === "Google Antigravity"
+                                      ? "Google Antigravity CLI (agy)"
                                       : family}
                                   </span>
                                   <span className="font-mono text-[10px]">
@@ -4344,7 +4346,10 @@ export function App() {
                                         fetch(`${daemonUrl}/api/sessions/${activeSession.id}`, {
                                           method: "PATCH",
                                           headers: { "Content-Type": "application/json" },
-                                          body: JSON.stringify({ model: m.id }),
+                                          body: JSON.stringify({
+                                            model: m.id,
+                                            provider: m.agentKind,
+                                          }),
                                         }).catch(() => {});
                                         setModelPickerOpen(false);
                                       }}
@@ -5336,7 +5341,7 @@ export function App() {
                   <div>
                     <div className="mb-2 flex items-center justify-between">
                       <label className="text-[11.5px] font-medium text-[var(--v-fg-secondary)]">
-                        CLI &amp; ACP Providers (Claude, Codex, Gemini ACP, OpenCode, Copilot, Qwen)
+                        CLI &amp; ACP Providers (Claude, Codex, Antigravity `agy`, OpenCode, Copilot, Qwen)
                       </label>
                       <button
                         onClick={refreshSessions}

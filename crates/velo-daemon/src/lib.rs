@@ -901,6 +901,40 @@ async fn health_handler() -> impl IntoResponse {
     }))
 }
 
+static AGY_MODELS_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<Vec<(String, String)>>>> =
+    std::sync::OnceLock::new();
+static AGY_MODELS_FETCHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn parse_agy_models_stdout(raw: &str) -> Vec<(String, String)> {
+    let mut parsed = Vec::new();
+    for raw_line in raw.lines() {
+        let clean = raw_line.rsplit('\r').next().unwrap_or(raw_line).trim();
+        if clean.is_empty() || clean.contains("Fetching available models") {
+            continue;
+        }
+        let mut parts = clean.splitn(2, char::is_whitespace);
+        let Some(slug) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !slug
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let label = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(slug);
+        parsed.push((slug.to_string(), label.to_string()));
+    }
+    parsed
+}
+
 async fn list_runtimes_handler() -> impl IntoResponse {
     let runtimes = velo_agent::detect_local_runtimes().await;
     Json(json!({ "runtimes": runtimes }))
@@ -1075,17 +1109,93 @@ async fn list_models_handler() -> impl IntoResponse {
         }
     }
 
-    // 3. ACP & Multi-Provider Catalog (Gemini CLI, OpenCode, GitHub Copilot CLI, Qwen Code)
+    // 3. Google Antigravity CLI (`agy` — https://antigravity.google/cli/install.sh)
+    let agy_bin = velo_agent::resolve_cli_binary("agy");
+    let agy_installed = agy_bin.is_some();
+    let cache_lock = AGY_MODELS_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
+    let cached_agy = cache_lock.read().await.clone();
+
+    if cached_agy.is_none() {
+        if let Some(bin_path) = agy_bin {
+            if !AGY_MODELS_FETCHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tokio::spawn(async move {
+                    let aug_path = velo_agent::discover_augmented_path();
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_secs(12),
+                        Command::new(bin_path)
+                            .arg("models")
+                            .env("PATH", aug_path)
+                            .output(),
+                    )
+                    .await;
+                    if let Ok(Ok(out)) = res {
+                        if out.status.success() {
+                            let parsed =
+                                parse_agy_models_stdout(&String::from_utf8_lossy(&out.stdout));
+                            if !parsed.is_empty() {
+                                let lock =
+                                    AGY_MODELS_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
+                                *lock.write().await = Some(parsed);
+                            }
+                        }
+                    }
+                    AGY_MODELS_FETCHING.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        }
+    }
+
+    let agy_entries: Vec<(String, String)> = cached_agy.unwrap_or_else(|| {
+        vec![
+            (
+                "gemini-4-carbon-high".to_string(),
+                "Gemini 4 Carbon (High)".to_string(),
+            ),
+            (
+                "gemini-4-carbon-medium".to_string(),
+                "Gemini 4 Carbon (Medium)".to_string(),
+            ),
+            (
+                "gemini-4-argon-high".to_string(),
+                "Gemini 4 Argon (High)".to_string(),
+            ),
+            (
+                "gemini-3.8-flash-high".to_string(),
+                "Gemini 3.8 Flash (High)".to_string(),
+            ),
+            (
+                "gpt-oss-120b-medium".to_string(),
+                "GPT-OSS 120B (Medium)".to_string(),
+            ),
+        ]
+    });
+
+    for (idx, (slug, display)) in agy_entries.into_iter().enumerate() {
+        if seen_ids.insert(slug.clone()) {
+            let short_lbl = display
+                .replace(" (Medium)", "")
+                .replace(" (High)", " High")
+                .replace(" (Low)", " Low");
+            models.push(json!({
+                "id": slug,
+                "label": display,
+                "shortLabel": short_lbl,
+                "family": "Google Antigravity",
+                "agentKind": "agy",
+                "runtimeId": "agy",
+                "installed": agy_installed,
+                "desc": if agy_installed {
+                    "Installed · Google Antigravity CLI (`agy --output-format stream-json`)"
+                } else {
+                    "Install via `curl -fsSL https://antigravity.google/cli/install.sh | bash`"
+                },
+                "isDefault": idx == 0,
+            }));
+        }
+    }
+
+    // 4. ACP & Multi-Provider Catalog (OpenCode, GitHub Copilot CLI, Qwen Code)
     let acp_catalog = [
-        (
-            "acp-gemini-cli",
-            "Gemini CLI (ACP)",
-            "Gemini ACP",
-            "ACP · Google",
-            "acp:gemini --experimental-acp",
-            "gemini",
-            "Agent Client Protocol stdio integration for Gemini CLI",
-        ),
         (
             "acp-opencode",
             "OpenCode (ACP)",
@@ -1316,6 +1426,7 @@ async fn delete_session_handler(
 #[derive(Debug, serde::Deserialize)]
 struct UpdateSessionRequest {
     name: Option<String>,
+    provider: Option<AgentProvider>,
     model: Option<String>,
     effort: Option<String>,
     approval_mode: Option<String>,
@@ -1332,6 +1443,12 @@ async fn update_session_handler(
         if let Some(s) = guard.sessions.get_mut(&id) {
             if let Some(name) = req.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
                 s.name = name;
+            }
+            if let Some(new_prov) = req.provider {
+                if s.provider != new_prov {
+                    s.provider = new_prov;
+                    s.provider_session_id = None;
+                }
             }
             if let Some(model) = req.model {
                 s.model = if model.trim().is_empty() {
@@ -1952,7 +2069,15 @@ impl DaemonState {
             anyhow::bail!("Session not found");
         };
 
-        let target_provider = req.provider.clone().unwrap_or_else(|| session.provider.clone());
+        let target_provider = req.provider.clone().unwrap_or_else(|| {
+            if let Some(ref m) = req.model {
+                let ml = m.to_lowercase();
+                if ml.starts_with("gemini-") || ml.starts_with("gpt-oss-") || ml == "agy" {
+                    return AgentProvider::Antigravity;
+                }
+            }
+            session.provider.clone()
+        });
         let can_resume_native = req.truncate_to_user_turn.is_none()
             && !req.reset_thread
             && target_provider == session.provider;
@@ -3254,11 +3379,11 @@ pub async fn handle_mcp_request_for_session(
                     },
                     {
                         "name": "velo_spawn_agent",
-                        "description": "Spawn a new coding agent (claude, codex, opencode, gemini, acp:...) inside an isolated Git worktree",
+                        "description": "Spawn a new coding agent (claude, codex, agy, opencode, acp:...) inside an isolated Git worktree",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "provider": { "type": "string", "description": "claude, codex, opencode, gemini, or acp:<cmd>" },
+                                "provider": { "type": "string", "description": "claude, codex, agy, opencode, or acp:<cmd>" },
                                 "prompt": { "type": "string", "description": "Task instructions" },
                                 "repo_path": { "type": "string", "description": "Repository root path" },
                                 "branch": { "type": "string", "description": "Branch name" }

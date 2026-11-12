@@ -199,6 +199,11 @@ pub fn spawn_daemon_e2ee_bridge(state: DaemonState, ticket: PairingTicket) {
                                         .get("approval_mode")
                                         .and_then(|v| v.as_str())
                                         .map(str::to_string);
+                                    let provider = cmd_val
+                                        .get("provider")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.trim().is_empty())
+                                        .map(AgentProvider::from_str_loose);
                                     let _ = state
                                         .dispatch_session_input(
                                             sid,
@@ -206,7 +211,7 @@ pub fn spawn_daemon_e2ee_bridge(state: DaemonState, ticket: PairingTicket) {
                                                 input: inp.to_string(),
                                                 model,
                                                 effort,
-                                                provider: None,
+                                                provider,
                                                 reset_thread: false,
                                                 truncate_to_user_turn: None,
                                                 images: Vec::new(),
@@ -251,13 +256,7 @@ pub fn spawn_daemon_e2ee_bridge(state: DaemonState, ticket: PairingTicket) {
                                     .get("provider")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("claude");
-                                let provider = match provider_raw {
-                                    "codex" => AgentProvider::Codex,
-                                    p if p.starts_with("acp:") => {
-                                        AgentProvider::Acp(p.trim_start_matches("acp:").to_string())
-                                    }
-                                    _ => AgentProvider::Claude,
-                                };
+                                let provider = AgentProvider::from_str_loose(provider_raw);
                                 let req = CreateSessionRequest {
                                     name: cmd_val
                                         .get("name")

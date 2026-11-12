@@ -127,7 +127,13 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
             return branch
         }()
 
-        let defaultModel = agentKind == "codex" ? "gpt-6.1-sol" : "claude-fable-5-2"
+        let defaultModel: String = {
+            if agentKind == "codex" { return "gpt-6.1-sol" }
+            if agentKind == "agy" || agentKind.contains("antigravity") || agentKind.contains("gemini") {
+                return "gemini-4-carbon-high"
+            }
+            return "claude-fable-5-2"
+        }()
         let model = (dict["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? defaultModel
         let modelShort = VeloModelOption.shortLabel(for: model)
         let effort = (dict["effort"] as? String) ?? (agentKind == "codex" ? "high" : "medium")
@@ -216,6 +222,20 @@ public struct VeloModelOption: Identifiable, Equatable, Sendable {
             shortLabel: "GPT-6.1-Sol",
             family: "OpenAI",
             agentKind: "codex"
+        ),
+        VeloModelOption(
+            id: "gemini-4-carbon-high",
+            label: "Gemini 4 Carbon (Antigravity agy)",
+            shortLabel: "Gemini 4 Carbon High",
+            family: "Google Antigravity",
+            agentKind: "agy"
+        ),
+        VeloModelOption(
+            id: "gemini-3.8-flash-high",
+            label: "Gemini 3.8 Flash (Antigravity agy)",
+            shortLabel: "Gemini 3.8 Flash",
+            family: "Google Antigravity",
+            agentKind: "agy"
         ),
     ]
 
@@ -337,14 +357,25 @@ public enum VeloFormatting {
         output: String?
     ) -> (displayName: String, workingVerb: String, summary: String, iconSystemName: String) {
         let lower = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let command = (argsDict?["command"] as? String) ?? (argsDict?["cmd"] as? String) ?? ""
+        let command = (argsDict?["command"] as? String)
+            ?? (argsDict?["CommandLine"] as? String)
+            ?? (argsDict?["cmd"] as? String)
+            ?? ""
         let rawPath = (argsDict?["file_path"] as? String)
             ?? (argsDict?["path"] as? String)
+            ?? (argsDict?["Path"] as? String)
+            ?? (argsDict?["TargetFile"] as? String)
+            ?? (argsDict?["AbsolutePath"] as? String)
+            ?? (argsDict?["DirectoryPath"] as? String)
             ?? (argsDict?["target"] as? String)
             ?? ""
         let shortPath = rawPath.split(separator: "/").suffix(2).joined(separator: "/")
 
-        var query = (argsDict?["pattern"] as? String) ?? (argsDict?["query"] as? String) ?? ""
+        var query = (argsDict?["pattern"] as? String)
+            ?? (argsDict?["Pattern"] as? String)
+            ?? (argsDict?["query"] as? String)
+            ?? (argsDict?["Query"] as? String)
+            ?? ""
         if query.isEmpty, let output {
             let firstLine = output.components(separatedBy: .newlines).first ?? ""
             if firstLine.lowercased().hasPrefix("searched:") {

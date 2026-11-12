@@ -1,8 +1,8 @@
 export type AgentKind =
   | "claude"
   | "codex"
+  | "agy"
   | "opencode"
-  | "gemini"
   | "copilot"
   | "qwen"
   | string;
@@ -13,8 +13,8 @@ export interface ModelOption {
   id: string;
   label: string;
   shortLabel: string;
-  family: "Anthropic" | "OpenAI" | "Google" | string;
-  runtimeId: "claude" | "codex" | "gemini" | "opencode" | "copilot" | "qwen" | string;
+  family: "Anthropic" | "OpenAI" | "Google Antigravity" | string;
+  runtimeId: "claude" | "codex" | "agy" | "opencode" | "copilot" | "qwen" | string;
   agentKind: AgentKind;
   desc: string;
   installed?: boolean;
@@ -188,16 +188,54 @@ export const MODEL_CATALOG: ModelOption[] = [
     agentKind: "codex",
     desc: "Grok 4.6 coding and reasoning model via Codex CLI",
   },
-  // ACP (Agent Client Protocol) & Multi-Provider Ecosystem
+  // Google Antigravity CLI (`agy` — curl -fsSL https://antigravity.google/cli/install.sh | bash)
   {
-    id: "acp-gemini-cli",
-    label: "Gemini CLI (ACP)",
-    shortLabel: "Gemini ACP",
-    family: "ACP · Google",
-    runtimeId: "gemini",
-    agentKind: "acp:gemini --experimental-acp",
-    desc: "Agent Client Protocol JSON-RPC stdio integration for Gemini CLI",
+    id: "gemini-4-carbon-high",
+    label: "Gemini 4 Carbon (High)",
+    shortLabel: "Gemini 4 Carbon High",
+    family: "Google Antigravity",
+    runtimeId: "agy",
+    agentKind: "agy",
+    desc: "Google Antigravity CLI (`agy`) · Gemini 4 Carbon flagship coding & reasoning",
+    isDefault: true,
   },
+  {
+    id: "gemini-4-carbon-medium",
+    label: "Gemini 4 Carbon (Medium)",
+    shortLabel: "Gemini 4 Carbon",
+    family: "Google Antigravity",
+    runtimeId: "agy",
+    agentKind: "agy",
+    desc: "Google Antigravity CLI (`agy`) · Balanced speed and reasoning depth",
+  },
+  {
+    id: "gemini-4-argon-high",
+    label: "Gemini 4 Argon (High)",
+    shortLabel: "Gemini 4 Argon High",
+    family: "Google Antigravity",
+    runtimeId: "agy",
+    agentKind: "agy",
+    desc: "Google Antigravity CLI (`agy`) · Gemini 4 Argon high-effort reasoning",
+  },
+  {
+    id: "gemini-3.8-flash-high",
+    label: "Gemini 3.8 Flash (High)",
+    shortLabel: "Gemini 3.8 Flash",
+    family: "Google Antigravity",
+    runtimeId: "agy",
+    agentKind: "agy",
+    desc: "Google Antigravity CLI (`agy`) · Low-latency Flash agentic execution",
+  },
+  {
+    id: "gpt-oss-120b-medium",
+    label: "GPT-OSS 120B (Medium)",
+    shortLabel: "GPT-OSS 120B",
+    family: "Google Antigravity",
+    runtimeId: "agy",
+    agentKind: "agy",
+    desc: "Google Antigravity CLI (`agy`) · Open-weight 120B coding model",
+  },
+  // ACP (Agent Client Protocol) & Multi-Provider Ecosystem
   {
     id: "acp-opencode",
     label: "OpenCode (ACP)",
@@ -399,10 +437,10 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     r.model ??
       (agentKind === "codex"
         ? "gpt-6.1-sol"
+        : agentKind === "agy" || agentKind.includes("antigravity") || agentKind.includes("gemini")
+        ? "gemini-4-carbon-high"
         : agentKind.includes("opencode")
         ? "acp-opencode"
-        : agentKind.includes("gemini")
-        ? "acp-gemini-cli"
         : agentKind.includes("copilot")
         ? "acp-copilot"
         : agentKind.includes("qwen")
@@ -440,8 +478,8 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
       foundModel?.shortLabel ??
       (agentKind === "codex"
         ? "GPT-6.1-Sol"
-        : agentKind.includes("gemini")
-        ? "Gemini ACP"
+        : agentKind === "agy" || agentKind.includes("antigravity") || agentKind.includes("gemini")
+        ? "Gemini 4 Carbon High"
         : agentKind.includes("opencode")
         ? "OpenCode"
         : "Claude Fable 5.2"),

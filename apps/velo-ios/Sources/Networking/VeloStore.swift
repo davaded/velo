@@ -293,12 +293,17 @@ public final class VeloStore: ObservableObject {
         list.append(userItem)
         eventsBySession[sessionId] = list
 
+        let matchedOpt = models.first(where: { $0.id == model })
         if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[idx].status = .running
             sessions[idx].model = model
-            sessions[idx].modelShort = models.first(where: { $0.id == model })?.shortLabel ?? VeloModelOption.shortLabel(for: model)
+            sessions[idx].modelShort = matchedOpt?.shortLabel ?? VeloModelOption.shortLabel(for: model)
+            if let ak = matchedOpt?.agentKind, !ak.isEmpty {
+                sessions[idx].agentKind = ak
+            }
             sessions[idx].effort = effort
         }
+        let providerKind = matchedOpt?.agentKind ?? sessions.first(where: { $0.id == sessionId })?.agentKind ?? "claude"
         triggerHaptic(.light)
 
         switch connectionConfig {
@@ -311,6 +316,7 @@ public final class VeloStore: ObservableObject {
                 "input": clean,
                 "model": model,
                 "effort": effort,
+                "provider": providerKind,
                 "approval_mode": approvalMode,
             ]
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -323,6 +329,7 @@ public final class VeloStore: ObservableObject {
                 "input": clean,
                 "model": model,
                 "effort": effort,
+                "provider": providerKind,
                 "approval_mode": approvalMode,
             ])
         case .none:
@@ -349,7 +356,7 @@ public final class VeloStore: ObservableObject {
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             var body: [String: Any] = [
-                "provider": modelOption.agentKind == "codex" ? "codex" : "claude",
+                "provider": modelOption.agentKind.isEmpty ? "claude" : modelOption.agentKind,
                 "prompt": cleanPrompt,
                 "repo_path": repoPath,
                 "model": modelOption.id,
@@ -388,7 +395,7 @@ public final class VeloStore: ObservableObject {
         case .e2eeRelay:
             var payload: [String: Any] = [
                 "cmd": "create_session",
-                "provider": modelOption.agentKind == "codex" ? "codex" : "claude",
+                "provider": modelOption.agentKind.isEmpty ? "claude" : modelOption.agentKind,
                 "prompt": cleanPrompt,
                 "repo_path": repoPath,
                 "model": modelOption.id,

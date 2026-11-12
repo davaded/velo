@@ -710,16 +710,23 @@ export function resolvePaseoToolPresentation(
   const filePath =
     (inputObj.file_path as string) ||
     (inputObj.path as string) ||
+    (inputObj.Path as string) ||
+    (inputObj.TargetFile as string) ||
+    (inputObj.AbsolutePath as string) ||
+    (inputObj.DirectoryPath as string) ||
     (inputObj.file as string) ||
     (inputObj.target as string) ||
     undefined;
   const command =
     (inputObj.command as string) ||
+    (inputObj.CommandLine as string) ||
     (inputObj.cmd as string) ||
     (typeof input === "string" ? input : undefined);
   let query =
     (inputObj.pattern as string) ||
+    (inputObj.Pattern as string) ||
     (inputObj.query as string) ||
+    (inputObj.Query as string) ||
     undefined;
 
   if ((!query || !query.trim()) && output && output.startsWith("Searched:")) {
@@ -730,7 +737,12 @@ export function resolvePaseoToolPresentation(
     ? filePath.replace(/^\/Users\/[^/]+\/code\/[^/]+\//, "")
     : undefined;
 
-  if (lower.includes("bash") || lower.includes("shell") || lower.includes("cmd")) {
+  if (
+    lower.includes("bash") ||
+    lower.includes("shell") ||
+    lower.includes("cmd") ||
+    lower.includes("command")
+  ) {
     return {
       displayName: "Shell",
       workingVerb: "Running command",
@@ -740,7 +752,7 @@ export function resolvePaseoToolPresentation(
       command: command || "",
     };
   }
-  if (lower.includes("read") || lower.includes("view")) {
+  if (lower.includes("read") || lower.includes("view") || lower === "list_dir") {
     return {
       displayName: "Read",
       workingVerb: shortPath ? `Reading ${shortPath}` : "Reading file",
