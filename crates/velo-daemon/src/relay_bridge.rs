@@ -1,15 +1,19 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
 use tracing::{info, warn};
 use uuid::Uuid;
-use velo_protocol::{SessionInfo, SessionInputRequest, WsServerMessage};
+use velo_protocol::{
+    AgentProvider, CreateSessionRequest, SessionInfo, SessionInputRequest, WsServerMessage,
+};
 use velo_relay::{
     DEFAULT_RELAY_PORT, EncryptedRelayFrame, PairingTicket, build_encrypted_frame, open_payload,
     run_relay_server,
 };
+use velo_worktree::WorktreeManager;
 
 use crate::DaemonState;
 
@@ -217,6 +221,115 @@ pub fn spawn_daemon_e2ee_bridge(state: DaemonState, ticket: PairingTicket) {
                             if let Some(sid_s) = cmd_val.get("session_id").and_then(|v| v.as_str()) {
                                 if let Ok(sid) = Uuid::parse_str(sid_s) {
                                     state.stop_session_by_id(sid).await;
+                                }
+                            }
+                        }
+                        "create_session" => {
+                            let prompt = cmd_val
+                                .get("prompt")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            if !prompt.is_empty() {
+                                let fallback_repo = {
+                                    let guard = state.inner.read().await;
+                                    guard
+                                        .sessions
+                                        .values()
+                                        .next()
+                                        .map(|s| s.repo_root.clone())
+                                        .unwrap_or_else(|| "/Users/daiyudai/code/velo".to_string())
+                                };
+                                let repo_path = cmd_val
+                                    .get("repo_path")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.trim().is_empty())
+                                    .map(str::to_string)
+                                    .unwrap_or(fallback_repo);
+                                let provider_raw = cmd_val
+                                    .get("provider")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("claude");
+                                let provider = match provider_raw {
+                                    "codex" => AgentProvider::Codex,
+                                    p if p.starts_with("acp:") => {
+                                        AgentProvider::Acp(p.trim_start_matches("acp:").to_string())
+                                    }
+                                    _ => AgentProvider::Claude,
+                                };
+                                let req = CreateSessionRequest {
+                                    name: cmd_val
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string),
+                                    provider,
+                                    prompt,
+                                    repo_path,
+                                    branch: cmd_val
+                                        .get("branch")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string),
+                                    use_pty: false,
+                                    parent_session_id: None,
+                                    model: cmd_val
+                                        .get("model")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string),
+                                    effort: cmd_val
+                                        .get("effort")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string),
+                                    images: Vec::new(),
+                                    approval_mode: cmd_val
+                                        .get("approval_mode")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string),
+                                    setup_command: None,
+                                };
+                                if state.create_session(req).await.is_ok() {
+                                    let guard = state.inner.read().await;
+                                    let mut sessions: Vec<SessionInfo> =
+                                        guard.sessions.values().cloned().collect();
+                                    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                    if let Ok(snap) = serde_json::to_value(
+                                        WsServerMessage::SessionsSnapshot { sessions },
+                                    ) {
+                                        if let Some(frame_txt) = send_sealed(&snap, &mut out_nonce) {
+                                            let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "get_diff" => {
+                            if let Some(sid_s) = cmd_val.get("session_id").and_then(|v| v.as_str()) {
+                                if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                    let wt_opt = {
+                                        let guard = state.inner.read().await;
+                                        guard.sessions.get(&sid).map(|s| s.worktree_path.clone())
+                                    };
+                                    if let Some(wt_str) = wt_opt {
+                                        let wt_path = Path::new(&wt_str);
+                                        let stats = WorktreeManager::compute_diff_stats(wt_path)
+                                            .await
+                                            .unwrap_or_default();
+                                        let diff = WorktreeManager::get_unified_diff(wt_path)
+                                            .await
+                                            .unwrap_or_default();
+                                        let diff_snap = json!({
+                                            "type": "diff_snapshot",
+                                            "session_id": sid,
+                                            "stats": stats,
+                                            "diff": diff,
+                                        });
+                                        if let Some(frame_txt) =
+                                            send_sealed(&diff_snap, &mut out_nonce)
+                                        {
+                                            let _ =
+                                                writer.send(WsMsg::Text(frame_txt.into())).await;
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -1,0 +1,382 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		00EF0E4CAD7E2FEBB6F1E847 /* VeloStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC020058B3917BAE9C4C26A5 /* VeloStore.swift */; };
+		3D1D5B782183B9D7E501EA24 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = E7494E1C76CB80854A3CFA09 /* Assets.xcassets */; };
+		43C9F9C5CA2C460BEB9DF8A0 /* VeloModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B23793B28F46BDB8C60A104 /* VeloModels.swift */; };
+		50FFA3CFDF1E34DD3EA7133E /* ShimmerAndStatusViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = E13A632532CFAE5CC49E17CB /* ShimmerAndStatusViews.swift */; };
+		66FFAD59E86DAA8A5D79E025 /* ChatThreadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D828B8E5BF84F0E2643BE12B /* ChatThreadView.swift */; };
+		97D055905EB279BECD30AE6E /* RootSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */; };
+		C2256A61C8C4F603B293EDF5 /* QRScannerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D65ECD2C5F1E76064D249E2D /* QRScannerSheet.swift */; };
+		C4B831DBDF9BB144D624EEE3 /* VeloMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79284B976E54269E8F2EB68C /* VeloMobileApp.swift */; };
+		E97A462096D560AACC4C4D15 /* E2EERelayCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = EACCFB84DE2C81BDE5B763D5 /* E2EERelayCrypto.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootSessionsView.swift; sourceTree = "<group>"; };
+		4B23793B28F46BDB8C60A104 /* VeloModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloModels.swift; sourceTree = "<group>"; };
+		79284B976E54269E8F2EB68C /* VeloMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloMobileApp.swift; sourceTree = "<group>"; };
+		CC020058B3917BAE9C4C26A5 /* VeloStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloStore.swift; sourceTree = "<group>"; };
+		D65ECD2C5F1E76064D249E2D /* QRScannerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerSheet.swift; sourceTree = "<group>"; };
+		D828B8E5BF84F0E2643BE12B /* ChatThreadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatThreadView.swift; sourceTree = "<group>"; };
+		E13A632532CFAE5CC49E17CB /* ShimmerAndStatusViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShimmerAndStatusViews.swift; sourceTree = "<group>"; };
+		E7494E1C76CB80854A3CFA09 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		EACCFB84DE2C81BDE5B763D5 /* E2EERelayCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = E2EERelayCrypto.swift; sourceTree = "<group>"; };
+		F54844DBA9A803062867CFC0 /* VeloMobile.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VeloMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		0652BC15800B61DFD7B7BB34 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F54844DBA9A803062867CFC0 /* VeloMobile.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		7DF8E058957E8E14BB047170 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				D828B8E5BF84F0E2643BE12B /* ChatThreadView.swift */,
+				D65ECD2C5F1E76064D249E2D /* QRScannerSheet.swift */,
+				1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */,
+				E13A632532CFAE5CC49E17CB /* ShimmerAndStatusViews.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		967F79521E40624C830B8153 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				4B23793B28F46BDB8C60A104 /* VeloModels.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		BF639AECBA2A47ABE4E80AB6 = {
+			isa = PBXGroup;
+			children = (
+				E7494E1C76CB80854A3CFA09 /* Assets.xcassets */,
+				C2A88D1CEB50F914729DD9E3 /* Sources */,
+				0652BC15800B61DFD7B7BB34 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		C2A88D1CEB50F914729DD9E3 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				79284B976E54269E8F2EB68C /* VeloMobileApp.swift */,
+				EC536DFDE18BF74BD03605F4 /* Crypto */,
+				967F79521E40624C830B8153 /* Models */,
+				D3C784906D8D66941735FB50 /* Networking */,
+				7DF8E058957E8E14BB047170 /* Views */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		D3C784906D8D66941735FB50 /* Networking */ = {
+			isa = PBXGroup;
+			children = (
+				CC020058B3917BAE9C4C26A5 /* VeloStore.swift */,
+			);
+			path = Networking;
+			sourceTree = "<group>";
+		};
+		EC536DFDE18BF74BD03605F4 /* Crypto */ = {
+			isa = PBXGroup;
+			children = (
+				EACCFB84DE2C81BDE5B763D5 /* E2EERelayCrypto.swift */,
+			);
+			path = Crypto;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		37829F5DBB82079F6A39FB35 /* VeloMobile */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0B10971F3E3104CCF741E895 /* Build configuration list for PBXNativeTarget "VeloMobile" */;
+			buildPhases = (
+				56AB15BD38DB91D8B5ECB28E /* Sources */,
+				649C3AD76D5C744ECCDD42F5 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = VeloMobile;
+			packageProductDependencies = (
+			);
+			productName = VeloMobile;
+			productReference = F54844DBA9A803062867CFC0 /* VeloMobile.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		279B808EB872311CFD08F8C4 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					37829F5DBB82079F6A39FB35 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = F8864A57A67DF7996F05F77C /* Build configuration list for PBXProject "VeloMobile" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = BF639AECBA2A47ABE4E80AB6;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 0652BC15800B61DFD7B7BB34 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				37829F5DBB82079F6A39FB35 /* VeloMobile */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		649C3AD76D5C744ECCDD42F5 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3D1D5B782183B9D7E501EA24 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		56AB15BD38DB91D8B5ECB28E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				66FFAD59E86DAA8A5D79E025 /* ChatThreadView.swift in Sources */,
+				E97A462096D560AACC4C4D15 /* E2EERelayCrypto.swift in Sources */,
+				C2256A61C8C4F603B293EDF5 /* QRScannerSheet.swift in Sources */,
+				97D055905EB279BECD30AE6E /* RootSessionsView.swift in Sources */,
+				50FFA3CFDF1E34DD3EA7133E /* ShimmerAndStatusViews.swift in Sources */,
+				C4B831DBDF9BB144D624EEE3 /* VeloMobileApp.swift in Sources */,
+				43C9F9C5CA2C460BEB9DF8A0 /* VeloModels.swift in Sources */,
+				00EF0E4CAD7E2FEBB6F1E847 /* VeloStore.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		17229218FBF737F48C427A9A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Velo;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.velo.mobile;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		45F33FCA9F1B0D41E43FFCD9 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.2.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.10;
+			};
+			name = Debug;
+		};
+		BA093B2854510A96BE88D754 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.2.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.10;
+			};
+			name = Release;
+		};
+		E1CDEEAE7F6DDF4AA6AF3E61 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Velo;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.velo.mobile;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0B10971F3E3104CCF741E895 /* Build configuration list for PBXNativeTarget "VeloMobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				17229218FBF737F48C427A9A /* Debug */,
+				E1CDEEAE7F6DDF4AA6AF3E61 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		F8864A57A67DF7996F05F77C /* Build configuration list for PBXProject "VeloMobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				45F33FCA9F1B0D41E43FFCD9 /* Debug */,
+				BA093B2854510A96BE88D754 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 279B808EB872311CFD08F8C4 /* Project object */;
+}
