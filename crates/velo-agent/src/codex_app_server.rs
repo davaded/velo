@@ -10,7 +10,10 @@ use tracing::{debug, info};
 use uuid::Uuid;
 use velo_protocol::{AgentEvent, SessionStatus};
 
-use crate::{AgentHandle, acp::request_daemon_approval, discover_augmented_path, resolve_cli_binary};
+use crate::{
+    AgentHandle, acp::request_daemon_approval, apply_proxy_env_tokio, discover_augmented_path,
+    is_cli_auth_error_text, resolve_cli_binary,
+};
 
 /// Spawns `codex app-server` over JSON-RPC 2.0 stdio (the native protocol used by Codex Desktop & Paseo).
 /// Streams real-time token-by-token `item/agentMessage/delta`, `item/reasoning/summaryTextDelta`,
@@ -47,6 +50,7 @@ pub async fn spawn_codex_app_server(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_proxy_env_tokio(&mut cmd);
     #[cfg(unix)]
     cmd.process_group(0);
 
@@ -84,13 +88,26 @@ pub async fn spawn_codex_app_server(
         timestamp: Utc::now(),
     });
 
-    // Drain stderr cleanly for debug logging without polluting chat stream
+    // Drain stderr cleanly for debug logging and surface any Codex auth failures immediately
+    let tx_stderr = event_tx.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
+        let mut sent_auth = false;
         while let Ok(Some(line)) = lines.next_line().await {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 debug!("[codex-app-server:{}] stderr: {}", session_id, trimmed);
+                if !sent_auth && is_cli_auth_error_text(trimmed) {
+                    sent_auth = true;
+                    let _ = tx_stderr.send(AgentEvent::Error {
+                        session_id,
+                        error: format!(
+                            "[AUTH_REQUIRED|codex|codex login|] OpenAI Codex CLI 需要重新登录认证：{}",
+                            trimmed
+                        ),
+                        timestamp: Utc::now(),
+                    });
+                }
             }
         }
     });

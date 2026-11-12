@@ -6,7 +6,10 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -150,6 +153,160 @@ pub fn resolve_cli_binary(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Discovers active HTTP/HTTPS/SOCKS proxy from environment or live macOS system settings (`scutil --proxy`).
+/// Ensures `launchd` background daemon subprocesses (`agy`, `claude`, `codex`, `grok`, `cursor-agent`)
+/// seamlessly reach OAuth / model endpoints while bypassing proxy for local `127.0.0.1` MCP callbacks.
+pub fn discover_system_proxy_url() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            let t = val.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("/usr/sbin/scutil")
+            .arg("--proxy")
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut http_enable = false;
+                let mut http_host = String::new();
+                let mut http_port = String::new();
+                let mut https_enable = false;
+                let mut https_host = String::new();
+                let mut https_port = String::new();
+                let mut socks_enable = false;
+                let mut socks_host = String::new();
+                let mut socks_port = String::new();
+
+                for line in text.lines() {
+                    let Some((k, v)) = line.split_once(':') else {
+                        continue;
+                    };
+                    let key = k.trim();
+                    let val = v.trim();
+                    match key {
+                        "HTTPEnable" => http_enable = val == "1",
+                        "HTTPProxy" => http_host = val.to_string(),
+                        "HTTPPort" => http_port = val.to_string(),
+                        "HTTPSEnable" => https_enable = val == "1",
+                        "HTTPSProxy" => https_host = val.to_string(),
+                        "HTTPSPort" => https_port = val.to_string(),
+                        "SOCKSEnable" => socks_enable = val == "1",
+                        "SOCKSProxy" => socks_host = val.to_string(),
+                        "SOCKSPort" => socks_port = val.to_string(),
+                        _ => {}
+                    }
+                }
+
+                if https_enable && !https_host.is_empty() && !https_port.is_empty() {
+                    return Some(format!("http://{}:{}", https_host, https_port));
+                }
+                if http_enable && !http_host.is_empty() && !http_port.is_empty() {
+                    return Some(format!("http://{}:{}", http_host, http_port));
+                }
+                if socks_enable && !socks_host.is_empty() && !socks_port.is_empty() {
+                    return Some(format!("socks5://{}:{}", socks_host, socks_port));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn apply_proxy_env_tokio(cmd: &mut Command) {
+    if let Some(proxy_url) = discover_system_proxy_url() {
+        let no_proxy = "localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8";
+        cmd.env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env("NO_PROXY", no_proxy)
+            .env("no_proxy", no_proxy);
+    }
+}
+
+fn apply_proxy_env_pty(cmd: &mut CommandBuilder) {
+    if let Some(proxy_url) = discover_system_proxy_url() {
+        let no_proxy = "localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8";
+        cmd.env("HTTP_PROXY", &proxy_url);
+        cmd.env("http_proxy", &proxy_url);
+        cmd.env("HTTPS_PROXY", &proxy_url);
+        cmd.env("https_proxy", &proxy_url);
+        cmd.env("ALL_PROXY", &proxy_url);
+        cmd.env("all_proxy", &proxy_url);
+        cmd.env("NO_PROXY", no_proxy);
+        cmd.env("no_proxy", no_proxy);
+    }
+}
+
+pub fn is_cli_auth_error_text(text: &str) -> bool {
+    let l = text.to_lowercase();
+    l.contains("authentication required")
+        || l.contains("not authenticated")
+        || l.contains("authentication failed")
+        || l.contains("authentication timed out")
+        || l.contains("please visit the url to log in")
+        || l.contains("accounts.google.com/o/oauth2/auth")
+        || l.contains("agent login")
+        || l.contains("cursor-agent login")
+        || l.contains("claude login")
+        || l.contains("claude auth login")
+        || l.contains("codex login")
+        || l.contains("grok login")
+        || l.contains("please run /login")
+        || l.contains("please run '/login'")
+        || l.contains("api_key environment variable")
+        || l.contains("missing api key")
+        || l.contains("invalid api key")
+        || l.contains("401 unauthorized")
+        || l.contains("oauth token has expired")
+        || l.contains("re-authenticate")
+}
+
+pub fn provider_auth_metadata(provider: &AgentProvider) -> (&'static str, &'static str, &'static str) {
+    match provider {
+        AgentProvider::Antigravity => ("agy", "Google Antigravity CLI (agy)", "agy -i hi"),
+        AgentProvider::Cursor => ("cursor", "Cursor Agent CLI", "cursor-agent login"),
+        AgentProvider::Claude => ("claude", "Claude Code", "claude auth login"),
+        AgentProvider::Codex => ("codex", "OpenAI Codex CLI", "codex login"),
+        AgentProvider::Grok => ("grok", "xAI Grok CLI", "grok"),
+        AgentProvider::OpenCode => ("opencode", "OpenCode CLI", "opencode auth login"),
+        AgentProvider::Copilot => ("copilot", "GitHub Copilot CLI", "copilot auth login"),
+        AgentProvider::Qwen => ("qwen", "Qwen Code CLI", "qwen"),
+        AgentProvider::Acp(_) | AgentProvider::Custom(_) => ("custom", "Agent CLI", "请先在终端完成对应 CLI 登录"),
+    }
+}
+
+fn extract_https_url_from_text(s: &str) -> Option<String> {
+    let idx = s.find("https://")?;
+    let rest = &s[idx..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '>' || c == ')')
+        .unwrap_or(rest.len());
+    let u = rest[..end].trim();
+    if u.len() > 10 {
+        Some(u.to_string())
+    } else {
+        None
+    }
 }
 
 /// Discovers active `CLAUDE_CODE_OAUTH_TOKEN` from the user's running Claude Desktop / Claude Code session
@@ -495,21 +652,50 @@ impl AgentSpawner {
         let (input_tx, _input_rx) = mpsc::unbounded_channel::<String>();
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
 
+        let emitted_error = Arc::new(AtomicBool::new(false));
+        let saw_assistant_output = Arc::new(AtomicBool::new(false));
+        let recent_stderr: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
         // Parse stdout lines (Claude stream-json, Codex --json, Grok, Cursor, Antigravity)
         let tx_out = event_tx.clone();
         let provider_clone = provider.clone();
+        let emitted_err_out = Arc::clone(&emitted_error);
+        let saw_out_flag = Arc::clone(&saw_assistant_output);
         let stdout_task = tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stdout).lines();
             let mut saw_message_delta = false;
             while let Ok(Some(line)) = reader.next_line().await {
                 let parsed = parse_agent_stdout_line(session_id, &provider_clone, &line);
                 for ev in &parsed {
-                    if matches!(ev, AgentEvent::MessageDelta { .. }) {
-                        saw_message_delta = true;
+                    match ev {
+                        AgentEvent::MessageDelta { .. } | AgentEvent::MessageChunk { .. } => {
+                            saw_out_flag.store(true, Ordering::SeqCst);
+                            if matches!(ev, AgentEvent::MessageDelta { .. }) {
+                                saw_message_delta = true;
+                            }
+                        }
+                        AgentEvent::Error { error, .. } => {
+                            emitted_err_out.store(true, Ordering::SeqCst);
+                            if is_cli_auth_error_text(error) {
+                                let (prov_key, prov_label, login_cmd) =
+                                    provider_auth_metadata(&provider_clone);
+                                let auth_url =
+                                    extract_https_url_from_text(error).unwrap_or_default();
+                                let formatted = format!(
+                                    "[AUTH_REQUIRED|{}|{}|{}] {} 认证失效或未登录：{}",
+                                    prov_key, login_cmd, auth_url, prov_label, error
+                                );
+                                let _ = tx_out.send(AgentEvent::Error {
+                                    session_id,
+                                    error: formatted,
+                                    timestamp: Utc::now(),
+                                });
+                                continue;
+                            }
+                        }
+                        _ => {}
                     }
-                }
-                for ev in parsed {
-                    let _ = tx_out.send(ev);
+                    let _ = tx_out.send(ev.clone());
                 }
                 // Fallback for Cursor CLI if all assistant chunks carried `timestamp_ms` and final text only appeared in `result.result`
                 if matches!(provider_clone, AgentProvider::Cursor) && !saw_message_delta {
@@ -525,6 +711,7 @@ impl AgentSpawner {
                                     .filter(|s| !s.trim().is_empty())
                                 {
                                     saw_message_delta = true;
+                                    saw_out_flag.store(true, Ordering::SeqCst);
                                     let _ = tx_out.send(AgentEvent::MessageDelta {
                                         session_id,
                                         text: res_txt.to_string(),
@@ -538,34 +725,117 @@ impl AgentSpawner {
             }
         });
 
-        // Parse stderr lines (ignore benign stdin notice from codex; surface fatal CLI / auth errors)
+        // Parse stderr lines (surface CLI auth failures immediately without waiting 60s on stdin timeout)
         let tx_err = event_tx.clone();
+        let provider_err = provider.clone();
+        let emitted_err_stderr = Arc::clone(&emitted_error);
+        let recent_stderr_writer = Arc::clone(&recent_stderr);
         let stderr_task = tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stderr).lines();
+            let mut auth_banner_sent = false;
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
-                if !trimmed.is_empty() && !trimmed.contains("Reading additional input from stdin") {
-                    let _ = tx_err.send(AgentEvent::PtyOutput {
+                if trimmed.is_empty() || trimmed.contains("Reading additional input from stdin") {
+                    continue;
+                }
+                let _ = tx_err.send(AgentEvent::PtyOutput {
+                    session_id,
+                    line: format!("[stderr] {}", line),
+                    timestamp: Utc::now(),
+                });
+                if let Ok(mut buf) = recent_stderr_writer.lock() {
+                    if buf.len() < 12 {
+                        buf.push(trimmed.to_string());
+                    }
+                }
+
+                if !auth_banner_sent && is_cli_auth_error_text(trimmed) {
+                    auth_banner_sent = true;
+                    emitted_err_stderr.store(true, Ordering::SeqCst);
+                    let mut auth_url = extract_https_url_from_text(trimmed);
+                    let mut extra_lines: Vec<String> = Vec::new();
+
+                    // Collect immediate follow-up stderr lines (e.g. `agy` prints OAuth URL on the next line)
+                    for _ in 0..4 {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(160),
+                            reader.next_line(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(next_l))) => {
+                                let nt = next_l.trim();
+                                if !nt.is_empty() {
+                                    let _ = tx_err.send(AgentEvent::PtyOutput {
+                                        session_id,
+                                        line: format!("[stderr] {}", next_l),
+                                        timestamp: Utc::now(),
+                                    });
+                                    if auth_url.is_none() {
+                                        auth_url = extract_https_url_from_text(nt);
+                                    }
+                                    extra_lines.push(nt.to_string());
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    let (prov_key, prov_label, login_cmd) = provider_auth_metadata(&provider_err);
+                    let clean_reason = trimmed
+                        .strip_prefix("Error:")
+                        .or_else(|| trimmed.strip_prefix("error:"))
+                        .map(str::trim)
+                        .unwrap_or(trimmed);
+                    let formatted = format!(
+                        "[AUTH_REQUIRED|{}|{}|{}] {} 需要重新登录认证：{}",
+                        prov_key,
+                        login_cmd,
+                        auth_url.unwrap_or_default(),
+                        prov_label,
+                        clean_reason
+                    );
+                    let _ = tx_err.send(AgentEvent::Error {
                         session_id,
-                        line: format!("[stderr] {}", line),
+                        error: formatted,
                         timestamp: Utc::now(),
                     });
-                    if trimmed.starts_with("Error:")
-                        || trimmed.starts_with("error:")
-                        || trimmed.starts_with("Fatal:")
+
+                    // If headless CLI (`Stdio::null()`) is waiting 60s for interactive OAuth paste, terminate immediately so UI stops spinning
+                    if extra_lines
+                        .iter()
+                        .any(|l| l.to_lowercase().contains("waiting for authentication"))
                     {
-                        let _ = tx_err.send(AgentEvent::Error {
-                            session_id,
-                            error: trimmed.to_string(),
-                            timestamp: Utc::now(),
-                        });
+                        #[cfg(unix)]
+                        if let Some(p) = pid {
+                            let _ = Command::new("kill")
+                                .args(["-9", &format!("-{}", p)])
+                                .status()
+                                .await;
+                        }
+                        break;
                     }
+                    continue;
+                }
+
+                if !auth_banner_sent
+                    && (trimmed.starts_with("Error:")
+                        || trimmed.starts_with("error:")
+                        || trimmed.starts_with("Fatal:"))
+                {
+                    emitted_err_stderr.store(true, Ordering::SeqCst);
+                    let _ = tx_err.send(AgentEvent::Error {
+                        session_id,
+                        error: trimmed.to_string(),
+                        timestamp: Utc::now(),
+                    });
                 }
             }
         });
 
         // Supervise process exit or manual stop
         let tx_status = event_tx.clone();
+        let provider_exit = provider.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = &mut kill_rx => {
@@ -588,6 +858,8 @@ impl AgentSpawner {
                     });
                 }
                 status_res = child.wait() => {
+                    // Allow stdout/stderr tasks a brief moment to flush final lines before checking fallback
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                     match status_res {
                         Ok(exit) if exit.success() => {
                             let _ = tx_status.send(AgentEvent::StatusChanged {
@@ -598,6 +870,23 @@ impl AgentSpawner {
                             });
                         }
                         Ok(exit) => {
+                            if !emitted_error.load(Ordering::SeqCst)
+                                && !saw_assistant_output.load(Ordering::SeqCst)
+                            {
+                                let stderr_summary = recent_stderr
+                                    .lock()
+                                    .ok()
+                                    .map(|v| v.join(" · "))
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| {
+                                        format!("`{}` 异常退出 ({})", provider_exit, exit)
+                                    });
+                                let _ = tx_status.send(AgentEvent::Error {
+                                    session_id,
+                                    error: stderr_summary,
+                                    timestamp: Utc::now(),
+                                });
+                            }
                             let _ = tx_status.send(AgentEvent::StatusChanged {
                                 session_id,
                                 status: SessionStatus::Failed,
@@ -606,6 +895,13 @@ impl AgentSpawner {
                             });
                         }
                         Err(err) => {
+                            if !emitted_error.load(Ordering::SeqCst) {
+                                let _ = tx_status.send(AgentEvent::Error {
+                                    session_id,
+                                    error: format!("Agent wait error: {}", err),
+                                    timestamp: Utc::now(),
+                                });
+                            }
                             let _ = tx_status.send(AgentEvent::StatusChanged {
                                 session_id,
                                 status: SessionStatus::Failed,
@@ -1106,6 +1402,7 @@ impl AgentSpawner {
             }
         };
         cmd.env("PATH", aug_path);
+        apply_proxy_env_tokio(&mut cmd);
         cmd
     }
 
@@ -1208,6 +1505,7 @@ impl AgentSpawner {
             }
         };
         cmd.env("PATH", aug_path);
+        apply_proxy_env_pty(&mut cmd);
         cmd.cwd(cwd);
         cmd
     }

@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 use velo_protocol::{AgentEvent, SessionStatus};
 
-use crate::{AgentHandle, discover_augmented_path, resolve_cli_binary};
+use crate::{AgentHandle, apply_proxy_env_tokio, discover_augmented_path, resolve_cli_binary};
 
 /// Spawns an ACP (Agent Client Protocol) JSON-RPC 2.0 over stdio agent subprocess.
 /// Supports `initialize` -> `session/new` / `session/load` -> `session/prompt`,
@@ -44,6 +44,7 @@ pub async fn spawn_acp_agent(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_proxy_env_tokio(&mut cmd);
 
     let mut child = cmd
         .spawn()

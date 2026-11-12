@@ -277,7 +277,12 @@ public final class VeloStore: ObservableObject {
             guard let (data, _) = try? await URLSession.shared.data(from: url),
                   let rawList = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
             else { return }
-            let items = Self.reconstructEventsFromHistory(sessionId: sessionId, rawList: rawList)
+            let fallbackProv = sessions.first(where: { $0.id == sessionId })?.agentKind ?? "agy"
+            let items = Self.reconstructEventsFromHistory(
+                sessionId: sessionId,
+                rawList: rawList,
+                fallbackProvider: fallbackProv
+            )
             if !items.isEmpty || self.eventsBySession[sessionId] == nil {
                 self.eventsBySession[sessionId] = items
             }
@@ -515,6 +520,37 @@ public final class VeloStore: ObservableObject {
         }
     }
 
+    @discardableResult
+    public func requestMacCLILogin(provider: String) async -> Bool {
+        let cleanProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "agy" : provider
+        triggerHaptic(.medium)
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let encoded = cleanProvider.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+                  let url = URL(string: "\(baseURL)/api/providers/\(encoded)/login")
+            else { return false }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            if let (_, resp) = try? await URLSession.shared.data(for: req),
+               let http = resp as? HTTPURLResponse
+            {
+                return (200..<300).contains(http.statusCode)
+            }
+            return false
+
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "launch_cli_login",
+                "provider": cleanProvider,
+            ])
+            return true
+
+        case .none:
+            return false
+        }
+    }
+
     /// Initiates or rotates X25519 Ephemeral Forward-Secrecy session key agreement & full state sync.
     private func sendEncryptedSync() {
         let eph = E2EERelayCrypto.generateEphemeralKeypair()
@@ -635,8 +671,13 @@ public final class VeloStore: ObservableObject {
            let sid = raw["session_id"] as? String,
            let rawEvs = raw["events"] as? [[String: Any]]
         {
-            let items = Self.reconstructEventsFromHistory(sessionId: sid, rawList: rawEvs)
-            if !items.isEmpty {
+            let fallbackProv = sessions.first(where: { $0.id == sid })?.agentKind ?? "agy"
+            let items = Self.reconstructEventsFromHistory(
+                sessionId: sid,
+                rawList: rawEvs,
+                fallbackProvider: fallbackProv
+            )
+            if !items.isEmpty || eventsBySession[sid] == nil {
                 eventsBySession[sid] = items
             }
             return
@@ -670,12 +711,18 @@ public final class VeloStore: ObservableObject {
         case "user_message":
             let text = (evObj["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !text.isEmpty else { return }
+            if !sessions.contains(where: { $0.id == sid }) {
+                Task { await refreshSessionsAndActiveEvents() }
+            }
             var list = eventsBySession[sid] ?? []
-            let duplicate = list.suffix(3).contains { item in
+            if let localIdx = list.lastIndex(where: { item in
+                guard item.id.hasPrefix("u-local-") || item.id.hasPrefix("u-init-") else { return false }
                 if case .user = item.kind, item.content == text { return true }
                 return false
-            }
-            if !duplicate {
+            }) {
+                list[localIdx].id = "u-sync-\(UUID().uuidString.prefix(8))"
+                eventsBySession[sid] = list
+            } else {
                 list.append(
                     TimelineEventItem(
                         id: "u-ws-\(UUID().uuidString.prefix(8))",
@@ -1001,6 +1048,62 @@ public final class VeloStore: ObservableObject {
             )
             eventsBySession[sid] = list
 
+        case "error":
+            let rawErr = ((evObj["error"] as? String) ?? "Agent 执行异常").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !rawErr.isEmpty else { return }
+            let fallbackProv = sessions.first(where: { $0.id == sid })?.agentKind ?? "agy"
+            let parsed = VeloFormatting.parseAgentError(rawErr, fallbackProvider: fallbackProv)
+            let origin = stepStartedAtBySession[sid] ?? turnStartedAtBySession[sid] ?? now
+
+            var list = eventsBySession[sid] ?? []
+            for i in list.indices {
+                switch list[i].kind {
+                case .thinking(let startedAt, let dur, true):
+                    let finalDur = dur ?? max(500, Int(now.timeIntervalSince(startedAt ?? origin) * 1000))
+                    list[i].kind = .thinking(startedAt: startedAt, durationMs: finalDur, isStreaming: false)
+                case .assistant(true):
+                    list[i].kind = .assistant(isStreaming: false)
+                default:
+                    break
+                }
+            }
+
+            if let lastIdx = list.indices.last,
+               case .error(let prevAuth, _, _, _) = list[lastIdx].kind
+            {
+                // Keep richer auth-required card if followed by generic exit status error
+                if !prevAuth && parsed.isAuthRequired {
+                    list[lastIdx].content = parsed.message
+                    list[lastIdx].kind = .error(
+                        isAuthRequired: true,
+                        provider: parsed.provider,
+                        loginCommand: parsed.loginCommand,
+                        authURL: parsed.authURL
+                    )
+                }
+            } else {
+                list.append(
+                    TimelineEventItem(
+                        id: "err-\(UUID().uuidString.prefix(8))",
+                        sessionId: sid,
+                        timestamp: nowLabel,
+                        content: parsed.message,
+                        kind: .error(
+                            isAuthRequired: parsed.isAuthRequired,
+                            provider: parsed.provider,
+                            loginCommand: parsed.loginCommand,
+                            authURL: parsed.authURL
+                        )
+                    )
+                )
+                triggerNotificationHaptic(.error)
+                notifyUser(
+                    title: parsed.isAuthRequired ? "CLI 认证已失效 · 请重新登录" : "CLI 执行异常",
+                    body: parsed.message
+                )
+            }
+            eventsBySession[sid] = list
+
         default:
             break
         }
@@ -1017,7 +1120,8 @@ public final class VeloStore: ObservableObject {
 
     public static func reconstructEventsFromHistory(
         sessionId: String,
-        rawList: [[String: Any]]
+        rawList: [[String: Any]],
+        fallbackProvider: String = "agy"
     ) -> [TimelineEventItem] {
         var out: [TimelineEventItem] = []
         var activeUserIdx: Int?
@@ -1182,15 +1286,35 @@ public final class VeloStore: ObservableObject {
 
             case "error":
                 let errText = (ev["error"] as? String) ?? "Agent error"
-                out.append(
-                    TimelineEventItem(
-                        id: "err-hist-\(i)",
-                        sessionId: sessionId,
-                        timestamp: tsLabel,
-                        content: "⚠️ \(errText)",
-                        kind: .assistant(isStreaming: false)
+                let parsed = VeloFormatting.parseAgentError(errText, fallbackProvider: fallbackProvider)
+                if let lastIdx = out.indices.last,
+                   case .error(let prevAuth, _, _, _) = out[lastIdx].kind
+                {
+                    if !prevAuth && parsed.isAuthRequired {
+                        out[lastIdx].content = parsed.message
+                        out[lastIdx].kind = .error(
+                            isAuthRequired: true,
+                            provider: parsed.provider,
+                            loginCommand: parsed.loginCommand,
+                            authURL: parsed.authURL
+                        )
+                    }
+                } else {
+                    out.append(
+                        TimelineEventItem(
+                            id: "err-hist-\(i)",
+                            sessionId: sessionId,
+                            timestamp: tsLabel,
+                            content: parsed.message,
+                            kind: .error(
+                                isAuthRequired: parsed.isAuthRequired,
+                                provider: parsed.provider,
+                                loginCommand: parsed.loginCommand,
+                                authURL: parsed.authURL
+                            )
+                        )
                     )
-                )
+                }
 
             default:
                 break

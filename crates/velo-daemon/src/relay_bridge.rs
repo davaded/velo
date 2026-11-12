@@ -777,6 +777,13 @@ async fn run_supervised_e2ee_bridge(
                                         }
                                     }
                                 }
+                                "launch_cli_login" => {
+                                    let prov = cmd_val
+                                        .get("provider")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("agy");
+                                    let _ = crate::launch_provider_cli_login(prov).await;
+                                }
                                 "create_session" => {
                                     let prompt = cmd_val
                                         .get("prompt")

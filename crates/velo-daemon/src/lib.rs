@@ -158,7 +158,8 @@ impl DaemonState {
                     let mut guard = state.inner.write().await;
                     if !matches!(
                         event,
-                        AgentEvent::ProviderSessionBound { .. }
+                        AgentEvent::UserMessage { .. }
+                            | AgentEvent::ProviderSessionBound { .. }
                             | AgentEvent::ThinkingChunk { .. }
                             | AgentEvent::MessageChunk { .. }
                             | AgentEvent::TerminalOutput { .. }
@@ -686,23 +687,32 @@ impl DaemonState {
             preview_url: None,
         };
 
+        let initial_user_ev = if !prompt.trim().is_empty() || !images.is_empty() {
+            Some(AgentEvent::UserMessage {
+                session_id,
+                text: prompt.clone(),
+                images: images.clone(),
+                timestamp: now,
+            })
+        } else {
+            None
+        };
+
         {
             let mut guard = self.inner.write().await;
             guard.sessions.insert(session_id, session.clone());
-            if !prompt.trim().is_empty() || !images.is_empty() {
+            if let Some(ref uev) = initial_user_ev {
                 guard
                     .event_history
                     .entry(session_id)
                     .or_default()
-                    .push(AgentEvent::UserMessage {
-                        session_id,
-                        text: prompt.clone(),
-                        images: images.clone(),
-                        timestamp: now,
-                    });
+                    .push(uev.clone());
             }
         }
         let _ = self.persist_session_events(session_id).await;
+        if let Some(uev) = initial_user_ev {
+            let _ = self.event_tx.send(uev);
+        }
 
         // If the user created an empty worktree thread (e.g. via New Thread / Advanced Worktree)
         // without typing an initial prompt yet, prepare the isolated worktree in an idle state
@@ -792,6 +802,10 @@ pub fn build_router(state: DaemonState) -> Router {
         .route(
             "/api/system/service",
             get(get_system_service_handler).post(update_system_service_handler),
+        )
+        .route(
+            "/api/providers/{provider}/login",
+            post(provider_cli_login_handler),
         )
         .route("/api/pick-folder", post(pick_folder_handler))
         .route("/api/open-editor", post(open_editor_handler))
@@ -1183,12 +1197,12 @@ pub(crate) async fn build_models_catalog_json() -> Value {
             if !AGY_MODELS_FETCHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 tokio::spawn(async move {
                     let aug_path = velo_agent::discover_augmented_path();
+                    let mut m_cmd = Command::new(bin_path);
+                    m_cmd.arg("models").env("PATH", aug_path);
+                    velo_agent::apply_proxy_env_tokio(&mut m_cmd);
                     let res = tokio::time::timeout(
                         std::time::Duration::from_secs(12),
-                        Command::new(bin_path)
-                            .arg("models")
-                            .env("PATH", aug_path)
-                            .output(),
+                        m_cmd.output(),
                     )
                     .await;
                     if let Ok(Ok(out)) = res {
@@ -1382,12 +1396,12 @@ pub(crate) async fn build_models_catalog_json() -> Value {
             if !CURSOR_MODELS_FETCHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 tokio::spawn(async move {
                     let aug_path = velo_agent::discover_augmented_path();
+                    let mut c_cmd = Command::new(bin_path);
+                    c_cmd.arg("--list-models").env("PATH", aug_path);
+                    velo_agent::apply_proxy_env_tokio(&mut c_cmd);
                     let res = tokio::time::timeout(
                         std::time::Duration::from_secs(8),
-                        Command::new(bin_path)
-                            .arg("--list-models")
-                            .env("PATH", aug_path)
-                            .output(),
+                        c_cmd.output(),
                     )
                     .await;
                     if let Ok(Ok(out)) = res {
@@ -2384,20 +2398,22 @@ impl DaemonState {
             None
         };
 
+        let user_ev = AgentEvent::UserMessage {
+            session_id: id,
+            text: req.input.clone(),
+            images: req.images.clone(),
+            timestamp: Utc::now(),
+        };
         {
             let mut guard = self.inner.write().await;
             guard
                 .event_history
                 .entry(id)
                 .or_default()
-                .push(AgentEvent::UserMessage {
-                    session_id: id,
-                    text: req.input.clone(),
-                    images: req.images.clone(),
-                    timestamp: Utc::now(),
-                });
+                .push(user_ev.clone());
         }
         let _ = self.persist_session_events(id).await;
+        let _ = self.event_tx.send(user_ev);
 
         let effective_prompt = if resume_session_id.is_some() {
             req.input.clone()
@@ -4474,6 +4490,75 @@ async fn pair_ticket_handler(
 struct UpdateSystemServiceRequest {
     action: Option<String>,
     prevent_idle_sleep: Option<bool>,
+}
+
+pub(crate) async fn launch_provider_cli_login(provider_raw: &str) -> Result<String> {
+    let prov = AgentProvider::from_str_loose(provider_raw);
+    let aug_path = velo_agent::discover_augmented_path();
+    let proxy_export = if let Some(p) = velo_agent::discover_system_proxy_url() {
+        format!(
+            "export HTTP_PROXY='{p}' HTTPS_PROXY='{p}' ALL_PROXY='{p}' http_proxy='{p}' https_proxy='{p}' all_proxy='{p}' NO_PROXY='localhost,127.0.0.1,::1'\n"
+        )
+    } else {
+        String::new()
+    };
+
+    let (bin_name, args_str, label) = match prov {
+        AgentProvider::Antigravity => ("agy", "-i \"hi\"", "Google Antigravity CLI (agy)"),
+        AgentProvider::Cursor => ("cursor-agent", "login", "Cursor Agent CLI"),
+        AgentProvider::Claude => ("claude", "auth login", "Claude Code"),
+        AgentProvider::Codex => ("codex", "login", "OpenAI Codex CLI"),
+        AgentProvider::Grok => ("grok", "", "xAI Grok CLI"),
+        AgentProvider::OpenCode => ("opencode", "auth login", "OpenCode CLI"),
+        AgentProvider::Copilot => ("copilot", "auth login", "GitHub Copilot CLI"),
+        AgentProvider::Qwen => ("qwen", "", "Qwen Code CLI"),
+        AgentProvider::Acp(_) | AgentProvider::Custom(_) => ("agy", "-i \"hi\"", "Agent CLI"),
+    };
+
+    let resolved_bin = velo_agent::resolve_cli_binary(bin_name)
+        .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''")))
+        .unwrap_or_else(|| bin_name.to_string());
+    let full_cmd = if args_str.is_empty() {
+        resolved_bin
+    } else {
+        format!("{} {}", resolved_bin, args_str)
+    };
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/Users/daiyudai"));
+    let script_dir = home.join(".velo/bin");
+    tokio::fs::create_dir_all(&script_dir).await?;
+    let script_path = script_dir.join("velo-cli-login.command");
+    let script_content = format!(
+        "#!/bin/zsh\nclear\nexport PATH=\"{aug_path}:$PATH\"\n{proxy_export}echo \"🔐 正在为 Velo 启动 {label} 登录认证…\"\necho \"命令: {full_cmd}\"\necho \"\"\n{full_cmd}\necho \"\"\necho \"✅ 登录完成后可直接关闭此窗口，回到 Velo 点击重试即可。\"\nexec zsh -l\n"
+    );
+    tokio::fs::write(&script_path, script_content).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let status = Command::new("/usr/bin/open")
+        .args(["-a", "Terminal", &script_path.to_string_lossy()])
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("Failed to open Terminal.app for CLI login");
+    }
+    Ok(format!("已在 Mac 端拉起 Terminal 执行 `{}` 登录流程", label))
+}
+
+async fn provider_cli_login_handler(
+    AxumPath(provider): AxumPath<String>,
+) -> impl IntoResponse {
+    match launch_provider_cli_login(&provider).await {
+        Ok(msg) => (StatusCode::OK, Json(json!({ "ok": true, "message": msg }))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_system_service_handler() -> impl IntoResponse {

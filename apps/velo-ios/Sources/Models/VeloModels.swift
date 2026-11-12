@@ -306,6 +306,12 @@ public enum TimelineEventKind: Equatable, Sendable {
         isError: Bool
     )
     case assistant(isStreaming: Bool)
+    case error(
+        isAuthRequired: Bool,
+        provider: String,
+        loginCommand: String,
+        authURL: String?
+    )
 }
 
 public struct TimelineEventItem: Identifiable, Equatable, Sendable {
@@ -512,5 +518,129 @@ public enum VeloFormatting {
         }
         flushCurrent()
         return files
+    }
+
+    public static func defaultLoginCommand(for provider: String) -> String {
+        let p = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if p == "cursor" || p.contains("cursor") { return "cursor-agent login" }
+        if p == "agy" || p.contains("antigravity") || p.contains("gemini") { return "agy -i \"hi\"" }
+        if p == "claude" || p.contains("anthropic") { return "claude login" }
+        if p == "codex" || p.contains("openai") { return "codex login" }
+        if p == "grok" || p.contains("xai") { return "export XAI_API_KEY=..." }
+        return "\(p.isEmpty ? "agy" : p) login"
+    }
+
+    public static func providerDisplayName(_ provider: String) -> String {
+        let p = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if p == "agy" || p.contains("antigravity") || p.contains("gemini") { return "Antigravity CLI (agy)" }
+        if p == "cursor" || p.contains("cursor") { return "Cursor CLI" }
+        if p == "claude" { return "Claude Code" }
+        if p == "codex" { return "OpenAI Codex" }
+        if p == "grok" { return "xAI Grok CLI" }
+        return provider.uppercased()
+    }
+
+    public static func parseAgentError(
+        _ raw: String,
+        fallbackProvider: String
+    ) -> (message: String, isAuthRequired: Bool, provider: String, loginCommand: String, authURL: String?) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var provider = fallbackProvider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if provider.isEmpty { provider = "agy" }
+
+        // 1. Structured `[AUTH_REQUIRED|<provider>|<loginCmd>|<authUrl>] <msg>` emitted by velo-agent
+        if trimmed.hasPrefix("[AUTH_REQUIRED|"),
+           let closeRange = trimmed.range(of: "]")
+        {
+            let header = String(trimmed[trimmed.index(trimmed.startIndex, offsetBy: 15)..<closeRange.lowerBound])
+            let parts = header.components(separatedBy: "|")
+            let prov = (parts.first ?? provider).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !prov.isEmpty { provider = prov }
+            let cmd = parts.count > 1 && !parts[1].trimmingCharacters(in: .whitespaces).isEmpty
+                ? parts[1].trimmingCharacters(in: .whitespaces)
+                : defaultLoginCommand(for: provider)
+            let urlStr: String? = {
+                guard parts.count > 2 else { return nil }
+                let u = parts[2].trimmingCharacters(in: .whitespacesAndNewlines)
+                return u.hasPrefix("http") ? u : nil
+            }()
+            let body = String(trimmed[closeRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanBody = cleanErrorText(body, provider: provider, isAuth: true)
+            return (cleanBody, true, provider, cmd, urlStr ?? extractFirstAuthURL(from: body))
+        }
+
+        // 2. Heuristic detection for historical or raw stderr CLI auth failures
+        let lower = trimmed.lowercased()
+        let isAuth = lower.contains("authentication required")
+            || lower.contains("authentication timed out")
+            || lower.contains("waiting for authentication")
+            || lower.contains("please visit the url to log in")
+            || lower.contains("agent login")
+            || lower.contains("not logged in")
+            || lower.contains("login required")
+            || lower.contains("re-authenticate")
+            || lower.contains("unauthenticated")
+            || lower.contains("401 unauthorized")
+            || lower.contains("invalid_api_key")
+            || lower.contains("missing api key")
+            || lower.contains("xai_api_key")
+            || lower.contains("openai_api_key")
+            || lower.contains("anthropic_api_key")
+
+        if lower.contains("cursor-agent") || lower.contains("agent login") {
+            provider = "cursor"
+        } else if lower.contains("accounts.google.com") || lower.contains("antigravity") || lower.contains("agy") {
+            provider = "agy"
+        }
+
+        let cmd = defaultLoginCommand(for: provider)
+        let urlStr = isAuth ? extractFirstAuthURL(from: trimmed) : nil
+        let cleanMsg = cleanErrorText(trimmed, provider: provider, isAuth: isAuth)
+        return (cleanMsg, isAuth, provider, cmd, urlStr)
+    }
+
+    private static func extractFirstAuthURL(from text: String) -> String? {
+        for token in text.components(separatedBy: .whitespacesAndNewlines) {
+            let clean = token.trimmingCharacters(in: CharacterSet(charactersIn: "()[]<>\"'.,;"))
+            if (clean.hasPrefix("https://") || clean.hasPrefix("http://"))
+                && !clean.contains("127.0.0.1")
+                && !clean.contains("localhost")
+            {
+                return clean
+            }
+        }
+        return nil
+    }
+
+    private static func cleanErrorText(_ raw: String, provider: String, isAuth: Bool) -> String {
+        let lines = raw
+            .components(separatedBy: .newlines)
+            .map {
+                $0.replacingOccurrences(of: "[stderr]", with: "")
+                    .replacingOccurrences(of: "⚠️", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            .filter { line in
+                guard !line.isEmpty else { return false }
+                let l = line.lowercased()
+                if l.hasPrefix("http://") || l.hasPrefix("https://") { return false }
+                if l.hasPrefix("waiting for authentication") { return false }
+                return true
+            }
+
+        if isAuth {
+            let provName = providerDisplayName(provider)
+            if lines.isEmpty {
+                return "\(provName) 登录态已失效或网络刷新令牌超时，请在 Mac 终端重新完成登录授权。"
+            }
+            let joined = lines.prefix(2).joined(separator: " ")
+            if joined.lowercased().contains("authentication timed out")
+                || joined.lowercased().contains("please visit the url to log in")
+            {
+                return "\(provName) 认证已过期（或代理未就绪导致 OAuth 刷新失败），请点击下方按钮在 Mac 终端完成登录。"
+            }
+            return joined
+        }
+        return lines.isEmpty ? "CLI 进程异常退出，未返回有效响应。" : lines.prefix(3).joined(separator: "\n")
     }
 }

@@ -345,6 +345,11 @@ function reconstructEventsFromHistory(
       });
     } else if (evType === "error") {
       const errText = String(ev.error ?? "Agent execution error");
+      const prevItem = reconstructed[reconstructed.length - 1];
+      // Deduplicate stacked timeout/auth error lines within the same turn
+      if (prevItem && prevItem.id.startsWith("err-")) {
+        continue;
+      }
       reconstructed.push({
         id: `err-hist-${i}`,
         session_id: sid,
@@ -355,6 +360,76 @@ function reconstructEventsFromHistory(
     }
   }
   return reconstructed;
+}
+
+function parseAgentErrorBanner(
+  rawContent: string,
+  fallbackProvider: string
+): {
+  isError: boolean;
+  isAuthRequired: boolean;
+  provider: string;
+  loginCommand: string;
+  authUrl: string;
+  message: string;
+} | null {
+  const trimmed = rawContent.trim();
+  const hasWarnPrefix = trimmed.startsWith("⚠️");
+  const stripped = hasWarnPrefix ? trimmed.replace(/^⚠️\s*/, "").trim() : trimmed;
+  if (!hasWarnPrefix && !stripped.startsWith("[AUTH_REQUIRED|")) {
+    return null;
+  }
+
+  const defaultLoginCmd = (p: string) => {
+    if (p === "cursor" || p === "cursor-agent") return "cursor-agent login";
+    if (p === "agy" || p === "antigravity") return 'agy -i "hi"';
+    if (p === "codex") return "codex login";
+    if (p === "grok") return "grok";
+    return "claude auth login";
+  };
+
+  if (stripped.startsWith("[AUTH_REQUIRED|")) {
+    const closeIdx = stripped.indexOf("]");
+    if (closeIdx !== -1) {
+      const meta = stripped.slice(1, closeIdx).split("|");
+      const provider = meta[1] || fallbackProvider || "agy";
+      const loginCommand = meta[2] || defaultLoginCmd(provider);
+      const authUrl = meta[3] || "";
+      const message = stripped.slice(closeIdx + 1).trim();
+      return {
+        isError: true,
+        isAuthRequired: true,
+        provider,
+        loginCommand,
+        authUrl,
+        message: message || "CLI 需要重新登录认证",
+      };
+    }
+  }
+
+  const isAuth =
+    /authentication required|not authenticated|authentication timed out|authentication failed|agent login|claude login|codex login|api_key|oauth|401 unauthorized/i.test(
+      stripped
+    );
+  const detectedProv = /agent login|cursor/i.test(stripped)
+    ? "cursor"
+    : /accounts\.google\.com|antigravity|agy/i.test(stripped)
+    ? "agy"
+    : /codex/i.test(stripped)
+    ? "codex"
+    : /grok|xai/i.test(stripped)
+    ? "grok"
+    : fallbackProvider || "claude";
+  const urlMatch = stripped.match(/https:\/\/[^\s"'<>)]+/);
+
+  return {
+    isError: true,
+    isAuthRequired: isAuth,
+    provider: detectedProv,
+    loginCommand: defaultLoginCmd(detectedProv),
+    authUrl: urlMatch ? urlMatch[0] : "",
+    message: stripped,
+  };
 }
 
 export function App() {
@@ -873,35 +948,62 @@ export function App() {
     });
   }, [activeSession.id, refreshSessionDiffAndFiles]);
 
-  // Load persisted event history from ~/.velo/events/<session-id>.json on startup or session switch
+  const activeSessionIdRef = useRef<string>(activeSession.id);
   useEffect(() => {
-    const sid = activeSession.id;
-    if (!sid || sid.startsWith("sess-") || sid.startsWith("wt-")) return;
-    if (eventsBySession[sid] && eventsBySession[sid].length > 0) return;
+    activeSessionIdRef.current = activeSession.id;
+  }, [activeSession.id]);
 
-    fetch(`${daemonUrl}/api/sessions/${sid}/events`)
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((rawList: Array<Record<string, unknown>>) => {
-        if (!Array.isArray(rawList) || rawList.length === 0) return;
-        const reconstructed = reconstructEventsFromHistory(sid, rawList);
-        if (reconstructed.length > 0) {
-          setEventsBySession((prev) =>
-            prev[sid] && prev[sid].length > 0 ? prev : { ...prev, [sid]: reconstructed }
-          );
-        }
-      })
-      .catch(() => {
-        if (e2eeRelayConfig && e2eeWsRef.current && e2eeWsRef.current.readyState === WebSocket.OPEN) {
-          const sealed = e2eeSealJson(
-            e2eeRelayConfig.sharedKeyHex,
-            "mobile-web",
-            e2eeNonceRef.current++,
-            { cmd: "get_events", session_id: sid }
-          );
-          e2eeWsRef.current.send(sealed);
-        }
-      });
-  }, [activeSession.id, daemonUrl, e2eeRelayConfig, eventsBySession]);
+  // Authoritative sync of persisted event history from ~/.velo/events/<session-id>.json
+  const syncSessionEventsFromDaemon = useCallback(
+    (sid: string) => {
+      if (!sid || sid.startsWith("sess-") || sid.startsWith("wt-")) return;
+      fetch(`${daemonUrl}/api/sessions/${sid}/events`)
+        .then((r) => (r.ok ? r.json() : Promise.reject()))
+        .then((rawList: Array<Record<string, unknown>>) => {
+          if (!Array.isArray(rawList) || rawList.length === 0) return;
+          const reconstructed = reconstructEventsFromHistory(sid, rawList);
+          if (reconstructed.length > 0) {
+            setEventsBySession((prev) => {
+              const cur = prev[sid] || [];
+              const isActivelyStreaming = cur.some((x) => x.is_streaming_chunk);
+              if (isActivelyStreaming && cur.length > reconstructed.length) {
+                return prev;
+              }
+              return { ...prev, [sid]: reconstructed };
+            });
+          }
+        })
+        .catch(() => {
+          if (
+            e2eeRelayConfig &&
+            e2eeWsRef.current &&
+            e2eeWsRef.current.readyState === WebSocket.OPEN
+          ) {
+            const sealed = e2eeSealJson(
+              e2eeRelayConfig.sharedKeyHex,
+              "mobile-web",
+              e2eeNonceRef.current++,
+              { cmd: "get_events", session_id: sid }
+            );
+            e2eeWsRef.current.send(sealed);
+          }
+        });
+    },
+    [daemonUrl, e2eeRelayConfig]
+  );
+
+  useEffect(() => {
+    syncSessionEventsFromDaemon(activeSession.id);
+  }, [activeSession.id, syncSessionEventsFromDaemon]);
+
+  useEffect(() => {
+    const onFocus = () => {
+      refreshSessions();
+      syncSessionEventsFromDaemon(activeSessionIdRef.current);
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshSessions, syncSessionEventsFromDaemon]);
 
   const fetchPairTicket = useCallback(
     (relayOverride?: string) => {
@@ -1056,13 +1158,28 @@ export function App() {
         const text = String(evObj.text ?? "").trim();
         const imgs = Array.isArray(evObj.images) ? evObj.images.map(String).filter(Boolean) : [];
         if (!text && imgs.length === 0) return;
+        turnStartMsRef.current[sid] = Date.now();
+        stepStartMsRef.current[sid] = Date.now();
+        setSessions((prev) => {
+          if (!prev.some((s) => s.id === sid)) {
+            refreshSessions();
+          }
+          return prev;
+        });
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
-          // Deduplicate against optimistic user bubble already appended locally
-          const alreadyRendered = list
-            .slice(-3)
-            .some((item) => item.kind === "user" && item.content.trim() === text);
-          if (alreadyRendered) return prev;
+          // Only deduplicate against an unconfirmed optimistic bubble sent from THIS desktop window (`u-local-*`)
+          for (let i = list.length - 1; i >= Math.max(0, list.length - 3); i--) {
+            if (
+              list[i].kind === "user" &&
+              list[i].id.startsWith("u-local-") &&
+              list[i].content.trim() === text
+            ) {
+              const next = [...list];
+              next[i] = { ...next[i], id: `u-sync-${Date.now()}` };
+              return { ...prev, [sid]: next };
+            }
+          }
           return {
             ...prev,
             [sid]: [
@@ -1312,59 +1429,11 @@ export function App() {
               : s
           )
         );
-        if (st === "completed") {
-          refreshSessionDiffAndFiles(sid);
-          // Fallback sync ONLY if WebSocket missed the final assistant message in this turn
-          fetch(`${daemonUrl}/api/sessions/${sid}/events`)
-            .then((r) => (r.ok ? r.json() : Promise.reject()))
-            .then((evList: Array<Record<string, unknown>>) => {
-              if (!Array.isArray(evList)) return;
-              let lastRunStart = 0;
-              for (let i = evList.length - 1; i >= 0; i--) {
-                if (evList[i].type === "status_changed" && evList[i].status === "running") {
-                  lastRunStart = i;
-                  break;
-                }
-              }
-              const latestTurnEvents = evList.slice(lastRunStart);
-              const texts = latestTurnEvents
-                .filter((e) => e.type === "message_delta" && typeof e.text === "string")
-                .map((e) => String(e.text).trim())
-                .filter(Boolean);
-              if (texts.length === 0) return;
-
-              setEventsBySession((prev) => {
-                const list = prev[sid] || [];
-                let lastUserIdx = -1;
-                for (let i = list.length - 1; i >= 0; i--) {
-                  if (list[i].kind === "user") {
-                    lastUserIdx = i;
-                    break;
-                  }
-                }
-                const hasAssistantInTurn = list
-                  .slice(lastUserIdx + 1)
-                  .some((item) => item.kind === "assistant" && item.content.trim().length > 0);
-                if (hasAssistantInTurn) return prev;
-
-                const lastText = texts[texts.length - 1];
-                return {
-                  ...prev,
-                  [sid]: [
-                    ...list,
-                    {
-                      id: `as-sync-${Date.now()}`,
-                      session_id: sid,
-                      timestamp: now,
-                      kind: "assistant",
-                      content: lastText,
-                      is_streaming_chunk: false,
-                    },
-                  ],
-                };
-              });
-            })
-            .catch(() => {});
+        if (st === "completed" || st === "failed") {
+          if (st === "completed") {
+            refreshSessionDiffAndFiles(sid);
+          }
+          syncSessionEventsFromDaemon(sid);
         }
         return;
       }
@@ -1744,56 +1813,87 @@ export function App() {
 
       if (evType === "error") {
         const errText = String(evObj.error ?? "Agent execution error");
-        setEventsBySession((prev) => ({
-          ...prev,
-          [sid]: [
-            ...(prev[sid] || []),
-            {
-              id: `err-${Date.now()}`,
-              session_id: sid,
-              timestamp: now,
-              kind: "assistant",
-              content: `⚠️ ${errText}`,
-            },
-          ],
-        }));
+        setEventsBySession((prev) => {
+          const list = prev[sid] || [];
+          const prevItem = list[list.length - 1];
+          if (prevItem && prevItem.id.startsWith("err-")) {
+            return prev;
+          }
+          return {
+            ...prev,
+            [sid]: [
+              ...list,
+              {
+                id: `err-${Date.now()}`,
+                session_id: sid,
+                timestamp: now,
+                kind: "assistant",
+                content: `⚠️ ${errText}`,
+              },
+            ],
+          };
+        });
         scrollChatToBottom(false);
       }
     },
-    [daemonUrl, refreshSessionDiffAndFiles, scrollChatToBottom]
+    [
+      daemonUrl,
+      refreshSessionDiffAndFiles,
+      refreshSessions,
+      scrollChatToBottom,
+      syncSessionEventsFromDaemon,
+    ]
   );
 
-  // Subscribe to live WebSocket events from real Claude Code / Codex / ACP turns
+  // Subscribe to live WebSocket events with automatic reconnect across daemon restarts
   useEffect(() => {
     const wsUrl = `${daemonUrl.replace(/^http/, "ws")}/ws`;
     let ws: WebSocket | null = null;
-    try {
-      ws = new WebSocket(wsUrl);
-      ws.onopen = () => {
-        directWsConnectedRef.current = true;
-        setConnected(true);
-      };
-      ws.onmessage = (msg) => {
-        try {
-          const raw = JSON.parse(msg.data) as Record<string, unknown>;
-          processServerPayload(raw);
-        } catch {
-          // ignore malformed frames
-        }
-      };
-      ws.onclose = () => {
+    let reconnectTimer: number | null = null;
+    let unmounted = false;
+
+    const connectWs = () => {
+      if (unmounted) return;
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+          if (unmounted) return;
+          directWsConnectedRef.current = true;
+          setConnected(true);
+          refreshSessions();
+          syncSessionEventsFromDaemon(activeSessionIdRef.current);
+        };
+        ws.onmessage = (msg) => {
+          try {
+            const raw = JSON.parse(msg.data) as Record<string, unknown>;
+            processServerPayload(raw);
+          } catch {
+            // ignore malformed frames
+          }
+        };
+        ws.onclose = () => {
+          directWsConnectedRef.current = false;
+          if (unmounted) return;
+          setConnected(
+            Boolean(e2eeWsRef.current && e2eeWsRef.current.readyState === WebSocket.OPEN)
+          );
+          reconnectTimer = window.setTimeout(connectWs, 1500);
+        };
+      } catch {
         directWsConnectedRef.current = false;
-        setConnected(Boolean(e2eeWsRef.current && e2eeWsRef.current.readyState === WebSocket.OPEN));
-      };
-    } catch {
-      directWsConnectedRef.current = false;
-      setConnected(false);
-    }
+        setConnected(false);
+        reconnectTimer = window.setTimeout(connectWs, 2000);
+      }
+    };
+
+    connectWs();
     return () => {
+      unmounted = true;
       directWsConnectedRef.current = false;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (ws) ws.close();
     };
-  }, [daemonUrl, processServerPayload]);
+  }, [daemonUrl, processServerPayload, refreshSessions, syncSessionEventsFromDaemon]);
 
   // Connect to True E2EE Remote Relay (`ChaCha20-Poly1305`) when `?relay=...&room=...&key=...` is present
   useEffect(() => {
@@ -2075,7 +2175,7 @@ export function App() {
     const now = new Date().toLocaleTimeString([], { hour12: false });
     const baseEvents = overridePriorEvents ?? (eventsBySession[activeSession.id] || []);
     const userEv: AgentEvent = {
-      id: `u-${Date.now()}`,
+      id: `u-local-${Date.now()}`,
       session_id: activeSession.id,
       timestamp: now,
       kind: "user",
@@ -4138,6 +4238,104 @@ export function App() {
                                     isError={ev.tool_is_error}
                                     onOpenDiffTab={() => openDiffForFile(ev.tool_args)}
                                   />
+                                );
+                              }
+
+                              const errBanner = parseAgentErrorBanner(
+                                ev.content,
+                                activeSession.agent_kind || "claude"
+                              );
+                              if (errBanner) {
+                                return (
+                                  <div
+                                    key={ev.id}
+                                    data-testid="agent-error-banner"
+                                    className={`my-1.5 flex w-full flex-col gap-2.5 rounded-xl border px-3.5 py-3 ${
+                                      errBanner.isAuthRequired
+                                        ? "border-amber-500/35 bg-amber-500/[0.07]"
+                                        : "border-red-500/35 bg-red-500/[0.07]"
+                                    }`}
+                                  >
+                                    <div className="flex items-center justify-between gap-2">
+                                      <div className="flex items-center gap-2">
+                                        <Lock
+                                          className={`h-3.5 w-3.5 shrink-0 ${
+                                            errBanner.isAuthRequired
+                                              ? "text-amber-400"
+                                              : "text-red-400"
+                                          }`}
+                                        />
+                                        <span
+                                          className={`text-[12.5px] font-semibold ${
+                                            errBanner.isAuthRequired
+                                              ? "text-amber-400"
+                                              : "text-red-400"
+                                          }`}
+                                        >
+                                          {errBanner.isAuthRequired
+                                            ? "CLI 认证已失效 · 需要重新登录"
+                                            : "CLI 执行错误"}
+                                        </span>
+                                      </div>
+                                      <span className="font-mono text-[10.5px] text-[var(--v-fg-muted)]">
+                                        {ev.timestamp}
+                                      </span>
+                                    </div>
+
+                                    <div className="text-[12.5px] leading-relaxed text-[var(--v-fg-primary)] break-words">
+                                      {errBanner.message}
+                                    </div>
+
+                                    {errBanner.isAuthRequired && (
+                                      <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            if (
+                                              !sendE2eeCommand({
+                                                cmd: "launch_cli_login",
+                                                provider: errBanner.provider,
+                                              })
+                                            ) {
+                                              fetch(
+                                                `${daemonUrl}/api/providers/${encodeURIComponent(
+                                                  errBanner.provider
+                                                )}/login`,
+                                                { method: "POST" }
+                                              )
+                                                .then((r) => r.json())
+                                                .then((d) => {
+                                                  if (d?.message) {
+                                                    setGitActionNotice(String(d.message));
+                                                    window.setTimeout(
+                                                      () => setGitActionNotice(null),
+                                                      3500
+                                                    );
+                                                  }
+                                                })
+                                                .catch(() => {});
+                                            }
+                                          }}
+                                          className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-[11.5px] font-semibold text-black hover:bg-amber-400"
+                                        >
+                                          <Terminal className="h-3.5 w-3.5" />
+                                          在 Mac 终端一键登录 ({errBanner.loginCommand})
+                                        </button>
+
+                                        {errBanner.authUrl && (
+                                          <a
+                                            href={errBanner.authUrl}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-2.5 py-1.5 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
+                                          >
+                                            <Globe className="h-3.5 w-3.5" />
+                                            打开浏览器授权页 ↗
+                                          </a>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
                                 );
                               }
 
