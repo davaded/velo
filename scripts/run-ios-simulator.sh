@@ -31,5 +31,5 @@ echo "🔨 Building Native SwiftUI VeloMobile.app..."
 APP_PATH="${DERIVED}/Build/Products/Debug-iphonesimulator/VeloMobile.app"
 echo "🚀 Installing & Launching VeloMobile (${APP_PATH})..."
 xcrun simctl install "${SIM_UDID}" "${APP_PATH}"
-xcrun simctl launch "${SIM_UDID}" dev.velo.mobile
+xcrun simctl launch "${SIM_UDID}" com.daiyudai.velo.mobile
 echo "✅ VeloMobile is live on Simulator and connected to http://127.0.0.1:6767!"

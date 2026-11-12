@@ -32,9 +32,12 @@ public final class VeloStore: ObservableObject {
             self.connectionConfig = decoded
         } else {
             #if targetEnvironment(simulator)
-            // On iOS Simulator, auto-pair to the host Mac's local Velo Daemon out of the box!
             let simDefault = ConnectionModeConfig.direct(baseURL: "http://127.0.0.1:6767")
             self.connectionConfig = simDefault
+            #else
+            // Pre-configured with your Mac's LAN daemon address (can also scan QR anytime)
+            let lanDefault = ConnectionModeConfig.direct(baseURL: "http://192.168.10.3:6767")
+            self.connectionConfig = lanDefault
             #endif
         }
 
