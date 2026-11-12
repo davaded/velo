@@ -525,6 +525,7 @@ impl DaemonState {
                 images: Vec::new(),
                 approval_mode: Some("auto_edit".to_string()),
                 setup_command: None,
+                use_worktree: true,
             })
             .await?;
 
@@ -544,10 +545,13 @@ impl DaemonState {
         let session_id = Uuid::new_v4();
         let repo_path = PathBuf::from(&req.repo_path);
 
-        let provision = self
-            .worktree_mgr
-            .provision_worktree(&repo_path, session_id, req.branch.as_deref())
-            .await?;
+        let provision = if req.use_worktree {
+            self.worktree_mgr
+                .provision_worktree(&repo_path, session_id, req.branch.as_deref())
+                .await?
+        } else {
+            WorktreeManager::resolve_in_place_workspace(&repo_path).await
+        };
 
         // Run per-repo setup hook or `.velo/setup.sh` if isolated worktree was provisioned
         let configured_hook = if req.setup_command.is_some() {
@@ -1666,57 +1670,142 @@ struct DeleteSessionQuery {
     cleanup_worktree: Option<bool>,
 }
 
+impl DaemonState {
+    pub async fn delete_session_by_id(&self, id: Uuid, cleanup_wt: bool) -> bool {
+        let (removed_session, wt_still_in_use) = {
+            let mut guard = self.inner.write().await;
+            if let Some(mut handle) = guard.handles.remove(&id) {
+                handle.stop();
+            }
+            if let Some(mut shell) = guard.shells.remove(&id) {
+                shell.stop();
+            }
+            guard.event_history.remove(&id);
+            let removed = guard.sessions.remove(&id);
+            let in_use = removed
+                .as_ref()
+                .map(|rem| {
+                    guard
+                        .sessions
+                        .values()
+                        .any(|other| other.worktree_path == rem.worktree_path)
+                })
+                .unwrap_or(false);
+            (removed, in_use)
+        };
+
+        let ev_file = self.events_dir.join(format!("{}.json", id));
+        let _ = tokio::fs::remove_file(&ev_file).await;
+
+        let mut worktree_removed = false;
+        if let Some(ref s) = removed_session {
+            if cleanup_wt && !wt_still_in_use && s.worktree_path != s.repo_root {
+                let repo_root = PathBuf::from(&s.repo_root);
+                let wt_path = PathBuf::from(&s.worktree_path);
+                if self
+                    .worktree_mgr
+                    .remove_worktree(&repo_root, &wt_path)
+                    .await
+                    .is_ok()
+                {
+                    worktree_removed = true;
+                }
+                if wt_path.starts_with(self.worktree_mgr.base_dir()) {
+                    let _ = tokio::fs::remove_dir_all(&wt_path).await;
+                }
+            }
+        }
+
+        let _ = self.persist_sessions().await;
+        worktree_removed
+    }
+
+    pub async fn update_session_fields(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        provider: Option<AgentProvider>,
+        model: Option<String>,
+        effort: Option<String>,
+        approval_mode: Option<String>,
+        preview_url: Option<String>,
+    ) -> Option<SessionInfo> {
+        let updated = {
+            let mut guard = self.inner.write().await;
+            let has_history = guard
+                .event_history
+                .get(&id)
+                .map(|evs| {
+                    evs.iter().any(|ev| {
+                        matches!(
+                            ev,
+                            AgentEvent::UserMessage { .. }
+                                | AgentEvent::MessageDelta { .. }
+                                | AgentEvent::ToolCallRequested { .. }
+                        )
+                    })
+                })
+                .unwrap_or(false);
+
+            if let Some(s) = guard.sessions.get_mut(&id) {
+                let is_engine_bound = s.provider_session_id.is_some() || has_history;
+                if let Some(n) = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+                    s.name = n;
+                }
+                let mut provider_conflict = false;
+                if let Some(new_prov) = provider {
+                    if s.provider != new_prov {
+                        if !is_engine_bound {
+                            s.provider = new_prov;
+                            s.provider_session_id = None;
+                        } else {
+                            provider_conflict = true;
+                        }
+                    }
+                }
+                if !provider_conflict {
+                    if let Some(m) = model {
+                        s.model = if m.trim().is_empty() { None } else { Some(m) };
+                    }
+                }
+                if let Some(eff) = effort {
+                    s.effort = if eff.trim().is_empty() {
+                        None
+                    } else {
+                        Some(eff)
+                    };
+                }
+                if let Some(mode) = approval_mode.filter(|m| !m.trim().is_empty()) {
+                    s.approval_mode = mode;
+                }
+                if let Some(purl) = preview_url {
+                    s.preview_url = if purl.trim().is_empty() {
+                        None
+                    } else {
+                        Some(purl)
+                    };
+                }
+                s.updated_at = Utc::now();
+                Some(s.clone())
+            } else {
+                None
+            }
+        };
+
+        if updated.is_some() {
+            let _ = self.persist_sessions().await;
+        }
+        updated
+    }
+}
+
 async fn delete_session_handler(
     State(state): State<DaemonState>,
     AxumPath(id): AxumPath<Uuid>,
     Query(query): Query<DeleteSessionQuery>,
 ) -> impl IntoResponse {
     let cleanup_wt = query.cleanup_worktree.unwrap_or(true);
-    let (removed_session, wt_still_in_use) = {
-        let mut guard = state.inner.write().await;
-        if let Some(mut handle) = guard.handles.remove(&id) {
-            handle.stop();
-        }
-        if let Some(mut shell) = guard.shells.remove(&id) {
-            shell.stop();
-        }
-        guard.event_history.remove(&id);
-        let removed = guard.sessions.remove(&id);
-        let in_use = removed
-            .as_ref()
-            .map(|rem| {
-                guard
-                    .sessions
-                    .values()
-                    .any(|other| other.worktree_path == rem.worktree_path)
-            })
-            .unwrap_or(false);
-        (removed, in_use)
-    };
-
-    let ev_file = state.events_dir.join(format!("{}.json", id));
-    let _ = tokio::fs::remove_file(&ev_file).await;
-
-    let mut worktree_removed = false;
-    if let Some(ref s) = removed_session {
-        if cleanup_wt && !wt_still_in_use && s.worktree_path != s.repo_root {
-            let repo_root = PathBuf::from(&s.repo_root);
-            let wt_path = PathBuf::from(&s.worktree_path);
-            if state
-                .worktree_mgr
-                .remove_worktree(&repo_root, &wt_path)
-                .await
-                .is_ok()
-            {
-                worktree_removed = true;
-            }
-            if wt_path.starts_with(state.worktree_mgr.base_dir()) {
-                let _ = tokio::fs::remove_dir_all(&wt_path).await;
-            }
-        }
-    }
-
-    let _ = state.persist_sessions().await;
+    let worktree_removed = state.delete_session_by_id(id, cleanup_wt).await;
     (
         StatusCode::OK,
         Json(json!({
@@ -1743,54 +1832,20 @@ async fn update_session_handler(
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<UpdateSessionRequest>,
 ) -> impl IntoResponse {
-    let updated = {
-        let mut guard = state.inner.write().await;
-        if let Some(s) = guard.sessions.get_mut(&id) {
-            if let Some(name) = req.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
-                s.name = name;
-            }
-            if let Some(new_prov) = req.provider {
-                if s.provider != new_prov {
-                    s.provider = new_prov;
-                    s.provider_session_id = None;
-                }
-            }
-            if let Some(model) = req.model {
-                s.model = if model.trim().is_empty() {
-                    None
-                } else {
-                    Some(model)
-                };
-            }
-            if let Some(effort) = req.effort {
-                s.effort = if effort.trim().is_empty() {
-                    None
-                } else {
-                    Some(effort)
-                };
-            }
-            if let Some(mode) = req.approval_mode.filter(|m| !m.trim().is_empty()) {
-                s.approval_mode = mode;
-            }
-            if let Some(purl) = req.preview_url {
-                s.preview_url = if purl.trim().is_empty() {
-                    None
-                } else {
-                    Some(purl)
-                };
-            }
-            s.updated_at = Utc::now();
-            Some(s.clone())
-        } else {
-            None
-        }
-    };
+    let updated = state
+        .update_session_fields(
+            id,
+            req.name,
+            req.provider,
+            req.model,
+            req.effort,
+            req.approval_mode,
+            req.preview_url,
+        )
+        .await;
 
     match updated {
-        Some(s) => {
-            let _ = state.persist_sessions().await;
-            (StatusCode::OK, Json(json!(s))).into_response()
-        }
+        Some(s) => (StatusCode::OK, Json(json!(s))).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Session not found" })),
@@ -2339,13 +2394,37 @@ fn build_conversation_transcript_prefix(
     }
 }
 
+fn truncate_utf8_tail(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(total - max_chars).collect();
+    format!("...(earlier turns omitted)...\n{}", tail)
+}
+
+fn clean_provider_badge(provider: &AgentProvider) -> &'static str {
+    match provider {
+        AgentProvider::Claude => "Claude",
+        AgentProvider::Codex => "Codex",
+        AgentProvider::Antigravity => "AGY",
+        AgentProvider::Grok => "Grok",
+        AgentProvider::Cursor => "Cursor",
+        AgentProvider::OpenCode => "OpenCode",
+        AgentProvider::Copilot => "Copilot",
+        AgentProvider::Qwen => "Qwen",
+        AgentProvider::Acp(_) => "ACP",
+        AgentProvider::Custom(_) => "Agent",
+    }
+}
+
 impl DaemonState {
     pub async fn dispatch_session_input(
         &self,
         id: Uuid,
         req: SessionInputRequest,
     ) -> Result<Value> {
-        let (existing_session, prior_transcript) = {
+        let (existing_session, prior_transcript, parent_handoff_context) = {
             let mut guard = self.inner.write().await;
             if let Some(mut old_handle) = guard.handles.remove(&id) {
                 old_handle.stop();
@@ -2367,28 +2446,86 @@ impl DaemonState {
                 let evs = guard.event_history.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
                 build_conversation_transcript_prefix(evs, &s.prompt)
             });
-            (sess, transcript)
+            let parent_ctx = if transcript.is_none() {
+                sess.as_ref()
+                    .and_then(|s| s.parent_session_id)
+                    .and_then(|pid| {
+                        let ps = guard.sessions.get(&pid)?;
+                        let pevs = guard
+                            .event_history
+                            .get(&pid)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        let ptr = build_conversation_transcript_prefix(pevs, &ps.prompt);
+                        let mut parts: Vec<String> = vec![format!(
+                            "[Context handed off from {} session \"{}\"]",
+                            clean_provider_badge(&ps.provider),
+                            ps.name
+                        )];
+                        if !ps.diff_stats.modified_files.is_empty() {
+                            parts.push(format!(
+                                "Modified files ({}): {}",
+                                ps.diff_stats.files_changed,
+                                ps.diff_stats.modified_files.join(", ")
+                            ));
+                        }
+                        if let Some(t) = ptr {
+                            parts.push(truncate_utf8_tail(&t, 6000));
+                        }
+                        Some(parts.join("\n"))
+                    })
+            } else {
+                None
+            };
+            (sess, transcript, parent_ctx)
         };
 
         let Some(session) = existing_session else {
             anyhow::bail!("Session not found");
         };
 
-        let target_provider = req.provider.clone().unwrap_or_else(|| {
-            if let Some(ref m) = req.model {
-                let ml = m.to_lowercase();
-                if ml.starts_with("gemini-") || ml.starts_with("gpt-oss-") || ml == "agy" {
-                    return AgentProvider::Antigravity;
+        let is_engine_bound = req.truncate_to_user_turn.is_none()
+            && !req.reset_thread
+            && (session.provider_session_id.is_some() || prior_transcript.is_some());
+
+        let (target_provider, effective_model) = if is_engine_bound {
+            let provider_conflict = req
+                .provider
+                .as_ref()
+                .map(|p| p != &session.provider)
+                .unwrap_or(false);
+            let chosen_model = if provider_conflict {
+                session.model.clone()
+            } else {
+                req.model.clone().or_else(|| session.model.clone())
+            };
+            (session.provider.clone(), chosen_model)
+        } else {
+            let inferred_prov = req.provider.clone().unwrap_or_else(|| {
+                if let Some(ref m) = req.model {
+                    let ml = m.to_lowercase();
+                    if ml.starts_with("gemini-") || ml.starts_with("gpt-oss-") || ml == "agy" {
+                        return AgentProvider::Antigravity;
+                    }
+                    if ml.starts_with("grok-") || ml == "grok" {
+                        return AgentProvider::Grok;
+                    }
+                    if ml.starts_with("cursor:") || ml == "cursor" || ml == "cursor-agent" {
+                        return AgentProvider::Cursor;
+                    }
+                    if ml.starts_with("claude-") {
+                        return AgentProvider::Claude;
+                    }
+                    if ml.starts_with("gpt-") || ml.starts_with("o3") || ml.starts_with("o4") {
+                        return AgentProvider::Codex;
+                    }
                 }
-                if ml.starts_with("grok-") || ml == "grok" {
-                    return AgentProvider::Grok;
-                }
-                if ml.starts_with("cursor:") || ml == "cursor" || ml == "cursor-agent" {
-                    return AgentProvider::Cursor;
-                }
-            }
-            session.provider.clone()
-        });
+                session.provider.clone()
+            });
+            let chosen_model = req.model.clone().or_else(|| session.model.clone());
+            (inferred_prov, chosen_model)
+        };
+
         let can_resume_native = req.truncate_to_user_turn.is_none()
             && !req.reset_thread
             && target_provider == session.provider;
@@ -2417,11 +2554,14 @@ impl DaemonState {
 
         let effective_prompt = if resume_session_id.is_some() {
             req.input.clone()
-        } else if let Some(history) = prior_transcript {
+        } else if let Some(history) = prior_transcript.as_ref() {
             format!(
-                "<conversation_history>\n{}\n</conversation_history>\n\nUser: {}",
-                history, req.input
+                "{}\n\n---\n[Prior conversation context in this session]\n{}",
+                req.input,
+                truncate_utf8_tail(history, 6000)
             )
+        } else if let Some(parent_ctx) = parent_handoff_context {
+            format!("{}\n\n---\n{}", req.input, parent_ctx)
         } else {
             req.input.clone()
         };
@@ -2438,7 +2578,7 @@ impl DaemonState {
             effective_prompt,
             wt_path,
             false,
-            req.model.clone().or_else(|| session.model.clone()),
+            effective_model.clone(),
             req.effort.clone().or_else(|| session.effort.clone()),
             resume_session_id.clone(),
             req.images.clone(),
@@ -2456,11 +2596,24 @@ impl DaemonState {
                     s.provider_session_id = None;
                 }
                 s.provider = target_provider;
-                if req.model.is_some() {
-                    s.model = req.model.clone();
+                if effective_model.is_some() {
+                    s.model = effective_model;
                 }
                 if req.effort.is_some() {
                     s.effort = req.effort.clone();
+                }
+                if prior_transcript.is_none()
+                    && (s.name == "New thread" || s.prompt.trim().is_empty())
+                    && !req.input.trim().is_empty()
+                {
+                    let first_line = req.input.lines().next().unwrap_or("").trim();
+                    if !first_line.is_empty() {
+                        let clean_title: String = first_line.chars().take(44).collect();
+                        if s.parent_session_id.is_none() {
+                            s.name = clean_title;
+                        }
+                        s.prompt = req.input.clone();
+                    }
                 }
                 s.approval_mode = effective_approval;
                 s.status = SessionStatus::Running;
@@ -2476,6 +2629,88 @@ impl DaemonState {
             "pid": pid,
             "resumed_thread_id": resume_session_id,
         }))
+    }
+
+    pub async fn handoff_session(
+        &self,
+        id: Uuid,
+        req: HandoffSessionRequest,
+    ) -> Result<SessionInfo> {
+        let source_session = {
+            let guard = self.inner.read().await;
+            guard
+                .sessions
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Source session not found"))?
+        };
+
+        let stripped_base = source_session
+            .name
+            .split(" · ")
+            .next()
+            .unwrap_or(&source_session.name)
+            .trim();
+        let base_title = if stripped_base.is_empty() || stripped_base == "New thread" {
+            let fallback_line = source_session.prompt.lines().next().unwrap_or("").trim();
+            if fallback_line.is_empty() {
+                "Session".to_string()
+            } else {
+                fallback_line.chars().take(36).collect()
+            }
+        } else {
+            stripped_base.chars().take(36).collect()
+        };
+
+        let target_badge = clean_provider_badge(&req.target_provider);
+        let handoff_title = format!("{} · {}", base_title, target_badge);
+
+        let new_session_id = Uuid::new_v4();
+        let created = self
+            .spawn_in_existing_worktree_with_mode(
+                new_session_id,
+                Some(handoff_title),
+                req.target_provider.clone(),
+                String::new(),
+                PathBuf::from(&source_session.repo_root),
+                PathBuf::from(&source_session.worktree_path),
+                source_session.branch.clone(),
+                false,
+                Some(source_session.id),
+                req.model.clone(),
+                req.effort.clone().or_else(|| source_session.effort.clone()),
+                Vec::new(),
+                source_session.approval_mode.clone(),
+            )
+            .await?;
+
+        if let Some(extra) = req
+            .additional_instructions
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            let _ = self
+                .dispatch_session_input(
+                    created.id,
+                    SessionInputRequest {
+                        input: extra,
+                        model: req.model,
+                        effort: req.effort.or(source_session.effort),
+                        provider: Some(req.target_provider),
+                        reset_thread: false,
+                        truncate_to_user_turn: None,
+                        images: Vec::new(),
+                        approval_mode: Some(source_session.approval_mode),
+                    },
+                )
+                .await?;
+            let guard = self.inner.read().await;
+            if let Some(updated) = guard.sessions.get(&created.id).cloned() {
+                return Ok(updated);
+            }
+        }
+
+        Ok(created)
     }
 }
 
@@ -2783,68 +3018,16 @@ async fn handoff_session_handler(
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<HandoffSessionRequest>,
 ) -> impl IntoResponse {
-    let source_session = {
-        let guard = state.inner.read().await;
-        match guard.sessions.get(&id).cloned() {
-            Some(s) => s,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Source session not found" })),
-                )
-                    .into_response();
-            }
-        }
-    };
-
-    let wt_path = Path::new(&source_session.worktree_path);
-    let diff_stats = WorktreeManager::compute_diff_stats(wt_path)
-        .await
-        .unwrap_or_default();
-
-    let extra = req
-        .additional_instructions
-        .unwrap_or_else(|| "Continue implementation and verify all changes.".to_string());
-
-    let handoff_prompt = format!(
-        "[VELO HANDOFF from session {} ({}) on branch `{}`]\n\
-         Original Task: {}\n\
-         Modified Files So Far ({}): {}\n\
-         Handoff Instructions: {}",
-        &source_session.id.to_string()[..8],
-        source_session.provider,
-        source_session.branch,
-        source_session.prompt,
-        diff_stats.files_changed,
-        diff_stats.modified_files.join(", "),
-        extra
-    );
-
-    let new_session_id = Uuid::new_v4();
-    let short_id = &new_session_id.to_string()[..8];
-    match state
-        .spawn_in_existing_worktree(
-            new_session_id,
-            Some(format!("handoff-{}-{}", req.target_provider, short_id)),
-            req.target_provider,
-            handoff_prompt,
-            PathBuf::from(&source_session.repo_root),
-            PathBuf::from(&source_session.worktree_path),
-            source_session.branch,
-            false,
-            Some(source_session.id),
-            None,
-            None,
-            Vec::new(),
-        )
-        .await
-    {
+    match state.handoff_session(id, req).await {
         Ok(session) => (StatusCode::CREATED, Json(json!(session))).into_response(),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": err.to_string() })),
-        )
-            .into_response(),
+        Err(err) => {
+            let code = if err.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (code, Json(json!({ "error": err.to_string() }))).into_response()
+        }
     }
 }
 
@@ -2956,6 +3139,7 @@ async fn committee_handler(
             images: Vec::new(),
             approval_mode: None,
             setup_command: None,
+            use_worktree: true,
         };
         match state.create_session(create_req).await {
             Ok(s) => spawned.push(s),
@@ -2987,6 +3171,7 @@ async fn loop_handler(
         max_iters, req.prompt, req.check_command
     );
 
+    let use_worktree = req.branch.is_some();
     let create_req = CreateSessionRequest {
         name: req
             .name
@@ -3003,6 +3188,7 @@ async fn loop_handler(
         images: Vec::new(),
         approval_mode: None,
         setup_command: None,
+        use_worktree,
     };
 
     let initial_session = match state.create_session(create_req).await {
@@ -3815,6 +4001,7 @@ pub async fn handle_mcp_request_for_session(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
 
+                    let use_worktree = branch.is_some();
                     let req = CreateSessionRequest {
                         name: None,
                         provider: AgentProvider::from_str_loose(provider_str),
@@ -3828,6 +4015,7 @@ pub async fn handle_mcp_request_for_session(
                         images: Vec::new(),
                         approval_mode: None,
                         setup_command: None,
+                        use_worktree,
                     };
                     match state.create_session(req).await {
                         Ok(s) => json!({
@@ -4268,6 +4456,7 @@ mod tests {
             images: Vec::new(),
             approval_mode: None,
             setup_command: None,
+            use_worktree: true,
         };
 
         let session = state.create_session(req).await?;
@@ -4281,6 +4470,42 @@ mod tests {
         assert_eq!(updated.diff_stats.files_changed, 1);
         assert_eq!(updated.diff_stats.insertions, 1);
         drop(guard);
+
+        // Verify default in-place workspace + cross-engine handoff creates clean child session
+        let inplace_req = CreateSessionRequest {
+            name: Some("Check architecture".to_string()),
+            provider: velo_protocol::AgentProvider::Codex,
+            prompt: String::new(),
+            repo_path: repo_dir.to_string_lossy().to_string(),
+            branch: None,
+            use_pty: false,
+            parent_session_id: None,
+            model: Some("gpt-5.4".to_string()),
+            effort: Some("high".to_string()),
+            images: Vec::new(),
+            approval_mode: None,
+            setup_command: None,
+            use_worktree: false,
+        };
+        let inplace_sess = state.create_session(inplace_req).await?;
+        assert_eq!(inplace_sess.worktree_path, inplace_sess.repo_root);
+
+        let handed_off = state
+            .handoff_session(
+                inplace_sess.id,
+                HandoffSessionRequest {
+                    target_provider: velo_protocol::AgentProvider::Grok,
+                    model: Some("grok-4.7".to_string()),
+                    effort: Some("medium".to_string()),
+                    additional_instructions: None,
+                },
+            )
+            .await?;
+        assert_eq!(handed_off.parent_session_id, Some(inplace_sess.id));
+        assert_eq!(handed_off.provider, velo_protocol::AgentProvider::Grok);
+        assert_eq!(handed_off.model.as_deref(), Some("grok-4.7"));
+        assert_eq!(handed_off.name, "Check architecture · Grok");
+        assert_eq!(handed_off.worktree_path, inplace_sess.repo_root);
 
         // Verify built-in MCP Server tools/list & velo_list_sessions
         let mcp_list = handle_mcp_request(

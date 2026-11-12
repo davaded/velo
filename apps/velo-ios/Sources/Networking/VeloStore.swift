@@ -19,6 +19,7 @@ public final class VeloStore: ObservableObject {
     @Published public var diffsBySession: [String: [DiffFileSection]] = [:]
     @Published public var turnStartedAtBySession: [String: Date] = [:]
     @Published public var models: [VeloModelOption] = VeloModelOption.defaults
+    @Published public var latestCreatedOrHandoffSessionId: String?
 
     private var wsTask: URLSessionWebSocketTask?
     private var reconnectTask: Task<Void, Never>?
@@ -239,7 +240,19 @@ public final class VeloStore: ObservableObject {
             let short = (item["shortLabel"] as? String) ?? label
             let family = (item["family"] as? String) ?? "Model"
             let kind = (item["agentKind"] as? String) ?? "claude"
-            return VeloModelOption(id: id, label: label, shortLabel: short, family: family, agentKind: kind)
+            let desc = (item["desc"] as? String) ?? ""
+            let installed = (item["installed"] as? Bool) ?? true
+            let isDefault = (item["isDefault"] as? Bool) ?? false
+            return VeloModelOption(
+                id: id,
+                label: label,
+                shortLabel: short,
+                family: family,
+                agentKind: kind,
+                desc: desc,
+                installed: installed,
+                isDefault: isDefault
+            )
         }
         if !parsed.isEmpty {
             self.models = parsed
@@ -386,10 +399,10 @@ public final class VeloStore: ObservableObject {
         repoPath: String,
         branch: String?,
         modelOption: VeloModelOption,
-        effort: String
+        effort: String,
+        useWorktree: Bool = false
     ) async -> String? {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanPrompt.isEmpty else { return nil }
         triggerHaptic(.medium)
 
         switch connectionConfig {
@@ -405,11 +418,12 @@ public final class VeloStore: ObservableObject {
                 "model": modelOption.id,
                 "effort": effort,
                 "approval_mode": "auto_edit",
+                "use_worktree": useWorktree,
             ]
             if let title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
                 body["name"] = title.trimmingCharacters(in: .whitespaces)
             }
-            if let branch, !branch.trimmingCharacters(in: .whitespaces).isEmpty {
+            if useWorktree, let branch, !branch.trimmingCharacters(in: .whitespaces).isEmpty {
                 body["branch"] = branch.trimmingCharacters(in: .whitespaces)
             }
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -418,19 +432,24 @@ public final class VeloStore: ObservableObject {
                let created = VeloSessionItem.fromJSON(dict)
             {
                 let now = Date()
-                turnStartedAtBySession[created.id] = now
-                stepStartedAtBySession[created.id] = now
+                if !cleanPrompt.isEmpty {
+                    turnStartedAtBySession[created.id] = now
+                    stepStartedAtBySession[created.id] = now
+                    eventsBySession[created.id] = [
+                        TimelineEventItem(
+                            id: "u-init-\(UUID().uuidString.prefix(6))",
+                            sessionId: created.id,
+                            timestamp: Self.shortTimeString(from: now),
+                            content: cleanPrompt,
+                            kind: .user(images: [])
+                        )
+                    ]
+                } else {
+                    eventsBySession[created.id] = []
+                }
                 sessions.insert(created, at: 0)
                 activeSessionId = created.id
-                eventsBySession[created.id] = [
-                    TimelineEventItem(
-                        id: "u-init-\(UUID().uuidString.prefix(6))",
-                        sessionId: created.id,
-                        timestamp: Self.shortTimeString(from: now),
-                        content: cleanPrompt,
-                        kind: .user(images: [])
-                    )
-                ]
+                latestCreatedOrHandoffSessionId = created.id
                 return created.id
             }
             return nil
@@ -444,15 +463,162 @@ public final class VeloStore: ObservableObject {
                 "model": modelOption.id,
                 "effort": effort,
                 "approval_mode": "auto_edit",
+                "use_worktree": useWorktree,
             ]
             if let title, !title.isEmpty { payload["name"] = title }
-            if let branch, !branch.isEmpty { payload["branch"] = branch }
+            if useWorktree, let branch, !branch.isEmpty { payload["branch"] = branch }
             pendingSelectNewestSession = true
             sendEncryptedCommand(payload)
             return nil
 
         case .none:
             return nil
+        }
+    }
+
+    public func updateSessionModelAndEffort(
+        sessionId: String,
+        modelOption: VeloModelOption,
+        effort: String
+    ) async {
+        let hasEvents = !(eventsBySession[sessionId]?.isEmpty ?? true)
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[idx].model = modelOption.id
+            sessions[idx].modelShort = modelOption.shortLabel
+            sessions[idx].effort = effort
+            if !hasEvents && !modelOption.agentKind.isEmpty {
+                sessions[idx].agentKind = modelOption.agentKind
+            }
+        }
+        triggerHaptic(.light)
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "PATCH"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            var body: [String: Any] = [
+                "model": modelOption.id,
+                "effort": effort,
+            ]
+            if !hasEvents && !modelOption.agentKind.isEmpty {
+                body["provider"] = modelOption.agentKind
+            }
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            _ = try? await URLSession.shared.data(for: req)
+
+        case .e2eeRelay:
+            var payload: [String: Any] = [
+                "cmd": "update_session",
+                "session_id": sessionId,
+                "model": modelOption.id,
+                "effort": effort,
+            ]
+            if !hasEvents && !modelOption.agentKind.isEmpty {
+                payload["provider"] = modelOption.agentKind
+            }
+            sendEncryptedCommand(payload)
+
+        case .none:
+            break
+        }
+    }
+
+    public func handoffSession(
+        sourceSessionId: String,
+        targetOption: VeloModelOption,
+        effort: String,
+        instructions: String? = nil
+    ) async -> String? {
+        let cleanInstructions = instructions?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetProv = targetOption.agentKind.isEmpty ? "claude" : targetOption.agentKind
+        triggerHaptic(.medium)
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sourceSessionId)/handoff") else { return nil }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            var body: [String: Any] = [
+                "target_provider": targetProv,
+                "model": targetOption.id,
+                "effort": effort,
+            ]
+            if let cleanInstructions, !cleanInstructions.isEmpty {
+                body["additional_instructions"] = cleanInstructions
+            }
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            if let (data, _) = try? await URLSession.shared.data(for: req),
+               let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let created = VeloSessionItem.fromJSON(dict)
+            {
+                sessions.removeAll(where: { $0.id == created.id })
+                sessions.insert(created, at: 0)
+                activeSessionId = created.id
+                latestCreatedOrHandoffSessionId = created.id
+                if let cleanInstructions, !cleanInstructions.isEmpty {
+                    let now = Date()
+                    turnStartedAtBySession[created.id] = now
+                    stepStartedAtBySession[created.id] = now
+                    eventsBySession[created.id] = [
+                        TimelineEventItem(
+                            id: "u-ho-\(UUID().uuidString.prefix(6))",
+                            sessionId: created.id,
+                            timestamp: Self.shortTimeString(from: now),
+                            content: cleanInstructions,
+                            kind: .user(images: [])
+                        )
+                    ]
+                } else {
+                    eventsBySession[created.id] = []
+                }
+                return created.id
+            }
+            return nil
+
+        case .e2eeRelay:
+            var payload: [String: Any] = [
+                "cmd": "handoff_session",
+                "session_id": sourceSessionId,
+                "target_provider": targetProv,
+                "model": targetOption.id,
+                "effort": effort,
+            ]
+            if let cleanInstructions, !cleanInstructions.isEmpty {
+                payload["additional_instructions"] = cleanInstructions
+            }
+            pendingSelectNewestSession = true
+            sendEncryptedCommand(payload)
+            return nil
+
+        case .none:
+            return nil
+        }
+    }
+
+    public func deleteSession(_ sessionId: String) async {
+        triggerHaptic(.rigid)
+        sessions.removeAll(where: { $0.id == sessionId })
+        eventsBySession.removeValue(forKey: sessionId)
+        if activeSessionId == sessionId {
+            activeSessionId = sessions.first?.id
+        }
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "DELETE"
+            _ = try? await URLSession.shared.data(for: req)
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "delete_session",
+                "session_id": sessionId,
+            ])
+        case .none:
+            break
         }
     }
 
@@ -646,6 +812,16 @@ public final class VeloStore: ObservableObject {
                 return
             }
 
+            if type == "handoff_completed",
+               let newSid = raw["new_session_id"] as? String, !newSid.isEmpty
+            {
+                pendingSelectNewestSession = false
+                self.activeSessionId = newSid
+                self.latestCreatedOrHandoffSessionId = newSid
+                Task { await loadEventsForSession(newSid) }
+                return
+            }
+
             if type == "pong" {
                 return
             }
@@ -659,6 +835,7 @@ public final class VeloStore: ObservableObject {
             if pendingSelectNewestSession, let newest = parsed.first {
                 pendingSelectNewestSession = false
                 self.activeSessionId = newest.id
+                self.latestCreatedOrHandoffSessionId = newest.id
                 Task { await loadEventsForSession(newest.id) }
             } else if self.activeSessionId == nil, let first = parsed.first {
                 self.activeSessionId = first.id

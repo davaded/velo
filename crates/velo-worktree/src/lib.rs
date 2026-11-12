@@ -69,6 +69,40 @@ impl WorktreeManager {
         Ok(PathBuf::from(root_str))
     }
 
+    /// Resolves an in-place workspace directly inside the real repository root (no isolated Git worktree).
+    /// This ensures normal interactive sessions belong natively to the user's real project directory.
+    pub async fn resolve_in_place_workspace(repo_path: &Path) -> WorktreeProvision {
+        let repo_root = match Self::resolve_repo_root(repo_path).await {
+            Ok(root) => root,
+            Err(_) => repo_path.to_path_buf(),
+        };
+
+        let detected_branch = match Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if b.is_empty() {
+                    "main".to_string()
+                } else {
+                    b
+                }
+            }
+            _ => "main".to_string(),
+        };
+
+        WorktreeProvision {
+            repo_root: repo_root.clone(),
+            worktree_path: repo_root,
+            branch: detected_branch,
+            is_isolated_worktree: false,
+        }
+    }
+
     /// Provisions an isolated Git worktree for a session, or falls back to the directory if git is unavailable.
     pub async fn provision_worktree(
         &self,

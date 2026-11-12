@@ -4,16 +4,24 @@ import UIKit
 public struct ChatThreadView: View {
     @ObservedObject var store: VeloStore
     let sessionId: String
+    var onSwitchedSession: ((String) -> Void)?
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var draftPrompt: String = ""
     @State private var selectedModelId: String = "claude-fable-5-2"
     @State private var selectedEffort: String = "medium"
     @State private var showDiffSheet: Bool = false
+    @State private var showModelSheet: Bool = false
     @FocusState private var composerFocused: Bool
 
-    public init(store: VeloStore, sessionId: String) {
+    public init(
+        store: VeloStore,
+        sessionId: String,
+        onSwitchedSession: ((String) -> Void)? = nil
+    ) {
         self.store = store
         self.sessionId = sessionId
+        self.onSwitchedSession = onSwitchedSession
     }
 
     private var session: VeloSessionItem? {
@@ -24,272 +32,647 @@ public struct ChatThreadView: View {
         VeloStore.groupIntoTurns(store.eventsBySession[sessionId] ?? [])
     }
 
+    private var isEngineBound: Bool {
+        !turns.isEmpty
+    }
+
     private var isSessionRunning: Bool {
         guard let st = session?.status else { return false }
         return st == .running || st == .waitingApproval
     }
 
+    private var activeModelOption: VeloModelOption {
+        if let found = store.models.first(where: { $0.id == selectedModelId }) {
+            return found
+        }
+        if let def = VeloModelOption.defaults.first(where: { $0.id == selectedModelId }) {
+            return def
+        }
+        let cat = session?.engineCategory ?? .claude
+        return VeloModelOption(
+            id: selectedModelId,
+            label: VeloModelOption.shortLabel(for: selectedModelId),
+            shortLabel: VeloModelOption.shortLabel(for: selectedModelId),
+            family: cat.vendor,
+            agentKind: session?.agentKind ?? cat.rawValue
+        )
+    }
+
     public var body: some View {
-        VStack(spacing: 0) {
-            // 1. Chronological Native Turn Stream
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 18) {
-                        if turns.isEmpty {
-                            VStack(spacing: 10) {
-                                Image(systemName: "terminal")
-                                    .font(.system(size: 30, weight: .light))
-                                    .foregroundStyle(.secondary)
-                                Text(session?.branchName ?? "Ready")
-                                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                                Text("在下方输入需求，Agent 将在 Mac 隔离 Git Worktree 中自主执行并实时流式同步。")
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(.secondary)
-                                    .multilineTextAlignment(.center)
-                                    .padding(.horizontal, 28)
+        ZStack {
+            VeloTheme.canvas(colorScheme)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                // 1. Subtle Specular Context Strip (Bound Engine + Project/Branch + Handoff Origin)
+                if let s = session {
+                    threadContextBar(s)
+                }
+
+                // 2. Chronological Turn Stream
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 20) {
+                            if turns.isEmpty {
+                                emptyThreadHero
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 70)
-                        }
 
-                        ForEach(Array(turns.enumerated()), id: \.element.id) { idx, turn in
-                            let isLatest = idx == turns.count - 1
-                            let turnRunning = isLatest && isSessionRunning
+                            ForEach(Array(turns.enumerated()), id: \.element.id) { idx, turn in
+                                let isLatest = idx == turns.count - 1
+                                let turnRunning = isLatest && isSessionRunning
 
-                            TurnBlockView(
-                                turn: turn,
-                                isTurnRunning: turnRunning,
-                                turnStartedAt: isLatest ? store.turnStartedAtBySession[sessionId] : nil,
-                                waitingApproval: isLatest ? store.pendingApprovals[sessionId] : nil,
-                                waitingQuestion: isLatest ? store.pendingQuestions[sessionId] : nil,
-                                onRequestMacLogin: { provider in
-                                    await store.requestMacCLILogin(provider: provider)
-                                },
-                                onRetry: (!isSessionRunning && turn.userEvent != nil) ? {
-                                    if let text = turn.userEvent?.content {
-                                        Task {
-                                            await store.sendPrompt(
-                                                sessionId: sessionId,
-                                                text: text,
-                                                model: selectedModelId,
-                                                effort: selectedEffort
-                                            )
+                                TurnBlockView(
+                                    turn: turn,
+                                    isTurnRunning: turnRunning,
+                                    turnStartedAt: isLatest ? store.turnStartedAtBySession[sessionId] : nil,
+                                    waitingApproval: isLatest ? store.pendingApprovals[sessionId] : nil,
+                                    waitingQuestion: isLatest ? store.pendingQuestions[sessionId] : nil,
+                                    onRequestMacLogin: { provider in
+                                        await store.requestMacCLILogin(provider: provider)
+                                    },
+                                    onRetry: (!isSessionRunning && turn.userEvent != nil) ? {
+                                        if let text = turn.userEvent?.content {
+                                            Task {
+                                                await store.sendPrompt(
+                                                    sessionId: sessionId,
+                                                    text: text,
+                                                    model: selectedModelId,
+                                                    effort: selectedEffort
+                                                )
+                                            }
                                         }
-                                    }
-                                } : nil
-                            )
-                        }
-
-                        // Live Interactive Permission Approval Card
-                        if let approval = store.pendingApprovals[sessionId] {
-                            ApprovalPromptCard(
-                                prompt: approval,
-                                onApprove: {
-                                    Task {
-                                        await store.resolveApproval(sessionId: sessionId, requestId: approval.id, approve: true)
-                                    }
-                                },
-                                onDeny: {
-                                    Task {
-                                        await store.resolveApproval(sessionId: sessionId, requestId: approval.id, approve: false)
-                                    }
-                                }
-                            )
-                        }
-
-                        // Live Interactive Question Card
-                        if let question = store.pendingQuestions[sessionId] {
-                            QuestionPromptCard(prompt: question) { chosen in
-                                Task {
-                                    await store.answerQuestion(sessionId: sessionId, questionId: question.id, answers: chosen)
-                                }
-                            }
-                        }
-
-                        Color.clear
-                            .frame(height: 4)
-                            .id("BOTTOM_ANCHOR")
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
-                    .padding(.bottom, 10)
-                }
-                .scrollDismissesKeyboard(.interactively)
-                .onChange(of: store.eventsBySession[sessionId]?.count ?? 0) { _, _ in
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
-                    }
-                }
-                .onChange(of: session?.model) { _, newModel in
-                    if let newModel, !newModel.isEmpty {
-                        selectedModelId = newModel
-                    }
-                }
-                .onAppear {
-                    if let s = session {
-                        selectedModelId = s.model
-                        selectedEffort = s.effort
-                    }
-                    Task {
-                        await store.loadEventsForSession(sessionId)
-                        proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
-                    }
-                }
-            }
-
-            Divider()
-
-            // 2. Native iOS Composer Dock (Model + Effort + Multi-line Input + Send / Stop)
-            VStack(spacing: 8) {
-                HStack(spacing: 8) {
-                    // Model Menu Picker
-                    Menu {
-                        ForEach(store.models) { m in
-                            Button {
-                                selectedModelId = m.id
-                            } label: {
-                                HStack {
-                                    Text(m.label)
-                                    if m.id == selectedModelId {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "cpu")
-                                .font(.system(size: 11))
-                            Text(store.models.first(where: { $0.id == selectedModelId })?.shortLabel ?? VeloModelOption.shortLabel(for: selectedModelId))
-                                .font(.system(size: 12, weight: .medium))
-                                .lineLimit(1)
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.system(size: 9.5, weight: .semibold))
-                        }
-                        .foregroundStyle(.primary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color(.secondarySystemBackground), in: Capsule())
-                    }
-
-                    // Effort Menu Picker
-                    Menu {
-                        ForEach(["low", "medium", "high", "max"], id: \.self) { level in
-                            Button {
-                                selectedEffort = level
-                            } label: {
-                                HStack {
-                                    Text("Effort: \(level.capitalized)")
-                                    if level == selectedEffort {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "gauge.with.dots.needle.67percent")
-                                .font(.system(size: 11))
-                            Text(selectedEffort.capitalized)
-                                .font(.system(size: 12, weight: .medium))
-                        }
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(Color(.secondarySystemBackground), in: Capsule())
-                    }
-
-                    Spacer()
-
-                    if let s = session, s.insertions > 0 || s.deletions > 0 {
-                        Button {
-                            showDiffSheet = true
-                            Task { await store.fetchDiff(for: sessionId) }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Text("+\(s.insertions)")
-                                    .foregroundStyle(.green)
-                                Text("−\(s.deletions)")
-                                    .foregroundStyle(.red)
-                            }
-                            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color(.secondarySystemBackground), in: Capsule())
-                        }
-                    }
-                }
-
-                HStack(alignment: .bottom, spacing: 8) {
-                    TextField("发消息给 Mac 上的 Agent…", text: $draftPrompt, axis: .vertical)
-                        .lineLimit(1...5)
-                        .focused($composerFocused)
-                        .font(.system(size: 15))
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 9)
-                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-
-                    if isSessionRunning && draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Button {
-                            Task { await store.stopSession(sessionId) }
-                        } label: {
-                            Image(systemName: "stop.fill")
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundStyle(.white)
-                                .frame(width: 36, height: 36)
-                                .background(Color.red, in: Circle())
-                        }
-                    } else {
-                        let canSend = !draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        Button {
-                            let toSend = draftPrompt
-                            draftPrompt = ""
-                            composerFocused = false
-                            Task {
-                                await store.sendPrompt(
-                                    sessionId: sessionId,
-                                    text: toSend,
-                                    model: selectedModelId,
-                                    effort: selectedEffort
+                                    } : nil
                                 )
                             }
-                        } label: {
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundStyle(canSend ? Color(.systemBackground) : .secondary)
-                                .frame(width: 36, height: 36)
-                                .background(canSend ? Color.primary : Color(.tertiarySystemFill), in: Circle())
+
+                            if let approval = store.pendingApprovals[sessionId] {
+                                ApprovalPromptCard(
+                                    prompt: approval,
+                                    onApprove: {
+                                        Task {
+                                            await store.resolveApproval(sessionId: sessionId, requestId: approval.id, approve: true)
+                                        }
+                                    },
+                                    onDeny: {
+                                        Task {
+                                            await store.resolveApproval(sessionId: sessionId, requestId: approval.id, approve: false)
+                                        }
+                                    }
+                                )
+                            }
+
+                            if let question = store.pendingQuestions[sessionId] {
+                                QuestionPromptCard(prompt: question) { chosen in
+                                    Task {
+                                        await store.answerQuestion(sessionId: sessionId, questionId: question.id, answers: chosen)
+                                    }
+                                }
+                            }
+
+                            Color.clear
+                                .frame(height: 6)
+                                .id("BOTTOM_ANCHOR")
                         }
-                        .disabled(!canSend)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 14)
+                        .padding(.bottom, 12)
+                    }
+                    .scrollDismissesKeyboard(.interactively)
+                    .onChange(of: store.eventsBySession[sessionId]?.count ?? 0) { _, _ in
+                        withAnimation(.easeOut(duration: 0.22)) {
+                            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: session?.model) { _, newModel in
+                        if let newModel, !newModel.isEmpty {
+                            selectedModelId = newModel
+                        }
+                    }
+                    .onChange(of: sessionId) { _, newSid in
+                        if let s = store.sessions.first(where: { $0.id == newSid }) {
+                            selectedModelId = s.model
+                            selectedEffort = s.effort
+                        }
+                        Task {
+                            await store.loadEventsForSession(newSid)
+                            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                        }
+                    }
+                    .onAppear {
+                        if let s = session {
+                            selectedModelId = s.model
+                            selectedEffort = s.effort
+                        }
+                        Task {
+                            await store.loadEventsForSession(sessionId)
+                            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                        }
                     }
                 }
+
+                // 3. Floating Specular Composer Card (Rare UI / Beautiful UI)
+                floatingComposerDock
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(.bar)
         }
-        .navigationTitle(session?.title ?? "Thread")
+        .navigationTitle(session?.title ?? "对话")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showDiffSheet = true
-                    Task { await store.fetchDiff(for: sessionId) }
-                } label: {
-                    Image(systemName: "arrow.left.arrow.right.square")
+                HStack(spacing: 8) {
+                    Button {
+                        showModelSheet = true
+                    } label: {
+                        Image(systemName: "arrow.triangle.swap")
+                            .font(.system(size: 13.5, weight: .semibold))
+                    }
+
+                    Button {
+                        showDiffSheet = true
+                        Task { await store.fetchDiff(for: sessionId) }
+                    } label: {
+                        Image(systemName: "arrow.left.arrow.right.square")
+                            .font(.system(size: 14, weight: .semibold))
+                    }
                 }
             }
         }
         .sheet(isPresented: $showDiffSheet) {
             DiffViewerSheet(
-                branchName: session?.branchName ?? "worktree",
+                branchName: session?.branchName ?? "main",
                 files: store.diffsBySession[sessionId] ?? []
             )
+        }
+        .sheet(isPresented: $showModelSheet) {
+            ModelAndHandoffSheet(
+                store: store,
+                session: session,
+                isEngineBound: isEngineBound,
+                selectedModelId: $selectedModelId,
+                selectedEffort: $selectedEffort,
+                onSelectInPlace: { chosenModel, effort in
+                    selectedModelId = chosenModel.id
+                    selectedEffort = effort
+                    Task {
+                        await store.updateSessionModelAndEffort(
+                            sessionId: sessionId,
+                            modelOption: chosenModel,
+                            effort: effort
+                        )
+                    }
+                },
+                onHandoffToEngine: { targetModel, effort in
+                    let pendingInstruction = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                    draftPrompt = ""
+                    composerFocused = false
+                    Task {
+                        if let createdId = await store.handoffSession(
+                            sourceSessionId: sessionId,
+                            targetOption: targetModel,
+                            effort: effort,
+                            instructions: pendingInstruction.isEmpty ? nil : pendingInstruction
+                        ) {
+                            onSwitchedSession?(createdId)
+                        }
+                    }
+                }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+    }
+
+    // MARK: - Subviews
+
+    private func threadContextBar(_ s: VeloSessionItem) -> some View {
+        HStack(spacing: 7) {
+            EngineBadgePill(category: s.engineCategory, compact: true)
+
+            HStack(spacing: 3.5) {
+                Image(systemName: s.isIsolatedWorktree ? "arrow.triangle.branch" : "folder.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(s.isIsolatedWorktree ? VeloTheme.accentVioletSoft : .secondary)
+                Text("\(s.projectName) · \(s.branchName)")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            if s.parentSessionId != nil {
+                Text("↗ 已继承上下文")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(VeloTheme.accentViolet.opacity(0.12), in: Capsule())
+            }
+
+            Spacer(minLength: 4)
+
+            if s.insertions > 0 || s.deletions > 0 {
+                Button {
+                    showDiffSheet = true
+                    Task { await store.fetchDiff(for: sessionId) }
+                } label: {
+                    HStack(spacing: 3) {
+                        Text("+\(s.insertions)")
+                            .foregroundStyle(VeloTheme.emerald)
+                        Text("−\(s.deletions)")
+                            .foregroundStyle(VeloTheme.coral)
+                    }
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2.5)
+                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                }
+                .buttonStyle(VeloPressableButtonStyle())
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7.5)
+        .background(VeloTheme.cardSurface(colorScheme).opacity(0.88))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(VeloTheme.hairline(colorScheme))
+                .frame(height: 0.7)
+        }
+    }
+
+    private var emptyThreadHero: some View {
+        let cat = session?.engineCategory ?? activeModelOption.category
+        return VStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(cat.accentColor.opacity(0.14))
+                    .frame(width: 60, height: 60)
+                Image(systemName: cat.iconName)
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(cat.accentColor)
+            }
+
+            Text(activeModelOption.cleanTitle)
+                .font(.system(size: 16, weight: .bold))
+
+            if session?.parentSessionId != nil {
+                Text("已从前序会话无缝接力。输入下一条指令，\(cat.title) 将自动携带前序上下文与文件变更继续处理。")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .padding(.horizontal, 28)
+            } else {
+                Text("当前绑定 \(cat.title) 引擎，归属项目 `\(session?.projectName ?? "velo")`。在下方输入指令即可开始。")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .padding(.horizontal, 28)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 56)
+    }
+
+    private var floatingComposerDock: some View {
+        let cat = activeModelOption.category
+        let supportedEfforts = cat.supportedEfforts
+        let canSend = !draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        return VStack(spacing: 10) {
+            TextField("向 \(cat.shortBadge) 发送指令…", text: $draftPrompt, axis: .vertical)
+                .lineLimit(1...5)
+                .focused($composerFocused)
+                .font(.system(size: 15))
+                .padding(.horizontal, 4)
+                .padding(.top, 2)
+
+            HStack(spacing: 8) {
+                // Categorized Model & Handoff Sheet Trigger
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    showModelSheet = true
+                } label: {
+                    HStack(spacing: 5.5) {
+                        Image(systemName: cat.iconName)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(cat.accentColor)
+
+                        Text(activeModelOption.cleanTitle)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .stroke(cat.accentColor.opacity(0.28), lineWidth: 0.75)
+                    )
+                }
+                .buttonStyle(VeloPressableButtonStyle())
+
+                // Effort Quick Menu
+                Menu {
+                    ForEach(supportedEfforts, id: \.self) { level in
+                        Button {
+                            selectedEffort = level
+                            Task {
+                                await store.updateSessionModelAndEffort(
+                                    sessionId: sessionId,
+                                    modelOption: activeModelOption,
+                                    effort: level
+                                )
+                            }
+                        } label: {
+                            HStack {
+                                Text("推理强度 · \(level.uppercased())")
+                                if level == selectedEffort {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "dial.medium.fill")
+                            .font(.system(size: 10.5))
+                        Text(selectedEffort.uppercased())
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                }
+
+                Spacer(minLength: 4)
+
+                // Tactile Send / Stop Button
+                if isSessionRunning && !canSend {
+                    Button {
+                        Task { await store.stopSession(sessionId) }
+                    } label: {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 34, height: 34)
+                            .background(VeloTheme.coral, in: Circle())
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+                } else {
+                    Button {
+                        let toSend = draftPrompt
+                        draftPrompt = ""
+                        composerFocused = false
+                        Task {
+                            await store.sendPrompt(
+                                sessionId: sessionId,
+                                text: toSend,
+                                model: selectedModelId,
+                                effort: selectedEffort
+                            )
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 14.5, weight: .bold))
+                            .foregroundStyle(canSend ? .white : .secondary.opacity(0.55))
+                            .frame(width: 34, height: 34)
+                            .background(
+                                canSend
+                                    ? AnyShapeStyle(
+                                        LinearGradient(
+                                            colors: [VeloTheme.accentViolet, cat.accentColor],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                                    : AnyShapeStyle(VeloTheme.elevatedSurface(colorScheme)),
+                                in: Circle()
+                            )
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+                    .disabled(!canSend)
+                }
+            }
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .background(
+            VeloTheme.cardSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 1)
+        )
+        .shadow(
+            color: Color.black.opacity(colorScheme == .dark ? 0.35 : 0.06),
+            radius: 12,
+            x: 0,
+            y: 4
+        )
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+    }
+}
+
+// MARK: - Categorized Model & Cross-Engine Handoff Half-Sheet
+
+private struct ModelAndHandoffSheet: View {
+    @ObservedObject var store: VeloStore
+    let session: VeloSessionItem?
+    let isEngineBound: Bool
+    @Binding var selectedModelId: String
+    @Binding var selectedEffort: String
+    let onSelectInPlace: (VeloModelOption, String) -> Void
+    let onHandoffToEngine: (VeloModelOption, String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var currentCategory: VeloEngineCategory {
+        session?.engineCategory ?? .claude
+    }
+
+    private var groupedCatalog: [(category: VeloEngineCategory, models: [VeloModelOption])] {
+        let raw = VeloModelOption.groupedByCategory(store.models)
+        return raw.sorted { a, b in
+            (a.category == currentCategory ? 0 : 1) < (b.category == currentCategory ? 0 : 1)
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                VeloTheme.canvas(colorScheme)
+                    .ignoresSafeArea()
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        // Effort Selector Card for Current Session
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("推理强度 (Effort)")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(.secondary)
+
+                            HStack(spacing: 8) {
+                                ForEach(currentCategory.supportedEfforts, id: \.self) { lv in
+                                    let isSel = selectedEffort == lv
+                                    Button {
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                        selectedEffort = lv
+                                        if let curOpt = store.models.first(where: { $0.id == selectedModelId }) {
+                                            onSelectInPlace(curOpt, lv)
+                                        }
+                                    } label: {
+                                        Text(lv.uppercased())
+                                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                            .foregroundStyle(isSel ? .white : .secondary)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 8)
+                                            .background(
+                                                isSel ? currentCategory.accentColor : VeloTheme.cardSurface(colorScheme),
+                                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            )
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                    .stroke(VeloTheme.hairline(colorScheme), lineWidth: isSel ? 0 : 0.8)
+                                            )
+                                    }
+                                    .buttonStyle(VeloPressableButtonStyle())
+                                }
+                            }
+                        }
+
+                        // Categorized Engine Sections
+                        ForEach(groupedCatalog, id: \.category.id) { group in
+                            let isSameEngine = group.category == currentCategory
+                            let requiresHandoff = isEngineBound && !isSameEngine
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 7) {
+                                    EngineBadgePill(category: group.category, compact: false)
+
+                                    Spacer()
+
+                                    if requiresHandoff {
+                                        Text("携上下文新建会话 ↗")
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundStyle(VeloTheme.accentVioletSoft)
+                                    } else if isSameEngine && isEngineBound {
+                                        Text("当前绑定引擎 · 无损切换")
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundStyle(VeloTheme.emerald)
+                                    } else {
+                                        Text("可直接切换")
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+
+                                if requiresHandoff && group.category == groupedCatalog.first(where: { $0.category != currentCategory })?.category {
+                                    Text("以下为其他厂商引擎。点击任意模型将在同一项目目录新建干净会话并自动继承上下文，保持当前 \(currentCategory.shortBadge) 会话纯净不串台。")
+                                        .font(.system(size: 11.5))
+                                        .foregroundStyle(.secondary)
+                                        .lineSpacing(2)
+                                        .padding(.bottom, 2)
+                                }
+
+                                VStack(spacing: 6) {
+                                    ForEach(group.models) { m in
+                                        let isCurrent = m.id == selectedModelId && !requiresHandoff
+                                        Button {
+                                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                            let eff = group.category.supportedEfforts.contains(selectedEffort)
+                                                ? selectedEffort
+                                                : (group.category.supportedEfforts.contains("high") ? "high" : "medium")
+                                            dismiss()
+                                            if requiresHandoff {
+                                                onHandoffToEngine(m, eff)
+                                            } else {
+                                                onSelectInPlace(m, eff)
+                                            }
+                                        } label: {
+                                            HStack(spacing: 10) {
+                                                VStack(alignment: .leading, spacing: 2.5) {
+                                                    HStack(spacing: 6) {
+                                                        Text(m.cleanTitle)
+                                                            .font(.system(size: 14, weight: .semibold))
+                                                            .foregroundStyle(.primary)
+                                                        if m.isDefault {
+                                                            Text("默认")
+                                                                .font(.system(size: 9.5, weight: .bold))
+                                                                .foregroundStyle(group.category.accentColor)
+                                                                .padding(.horizontal, 5.5)
+                                                                .padding(.vertical, 1.5)
+                                                                .background(group.category.accentColor.opacity(0.14), in: Capsule())
+                                                        }
+                                                    }
+                                                    Text(m.cleanSubtitle)
+                                                        .font(.system(size: 11.5))
+                                                        .foregroundStyle(.secondary)
+                                                        .lineLimit(1)
+                                                }
+
+                                                Spacer()
+
+                                                if isCurrent {
+                                                    Image(systemName: "checkmark.circle.fill")
+                                                        .font(.system(size: 16))
+                                                        .foregroundStyle(VeloTheme.emerald)
+                                                } else if requiresHandoff {
+                                                    Text("↗ 接力")
+                                                        .font(.system(size: 11.5, weight: .semibold))
+                                                        .foregroundStyle(VeloTheme.accentVioletSoft)
+                                                        .padding(.horizontal, 8)
+                                                        .padding(.vertical, 4)
+                                                        .background(VeloTheme.accentViolet.opacity(0.13), in: Capsule())
+                                                }
+                                            }
+                                            .padding(.horizontal, 13)
+                                            .padding(.vertical, 10)
+                                            .background(
+                                                isCurrent
+                                                    ? group.category.accentColor.opacity(0.1)
+                                                    : VeloTheme.cardSurface(colorScheme),
+                                                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                            )
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                                    .stroke(
+                                                        isCurrent
+                                                            ? group.category.accentColor.opacity(0.5)
+                                                            : VeloTheme.hairline(colorScheme),
+                                                        lineWidth: isCurrent ? 1.15 : 0.8
+                                                    )
+                                            )
+                                        }
+                                        .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(16)
+                }
+            }
+            .navigationTitle("模型分类与跨引擎接力")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
         }
     }
 }
 
-// MARK: - Single Conversation Turn Block
+// MARK: - Single Conversation Turn Block (With Grouped Consecutive Tool Calls!)
 
 private struct TurnBlockView: View {
     let turn: ConversationTurnBlock
@@ -300,19 +683,61 @@ private struct TurnBlockView: View {
     let onRequestMacLogin: (String) async -> Bool
     let onRetry: (() -> Void)?
 
+    @Environment(\.colorScheme) private var colorScheme
+
+    fileprivate enum RenderSegment: Identifiable {
+        case single(item: TimelineEventItem, isLastItem: Bool)
+        case toolGroup(id: String, items: [TimelineEventItem])
+
+        var id: String {
+            switch self {
+            case .single(let item, _): return item.id
+            case .toolGroup(let id, _): return id
+            }
+        }
+    }
+
+    private var segments: [RenderSegment] {
+        var out: [RenderSegment] = []
+        var idx = 0
+        let total = turn.items.count
+
+        while idx < total {
+            let item = turn.items[idx]
+            if case .toolCall = item.kind {
+                var batch: [TimelineEventItem] = [item]
+                var j = idx + 1
+                while j < total, case .toolCall = turn.items[j].kind {
+                    batch.append(turn.items[j])
+                    j += 1
+                }
+                if batch.count >= 2 {
+                    out.append(.toolGroup(id: "tg-\(item.id)", items: batch))
+                } else {
+                    out.append(.single(item: item, isLastItem: idx == total - 1))
+                }
+                idx = j
+            } else {
+                out.append(.single(item: item, isLastItem: idx == total - 1))
+                idx += 1
+            }
+        }
+        return out
+    }
+
     private var computedPhase: AgentLivePhase {
         if let approval = waitingApproval {
-            return .waiting(label: "Waiting for approval (\(approval.toolName))")
+            return .waiting(label: "等待权限确认 (\(approval.toolName))")
         }
         if waitingQuestion != nil {
-            return .waiting(label: "Waiting for your answer")
+            return .waiting(label: "等待你的回答")
         }
         guard let last = turn.items.last else {
             return .thinking
         }
         switch last.kind {
         case .thinking(_, _, true):
-            return .working
+            return .thinking
         case .toolCall(_, _, let workingVerb, _, let output, _):
             return output == nil ? .tool(verb: workingVerb) : .working
         case .assistant(let isStreaming):
@@ -340,65 +765,87 @@ private struct TurnBlockView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // 1. User Right-Aligned Bubble
+        VStack(alignment: .leading, spacing: 10) {
+            // 1. User Specular Right-Aligned Bubble
             if let userEv = turn.userEvent {
                 HStack {
-                    Spacer(minLength: 48)
+                    Spacer(minLength: 42)
                     Text(userEv.content)
                         .font(.system(size: 15))
                         .foregroundStyle(.primary)
+                        .lineSpacing(3)
                         .padding(.horizontal, 14)
-                        .padding(.vertical, 9)
-                        .background(Color(.secondarySystemFill), in: UnevenRoundedRectangle(
-                            topLeadingRadius: 18,
-                            bottomLeadingRadius: 18,
-                            bottomTrailingRadius: 18,
-                            topTrailingRadius: 5
-                        ))
+                        .padding(.vertical, 10)
+                        .background(
+                            VeloTheme.userBubble(colorScheme),
+                            in: UnevenRoundedRectangle(
+                                topLeadingRadius: 18,
+                                bottomLeadingRadius: 18,
+                                bottomTrailingRadius: 18,
+                                topTrailingRadius: 5
+                            )
+                        )
+                        .overlay(
+                            UnevenRoundedRectangle(
+                                topLeadingRadius: 18,
+                                bottomLeadingRadius: 18,
+                                bottomTrailingRadius: 18,
+                                topTrailingRadius: 5
+                            )
+                            .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.9)
+                        )
                         .textSelection(.enabled)
                 }
             }
 
-            // 2. Chronological Agent Items
-            ForEach(Array(turn.items.enumerated()), id: \.element.id) { idx, item in
-                let isLast = idx == turn.items.count - 1
+            // 2. Chronological Agent Segments (Reasoning + Grouped Tools + Editorial Markdown)
+            ForEach(segments) { seg in
+                switch seg {
+                case .toolGroup(_, let batch):
+                    ToolCallGroupRowView(items: batch)
 
-                switch item.kind {
-                case .thinking(let startedAt, let durationMs, let isStreaming):
-                    ReasoningRowView(
-                        rawText: item.content,
-                        startedAt: startedAt ?? turnStartedAt,
-                        durationMs: durationMs,
-                        isStreaming: isStreaming && isTurnRunning && isLast
-                    )
+                case .single(let item, let isLast):
+                    switch item.kind {
+                    case .thinking(let startedAt, let durationMs, let isStreaming):
+                        ReasoningRowView(
+                            rawText: item.content,
+                            startedAt: startedAt ?? turnStartedAt,
+                            durationMs: durationMs,
+                            isStreaming: isStreaming && isTurnRunning && isLast
+                        )
 
-                case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isError):
-                    ToolCallRowView(
-                        toolName: toolName,
-                        displayName: displayName,
-                        workingVerb: workingVerb,
-                        summary: summary,
-                        output: output,
-                        isError: isError
-                    )
+                    case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isError):
+                        ToolCallRowView(
+                            toolName: toolName,
+                            displayName: displayName,
+                            workingVerb: workingVerb,
+                            summary: summary,
+                            output: output,
+                            isError: isError
+                        )
 
-                case .assistant:
-                    NativeMarkdownView(markdown: item.content)
+                    case .assistant(let isStreaming):
+                        VStack(alignment: .leading, spacing: 4) {
+                            NativeMarkdownView(markdown: item.content)
+                            if isStreaming && isTurnRunning && isLast {
+                                StreamingCursorDot()
+                            }
+                        }
 
-                case .error(let isAuthRequired, let provider, let loginCommand, let authURL):
-                    AgentErrorBannerView(
-                        message: item.content,
-                        isAuthRequired: isAuthRequired,
-                        provider: provider,
-                        loginCommand: loginCommand,
-                        authURL: authURL,
-                        onRequestMacLogin: onRequestMacLogin,
-                        onRetry: (!isTurnRunning && isLast) ? onRetry : nil
-                    )
+                    case .error(let isAuthRequired, let provider, let loginCommand, let authURL):
+                        AgentErrorBannerView(
+                            message: item.content,
+                            isAuthRequired: isAuthRequired,
+                            provider: provider,
+                            loginCommand: loginCommand,
+                            authURL: authURL,
+                            onRequestMacLogin: onRequestMacLogin,
+                            onRetry: (!isTurnRunning && isLast) ? onRetry : nil
+                        )
 
-                case .user:
-                    EmptyView()
+                    case .user:
+                        EmptyView()
+                    }
                 }
             }
 
@@ -429,12 +876,13 @@ private struct AgentErrorBannerView: View {
     let onRequestMacLogin: (String) async -> Bool
     let onRetry: (() -> Void)?
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isLaunchingLogin = false
     @State private var loginTriggered = false
     @State private var copiedCmd = false
 
     private var accent: Color {
-        isAuthRequired ? .orange : .red
+        isAuthRequired ? VeloTheme.amber : VeloTheme.coral
     }
 
     var body: some View {
@@ -444,7 +892,7 @@ private struct AgentErrorBannerView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(accent)
 
-                Text(isAuthRequired ? "CLI 认证已失效 · 需要重新登录" : "CLI 执行异常")
+                Text(isAuthRequired ? "CLI 认证已失效 · 需重新登录" : "CLI 执行异常")
                     .font(.system(size: 13.5, weight: .semibold))
                     .foregroundStyle(.primary)
 
@@ -484,13 +932,13 @@ private struct AgentErrorBannerView: View {
                     } label: {
                         Image(systemName: copiedCmd ? "checkmark" : "doc.on.doc")
                             .font(.system(size: 11.5, weight: .medium))
-                            .foregroundStyle(copiedCmd ? .green : .secondary)
+                            .foregroundStyle(copiedCmd ? VeloTheme.emerald : .secondary)
                     }
                     .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
-                .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .background(VeloTheme.codeSurface(colorScheme), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
 
             HStack(spacing: 8) {
@@ -516,13 +964,13 @@ private struct AgentErrorBannerView: View {
                         }
                         .padding(.horizontal, 11)
                         .padding(.vertical, 7)
-                        .foregroundStyle(loginTriggered ? Color.green : Color.white)
+                        .foregroundStyle(loginTriggered ? VeloTheme.emerald : Color.black)
                         .background(
-                            loginTriggered ? Color.green.opacity(0.16) : Color.orange,
+                            loginTriggered ? VeloTheme.emerald.opacity(0.16) : VeloTheme.amber,
                             in: RoundedRectangle(cornerRadius: 9, style: .continuous)
                         )
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(VeloPressableButtonStyle())
 
                     if let authURL, let url = URL(string: authURL) {
                         Link(destination: url) {
@@ -535,7 +983,7 @@ private struct AgentErrorBannerView: View {
                             .padding(.horizontal, 10)
                             .padding(.vertical, 7)
                             .foregroundStyle(.primary)
-                            .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                         }
                     }
                 }
@@ -551,9 +999,9 @@ private struct AgentErrorBannerView: View {
                         .padding(.horizontal, 10)
                         .padding(.vertical, 7)
                         .foregroundStyle(.primary)
-                        .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(VeloPressableButtonStyle())
                 }
 
                 Spacer(minLength: 0)
@@ -561,19 +1009,20 @@ private struct AgentErrorBannerView: View {
         }
         .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(accent.opacity(0.42), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(accent.opacity(0.45), lineWidth: 1)
         )
         .padding(.vertical, 2)
     }
 }
 
-// MARK: - Apple-Grade Native Block + Inline GFM Markdown Renderer
+// MARK: - Editorial Native Block + Inline GFM Markdown Renderer
 
 private struct NativeMarkdownView: View {
     let markdown: String
+    @Environment(\.colorScheme) private var colorScheme
 
     fileprivate enum ListMarker: Equatable {
         case bullet
@@ -616,17 +1065,17 @@ private struct NativeMarkdownView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 11) {
             ForEach(blocks) { block in
                 switch block {
                 case .heading(_, let level, let text):
                     HeadingBlockView(level: level, text: text)
 
                 case .paragraph(_, let text):
-                    InlineMarkdownText(text: text, baseSize: 15, baseWeight: .regular, lineSpacing: 3.5)
+                    InlineMarkdownText(text: text, baseSize: 15.2, baseWeight: .regular, lineSpacing: 4.2)
 
                 case .list(_, let items):
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 7) {
                         ForEach(items) { item in
                             MarkdownListRowView(entry: item)
                         }
@@ -635,18 +1084,20 @@ private struct NativeMarkdownView: View {
                 case .blockquote(_, let text):
                     HStack(alignment: .top, spacing: 10) {
                         RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.accentColor.opacity(0.65))
+                            .fill(VeloTheme.accentVioletSoft)
                             .frame(width: 3)
                         InlineMarkdownText(
                             text: text,
                             baseSize: 14.5,
                             baseWeight: .regular,
                             secondary: true,
-                            lineSpacing: 3
+                            lineSpacing: 3.5
                         )
-                        .padding(.vertical, 1)
+                        .padding(.vertical, 2)
                     }
-                    .padding(.vertical, 2)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(VeloTheme.elevatedSurface(colorScheme).opacity(0.45), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
                 case .codeBlock(_, let language, let code):
                     FencedCodeCardView(language: language, code: code)
@@ -655,7 +1106,9 @@ private struct NativeMarkdownView: View {
                     MarkdownTableCardView(headers: headers, alignments: alignments, rows: rows)
 
                 case .horizontalRule:
-                    Divider()
+                    Rectangle()
+                        .fill(VeloTheme.hairline(colorScheme))
+                        .frame(height: 1)
                         .padding(.vertical, 4)
                 }
             }
@@ -686,14 +1139,12 @@ private struct NativeMarkdownView: View {
             let line = lines[idx]
             let trimmed = line.trimmingCharacters(in: .whitespaces)
 
-            // 1. Blank line terminates open paragraph
             if trimmed.isEmpty {
                 flushParagraph()
                 idx += 1
                 continue
             }
 
-            // 2. Fenced Code Block (``` or ~~~)
             if let (fence, lang) = parseFenceOpen(line) {
                 flushParagraph()
                 idx += 1
@@ -712,7 +1163,6 @@ private struct NativeMarkdownView: View {
                 continue
             }
 
-            // 3. GFM Pipe Table
             if idx + 1 < lines.count,
                isTableRow(line),
                isTableSeparator(lines[idx + 1])
@@ -738,7 +1188,6 @@ private struct NativeMarkdownView: View {
                 continue
             }
 
-            // 4. Horizontal Rule (`---`, `***`, `___`)
             if isHorizontalRule(trimmed) {
                 flushParagraph()
                 result.append(.horizontalRule(id: nextId))
@@ -747,7 +1196,6 @@ private struct NativeMarkdownView: View {
                 continue
             }
 
-            // 5. ATX Heading (`#` .. `######`)
             if let (level, headingText) = parseHeading(line) {
                 flushParagraph()
                 result.append(.heading(id: nextId, level: level, text: headingText))
@@ -756,7 +1204,6 @@ private struct NativeMarkdownView: View {
                 continue
             }
 
-            // 6. Blockquote (`> ...`)
             if let firstQuote = parseBlockquoteLine(line) {
                 flushParagraph()
                 var quoteLines: [String] = [firstQuote]
@@ -770,7 +1217,6 @@ private struct NativeMarkdownView: View {
                 continue
             }
 
-            // 7. Ordered / Unordered / Task List
             if let firstItem = parseListLine(line, id: 0) {
                 flushParagraph()
                 var listItems: [ListEntry] = [firstItem]
@@ -780,7 +1226,6 @@ private struct NativeMarkdownView: View {
                     let nextLine = lines[idx]
                     let nextTrim = nextLine.trimmingCharacters(in: .whitespaces)
                     if nextTrim.isEmpty {
-                        // Allow single blank line inside a loose list if next line is another list item
                         if idx + 1 < lines.count, parseListLine(lines[idx + 1], id: itemId) != nil {
                             idx += 1
                             continue
@@ -799,7 +1244,6 @@ private struct NativeMarkdownView: View {
                         itemId += 1
                         idx += 1
                     } else if nextLine.hasPrefix("  ") || nextLine.hasPrefix("\t") {
-                        // Indented continuation line belonging to previous list item
                         listItems[listItems.count - 1].text += "\n" + nextTrim
                         idx += 1
                     } else {
@@ -811,7 +1255,6 @@ private struct NativeMarkdownView: View {
                 continue
             }
 
-            // 8. Normal Paragraph Line
             paragraphBuffer.append(line)
             idx += 1
         }
@@ -896,7 +1339,6 @@ private struct NativeMarkdownView: View {
         let depth = min(4, spaces / 2)
         let rest = line[idx...]
 
-        // Unordered (`- `, `* `, `+ `)
         if rest.hasPrefix("- ") || rest.hasPrefix("* ") || rest.hasPrefix("+ ") {
             let afterBullet = String(rest.dropFirst(2))
             if afterBullet.hasPrefix("[x] ") || afterBullet.hasPrefix("[X] ") {
@@ -918,7 +1360,6 @@ private struct NativeMarkdownView: View {
             return ListEntry(id: id, depth: depth, marker: .bullet, text: afterBullet)
         }
 
-        // Ordered (`1. `, `2) `)
         var digitEnd = rest.startIndex
         var digitCount = 0
         while digitEnd < rest.endIndex, rest[digitEnd].isNumber, digitCount < 5 {
@@ -983,13 +1424,14 @@ private struct NativeMarkdownView: View {
 private struct HeadingBlockView: View {
     let level: Int
     let text: String
+    @Environment(\.colorScheme) private var colorScheme
 
     private var fontSize: CGFloat {
         switch level {
         case 1: return 19.5
         case 2: return 17.5
         case 3: return 16.0
-        case 4: return 15.0
+        case 4: return 15.2
         default: return 14.5
         }
     }
@@ -999,14 +1441,21 @@ private struct HeadingBlockView: View {
     }
 
     var body: some View {
-        InlineMarkdownText(
-            text: text,
-            baseSize: fontSize,
-            baseWeight: fontWeight,
-            secondary: level >= 6,
-            lineSpacing: 2.5
-        )
-        .padding(.top, level <= 2 ? 4 : 2)
+        VStack(alignment: .leading, spacing: 5) {
+            InlineMarkdownText(
+                text: text,
+                baseSize: fontSize,
+                baseWeight: fontWeight,
+                secondary: level >= 6,
+                lineSpacing: 2.5
+            )
+            if level <= 2 {
+                Rectangle()
+                    .fill(VeloTheme.hairline(colorScheme))
+                    .frame(height: 0.8)
+            }
+        }
+        .padding(.top, level <= 2 ? 5 : 2)
     }
 }
 
@@ -1022,32 +1471,32 @@ private struct MarkdownListRowView: View {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 7) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             switch entry.marker {
             case .bullet:
                 Text(bulletSymbol)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(VeloTheme.accentVioletSoft)
                     .frame(minWidth: 12, alignment: .center)
 
             case .ordered(let num):
                 Text(num)
-                    .font(.system(size: 14, weight: .medium).monospacedDigit())
+                    .font(.system(size: 13.5, weight: .semibold).monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(minWidth: 18, alignment: .trailing)
 
             case .task(let checked):
                 Image(systemName: checked ? "checkmark.square.fill" : "square")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(checked ? Color.accentColor : Color.secondary)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(checked ? VeloTheme.emerald : Color.secondary)
                     .frame(minWidth: 16, alignment: .center)
             }
 
             InlineMarkdownText(
                 text: entry.text,
-                baseSize: 15,
+                baseSize: 15.2,
                 baseWeight: .regular,
-                lineSpacing: 3
+                lineSpacing: 3.5
             )
         }
         .padding(.leading, CGFloat(entry.depth) * 14)
@@ -1057,11 +1506,16 @@ private struct MarkdownListRowView: View {
 private struct FencedCodeCardView: View {
     let language: String
     let code: String
+    @Environment(\.colorScheme) private var colorScheme
     @State private var copied = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(VeloTheme.accentVioletSoft.opacity(0.75))
+                    .frame(width: 6.5, height: 6.5)
+
                 Text(language.isEmpty ? "code" : language.lowercased())
                     .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.secondary)
@@ -1070,6 +1524,7 @@ private struct FencedCodeCardView: View {
 
                 Button {
                     UIPasteboard.general.string = code
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     copied = true
                     Task {
                         try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -1078,33 +1533,41 @@ private struct FencedCodeCardView: View {
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: 10.5, weight: .semibold))
                         Text(copied ? "已复制" : "复制")
-                            .font(.system(size: 11.5, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                     }
-                    .foregroundStyle(copied ? .green : .secondary)
+                    .foregroundStyle(copied ? VeloTheme.emerald : .secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(VeloPressableButtonStyle())
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(Color(.tertiarySystemFill).opacity(0.65))
+            .padding(.vertical, 7.5)
+            .background(VeloTheme.codeHeader(colorScheme))
 
-            Divider()
+            Rectangle()
+                .fill(VeloTheme.hairline(colorScheme))
+                .frame(height: 0.75)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
                     .font(.system(size: 12.5, design: .monospaced))
-                    .lineSpacing(2.5)
+                    .lineSpacing(3)
                     .padding(12)
                     .textSelection(.enabled)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(
+            VeloTheme.codeSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+        )
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.9)
         )
     }
 }
@@ -1113,6 +1576,7 @@ private struct MarkdownTableCardView: View {
     let headers: [String]
     let alignments: [Alignment]
     let rows: [[String]]
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -1127,13 +1591,15 @@ private struct MarkdownTableCardView: View {
                         )
                         .padding(.horizontal, 11)
                         .padding(.vertical, 8)
-                        .frame(minWidth: 72, maxWidth: 260, alignment: alignments[safe: colIdx] ?? .leading)
+                        .frame(minWidth: 74, maxWidth: 260, alignment: alignments[safe: colIdx] ?? .leading)
                     }
                 }
-                .background(Color(.tertiarySystemFill))
+                .background(VeloTheme.codeHeader(colorScheme))
 
                 ForEach(Array(rows.enumerated()), id: \.offset) { rowIdx, row in
-                    Divider()
+                    Rectangle()
+                        .fill(VeloTheme.hairline(colorScheme))
+                        .frame(height: 0.7)
                     GridRow {
                         ForEach(Array(row.enumerated()), id: \.offset) { colIdx, cell in
                             InlineMarkdownText(
@@ -1143,18 +1609,18 @@ private struct MarkdownTableCardView: View {
                                 lineSpacing: 2
                             )
                             .padding(.horizontal, 11)
-                            .padding(.vertical, 7)
-                            .frame(minWidth: 72, maxWidth: 260, alignment: alignments[safe: colIdx] ?? .leading)
+                            .padding(.vertical, 7.5)
+                            .frame(minWidth: 74, maxWidth: 260, alignment: alignments[safe: colIdx] ?? .leading)
                         }
                     }
-                    .background(rowIdx.isMultiple(of: 2) ? Color.clear : Color(.tertiarySystemFill).opacity(0.35))
+                    .background(rowIdx.isMultiple(of: 2) ? Color.clear : VeloTheme.elevatedSurface(colorScheme).opacity(0.35))
                 }
             }
-            .background(Color(.secondarySystemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(VeloTheme.cardSurface(colorScheme))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.primary.opacity(0.1), lineWidth: 0.8)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.85)
             )
         }
     }
@@ -1168,10 +1634,10 @@ private extension Array {
 
 private struct InlineMarkdownText: View {
     let text: String
-    var baseSize: CGFloat = 15
+    var baseSize: CGFloat = 15.2
     var baseWeight: Font.Weight = .regular
     var secondary: Bool = false
-    var lineSpacing: CGFloat = 3.5
+    var lineSpacing: CGFloat = 4.0
 
     var body: some View {
         Text(Self.buildAttributed(text, baseSize: baseSize, baseWeight: baseWeight, secondary: secondary))
@@ -1205,11 +1671,11 @@ private struct InlineMarkdownText: View {
 
             if intents?.contains(.code) == true {
                 attributed[range].font = .system(
-                    size: max(12.0, (baseSize * 0.88).rounded(.toNearestOrEven)),
+                    size: max(12.2, (baseSize * 0.87).rounded(.toNearestOrEven)),
                     weight: .medium,
                     design: .monospaced
                 )
-                attributed[range].backgroundColor = Color(.tertiarySystemFill)
+                attributed[range].backgroundColor = VeloTheme.accentViolet.opacity(0.14)
             } else {
                 let isBold = intents?.contains(.stronglyEmphasized) == true
                 let isItalic = intents?.contains(.emphasized) == true
@@ -1225,7 +1691,7 @@ private struct InlineMarkdownText: View {
             }
 
             if run.link != nil {
-                attributed[range].foregroundColor = .accentColor
+                attributed[range].foregroundColor = VeloTheme.accentVioletSoft
                 attributed[range].underlineStyle = .single
             } else if secondary {
                 attributed[range].foregroundColor = .secondary
@@ -1236,49 +1702,56 @@ private struct InlineMarkdownText: View {
     }
 }
 
-// MARK: - Interactive Permission & Question Cards
+// MARK: - Interactive Permission & Question Specular Cards
 
 private struct ApprovalPromptCard: View {
     let prompt: PendingApprovalPrompt
     let onApprove: () -> Void
     let onDeny: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.shield.fill")
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(VeloTheme.amber)
                 Text("请求执行权限 · \(prompt.toolName)")
                     .font(.system(size: 13.5, weight: .semibold))
             }
 
             Text(prompt.commandPreview)
                 .font(.system(size: 12, design: .monospaced))
-                .padding(9)
+                .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+                .background(VeloTheme.codeSurface(colorScheme), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
 
             HStack(spacing: 10) {
-                Button(role: .destructive, action: onDeny) {
+                Button(action: onDeny) {
                     Text("拒绝")
                         .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(VeloTheme.coral)
                         .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(VeloTheme.coral.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(VeloPressableButtonStyle())
 
                 Button(action: onApprove) {
                     Text("允许执行")
                         .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(VeloTheme.emerald, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(VeloPressableButtonStyle())
             }
         }
         .padding(14)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+        .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.orange.opacity(0.45), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(VeloTheme.amber.opacity(0.45), lineWidth: 1)
         )
     }
 }
@@ -1286,11 +1759,16 @@ private struct ApprovalPromptCard: View {
 private struct QuestionPromptCard: View {
     let prompt: PendingQuestionPrompt
     let onSubmit: ([String]) -> Void
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(prompt.question)
-                .font(.system(size: 14, weight: .semibold))
+            HStack(spacing: 6) {
+                Image(systemName: "questionmark.bubble.fill")
+                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                Text(prompt.question)
+                    .font(.system(size: 14, weight: .semibold))
+            }
 
             ForEach(prompt.options, id: \.self) { opt in
                 Button {
@@ -1298,20 +1776,25 @@ private struct QuestionPromptCard: View {
                 } label: {
                     HStack {
                         Text(opt)
-                            .font(.system(size: 13.5))
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundStyle(.primary)
                         Spacer()
                         Image(systemName: "chevron.right")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.tertiary)
                     }
-                    .padding(10)
-                    .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
+                    .padding(11)
+                    .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(VeloPressableButtonStyle())
             }
         }
         .padding(14)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+        .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 1)
+        )
     }
 }
 
@@ -1321,10 +1804,14 @@ private struct DiffViewerSheet: View {
     let branchName: String
     let files: [DiffFileSection]
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         NavigationStack {
-            Group {
+            ZStack {
+                VeloTheme.canvas(colorScheme)
+                    .ignoresSafeArea()
+
                 if files.isEmpty {
                     ContentUnavailableView(
                         "工作区暂无未提交变更",
@@ -1332,42 +1819,53 @@ private struct DiffViewerSheet: View {
                         description: Text("分支 `\(branchName)` 当前与基准一致")
                     )
                 } else {
-                    List {
-                        ForEach(files) { file in
-                            Section {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        ForEach(file.lines) { row in
-                                            Text(row.text.isEmpty ? " " : row.text)
-                                                .font(.system(size: 11.5, design: .monospaced))
-                                                .foregroundStyle(color(for: row.kind))
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 1)
-                                                .background(bg(for: row.kind))
+                    ScrollView {
+                        VStack(spacing: 12) {
+                            ForEach(files) { file in
+                                VStack(alignment: .leading, spacing: 0) {
+                                    HStack {
+                                        Text(file.path)
+                                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Text("+\(file.additions)")
+                                            .foregroundStyle(VeloTheme.emerald)
+                                            .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                                        Text("−\(file.deletions)")
+                                            .foregroundStyle(VeloTheme.coral)
+                                            .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(VeloTheme.codeHeader(colorScheme))
+
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            ForEach(file.lines) { row in
+                                                Text(row.text.isEmpty ? " " : row.text)
+                                                    .font(.system(size: 11.5, design: .monospaced))
+                                                    .foregroundStyle(color(for: row.kind))
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                    .padding(.horizontal, 8)
+                                                    .padding(.vertical, 1.5)
+                                                    .background(bg(for: row.kind))
+                                            }
                                         }
+                                        .padding(.vertical, 4)
                                     }
                                 }
-                            } header: {
-                                HStack {
-                                    Text(file.path)
-                                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                        .textCase(nil)
-                                    Spacer()
-                                    Text("+\(file.additions)")
-                                        .foregroundStyle(.green)
-                                        .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                                    Text("−\(file.deletions)")
-                                        .foregroundStyle(.red)
-                                        .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                                }
+                                .background(VeloTheme.codeSurface(colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.85)
+                                )
                             }
                         }
+                        .padding(14)
                     }
-                    .listStyle(.insetGrouped)
                 }
             }
-            .navigationTitle("Worktree Diff")
+            .navigationTitle("变更对比 (Diff)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -1379,18 +1877,18 @@ private struct DiffViewerSheet: View {
 
     private func color(for kind: DiffLineRow.Kind) -> Color {
         switch kind {
-        case .addition: return .green
-        case .deletion: return .red
-        case .header: return .blue
+        case .addition: return VeloTheme.emerald
+        case .deletion: return VeloTheme.coral
+        case .header: return VeloTheme.accentVioletSoft
         case .context: return .secondary
         }
     }
 
     private func bg(for kind: DiffLineRow.Kind) -> Color {
         switch kind {
-        case .addition: return Color.green.opacity(0.1)
-        case .deletion: return Color.red.opacity(0.1)
-        case .header: return Color.blue.opacity(0.08)
+        case .addition: return VeloTheme.emerald.opacity(0.11)
+        case .deletion: return VeloTheme.coral.opacity(0.11)
+        case .header: return VeloTheme.accentViolet.opacity(0.10)
         case .context: return .clear
         }
     }

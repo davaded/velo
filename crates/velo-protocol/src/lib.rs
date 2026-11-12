@@ -360,12 +360,18 @@ pub struct CreateSessionRequest {
     pub approval_mode: Option<String>,
     #[serde(default)]
     pub setup_command: Option<String>,
+    #[serde(default)]
+    pub use_worktree: bool,
 }
 
 /// Request payload to hand off an existing session's worktree & context to another agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffSessionRequest {
     pub target_provider: AgentProvider,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     pub additional_instructions: Option<String>,
 }
 

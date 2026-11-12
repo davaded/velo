@@ -1,4 +1,180 @@
 import Foundation
+import SwiftUI
+
+// MARK: - 1. Engine Categories & Adaptive Design Tokens (Beautiful UI / Rare UI / BeUI)
+
+public enum VeloEngineCategory: String, CaseIterable, Identifiable, Sendable {
+    case claude
+    case codex
+    case agy
+    case grok
+    case cursor
+    case other
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .claude: return "Claude Code"
+        case .codex: return "OpenAI Codex"
+        case .agy: return "Antigravity"
+        case .grok: return "Grok CLI"
+        case .cursor: return "Cursor Agent"
+        case .other: return "ACP / Custom"
+        }
+    }
+
+    public var vendor: String {
+        switch self {
+        case .claude: return "Anthropic"
+        case .codex: return "OpenAI"
+        case .agy: return "Google"
+        case .grok: return "xAI"
+        case .cursor: return "Cursor"
+        case .other: return "Custom"
+        }
+    }
+
+    public var shortBadge: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .agy: return "AGY"
+        case .grok: return "Grok"
+        case .cursor: return "Cursor"
+        case .other: return "ACP"
+        }
+    }
+
+    public var iconName: String {
+        switch self {
+        case .claude: return "sparkles"
+        case .codex: return "terminal.fill"
+        case .agy: return "atom"
+        case .grok: return "bolt.fill"
+        case .cursor: return "cursorarrow.rays"
+        case .other: return "cpu"
+        }
+    }
+
+    public var accentColor: Color {
+        switch self {
+        case .claude:
+            return Color(red: 0.88, green: 0.53, blue: 0.35) // Anthropic Terracotta
+        case .codex:
+            return Color(red: 0.16, green: 0.78, blue: 0.56) // OpenAI Emerald
+        case .agy:
+            return Color(red: 0.35, green: 0.60, blue: 0.98) // Google Cobalt
+        case .grok:
+            return Color(red: 0.64, green: 0.48, blue: 0.98) // xAI Electric Violet
+        case .cursor:
+            return Color(red: 0.18, green: 0.76, blue: 0.88) // Cursor Cyan
+        case .other:
+            return Color.secondary
+        }
+    }
+
+    public var supportedEfforts: [String] {
+        switch self {
+        case .claude, .codex:
+            return ["low", "medium", "high", "max"]
+        case .agy, .grok, .other:
+            return ["low", "medium", "high"]
+        case .cursor:
+            return ["medium", "high"]
+        }
+    }
+
+    public static var primaryCategories: [VeloEngineCategory] {
+        [.claude, .codex, .agy, .grok, .cursor]
+    }
+
+    public static func from(agentKind: String, family: String = "") -> VeloEngineCategory {
+        let k = agentKind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let f = family.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if k == "claude" || f.contains("anthropic") { return .claude }
+        if k == "codex" || f.contains("openai") { return .codex }
+        if k == "agy" || k.contains("antigravity") || f.contains("antigravity") { return .agy }
+        if k == "grok" || f.contains("grok") || f.contains("xai") { return .grok }
+        if k == "cursor" || k.contains("cursor") || f.contains("cursor") { return .cursor }
+        return .other
+    }
+}
+
+public enum VeloTheme {
+    public static let accentViolet = Color(red: 0.545, green: 0.361, blue: 0.965) // #8B5CF6
+    public static let accentVioletSoft = Color(red: 0.655, green: 0.545, blue: 0.980) // #A78BFA
+    public static let emerald = Color(red: 0.204, green: 0.827, blue: 0.600) // #34D399
+    public static let coral = Color(red: 0.973, green: 0.443, blue: 0.443) // #F87171
+    public static let amber = Color(red: 0.984, green: 0.749, blue: 0.141) // #FBBF24
+
+    public static func canvas(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.043, green: 0.047, blue: 0.059) // #0B0C0F Obsidian
+            : Color(red: 0.965, green: 0.969, blue: 0.980) // #F6F7FA Editorial Light
+    }
+
+    public static func cardSurface(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.078, green: 0.084, blue: 0.108) // #14151B
+            : Color.white
+    }
+
+    public static func elevatedSurface(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.110, green: 0.118, blue: 0.150) // #1C1E26
+            : Color(red: 0.941, green: 0.949, blue: 0.969) // #F0F2F7
+    }
+
+    public static func codeSurface(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.055, green: 0.059, blue: 0.075) // #0E0F13
+            : Color(red: 0.957, green: 0.963, blue: 0.978)
+    }
+
+    public static func codeHeader(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.092, green: 0.098, blue: 0.125)
+            : Color(red: 0.922, green: 0.931, blue: 0.955)
+    }
+
+    public static func userBubble(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.128, green: 0.133, blue: 0.178)
+            : Color(red: 0.922, green: 0.929, blue: 0.961)
+    }
+
+    public static func hairline(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color.white.opacity(0.085)
+            : Color.black.opacity(0.075)
+    }
+
+    public static func specularRim(_ scheme: ColorScheme) -> LinearGradient {
+        if scheme == .dark {
+            return LinearGradient(
+                colors: [
+                    Color.white.opacity(0.16),
+                    Color.white.opacity(0.05),
+                    Color.white.opacity(0.03),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        } else {
+            return LinearGradient(
+                colors: [
+                    Color.black.opacity(0.09),
+                    Color.black.opacity(0.04),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+    }
+}
+
+// MARK: - 2. Pairing & Session Models
 
 public enum ConnectionModeConfig: Codable, Equatable, Sendable {
     case direct(baseURL: String)
@@ -34,7 +210,6 @@ public enum ConnectionModeConfig: Codable, Equatable, Sendable {
         let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
-        // Check query parameters for E2EE relay credentials (`velo://pair?...` or `http://.../?mobile=1&relay=...&room=...&key=...`)
         if let comp = URLComponents(string: trimmed) {
             let items = comp.queryItems ?? []
             let relay = items.first(where: { $0.name == "relay" })?.value?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -64,7 +239,6 @@ public enum ConnectionModeConfig: Codable, Equatable, Sendable {
             }
         }
 
-        // Bare host or IP (`192.168.1.20` or `192.168.1.20:6767`)
         var hostPort = trimmed
             .replacingOccurrences(of: "ws://", with: "http://")
             .replacingOccurrences(of: "wss://", with: "https://")
@@ -99,11 +273,38 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
     public var branchName: String
     public var repoRoot: String
     public var worktreePath: String
+    public var parentSessionId: String?
     public var approvalMode: String
     public var filesChanged: Int
     public var insertions: Int
     public var deletions: Int
     public var updatedAtLabel: String
+
+    public var engineCategory: VeloEngineCategory {
+        VeloEngineCategory.from(agentKind: agentKind)
+    }
+
+    public var projectName: String {
+        let name = URL(fileURLWithPath: repoRoot).lastPathComponent
+        return name.isEmpty ? "workspace" : name
+    }
+
+    public var isIsolatedWorktree: Bool {
+        worktreePath != repoRoot && worktreePath.contains("/.velo/worktrees/")
+    }
+
+    public static func cleanDisplayTitle(_ raw: String, fallback: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("<conversation_history>") {
+            if let userRange = s.range(of: "User:", options: .backwards) {
+                s = String(s[userRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                s = fallback
+            }
+        }
+        let firstLine = s.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? ""
+        return firstLine.isEmpty ? fallback : String(firstLine.prefix(54))
+    }
 
     public static func fromJSON(_ dict: [String: Any]) -> VeloSessionItem? {
         guard let rawId = dict["id"] else { return nil }
@@ -130,14 +331,18 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
         let rawName = (dict["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let rawPrompt = (dict["prompt"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let title: String = {
-            if let rawName, !rawName.isEmpty { return rawName }
-            if let rawPrompt, !rawPrompt.isEmpty { return String(rawPrompt.prefix(48)) }
-            return branch
+            if let rawName, !rawName.isEmpty {
+                return cleanDisplayTitle(rawName, fallback: branch)
+            }
+            if let rawPrompt, !rawPrompt.isEmpty {
+                return cleanDisplayTitle(rawPrompt, fallback: branch)
+            }
+            return "新对话"
         }()
 
         let defaultModel: String = {
             if agentKind == "codex" { return "gpt-6.1-sol" }
-            if agentKind == "grok" || agentKind.contains("grok") { return "grok-4.6" }
+            if agentKind == "grok" || agentKind.contains("grok") { return "grok-4.7" }
             if agentKind == "cursor" || agentKind.contains("cursor") { return "cursor:auto" }
             if agentKind == "agy" || agentKind.contains("antigravity") || agentKind.contains("gemini") {
                 return "gemini-4-carbon-high"
@@ -149,6 +354,7 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
         let effort = (dict["effort"] as? String)
             ?? ((agentKind == "codex" || agentKind == "grok") ? "high" : "medium")
         let approvalMode = (dict["approval_mode"] as? String) ?? "auto_edit"
+        let parentSessionId = (dict["parent_session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
 
         let statusStr = ((dict["status"] as? String) ?? "idle").lowercased()
         let status: SessionRunState = {
@@ -175,7 +381,7 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
                 f.dateFormat = "HH:mm"
                 return f.string(from: date)
             }
-            return "now"
+            return "刚刚"
         }()
 
         return VeloSessionItem(
@@ -189,6 +395,7 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
             branchName: branch,
             repoRoot: repoRoot,
             worktreePath: worktreePath,
+            parentSessionId: parentSessionId,
             approvalMode: approvalMode,
             filesChanged: filesChanged,
             insertions: insertions,
@@ -204,77 +411,154 @@ public struct VeloModelOption: Identifiable, Equatable, Sendable {
     public let shortLabel: String
     public let family: String
     public let agentKind: String
+    public let desc: String
+    public let installed: Bool
+    public let isDefault: Bool
+
+    public init(
+        id: String,
+        label: String,
+        shortLabel: String,
+        family: String,
+        agentKind: String,
+        desc: String = "",
+        installed: Bool = true,
+        isDefault: Bool = false
+    ) {
+        self.id = id
+        self.label = label
+        self.shortLabel = shortLabel
+        self.family = family
+        self.agentKind = agentKind
+        self.desc = desc
+        self.installed = installed
+        self.isDefault = isDefault
+    }
+
+    public var category: VeloEngineCategory {
+        VeloEngineCategory.from(agentKind: agentKind, family: family)
+    }
+
+    public var cleanTitle: String {
+        var s = label
+            .replacingOccurrences(of: " (Antigravity agy)", with: "")
+            .replacingOccurrences(of: " (xAI Grok CLI)", with: "")
+            .replacingOccurrences(of: " (Codex)", with: "")
+            .replacingOccurrences(of: " (cursor-agent)", with: "")
+        if category == .cursor, s.hasPrefix("Cursor · ") {
+            s = String(s.dropFirst("Cursor · ".count))
+        }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public var cleanSubtitle: String {
+        let d = desc
+            .replacingOccurrences(of: "Installed · ", with: "")
+            .replacingOccurrences(of: "Default in ~/.codex/config.toml · ", with: "")
+            .replacingOccurrences(of: "Default in ~/.grok/config.toml · ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !d.isEmpty { return d }
+        return "\(category.vendor) · \(id)"
+    }
+
+    public static func groupedByCategory(
+        _ options: [VeloModelOption]
+    ) -> [(category: VeloEngineCategory, models: [VeloModelOption])] {
+        var result: [(VeloEngineCategory, [VeloModelOption])] = []
+        for cat in VeloEngineCategory.allCases {
+            let matching = options.filter { $0.category == cat }
+            if !matching.isEmpty {
+                result.append((cat, matching))
+            }
+        }
+        return result
+    }
 
     public static let defaults: [VeloModelOption] = [
         VeloModelOption(
             id: "claude-fable-5-2",
             label: "Claude Fable 5.2",
-            shortLabel: "Claude Fable 5.2",
+            shortLabel: "Fable 5.2",
             family: "Anthropic",
-            agentKind: "claude"
+            agentKind: "claude",
+            desc: "Anthropic 旗舰全栈编码与架构推理模型",
+            isDefault: true
         ),
         VeloModelOption(
             id: "claude-opus-5-5",
             label: "Claude Opus 5.5",
             shortLabel: "Opus 5.5",
             family: "Anthropic",
-            agentKind: "claude"
+            agentKind: "claude",
+            desc: "深度多文件自主重构与复杂问题求解"
         ),
         VeloModelOption(
             id: "claude-sonnet-5",
             label: "Claude Sonnet 5",
             shortLabel: "Sonnet 5",
             family: "Anthropic",
-            agentKind: "claude"
+            agentKind: "claude",
+            desc: "高速均衡日常研发与工具执行"
         ),
         VeloModelOption(
             id: "gpt-6.1-sol",
-            label: "GPT-6.1-Sol (Codex)",
+            label: "GPT-6.1-Sol",
             shortLabel: "GPT-6.1-Sol",
             family: "OpenAI",
-            agentKind: "codex"
+            agentKind: "codex",
+            desc: "Codex 默认高阶代码生成与仓库级验证",
+            isDefault: true
         ),
         VeloModelOption(
             id: "gemini-4-carbon-high",
-            label: "Gemini 4 Carbon (Antigravity agy)",
-            shortLabel: "Gemini 4 Carbon High",
+            label: "Gemini 4 Carbon (High)",
+            shortLabel: "Gemini 4 Carbon",
             family: "Google Antigravity",
-            agentKind: "agy"
+            agentKind: "agy",
+            desc: "Google Antigravity 深度推理旗舰模型",
+            isDefault: true
         ),
         VeloModelOption(
             id: "gemini-3.8-flash-high",
-            label: "Gemini 3.8 Flash (Antigravity agy)",
+            label: "Gemini 3.8 Flash (High)",
             shortLabel: "Gemini 3.8 Flash",
             family: "Google Antigravity",
-            agentKind: "agy"
+            agentKind: "agy",
+            desc: "超低延迟响应与多模态工具协同"
         ),
         VeloModelOption(
             id: "grok-4.7",
-            label: "Grok 4.7 (xAI Grok CLI)",
+            label: "Grok 4.7",
             shortLabel: "Grok 4.7",
             family: "xAI Grok",
-            agentKind: "grok"
+            agentKind: "grok",
+            desc: "xAI 最新一代编码与推理模型",
+            isDefault: true
         ),
         VeloModelOption(
             id: "grok-4.6",
-            label: "Grok 4.6 (xAI Grok CLI)",
+            label: "Grok 4.6",
             shortLabel: "Grok 4.6",
             family: "xAI Grok",
-            agentKind: "grok"
+            agentKind: "grok",
+            desc: "稳健高速工具调用与代码改动"
         ),
         VeloModelOption(
             id: "cursor:auto",
-            label: "Cursor Auto (cursor-agent)",
+            label: "Cursor Auto",
             shortLabel: "Cursor Auto",
             family: "Cursor",
-            agentKind: "cursor"
+            agentKind: "cursor",
+            desc: "Cursor CLI 智能自动路由模型",
+            isDefault: true
         ),
         VeloModelOption(
             id: "cursor:composer",
-            label: "Cursor Composer (cursor-agent)",
-            shortLabel: "Cursor Composer",
+            label: "Cursor Composer",
+            shortLabel: "Composer",
             family: "Cursor",
-            agentKind: "cursor"
+            agentKind: "cursor",
+            desc: "Cursor 原生多文件极速编辑模型"
         ),
     ]
 
@@ -282,9 +566,16 @@ public struct VeloModelOption: Identifiable, Equatable, Sendable {
         if let found = defaults.first(where: { $0.id == modelId }) {
             return found.shortLabel
         }
+        if modelId.hasPrefix("cursor:") {
+            return String(modelId.dropFirst("cursor:".count)).capitalized
+        }
         return modelId
+            .replacingOccurrences(of: "-high", with: "")
+            .replacingOccurrences(of: "-medium", with: "")
     }
 }
+
+// MARK: - 3. Timeline, Diff & Formatting Helpers
 
 public enum AgentLivePhase: Equatable, Sendable {
     case thinking
@@ -470,6 +761,40 @@ public enum VeloFormatting {
         )
     }
 
+    public static func summarizeToolBatch(_ items: [TimelineEventItem]) -> (title: String, activeVerb: String?, hasError: Bool, isRunning: Bool) {
+        var reads = 0
+        var edits = 0
+        var commands = 0
+        var searches = 0
+        var others = 0
+        var hasError = false
+        var activeVerb: String?
+
+        for item in items {
+            guard case .toolCall(_, let displayName, let verb, _, let output, let err) = item.kind else { continue }
+            if err { hasError = true }
+            if output == nil { activeVerb = verb }
+            switch displayName {
+            case "Read": reads += 1
+            case "Edit": edits += 1
+            case "Shell": commands += 1
+            case "Search": searches += 1
+            default: others += 1
+            }
+        }
+
+        var parts: [String] = []
+        if reads > 0 { parts.append("读取 \(reads) 个文件") }
+        if searches > 0 { parts.append("搜索 \(searches) 次") }
+        if edits > 0 { parts.append("编辑 \(edits) 处") }
+        if commands > 0 { parts.append("执行 \(commands) 条命令") }
+        if others > 0 { parts.append("其他 \(others) 项") }
+
+        let detail = parts.isEmpty ? "已完成" : parts.joined(separator: " · ")
+        let title = "已调用 \(items.count) 个工具 · \(detail)"
+        return (title, activeVerb, hasError, activeVerb != nil)
+    }
+
     public static func parseUnifiedDiff(_ rawDiff: String) -> [DiffFileSection] {
         guard !rawDiff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         var files: [DiffFileSection] = []
@@ -548,7 +873,6 @@ public enum VeloFormatting {
         var provider = fallbackProvider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if provider.isEmpty { provider = "agy" }
 
-        // 1. Structured `[AUTH_REQUIRED|<provider>|<loginCmd>|<authUrl>] <msg>` emitted by velo-agent
         if trimmed.hasPrefix("[AUTH_REQUIRED|"),
            let closeRange = trimmed.range(of: "]")
         {
@@ -569,7 +893,6 @@ public enum VeloFormatting {
             return (cleanBody, true, provider, cmd, urlStr ?? extractFirstAuthURL(from: body))
         }
 
-        // 2. Heuristic detection for historical or raw stderr CLI auth failures
         let lower = trimmed.lowercased()
         let isAuth = lower.contains("authentication required")
             || lower.contains("authentication timed out")

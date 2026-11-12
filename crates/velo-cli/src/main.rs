@@ -263,6 +263,7 @@ async fn main() -> Result<()> {
             };
             let abs_repo = repo_dir.canonicalize().unwrap_or(repo_dir);
 
+            let use_worktree = branch.is_some();
             let req = CreateSessionRequest {
                 name,
                 provider: AgentProvider::from_str_loose(&agent),
@@ -276,6 +277,7 @@ async fn main() -> Result<()> {
                 images: Vec::new(),
                 approval_mode: None,
                 setup_command: None,
+                use_worktree,
             };
 
             let session: SessionInfo = http_post_json(addr, "/api/sessions", &req).await?;
@@ -411,6 +413,8 @@ async fn main() -> Result<()> {
             let target = resolve_session(addr, &session).await?;
             let req = HandoffSessionRequest {
                 target_provider: AgentProvider::from_str_loose(&to),
+                model: None,
+                effort: None,
                 additional_instructions: instructions,
             };
             let new_session: SessionInfo = http_post_json(

@@ -1972,8 +1972,7 @@ export function App() {
         return;
       }
 
-      const shortRand = Math.random().toString(36).slice(2, 6);
-      const branch = `feat/thread-${shortRand}`;
+      const branch = targetRepo.default_branch || "main";
       const newId = `wt-${Date.now()}`;
       const freshSession: VeloSession = {
         id: newId,
@@ -1985,7 +1984,7 @@ export function App() {
         effort: activeSession.effort || "medium",
         status: "idle",
         branch_name: branch,
-        worktree_path: `${targetRepo.path}/.velo/worktrees/feat-thread-${shortRand}`,
+        worktree_path: targetRepo.path,
         project_path: targetRepo.path,
         approval_mode: activeSession.approval_mode || "auto_edit",
         tokens_used: 0,
@@ -2238,31 +2237,34 @@ export function App() {
 
     // Real Daemon /handoff endpoint
     if (rawText.startsWith("/handoff")) {
+      const rest = rawText.replace("/handoff", "").trim();
+      const [firstToken, ...moreTokens] = rest.split(/\s+/);
+      const knownTargets = ["claude", "codex", "agy", "grok", "cursor"];
+      const targetProv =
+        firstToken && knownTargets.includes(firstToken.toLowerCase())
+          ? firstToken.toLowerCase()
+          : activeSession.agent_kind === "codex"
+          ? "claude"
+          : "codex";
+      const extraNote =
+        firstToken && knownTargets.includes(firstToken.toLowerCase())
+          ? moreTokens.join(" ").trim() || null
+          : rest || null;
       try {
         const res = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/handoff`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ goal: rawText.replace("/handoff", "").trim() || null }),
+          body: JSON.stringify({
+            target_provider: targetProv,
+            additional_instructions: extraNote,
+          }),
         });
         if (res.ok) {
-          const data = (await res.json()) as {
-            summary_markdown?: string;
-            new_session?: Record<string, unknown>;
-          };
-          const replyEv: AgentEvent = {
-            id: `ho-${Date.now()}`,
-            session_id: activeSession.id,
-            timestamp: now,
-            kind: "assistant",
-            content:
-              data.summary_markdown ||
-              "Context compacted (`64k → 9.2k tokens`) and migrated to fresh worktree session.",
-          };
-          setEventsBySession((prev) => ({
-            ...prev,
-            [activeSession.id]: [...(prev[activeSession.id] || []), replyEv],
-          }));
-          refreshSessions();
+          const rawNew = await res.json();
+          const created = normalizeToVeloSession(rawNew, 0);
+          created.repo_id = activeSession.repo_id;
+          setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)]);
+          setActiveId(created.id);
           return;
         }
       } catch {
@@ -2421,6 +2423,9 @@ export function App() {
       }
 
       // 2. If activeSession was a local thread not yet on the daemon, promote it to a real daemon session
+      const wantsIsolatedWorktree =
+        activeSession.worktree_path !== activeSession.project_path &&
+        activeSession.worktree_path.includes("/.velo/worktrees/");
       const createRes = await fetch(`${daemonUrl}/api/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2429,12 +2434,13 @@ export function App() {
           provider: providerName,
           prompt: priorHistory.length > 0 ? promptWithContext : text,
           repo_path: activeRepo.path || "/Users/daiyudai/code/velo",
-          branch: activeSession.branch_name,
+          branch: wantsIsolatedWorktree ? activeSession.branch_name : null,
           use_pty: false,
           model: activeSession.model,
           effort: activeSession.effort || "medium",
           approval_mode: activeSession.approval_mode,
           images: attachedPaths,
+          use_worktree: wantsIsolatedWorktree,
         }),
       });
 
@@ -3115,6 +3121,7 @@ export function App() {
           effort: "medium",
           approval_mode: newApproval,
           setup_command: setupCmd,
+          use_worktree: true,
         }),
       });
       if (res.ok) {
@@ -4598,108 +4605,214 @@ export function App() {
 
                   {/* Composer Bottom Toolbar: Concrete Model Picker (Claude / Codex / ACP) + Effort + Permission Mode + Voice */}
                   <div className="relative mt-1.5 flex flex-wrap items-center justify-between gap-2">
-                    {/* 1. Concrete Model & ACP Provider Picker Popover */}
+                    {/* 1. Categorized Engine & Model Picker Popover (Same-Engine Switch vs Cross-Engine Handoff) */}
                     {modelPickerOpen && (
-                      <div className="absolute bottom-9 left-0 z-30 w-[348px] max-w-[calc(100vw-32px)] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
-                        <div className="max-h-[340px] overflow-y-auto pr-0.5">
-                          {Array.from(new Set(modelCatalog.map((m) => m.family))).map((family) => {
-                            const familyModels = modelCatalog.filter((m) => m.family === family);
-                            if (familyModels.length === 0) return null;
-                            const runtimeId = familyModels[0].runtimeId;
-                            const rt = runtimes.find((r) => r.id === runtimeId);
-                            const isAcpFamily = String(family).startsWith("ACP");
-                            const isConnected = rt
-                              ? rt.available
-                              : familyModels[0].installed !== false;
-                            return (
-                              <div key={family} className="mb-1.5 last:mb-0">
-                                <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
-                                  <span>
-                                    {family === "Anthropic"
-                                      ? "Anthropic (Claude Code)"
-                                      : family === "OpenAI"
-                                      ? "OpenAI / Codex (~/.codex)"
-                                      : family === "Google Antigravity"
-                                      ? "Google Antigravity CLI (agy)"
-                                      : family === "xAI Grok"
-                                      ? "xAI Grok CLI (~/.grok)"
-                                      : family === "Cursor"
-                                      ? "Cursor Agent CLI (cursor-agent)"
-                                      : family}
-                                  </span>
-                                  <span className="font-mono text-[10px]">
-                                    {isConnected
-                                      ? "Connected"
-                                      : isAcpFamily
-                                      ? "ACP JSON-RPC"
-                                      : "Not configured"}
-                                  </span>
-                                </div>
-                                {familyModels.map((m) => {
-                                  const isCurrent = activeSession.model === m.id;
-                                  const canSelect = isConnected || isAcpFamily;
-                                  return (
-                                    <button
-                                      key={m.id}
-                                      disabled={!canSelect}
-                                      onClick={() => {
-                                        setSessions((prev) =>
-                                          prev.map((s) =>
-                                            s.id === activeSession.id
-                                              ? {
-                                                  ...s,
-                                                  agent_kind: m.agentKind,
-                                                  model: m.id,
-                                                  model_short: m.shortLabel,
-                                                }
-                                              : s
-                                          )
-                                        );
-                                        fetch(`${daemonUrl}/api/sessions/${activeSession.id}`, {
-                                          method: "PATCH",
-                                          headers: { "Content-Type": "application/json" },
-                                          body: JSON.stringify({
-                                            model: m.id,
-                                            provider: m.agentKind,
-                                          }),
-                                        }).catch(() => {});
-                                        setModelPickerOpen(false);
-                                      }}
-                                      className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
-                                        isCurrent
-                                          ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                                          : canSelect
-                                          ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
-                                          : "cursor-not-allowed text-[var(--v-fg-muted)] opacity-40"
+                      <div className="absolute bottom-9 left-0 z-30 w-[368px] max-w-[calc(100vw-32px)] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                        <div className="max-h-[360px] overflow-y-auto pr-0.5">
+                          {(() => {
+                            const isSessionBound =
+                              (eventsBySession[activeSession.id]?.length ?? 0) > 0;
+                            const allFamilies = Array.from(
+                              new Set(modelCatalog.map((m) => m.family))
+                            );
+                            const sortedFamilies = [...allFamilies].sort((a, b) => {
+                              const aMatch = modelCatalog.some(
+                                (m) =>
+                                  m.family === a && m.agentKind === activeSession.agent_kind
+                              );
+                              const bMatch = modelCatalog.some(
+                                (m) =>
+                                  m.family === b && m.agentKind === activeSession.agent_kind
+                              );
+                              return Number(bMatch) - Number(aMatch);
+                            });
+
+                            return sortedFamilies.map((family) => {
+                              const familyModels = modelCatalog.filter(
+                                (m) => m.family === family
+                              );
+                              if (familyModels.length === 0) return null;
+                              const familyAgentKind = familyModels[0].agentKind;
+                              const isSameEngine =
+                                familyAgentKind === activeSession.agent_kind;
+                              const isCrossEngineHandoff = isSessionBound && !isSameEngine;
+                              const runtimeId = familyModels[0].runtimeId;
+                              const rt = runtimes.find((r) => r.id === runtimeId);
+                              const isAcpFamily = String(family).startsWith("ACP");
+                              const isConnected = rt
+                                ? rt.available
+                                : familyModels[0].installed !== false;
+
+                              return (
+                                <div
+                                  key={family}
+                                  className={`mb-2 rounded-lg p-1 last:mb-0 ${
+                                    isSameEngine && isSessionBound
+                                      ? "border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/40"
+                                      : ""
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between px-2 py-1 text-[10.5px] font-semibold">
+                                    <span className="text-[var(--v-fg-body)]">
+                                      {family === "Anthropic"
+                                        ? "Anthropic · Claude Code"
+                                        : family === "OpenAI"
+                                        ? "OpenAI · Codex"
+                                        : family === "Google Antigravity"
+                                        ? "Google · Antigravity (agy)"
+                                        : family === "xAI Grok"
+                                        ? "xAI · Grok CLI"
+                                        : family === "Cursor"
+                                        ? "Cursor · Agent CLI"
+                                        : family}
+                                    </span>
+                                    <span
+                                      className={`font-mono text-[9.5px] ${
+                                        isCrossEngineHandoff
+                                          ? "text-[#A78BFA]"
+                                          : isSameEngine && isSessionBound
+                                          ? "text-[#34D399]"
+                                          : "text-[var(--v-fg-muted)]"
                                       }`}
                                     >
-                                      <div className="min-w-0 pr-2">
-                                        <div className="flex items-center gap-1.5 font-medium">
-                                          <span>{m.label}</span>
-                                          {m.isDefault && (
-                                            <span className="rounded bg-[var(--v-bg-active)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
-                                              default
-                                            </span>
-                                          )}
-                                          {!isConnected && isAcpFamily && (
-                                            <span className="rounded bg-[var(--v-bg-hover)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-faint)]">
-                                              install CLI
-                                            </span>
-                                          )}
+                                      {!isConnected && !isAcpFamily
+                                        ? "Not configured"
+                                        : isCrossEngineHandoff
+                                        ? "Handoff New Session ↗"
+                                        : isSameEngine && isSessionBound
+                                        ? "Bound Engine · Switch"
+                                        : "Ready"}
+                                    </span>
+                                  </div>
+                                  {familyModels.map((m) => {
+                                    const isCurrent = activeSession.model === m.id;
+                                    const canSelect = isConnected || isAcpFamily;
+                                    return (
+                                      <button
+                                        key={m.id}
+                                        disabled={!canSelect}
+                                        onClick={async () => {
+                                          setModelPickerOpen(false);
+                                          if (isCrossEngineHandoff) {
+                                            try {
+                                              const res = await fetch(
+                                                `${daemonUrl}/api/sessions/${activeSession.id}/handoff`,
+                                                {
+                                                  method: "POST",
+                                                  headers: {
+                                                    "Content-Type": "application/json",
+                                                  },
+                                                  body: JSON.stringify({
+                                                    target_provider: m.agentKind,
+                                                    model: m.id,
+                                                    effort:
+                                                      activeSession.effort || "medium",
+                                                  }),
+                                                }
+                                              );
+                                              if (res.ok) {
+                                                const rawNew = await res.json();
+                                                const created = normalizeToVeloSession(
+                                                  rawNew,
+                                                  0
+                                                );
+                                                created.repo_id = activeSession.repo_id;
+                                                created.agent_kind = m.agentKind;
+                                                created.model = m.id;
+                                                created.model_short = m.shortLabel;
+                                                setSessions((prev) => [
+                                                  created,
+                                                  ...prev.filter(
+                                                    (s) => s.id !== created.id
+                                                  ),
+                                                ]);
+                                                setActiveId(created.id);
+                                                setTimeout(
+                                                  () =>
+                                                    composerTextareaRef.current?.focus(),
+                                                  30
+                                                );
+                                                return;
+                                              }
+                                            } catch {
+                                              // fallback to E2EE command
+                                            }
+                                            sendE2eeCommand({
+                                              cmd: "handoff_session",
+                                              session_id: activeSession.id,
+                                              target_provider: m.agentKind,
+                                              model: m.id,
+                                              effort: activeSession.effort || "medium",
+                                            });
+                                            return;
+                                          }
+
+                                          setSessions((prev) =>
+                                            prev.map((s) =>
+                                              s.id === activeSession.id
+                                                ? {
+                                                    ...s,
+                                                    agent_kind: m.agentKind,
+                                                    model: m.id,
+                                                    model_short: m.shortLabel,
+                                                  }
+                                                : s
+                                            )
+                                          );
+                                          fetch(
+                                            `${daemonUrl}/api/sessions/${activeSession.id}`,
+                                            {
+                                              method: "PATCH",
+                                              headers: {
+                                                "Content-Type": "application/json",
+                                              },
+                                              body: JSON.stringify({
+                                                model: m.id,
+                                                provider: m.agentKind,
+                                              }),
+                                            }
+                                          ).catch(() => {});
+                                        }}
+                                        className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
+                                          isCurrent
+                                            ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                            : canSelect
+                                            ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
+                                            : "cursor-not-allowed text-[var(--v-fg-muted)] opacity-40"
+                                        }`}
+                                      >
+                                        <div className="min-w-0 pr-2">
+                                          <div className="flex items-center gap-1.5 font-medium">
+                                            <span>{m.label}</span>
+                                            {m.isDefault && (
+                                              <span className="rounded bg-[var(--v-bg-active)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
+                                                default
+                                              </span>
+                                            )}
+                                            {!isConnected && isAcpFamily && (
+                                              <span className="rounded bg-[var(--v-bg-hover)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-faint)]">
+                                                install CLI
+                                              </span>
+                                            )}
+                                          </div>
+                                          <div className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
+                                            {m.desc}
+                                          </div>
                                         </div>
-                                        <div className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
-                                          {m.desc}
-                                        </div>
-                                      </div>
-                                      {isCurrent && (
-                                        <Check className="h-3.5 w-3.5 shrink-0 text-[#34d399]" />
-                                      )}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            );
-                          })}
+                                        {isCurrent ? (
+                                          <Check className="h-3.5 w-3.5 shrink-0 text-[#34d399]" />
+                                        ) : isCrossEngineHandoff && canSelect ? (
+                                          <span className="shrink-0 font-mono text-[10px] text-[#A78BFA]">
+                                            ↗ Fork
+                                          </span>
+                                        ) : null}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              );
+                            });
+                          })()}
                         </div>
 
                         {/* Custom ACP Command Quick-Bind (`acp:<cmd>`) */}

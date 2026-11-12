@@ -791,63 +791,227 @@ async fn run_supervised_e2ee_bridge(
                                         .unwrap_or("")
                                         .trim()
                                         .to_string();
-                                    if !prompt.is_empty() {
-                                        let fallback_repo = {
-                                            let guard = state.inner.read().await;
-                                            guard
-                                                .sessions
-                                                .values()
-                                                .next()
-                                                .map(|s| s.repo_root.clone())
-                                                .unwrap_or_else(|| {
-                                                    "/Users/daiyudai/code/velo".to_string()
-                                                })
-                                        };
-                                        let repo_path = cmd_val
-                                            .get("repo_path")
+                                    let fallback_repo = {
+                                        let guard = state.inner.read().await;
+                                        guard
+                                            .sessions
+                                            .values()
+                                            .next()
+                                            .map(|s| s.repo_root.clone())
+                                            .unwrap_or_else(|| {
+                                                "/Users/daiyudai/code/velo".to_string()
+                                            })
+                                    };
+                                    let repo_path = cmd_val
+                                        .get("repo_path")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.trim().is_empty())
+                                        .map(str::to_string)
+                                        .unwrap_or(fallback_repo);
+                                    let provider_raw = cmd_val
+                                        .get("provider")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("claude");
+                                    let provider = AgentProvider::from_str_loose(provider_raw);
+                                    let use_worktree = cmd_val
+                                        .get("use_worktree")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    let req = CreateSessionRequest {
+                                        name: cmd_val
+                                            .get("name")
                                             .and_then(|v| v.as_str())
-                                            .filter(|s| !s.trim().is_empty())
-                                            .map(str::to_string)
-                                            .unwrap_or(fallback_repo);
-                                        let provider_raw = cmd_val
-                                            .get("provider")
+                                            .map(str::to_string),
+                                        provider,
+                                        prompt,
+                                        repo_path,
+                                        branch: cmd_val
+                                            .get("branch")
                                             .and_then(|v| v.as_str())
-                                            .unwrap_or("claude");
-                                        let provider = AgentProvider::from_str_loose(provider_raw);
-                                        let req = CreateSessionRequest {
-                                            name: cmd_val
-                                                .get("name")
+                                            .map(str::to_string),
+                                        use_pty: false,
+                                        parent_session_id: None,
+                                        model: cmd_val
+                                            .get("model")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string),
+                                        effort: cmd_val
+                                            .get("effort")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string),
+                                        images: Vec::new(),
+                                        approval_mode: cmd_val
+                                            .get("approval_mode")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string),
+                                        setup_command: None,
+                                        use_worktree,
+                                    };
+                                    if state.create_session(req).await.is_ok() {
+                                        let guard = state.inner.read().await;
+                                        let mut sessions: Vec<SessionInfo> =
+                                            guard.sessions.values().cloned().collect();
+                                        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                        if let Ok(snap) = serde_json::to_value(
+                                            WsServerMessage::SessionsSnapshot { sessions },
+                                        ) {
+                                            if let Some(frame_txt) = send_sealed_with_key(
+                                                &snap,
+                                                &active_key_hex,
+                                                &mut out_nonce,
+                                            ) {
+                                                let _ = writer
+                                                    .send(WsMsg::Text(frame_txt.into()))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                                "handoff_session" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let target_raw = cmd_val
+                                                .get("target_provider")
                                                 .and_then(|v| v.as_str())
-                                                .map(str::to_string),
-                                            provider,
-                                            prompt,
-                                            repo_path,
-                                            branch: cmd_val
-                                                .get("branch")
-                                                .and_then(|v| v.as_str())
-                                                .map(str::to_string),
-                                            use_pty: false,
-                                            parent_session_id: None,
-                                            model: cmd_val
+                                                .unwrap_or("claude");
+                                            let target_provider =
+                                                AgentProvider::from_str_loose(target_raw);
+                                            let model = cmd_val
                                                 .get("model")
                                                 .and_then(|v| v.as_str())
-                                                .map(str::to_string),
-                                            effort: cmd_val
+                                                .map(str::to_string);
+                                            let effort = cmd_val
                                                 .get("effort")
                                                 .and_then(|v| v.as_str())
-                                                .map(str::to_string),
-                                            images: Vec::new(),
-                                            approval_mode: cmd_val
+                                                .map(str::to_string);
+                                            let additional_instructions = cmd_val
+                                                .get("additional_instructions")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            let req = velo_protocol::HandoffSessionRequest {
+                                                target_provider,
+                                                model,
+                                                effort,
+                                                additional_instructions,
+                                            };
+                                            if let Ok(new_sess) =
+                                                state.handoff_session(sid, req).await
+                                            {
+                                                let sessions: Vec<SessionInfo> = {
+                                                    let guard = state.inner.read().await;
+                                                    let mut list: Vec<SessionInfo> =
+                                                        guard.sessions.values().cloned().collect();
+                                                    list.sort_by(|a, b| {
+                                                        b.created_at.cmp(&a.created_at)
+                                                    });
+                                                    list
+                                                };
+                                                if let Ok(snap) = serde_json::to_value(
+                                                    WsServerMessage::SessionsSnapshot { sessions },
+                                                ) {
+                                                    if let Some(frame_txt) = send_sealed_with_key(
+                                                        &snap,
+                                                        &active_key_hex,
+                                                        &mut out_nonce,
+                                                    ) {
+                                                        let _ = writer
+                                                            .send(WsMsg::Text(frame_txt.into()))
+                                                            .await;
+                                                    }
+                                                }
+                                                let handoff_msg = json!({
+                                                    "type": "handoff_completed",
+                                                    "source_session_id": sid,
+                                                    "new_session_id": new_sess.id,
+                                                });
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &handoff_msg,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "update_session" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let name = cmd_val
+                                                .get("name")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            let provider = cmd_val
+                                                .get("provider")
+                                                .and_then(|v| v.as_str())
+                                                .filter(|s| !s.trim().is_empty())
+                                                .map(AgentProvider::from_str_loose);
+                                            let model = cmd_val
+                                                .get("model")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            let effort = cmd_val
+                                                .get("effort")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            let approval_mode = cmd_val
                                                 .get("approval_mode")
                                                 .and_then(|v| v.as_str())
-                                                .map(str::to_string),
-                                            setup_command: None,
-                                        };
-                                        if state.create_session(req).await.is_ok() {
+                                                .map(str::to_string);
+                                            if state
+                                                .update_session_fields(
+                                                    sid,
+                                                    name,
+                                                    provider,
+                                                    model,
+                                                    effort,
+                                                    approval_mode,
+                                                    None,
+                                                )
+                                                .await
+                                                .is_some()
+                                            {
+                                                let guard = state.inner.read().await;
+                                                let mut sessions: Vec<SessionInfo> =
+                                                    guard.sessions.values().cloned().collect();
+                                                sessions.sort_by(|a, b| {
+                                                    b.created_at.cmp(&a.created_at)
+                                                });
+                                                if let Ok(snap) = serde_json::to_value(
+                                                    WsServerMessage::SessionsSnapshot { sessions },
+                                                ) {
+                                                    if let Some(frame_txt) = send_sealed_with_key(
+                                                        &snap,
+                                                        &active_key_hex,
+                                                        &mut out_nonce,
+                                                    ) {
+                                                        let _ = writer
+                                                            .send(WsMsg::Text(frame_txt.into()))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "delete_session" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let _ = state.delete_session_by_id(sid, true).await;
                                             let guard = state.inner.read().await;
                                             let mut sessions: Vec<SessionInfo> =
                                                 guard.sessions.values().cloned().collect();
-                                            sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                            sessions
+                                                .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                                             if let Ok(snap) = serde_json::to_value(
                                                 WsServerMessage::SessionsSnapshot { sessions },
                                             ) {
