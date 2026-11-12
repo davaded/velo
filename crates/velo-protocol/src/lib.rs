@@ -12,6 +12,8 @@ pub const DEFAULT_DAEMON_HOST: &str = "127.0.0.1";
 pub enum AgentProvider {
     Claude,
     Codex,
+    Grok,
+    Cursor,
     OpenCode,
     #[serde(rename = "agy")]
     Antigravity,
@@ -60,6 +62,8 @@ impl AgentProvider {
         match lower.as_str() {
             "claude" | "claude-code" => Self::Claude,
             "codex" | "openai" => Self::Codex,
+            "grok" | "grok-cli" | "xai" => Self::Grok,
+            "cursor" | "cursor-agent" | "cursor-cli" => Self::Cursor,
             "opencode" | "open-code" => Self::OpenCode,
             "agy" | "antigravity" | "antigravity-cli" | "gemini" | "gemini-cli" => {
                 Self::Antigravity
@@ -74,6 +78,8 @@ impl AgentProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
+            Self::Cursor => "cursor-agent",
             Self::OpenCode => "opencode",
             Self::Antigravity => "agy",
             Self::Copilot => "copilot",
@@ -89,6 +95,8 @@ impl fmt::Display for AgentProvider {
         match self {
             Self::Claude => write!(f, "claude"),
             Self::Codex => write!(f, "codex"),
+            Self::Grok => write!(f, "grok"),
+            Self::Cursor => write!(f, "cursor"),
             Self::OpenCode => write!(f, "opencode"),
             Self::Antigravity => write!(f, "agy"),
             Self::Copilot => write!(f, "copilot"),
@@ -462,5 +470,13 @@ mod tests {
         // Legacy persisted sessions with `"gemini"` cleanly map to `AgentProvider::Antigravity`
         let p_legacy: AgentProvider = serde_json::from_str("\"gemini\"").unwrap();
         assert_eq!(p_legacy, AgentProvider::Antigravity);
+
+        let p_grok: AgentProvider = serde_json::from_str("\"grok\"").unwrap();
+        assert_eq!(p_grok, AgentProvider::Grok);
+        assert_eq!(serde_json::to_string(&p_grok).unwrap(), "\"grok\"");
+
+        let p_cursor: AgentProvider = serde_json::from_str("\"cursor-agent\"").unwrap();
+        assert_eq!(p_cursor, AgentProvider::Cursor);
+        assert_eq!(serde_json::to_string(&p_cursor).unwrap(), "\"cursor\"");
     }
 }

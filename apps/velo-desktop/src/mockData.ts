@@ -2,6 +2,8 @@ export type AgentKind =
   | "claude"
   | "codex"
   | "agy"
+  | "grok"
+  | "cursor"
   | "opencode"
   | "copilot"
   | "qwen"
@@ -13,8 +15,17 @@ export interface ModelOption {
   id: string;
   label: string;
   shortLabel: string;
-  family: "Anthropic" | "OpenAI" | "Google Antigravity" | string;
-  runtimeId: "claude" | "codex" | "agy" | "opencode" | "copilot" | "qwen" | string;
+  family: "Anthropic" | "OpenAI" | "Google Antigravity" | "xAI Grok" | "Cursor" | string;
+  runtimeId:
+    | "claude"
+    | "codex"
+    | "agy"
+    | "grok"
+    | "cursor-agent"
+    | "opencode"
+    | "copilot"
+    | "qwen"
+    | string;
   agentKind: AgentKind;
   desc: string;
   installed?: boolean;
@@ -179,15 +190,6 @@ export const MODEL_CATALOG: ModelOption[] = [
     agentKind: "codex",
     desc: "Specialized ultra-fast Codex Spark model",
   },
-  {
-    id: "grok-4.6",
-    label: "Grok 4.6",
-    shortLabel: "Grok 4.6",
-    family: "OpenAI",
-    runtimeId: "codex",
-    agentKind: "codex",
-    desc: "Grok 4.6 coding and reasoning model via Codex CLI",
-  },
   // Google Antigravity CLI (`agy` — curl -fsSL https://antigravity.google/cli/install.sh | bash)
   {
     id: "gemini-4-carbon-high",
@@ -234,6 +236,91 @@ export const MODEL_CATALOG: ModelOption[] = [
     runtimeId: "agy",
     agentKind: "agy",
     desc: "Google Antigravity CLI (`agy`) · Open-weight 120B coding model",
+  },
+  // xAI Grok CLI (`grok` — ~/.grok/bin/grok & ~/.grok/models_cache.json)
+  {
+    id: "grok-4.6",
+    label: "Grok 4.6",
+    shortLabel: "Grok 4.6",
+    family: "xAI Grok",
+    runtimeId: "grok",
+    agentKind: "grok",
+    desc: "Default in ~/.grok/config.toml · Balanced frontier coding & tool execution",
+    isDefault: true,
+  },
+  {
+    id: "grok-4.7",
+    label: "Grok 4.7",
+    shortLabel: "Grok 4.7",
+    family: "xAI Grok",
+    runtimeId: "grok",
+    agentKind: "grok",
+    desc: "SpaceXAI's latest frontier model (`grok -p --output-format streaming-messages-json`)",
+  },
+  {
+    id: "grok-4.7-build-fast",
+    label: "Grok 4.7 Fast",
+    shortLabel: "Grok 4.7 Fast",
+    family: "xAI Grok",
+    runtimeId: "grok",
+    agentKind: "grok",
+    desc: "Fast low-latency Grok 4.7 coding variant",
+  },
+  {
+    id: "grok-4.5",
+    label: "Grok 4.5",
+    shortLabel: "Grok 4.5",
+    family: "xAI Grok",
+    runtimeId: "grok",
+    agentKind: "grok",
+    desc: "Efficient secondary & subagent Grok model",
+  },
+  // Cursor Agent CLI (`cursor-agent` / `agent` — ~/.local/bin/cursor-agent)
+  {
+    id: "cursor:auto",
+    label: "Cursor Auto",
+    shortLabel: "Cursor Auto",
+    family: "Cursor",
+    runtimeId: "cursor-agent",
+    agentKind: "cursor",
+    desc: "Cursor Agent CLI auto-router (`cursor-agent -p --output-format stream-json`)",
+    isDefault: true,
+  },
+  {
+    id: "cursor:composer",
+    label: "Cursor Composer",
+    shortLabel: "Cursor Composer",
+    family: "Cursor",
+    runtimeId: "cursor-agent",
+    agentKind: "cursor",
+    desc: "Cursor native multi-file fast coding model (`--model composer`)",
+  },
+  {
+    id: "cursor:claude-sonnet-4-6",
+    label: "Cursor · Claude Sonnet 4.6",
+    shortLabel: "Cursor Sonnet 4.6",
+    family: "Cursor",
+    runtimeId: "cursor-agent",
+    agentKind: "cursor",
+    desc: "Claude Sonnet 4.6 routed via Cursor Agent CLI",
+  },
+  {
+    id: "cursor:claude-opus-4-8",
+    label: "Cursor · Claude Opus 4.8",
+    shortLabel: "Cursor Opus 4.8",
+    family: "Cursor",
+    runtimeId: "cursor-agent",
+    agentKind: "cursor",
+    desc: "Claude Opus 4.8 routed via Cursor Agent CLI",
+  },
+  {
+    id: "cursor:gpt-5",
+    label: "Cursor · GPT-5",
+    shortLabel: "Cursor GPT-5",
+    family: "Cursor",
+    runtimeId: "cursor-agent",
+    agentKind: "cursor",
+    desc: "OpenAI GPT-5 routed via Cursor Agent CLI",
   },
   // ACP (Agent Client Protocol) & Multi-Provider Ecosystem
   {
@@ -437,6 +524,10 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     r.model ??
       (agentKind === "codex"
         ? "gpt-6.1-sol"
+        : agentKind === "grok" || agentKind.includes("grok")
+        ? "grok-4.6"
+        : agentKind === "cursor" || agentKind.includes("cursor")
+        ? "cursor:auto"
         : agentKind === "agy" || agentKind.includes("antigravity") || agentKind.includes("gemini")
         ? "gemini-4-carbon-high"
         : agentKind.includes("opencode")
@@ -478,6 +569,10 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
       foundModel?.shortLabel ??
       (agentKind === "codex"
         ? "GPT-6.1-Sol"
+        : agentKind === "grok" || agentKind.includes("grok")
+        ? "Grok 4.6"
+        : agentKind === "cursor" || agentKind.includes("cursor")
+        ? "Cursor Auto"
         : agentKind === "agy" || agentKind.includes("antigravity") || agentKind.includes("gemini")
         ? "Gemini 4 Carbon High"
         : agentKind.includes("opencode")

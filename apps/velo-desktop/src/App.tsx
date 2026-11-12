@@ -4370,6 +4370,10 @@ export function App() {
                                       ? "OpenAI / Codex (~/.codex)"
                                       : family === "Google Antigravity"
                                       ? "Google Antigravity CLI (agy)"
+                                      : family === "xAI Grok"
+                                      ? "xAI Grok CLI (~/.grok)"
+                                      : family === "Cursor"
+                                      ? "Cursor Agent CLI (cursor-agent)"
                                       : family}
                                   </span>
                                   <span className="font-mono text-[10px]">
@@ -4517,6 +4521,13 @@ export function App() {
                               { id: "xhigh", label: "xHigh" },
                               { id: "ultra", label: "Ultra" },
                               { id: "max", label: "Max" },
+                            ] as { id: EffortLevel; label: string }[])
+                          : activeSession.agent_kind === "grok"
+                          ? ([
+                              { id: "low", label: "Low" },
+                              { id: "medium", label: "Medium" },
+                              { id: "high", label: "High" },
+                              { id: "xhigh", label: "xHigh" },
                             ] as { id: EffortLevel; label: string }[])
                           : ([
                               { id: "low", label: "Low" },
@@ -5398,7 +5409,7 @@ export function App() {
                   <div>
                     <div className="mb-2 flex items-center justify-between">
                       <label className="text-[11.5px] font-medium text-[var(--v-fg-secondary)]">
-                        CLI &amp; ACP Providers (Claude, Codex, Antigravity `agy`, OpenCode, Copilot, Qwen)
+                        CLI &amp; ACP Providers (Claude, Codex, Antigravity `agy`, Grok, Cursor, OpenCode, Copilot, Qwen)
                       </label>
                       <button
                         onClick={refreshSessions}

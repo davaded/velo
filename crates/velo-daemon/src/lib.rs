@@ -909,6 +909,51 @@ static AGY_MODELS_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<Vec<(Str
 static AGY_MODELS_FETCHING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+static CURSOR_MODELS_CACHE: std::sync::OnceLock<
+    tokio::sync::RwLock<Option<Vec<(String, String)>>>,
+> = std::sync::OnceLock::new();
+static CURSOR_MODELS_FETCHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn parse_cursor_models_stdout(raw: &str) -> Vec<(String, String)> {
+    let mut parsed = Vec::new();
+    for line in raw.lines() {
+        let clean = line.trim().trim_start_matches('-').trim_start_matches('*').trim();
+        if clean.is_empty()
+            || clean.starts_with("Available")
+            || clean.starts_with("Loading")
+            || clean.starts_with("Error:")
+            || clean.starts_with("Tip:")
+        {
+            continue;
+        }
+        // Cursor `--list-models` formats lines like `gpt-5 - GPT-5` or `claude-sonnet-4-6 (default)` or bare `composer`
+        let (slug_raw, label_opt) = if let Some((l, r)) = clean.split_once(" - ") {
+            (l.trim(), Some(r.trim()))
+        } else {
+            let mut parts = clean.splitn(2, char::is_whitespace);
+            let s = parts.next().unwrap_or("").trim();
+            let rest = parts.next().map(str::trim).filter(|x| !x.is_empty());
+            (s, rest)
+        };
+        if slug_raw.is_empty()
+            || !slug_raw
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphanumeric())
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let display = match label_opt {
+            Some(lbl) if !lbl.starts_with('(') => format!("Cursor · {}", lbl),
+            _ => format!("Cursor · {}", slug_raw),
+        };
+        parsed.push((format!("cursor:{}", slug_raw), display));
+    }
+    parsed
+}
+
 fn parse_agy_models_stdout(raw: &str) -> Vec<(String, String)> {
     let mut parsed = Vec::new();
     for raw_line in raw.lines() {
@@ -1072,7 +1117,12 @@ pub(crate) async fn build_models_catalog_json() -> Value {
                     for item in arr {
                         let slug = item.get("slug").and_then(|v| v.as_str()).unwrap_or("");
                         let vis = item.get("visibility").and_then(|v| v.as_str()).unwrap_or("list");
-                        if slug.is_empty() || vis != "list" || slug == "codex-auto-review" || slug == "gpt-reserve" {
+                        if slug.is_empty()
+                            || vis != "list"
+                            || slug == "codex-auto-review"
+                            || slug == "gpt-reserve"
+                            || slug.starts_with("grok-")
+                        {
                             continue;
                         }
                         let display = item
@@ -1201,7 +1251,235 @@ pub(crate) async fn build_models_catalog_json() -> Value {
         }
     }
 
-    // 4. ACP & Multi-Provider Catalog (OpenCode, GitHub Copilot CLI, Qwen Code)
+    // 4. xAI Grok CLI (`grok` at ~/.grok/bin/grok, ~/.grok/config.toml & ~/.grok/models_cache.json)
+    let grok_installed = velo_agent::resolve_cli_binary("grok").is_some();
+    let grok_dir = home_path.join(".grok");
+    let mut default_grok_model = "grok-4.7".to_string();
+    if let Ok(cfg_str) = tokio::fs::read_to_string(grok_dir.join("config.toml")).await {
+        let mut in_models_section = false;
+        for line in cfg_str.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_models_section = trimmed == "[models]";
+                continue;
+            }
+            if in_models_section {
+                if let Some(rest) = trimmed.strip_prefix("default =") {
+                    let m = rest.trim().trim_matches('"').trim_matches('\'');
+                    if !m.is_empty() {
+                        default_grok_model = m.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    let mut grok_entries: Vec<(String, String, String, bool)> = Vec::new();
+    if let Ok(raw) = tokio::fs::read_to_string(grok_dir.join("models_cache.json")).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+            if let Some(obj) = val.get("models").and_then(|v| v.as_object()) {
+                for (slug, entry) in obj {
+                    let info = entry.get("info").unwrap_or(entry);
+                    let hidden = info.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let supported = info
+                        .get("supported_in_api")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if slug.is_empty() || hidden || !supported {
+                        continue;
+                    }
+                    let display = info
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(slug);
+                    let desc = info
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("xAI Grok CLI coding model");
+                    let is_def = slug == &default_grok_model;
+                    grok_entries.push((
+                        slug.clone(),
+                        display.to_string(),
+                        desc.to_string(),
+                        is_def,
+                    ));
+                }
+            }
+        }
+    }
+
+    if grok_entries.is_empty() {
+        for (slug, display, desc) in [
+            (
+                "grok-4.7",
+                "Grok 4.7",
+                "xAI's latest frontier coding & reasoning model",
+            ),
+            (
+                "grok-4.7-build-fast",
+                "Grok 4.7 Fast",
+                "Fast low-latency Grok 4.7 coding variant",
+            ),
+            (
+                "grok-4.6",
+                "Grok 4.6",
+                "Balanced frontier coding & tool execution",
+            ),
+            (
+                "grok-4.5",
+                "Grok 4.5",
+                "Efficient secondary & subagent Grok model",
+            ),
+        ] {
+            grok_entries.push((
+                slug.to_string(),
+                display.to_string(),
+                desc.to_string(),
+                slug == default_grok_model,
+            ));
+        }
+    } else {
+        // Order default model first, then descending version slug (so grok-4.7 precedes grok-4.5)
+        grok_entries.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| b.0.cmp(&a.0)));
+    }
+
+    for (slug, display, desc, is_def) in grok_entries {
+        if seen_ids.insert(slug.clone()) {
+            models.push(json!({
+                "id": slug,
+                "label": display,
+                "shortLabel": display,
+                "family": "xAI Grok",
+                "agentKind": "grok",
+                "runtimeId": "grok",
+                "installed": grok_installed,
+                "desc": if is_def {
+                    format!("Default in ~/.grok/config.toml · {}", desc)
+                } else {
+                    desc
+                },
+                "isDefault": is_def,
+            }));
+        }
+    }
+
+    // 5. Cursor Agent CLI (`cursor-agent` / `agent` at ~/.local/bin/cursor-agent)
+    let cursor_bin = velo_agent::resolve_cli_binary("cursor-agent");
+    let cursor_installed = cursor_bin.is_some();
+    let cursor_cache_lock = CURSOR_MODELS_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
+    let cached_cursor = cursor_cache_lock.read().await.clone();
+
+    if cached_cursor.is_none() {
+        if let Some(bin_path) = cursor_bin {
+            if !CURSOR_MODELS_FETCHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tokio::spawn(async move {
+                    let aug_path = velo_agent::discover_augmented_path();
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        Command::new(bin_path)
+                            .arg("--list-models")
+                            .env("PATH", aug_path)
+                            .output(),
+                    )
+                    .await;
+                    if let Ok(Ok(out)) = res {
+                        if out.status.success() {
+                            let parsed =
+                                parse_cursor_models_stdout(&String::from_utf8_lossy(&out.stdout));
+                            if !parsed.is_empty() {
+                                let lock = CURSOR_MODELS_CACHE
+                                    .get_or_init(|| tokio::sync::RwLock::new(None));
+                                *lock.write().await = Some(parsed);
+                            }
+                        }
+                    }
+                    CURSOR_MODELS_FETCHING.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        }
+    }
+
+    let mut cursor_entries: Vec<(String, String, String, String, bool)> = vec![(
+        "cursor:auto".to_string(),
+        "Cursor Auto".to_string(),
+        "Cursor Auto".to_string(),
+        if cursor_installed {
+            "Installed · Cursor Agent CLI auto-router (`cursor-agent -p --output-format stream-json`)"
+                .to_string()
+        } else {
+            "Install Cursor CLI (`cursor-agent`)"
+                .to_string()
+        },
+        true,
+    )];
+
+    if let Some(dynamic_list) = cached_cursor {
+        for (id, display) in dynamic_list {
+            let short = display.replace("Cursor · ", "Cursor ");
+            cursor_entries.push((
+                id,
+                display,
+                short,
+                "Cursor Agent CLI model (`--list-models`)".to_string(),
+                false,
+            ));
+        }
+    } else {
+        for (id, label, short_lbl, desc) in [
+            (
+                "cursor:composer",
+                "Cursor Composer",
+                "Cursor Composer",
+                "Cursor native multi-file fast coding model (`--model composer`)",
+            ),
+            (
+                "cursor:claude-sonnet-4-6",
+                "Cursor · Claude Sonnet 4.6",
+                "Cursor Sonnet 4.6",
+                "Claude Sonnet 4.6 routed via Cursor Agent CLI",
+            ),
+            (
+                "cursor:claude-opus-4-8",
+                "Cursor · Claude Opus 4.8",
+                "Cursor Opus 4.8",
+                "Claude Opus 4.8 routed via Cursor Agent CLI",
+            ),
+            (
+                "cursor:gpt-5",
+                "Cursor · GPT-5",
+                "Cursor GPT-5",
+                "OpenAI GPT-5 routed via Cursor Agent CLI",
+            ),
+        ] {
+            cursor_entries.push((
+                id.to_string(),
+                label.to_string(),
+                short_lbl.to_string(),
+                desc.to_string(),
+                false,
+            ));
+        }
+    }
+
+    for (id, label, short_lbl, desc, is_def) in cursor_entries {
+        if seen_ids.insert(id.clone()) {
+            models.push(json!({
+                "id": id,
+                "label": label,
+                "shortLabel": short_lbl,
+                "family": "Cursor",
+                "agentKind": "cursor",
+                "runtimeId": "cursor-agent",
+                "installed": cursor_installed,
+                "desc": desc,
+                "isDefault": is_def,
+            }));
+        }
+    }
+
+    // 6. ACP & Multi-Provider Catalog (OpenCode, GitHub Copilot CLI, Qwen Code)
     let acp_catalog = [
         (
             "acp-opencode",
@@ -2081,6 +2359,12 @@ impl DaemonState {
                 let ml = m.to_lowercase();
                 if ml.starts_with("gemini-") || ml.starts_with("gpt-oss-") || ml == "agy" {
                     return AgentProvider::Antigravity;
+                }
+                if ml.starts_with("grok-") || ml == "grok" {
+                    return AgentProvider::Grok;
+                }
+                if ml.starts_with("cursor:") || ml == "cursor" || ml == "cursor-agent" {
+                    return AgentProvider::Cursor;
                 }
             }
             session.provider.clone()

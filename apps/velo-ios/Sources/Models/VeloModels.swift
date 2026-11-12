@@ -137,6 +137,8 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
 
         let defaultModel: String = {
             if agentKind == "codex" { return "gpt-6.1-sol" }
+            if agentKind == "grok" || agentKind.contains("grok") { return "grok-4.6" }
+            if agentKind == "cursor" || agentKind.contains("cursor") { return "cursor:auto" }
             if agentKind == "agy" || agentKind.contains("antigravity") || agentKind.contains("gemini") {
                 return "gemini-4-carbon-high"
             }
@@ -144,7 +146,8 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
         }()
         let model = (dict["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? defaultModel
         let modelShort = VeloModelOption.shortLabel(for: model)
-        let effort = (dict["effort"] as? String) ?? (agentKind == "codex" ? "high" : "medium")
+        let effort = (dict["effort"] as? String)
+            ?? ((agentKind == "codex" || agentKind == "grok") ? "high" : "medium")
         let approvalMode = (dict["approval_mode"] as? String) ?? "auto_edit"
 
         let statusStr = ((dict["status"] as? String) ?? "idle").lowercased()
@@ -244,6 +247,34 @@ public struct VeloModelOption: Identifiable, Equatable, Sendable {
             shortLabel: "Gemini 3.8 Flash",
             family: "Google Antigravity",
             agentKind: "agy"
+        ),
+        VeloModelOption(
+            id: "grok-4.7",
+            label: "Grok 4.7 (xAI Grok CLI)",
+            shortLabel: "Grok 4.7",
+            family: "xAI Grok",
+            agentKind: "grok"
+        ),
+        VeloModelOption(
+            id: "grok-4.6",
+            label: "Grok 4.6 (xAI Grok CLI)",
+            shortLabel: "Grok 4.6",
+            family: "xAI Grok",
+            agentKind: "grok"
+        ),
+        VeloModelOption(
+            id: "cursor:auto",
+            label: "Cursor Auto (cursor-agent)",
+            shortLabel: "Cursor Auto",
+            family: "Cursor",
+            agentKind: "cursor"
+        ),
+        VeloModelOption(
+            id: "cursor:composer",
+            label: "Cursor Composer (cursor-agent)",
+            shortLabel: "Cursor Composer",
+            family: "Cursor",
+            agentKind: "cursor"
         ),
     ]
 

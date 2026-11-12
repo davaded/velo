@@ -68,8 +68,15 @@ pub fn discover_augmented_path() -> String {
             }
         }
 
-        // 3. Common user bin paths
-        for rel in [".local/bin", ".cargo/bin", ".bun/bin", "bin"] {
+        // 3. Common user bin paths (including xAI Grok CLI ~/.grok/bin and Cursor CLI ~/.cursor/bin)
+        for rel in [
+            ".local/bin",
+            ".grok/bin",
+            ".cursor/bin",
+            ".cargo/bin",
+            ".bun/bin",
+            "bin",
+        ] {
             let p = home.join(rel);
             if p.is_dir() {
                 dirs.push(p);
@@ -126,13 +133,20 @@ pub fn resolve_cli_binary(name: &str) -> Option<PathBuf> {
     }
 
     let path_str = discover_augmented_path();
-    for dir in path_str.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = Path::new(dir).join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+    let candidates: &[&str] = if name == "cursor-agent" || name == "cursor" {
+        &["cursor-agent", "agent"]
+    } else {
+        std::slice::from_ref(&name)
+    };
+    for cand_name in candidates {
+        for dir in path_str.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = Path::new(dir).join(cand_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -167,6 +181,8 @@ pub async fn detect_local_runtimes() -> Vec<LocalRuntimeInfo> {
         ("claude", "Claude Code"),
         ("codex", "OpenAI Codex"),
         ("agy", "Google Antigravity CLI (agy)"),
+        ("grok", "xAI Grok CLI (grok)"),
+        ("cursor-agent", "Cursor Agent CLI"),
         ("opencode", "OpenCode (ACP)"),
         ("copilot", "GitHub Copilot CLI"),
         ("qwen", "Qwen Code (ACP)"),
@@ -479,19 +495,50 @@ impl AgentSpawner {
         let (input_tx, _input_rx) = mpsc::unbounded_channel::<String>();
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
 
-        // Parse stdout lines (Claude stream-json or Codex --json)
+        // Parse stdout lines (Claude stream-json, Codex --json, Grok, Cursor, Antigravity)
         let tx_out = event_tx.clone();
         let provider_clone = provider.clone();
         let stdout_task = tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stdout).lines();
+            let mut saw_message_delta = false;
             while let Ok(Some(line)) = reader.next_line().await {
-                for ev in parse_agent_stdout_line(session_id, &provider_clone, &line) {
+                let parsed = parse_agent_stdout_line(session_id, &provider_clone, &line);
+                for ev in &parsed {
+                    if matches!(ev, AgentEvent::MessageDelta { .. }) {
+                        saw_message_delta = true;
+                    }
+                }
+                for ev in parsed {
                     let _ = tx_out.send(ev);
+                }
+                // Fallback for Cursor CLI if all assistant chunks carried `timestamp_ms` and final text only appeared in `result.result`
+                if matches!(provider_clone, AgentProvider::Cursor) && !saw_message_delta {
+                    let t = line.trim();
+                    if t.starts_with('{') && t.ends_with('}') {
+                        if let Ok(json) = serde_json::from_str::<Value>(t) {
+                            if json.get("type").and_then(|v| v.as_str()) == Some("result")
+                                && !json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                            {
+                                if let Some(res_txt) = json
+                                    .get("result")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.trim().is_empty())
+                                {
+                                    saw_message_delta = true;
+                                    let _ = tx_out.send(AgentEvent::MessageDelta {
+                                        session_id,
+                                        text: res_txt.to_string(),
+                                        timestamp: Utc::now(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });
 
-        // Parse stderr lines (ignore benign stdin notice from codex)
+        // Parse stderr lines (ignore benign stdin notice from codex; surface fatal CLI / auth errors)
         let tx_err = event_tx.clone();
         let stderr_task = tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stderr).lines();
@@ -503,6 +550,16 @@ impl AgentSpawner {
                         line: format!("[stderr] {}", line),
                         timestamp: Utc::now(),
                     });
+                    if trimmed.starts_with("Error:")
+                        || trimmed.starts_with("error:")
+                        || trimmed.starts_with("Fatal:")
+                    {
+                        let _ = tx_err.send(AgentEvent::Error {
+                            session_id,
+                            error: trimmed.to_string(),
+                            timestamp: Utc::now(),
+                        });
+                    }
                 }
             }
         });
@@ -884,6 +941,92 @@ impl AgentSpawner {
                 }
                 c
             }
+            AgentProvider::Grok => {
+                let bin = resolve_cli_binary("grok").unwrap_or_else(|| PathBuf::from("grok"));
+                let mut c = Command::new(bin);
+                if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
+                    c.arg(format!("--resume={}", rid.trim()));
+                }
+                let effective_prompt = if images.is_empty() {
+                    prompt.to_string()
+                } else {
+                    format!(
+                        "{}\n\n[Attached local image(s) — inspect directly with Read tool: {}]",
+                        prompt,
+                        images.join(", ")
+                    )
+                };
+                c.args([
+                    "-p",
+                    &effective_prompt,
+                    "--output-format",
+                    "streaming-messages-json",
+                    "--include-partial-messages",
+                ]);
+                if let Some(m) = model.filter(|s| {
+                    let t = s.trim();
+                    !t.is_empty() && t != "grok" && t != "grok-default"
+                }) {
+                    c.args(["-m", m]);
+                }
+                if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
+                    let mapped_eff = match eff.trim() {
+                        "low" => "low",
+                        "medium" => "medium",
+                        "xhigh" | "ultra" | "max" => "xhigh",
+                        _ => "high",
+                    };
+                    c.args(["--effort", mapped_eff]);
+                }
+                if approval_mode == "auto_edit" || approval_mode == "bypass" {
+                    c.arg("--always-approve");
+                } else {
+                    c.args(["--permission-mode", "acceptEdits"]);
+                }
+                c
+            }
+            AgentProvider::Cursor => {
+                let bin = resolve_cli_binary("cursor-agent")
+                    .unwrap_or_else(|| PathBuf::from("cursor-agent"));
+                let mut c = Command::new(bin);
+                if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
+                    c.args(["--resume", rid.trim()]);
+                }
+                let effective_prompt = if images.is_empty() {
+                    prompt.to_string()
+                } else {
+                    format!(
+                        "{}\n\n[Attached local image(s) — inspect directly: {}]",
+                        prompt,
+                        images.join(", ")
+                    )
+                };
+                c.args([
+                    "-p",
+                    &effective_prompt,
+                    "--output-format",
+                    "stream-json",
+                    "--stream-partial-output",
+                    "--trust",
+                    "--approve-mcps",
+                ]);
+                if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
+                    let raw_m = m.trim().strip_prefix("cursor:").unwrap_or(m.trim());
+                    if !raw_m.is_empty()
+                        && raw_m != "auto"
+                        && raw_m != "default"
+                        && raw_m != "cursor"
+                    {
+                        c.args(["--model", raw_m]);
+                    }
+                }
+                if approval_mode == "auto_edit" || approval_mode == "bypass" {
+                    c.arg("--force");
+                } else {
+                    c.arg("--auto-review");
+                }
+                c
+            }
             AgentProvider::OpenCode => {
                 let bin =
                     resolve_cli_binary("opencode").unwrap_or_else(|| PathBuf::from("opencode"));
@@ -993,6 +1136,26 @@ impl AgentSpawner {
                 }
                 c
             }
+            AgentProvider::Grok => {
+                let bin = resolve_cli_binary("grok")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "grok".to_string());
+                let mut c = CommandBuilder::new(bin);
+                if !prompt.trim().is_empty() {
+                    c.arg(prompt);
+                }
+                c
+            }
+            AgentProvider::Cursor => {
+                let bin = resolve_cli_binary("cursor-agent")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "cursor-agent".to_string());
+                let mut c = CommandBuilder::new(bin);
+                if !prompt.trim().is_empty() {
+                    c.arg(prompt);
+                }
+                c
+            }
             AgentProvider::OpenCode => {
                 let bin = resolve_cli_binary("opencode")
                     .map(|p| p.to_string_lossy().to_string())
@@ -1052,6 +1215,65 @@ impl AgentSpawner {
 
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Normalizes Cursor CLI `tool_call` payloads (`{"name":...,"arguments":...}` OR typed objects like `{"shellToolCall":{"args":...,"result":...}}`).
+fn extract_cursor_tool_call(tc_opt: Option<&Value>) -> (String, Value, Option<String>, bool) {
+    let Some(tc) = tc_opt else {
+        return ("Tool".to_string(), json!({}), None, false);
+    };
+    if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+        let args = tc
+            .get("arguments")
+            .or_else(|| tc.get("args"))
+            .or_else(|| tc.get("input"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        return (name.to_string(), args, None, false);
+    }
+    if let Some(obj) = tc.as_object() {
+        if let Some((raw_key, inner)) = obj.iter().next() {
+            let kl = raw_key.to_lowercase();
+            let friendly = if kl.contains("shell") || kl.contains("bash") || kl.contains("command")
+            {
+                "Bash"
+            } else if kl.contains("read") {
+                "Read"
+            } else if kl.contains("edit") || kl.contains("write") || kl.contains("delete") {
+                "Edit"
+            } else if kl.contains("grep")
+                || kl.contains("search")
+                || kl.contains("glob")
+                || kl.contains("ls")
+            {
+                "Search"
+            } else {
+                raw_key.as_str()
+            };
+            let args = inner
+                .get("args")
+                .or_else(|| inner.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let mut emb_out = None;
+            let mut emb_err = false;
+            if let Some(res) = inner.get("result") {
+                emb_err = res.get("error").is_some() || res.get("rejected").is_some();
+                emb_out = Some(match res {
+                    Value::String(s) => s.clone(),
+                    other => other
+                        .pointer("/success/stdout")
+                        .or_else(|| other.pointer("/success/content"))
+                        .or_else(|| other.pointer("/error/message"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| other.to_string()),
+                });
+            }
+            return (friendly.to_string(), args, emb_out, emb_err);
+        }
+    }
+    ("Tool".to_string(), json!({}), None, false)
 }
 
 /// Parses a single stdout line from Claude Code (`stream-json`), OpenAI Codex (`--json`), Google Antigravity (`agy --output-format stream-json`), or other agents into `AgentEvent`s.
@@ -1307,6 +1529,17 @@ pub fn parse_agent_stdout_line(
                             });
                         }
                     }
+                    if msg_type == "system"
+                        && json.get("subtype").and_then(|v| v.as_str()) == Some("init")
+                        && matches!(provider, AgentProvider::Grok | AgentProvider::Cursor)
+                    {
+                        events.push(AgentEvent::ThinkingChunk {
+                            session_id,
+                            delta: String::new(),
+                            replace: false,
+                            timestamp: Utc::now(),
+                        });
+                    }
                     if msg_type == "turn.completed" {
                         if let Some(usage) = json.get("usage") {
                             let input_tokens = usage
@@ -1416,8 +1649,17 @@ pub fn parse_agent_stdout_line(
                     }
                     return events;
                 }
-                // 1. Claude Code stream-json events
+                // 1. Claude Code / Grok CLI (`streaming-messages-json`) / Cursor CLI (`stream-json`) assistant events
                 "assistant" => {
+                    if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+                        if !sid.trim().is_empty() {
+                            events.push(AgentEvent::ProviderSessionBound {
+                                session_id,
+                                provider_session_id: sid.trim().to_string(),
+                                timestamp: Utc::now(),
+                            });
+                        }
+                    }
                     if let Some(usage) = json.pointer("/message/usage") {
                         let in_tok = usage
                             .get("input_tokens")
@@ -1446,6 +1688,9 @@ pub fn parse_agent_stdout_line(
                             });
                         }
                     }
+                    let is_cursor_partial = matches!(provider, AgentProvider::Cursor)
+                        && (json.get("timestamp_ms").is_some()
+                            || json.get("subtype").and_then(|v| v.as_str()) == Some("delta"));
                     if let Some(content_arr) = json
                         .pointer("/message/content")
                         .and_then(|v| v.as_array())
@@ -1456,22 +1701,42 @@ pub fn parse_agent_stdout_line(
                             match block_type {
                                 "text" => {
                                     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                        events.push(AgentEvent::MessageDelta {
-                                            session_id,
-                                            text: text.to_string(),
-                                            timestamp: Utc::now(),
-                                        });
+                                        if is_cursor_partial {
+                                            if !text.is_empty() {
+                                                events.push(AgentEvent::MessageChunk {
+                                                    session_id,
+                                                    delta: text.to_string(),
+                                                    replace: false,
+                                                    timestamp: Utc::now(),
+                                                });
+                                            }
+                                        } else {
+                                            events.push(AgentEvent::MessageDelta {
+                                                session_id,
+                                                text: text.to_string(),
+                                                timestamp: Utc::now(),
+                                            });
+                                        }
                                     }
                                 }
                                 "thinking" => {
                                     if let Some(thinking) =
                                         item.get("thinking").and_then(|v| v.as_str())
                                     {
-                                        events.push(AgentEvent::ThinkingDelta {
-                                            session_id,
-                                            text: thinking.to_string(),
-                                            timestamp: Utc::now(),
-                                        });
+                                        if is_cursor_partial {
+                                            events.push(AgentEvent::ThinkingChunk {
+                                                session_id,
+                                                delta: thinking.to_string(),
+                                                replace: false,
+                                                timestamp: Utc::now(),
+                                            });
+                                        } else {
+                                            events.push(AgentEvent::ThinkingDelta {
+                                                session_id,
+                                                text: thinking.to_string(),
+                                                timestamp: Utc::now(),
+                                            });
+                                        }
                                     }
                                 }
                                 "tool_use" => {
@@ -1498,6 +1763,103 @@ pub fn parse_agent_stdout_line(
                                 _ => {}
                             }
                         }
+                    }
+                    return events;
+                }
+                // Cursor CLI (`stream-json`) thinking & tool_call events + Grok CLI (`streaming-json`) thought/end
+                "thinking" | "thought" => {
+                    let subtype = json.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                    let txt = json
+                        .get("text")
+                        .or_else(|| json.get("delta"))
+                        .or_else(|| json.get("data"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if subtype == "completed" {
+                        if !txt.trim().is_empty() {
+                            events.push(AgentEvent::ThinkingDelta {
+                                session_id,
+                                text: txt.to_string(),
+                                timestamp: Utc::now(),
+                            });
+                        }
+                    } else {
+                        events.push(AgentEvent::ThinkingChunk {
+                            session_id,
+                            delta: txt.to_string(),
+                            replace: false,
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    return events;
+                }
+                "tool_call" => {
+                    let subtype = json
+                        .get("subtype")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("started");
+                    let call_id = json
+                        .get("call_id")
+                        .or_else(|| json.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("cursor-tool")
+                        .to_string();
+                    let (tool_name, arguments, embedded_out, embedded_err) =
+                        extract_cursor_tool_call(json.get("tool_call"));
+                    if subtype == "completed" {
+                        let (out_str, is_err) = if let Some(top_res) = json.get("result") {
+                            let is_e = json
+                                .get("is_error")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                                || top_res.get("error").is_some()
+                                || top_res.get("rejected").is_some();
+                            let s = match top_res {
+                                Value::String(st) => st.clone(),
+                                other => other
+                                    .pointer("/success/stdout")
+                                    .or_else(|| other.pointer("/success/content"))
+                                    .or_else(|| other.get("output"))
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| other.to_string()),
+                            };
+                            (s, is_e)
+                        } else if let Some(emb) = embedded_out {
+                            (emb, embedded_err)
+                        } else {
+                            ("(completed)".to_string(), false)
+                        };
+                        events.push(AgentEvent::ToolCallCompleted {
+                            session_id,
+                            tool_id: call_id,
+                            output: out_str,
+                            is_error: is_err,
+                            timestamp: Utc::now(),
+                        });
+                    } else {
+                        events.push(AgentEvent::ToolCallRequested {
+                            session_id,
+                            tool_id: call_id,
+                            tool_name,
+                            arguments,
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    return events;
+                }
+                "end" => {
+                    if let Some(sid) = json
+                        .get("sessionId")
+                        .or_else(|| json.get("session_id"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        events.push(AgentEvent::ProviderSessionBound {
+                            session_id,
+                            provider_session_id: sid.trim().to_string(),
+                            timestamp: Utc::now(),
+                        });
                     }
                     return events;
                 }
@@ -1582,14 +1944,32 @@ pub fn parse_agent_stdout_line(
                     let is_err = json
                         .get("is_error")
                         .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                        || json.get("subtype").and_then(|v| v.as_str())
+                            == Some("error_during_execution");
                     if is_err {
-                        if let Some(result_text) = json.get("result").and_then(|v| v.as_str()) {
+                        if let Some(result_text) = json
+                            .get("result")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                        {
                             events.push(AgentEvent::Error {
                                 session_id,
                                 error: result_text.to_string(),
                                 timestamp: Utc::now(),
                             });
+                        } else if let Some(errs) = json.get("errors").and_then(|v| v.as_array()) {
+                            let joined: Vec<String> = errs
+                                .iter()
+                                .filter_map(|e| e.as_str().map(str::to_string))
+                                .collect();
+                            if !joined.is_empty() {
+                                events.push(AgentEvent::Error {
+                                    session_id,
+                                    error: joined.join("; "),
+                                    timestamp: Utc::now(),
+                                });
+                            }
                         }
                     }
                     return events;
@@ -2169,5 +2549,81 @@ mod tests {
         assert!(ev_res
             .iter()
             .any(|e| matches!(e, AgentEvent::MessageDelta { text, .. } if text == "6\n")));
+    }
+
+    #[test]
+    fn test_parse_grok_cli_stream_events() {
+        let sid = Uuid::new_v4();
+        let init_line = r#"{"type":"system","subtype":"init","session_id":"grok-sess-42","uuid":"00000000-0000-0000-0000-000000000001"}"#;
+        let partial_text = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Grok 4.7 ready"}}}"#;
+        let err_result = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"","errors":["Not signed in. Run 'grok login' to authenticate"]}"#;
+
+        let ev_init = parse_agent_stdout_line(sid, &AgentProvider::Grok, init_line);
+        assert!(ev_init.iter().any(|e| matches!(
+            e,
+            AgentEvent::ProviderSessionBound { provider_session_id, .. } if provider_session_id == "grok-sess-42"
+        )));
+        assert!(ev_init
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ThinkingChunk { .. })));
+
+        let ev_chunk = parse_agent_stdout_line(sid, &AgentProvider::Grok, partial_text);
+        assert!(ev_chunk.iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageChunk { delta, replace: false, .. } if delta == "Grok 4.7 ready"
+        )));
+
+        let ev_err = parse_agent_stdout_line(sid, &AgentProvider::Grok, err_result);
+        assert!(ev_err.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { error, .. } if error.contains("grok login")
+        )));
+    }
+
+    #[test]
+    fn test_parse_cursor_cli_stream_events() {
+        let sid = Uuid::new_v4();
+        let sys_line = r#"{"type":"system","subtype":"init","session_id":"cursor-chat-99","model":"claude-sonnet-4-6"}"#;
+        let think_line = r#"{"type":"thinking","subtype":"delta","text":"Inspecting repo..."}"#;
+        let tool_start = r#"{"type":"tool_call","subtype":"started","call_id":"call_1","tool_call":{"shellToolCall":{"args":{"command":"cargo check"}}}}"#;
+        let tool_done = r#"{"type":"tool_call","subtype":"completed","call_id":"call_1","tool_call":{"shellToolCall":{"args":{"command":"cargo check"},"result":{"success":{"stdout":"Finished dev profile"}}}}}"#;
+        let partial_asst = r#"{"type":"assistant","timestamp_ms":1794400000123,"message":{"role":"assistant","content":[{"type":"text","text":"All checks "}]}}"#;
+        let final_asst = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"All checks passed."}]}}"#;
+
+        let ev_sys = parse_agent_stdout_line(sid, &AgentProvider::Cursor, sys_line);
+        assert!(ev_sys.iter().any(|e| matches!(
+            e,
+            AgentEvent::ProviderSessionBound { provider_session_id, .. } if provider_session_id == "cursor-chat-99"
+        )));
+
+        let ev_th = parse_agent_stdout_line(sid, &AgentProvider::Cursor, think_line);
+        assert!(ev_th.iter().any(|e| matches!(
+            e,
+            AgentEvent::ThinkingChunk { delta, .. } if delta == "Inspecting repo..."
+        )));
+
+        let ev_ts = parse_agent_stdout_line(sid, &AgentProvider::Cursor, tool_start);
+        assert!(ev_ts.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallRequested { tool_id, tool_name, .. } if tool_id == "call_1" && tool_name == "Bash"
+        )));
+
+        let ev_td = parse_agent_stdout_line(sid, &AgentProvider::Cursor, tool_done);
+        assert!(ev_td.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCallCompleted { tool_id, output, is_error: false, .. } if tool_id == "call_1" && output.contains("Finished dev profile")
+        )));
+
+        let ev_part = parse_agent_stdout_line(sid, &AgentProvider::Cursor, partial_asst);
+        assert!(ev_part.iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageChunk { delta, replace: false, .. } if delta == "All checks "
+        )));
+
+        let ev_fin = parse_agent_stdout_line(sid, &AgentProvider::Cursor, final_asst);
+        assert!(ev_fin.iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageDelta { text, .. } if text == "All checks passed."
+        )));
     }
 }
