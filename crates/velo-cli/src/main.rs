@@ -189,6 +189,13 @@ enum Commands {
         #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_RELAY_PORT))]
         listen: String,
     },
+
+    /// Manage macOS background LaunchAgent (`com.velo.daemon`) for always-on boot autostart
+    Service {
+        /// Action: `install` | `uninstall` | `status` | `restart`
+        #[arg(default_value = "status")]
+        action: String,
+    },
 }
 
 #[tokio::main]
@@ -585,6 +592,45 @@ async fn main() -> Result<()> {
             println!("🛰️  Starting Velo E2EE Relay Server on ws://{}", sock_addr);
             velo_relay::run_relay_server(sock_addr).await?;
         }
+        Commands::Service { action } => match action.trim().to_lowercase().as_str() {
+            "install" | "enable" => {
+                let plist_path = velo_daemon::service::stage_launch_agent_files(None)?;
+                velo_daemon::service::bootstrap_and_kickstart_sync(&plist_path)?;
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                let st = velo_daemon::service::get_service_status().await;
+                println!("✅ Velo macOS LaunchAgent installed & running!");
+                println!("   Label:     {}", st.label);
+                println!("   Plist:     {}", st.plist_path);
+                println!("   Binary:    {}", st.installed_binary_path);
+                println!("   Loaded:    {} (PID: {:?})", st.launchd_loaded, st.launchd_pid);
+                println!("   Logs:      {}", st.log_dir);
+            }
+            "uninstall" | "disable" | "remove" => {
+                velo_daemon::service::bootout_and_remove_plist_sync(true)?;
+                println!("🛑 Velo macOS LaunchAgent uninstalled ({})", velo_daemon::service::LAUNCH_AGENT_LABEL);
+            }
+            "restart" => {
+                velo_daemon::service::restart_launchd_service_sync()?;
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let st = velo_daemon::service::get_service_status().await;
+                println!("🔄 Velo macOS LaunchAgent restarted (PID: {:?})", st.launchd_pid);
+            }
+            _ => {
+                let st = velo_daemon::service::get_service_status().await;
+                let live_sleep_guard = http_get_json::<Value>(addr, "/api/system/service")
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("caffeinate_active").and_then(|b| b.as_bool()))
+                    .unwrap_or(st.caffeinate_active);
+                println!("⚙️  Velo macOS LaunchAgent ({})", st.label);
+                println!("   Installed:          {}", st.plist_installed);
+                println!("   Launchd Loaded:     {} (PID: {:?})", st.launchd_loaded, st.launchd_pid);
+                println!("   Prevent Idle Sleep: {} (active: {})", st.prevent_idle_sleep, live_sleep_guard);
+                println!("   Plist Path:         {}", st.plist_path);
+                println!("   Daemon Binary:      {}", st.installed_binary_path);
+                println!("   Logs Directory:     {}", st.log_dir);
+            }
+        },
     }
 
     Ok(())

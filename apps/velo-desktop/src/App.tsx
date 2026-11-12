@@ -611,6 +611,15 @@ export function App() {
   // Modals, Repo Worktree Setup Hooks, Custom ACP Runtime, & E2EE Pairing Ticket
   const [activeModal, setActiveModal] = useState<ModalKind>(null);
   const [pairTicket, setPairTicket] = useState<PairingTicketDto | null>(null);
+  const [serviceStatus, setServiceStatus] = useState<{
+    label: string;
+    plist_installed: boolean;
+    launchd_loaded: boolean;
+    launchd_pid?: number | null;
+    prevent_idle_sleep: boolean;
+    caffeinate_active: boolean;
+  } | null>(null);
+  const [serviceUpdating, setServiceUpdating] = useState<boolean>(false);
   const [cmdQuery, setCmdQuery] = useState<string>("");
   const [newTaskName, setNewTaskName] = useState<string>("feat/new-thread");
   const [newTaskDesc, setNewTaskDesc] = useState<string>("");
@@ -927,10 +936,53 @@ export function App() {
     }
   }, [daemonUrl, fetchPairTicket]);
 
+  const fetchServiceStatus = useCallback(() => {
+    fetch(`${daemonUrl}/api/system/service`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((st) => setServiceStatus(st))
+      .catch(() => {});
+  }, [daemonUrl]);
+
+  const handleUpdateSystemService = useCallback(
+    async (payload: {
+      action?: "install" | "uninstall" | "restart";
+      prevent_idle_sleep?: boolean;
+    }) => {
+      setServiceUpdating(true);
+      try {
+        const res = await fetch(`${daemonUrl}/api/system/service`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.service) setServiceStatus(data.service);
+        }
+      } catch {
+        // daemon may be restarting into launchd
+      } finally {
+        window.setTimeout(() => {
+          fetchServiceStatus();
+          if (payload.action === "install" || payload.action === "restart") {
+            fetchPairTicket();
+          }
+          setServiceUpdating(false);
+        }, 950);
+      }
+    },
+    [daemonUrl, fetchPairTicket, fetchServiceStatus]
+  );
+
   // Fetch Pairing Ticket & poll live E2EE bridge/tunnel status while QR modal is open
   useEffect(() => {
+    if (activeModal === "settings") {
+      fetchServiceStatus();
+      return;
+    }
     if (activeModal !== "qr") return;
     fetchPairTicket();
+    fetchServiceStatus();
     const timer = window.setInterval(() => {
       fetch(`${daemonUrl}/api/relay/status`)
         .then((r) => (r.ok ? r.json() : Promise.reject()))
@@ -946,9 +998,10 @@ export function App() {
           });
         })
         .catch(() => {});
+      fetchServiceStatus();
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [activeModal, daemonUrl, fetchPairTicket]);
+  }, [activeModal, daemonUrl, fetchPairTicket, fetchServiceStatus]);
 
   // Shared event dispatcher for both direct Daemon `/ws` and E2EE `velo-relay` (`ChaCha20-Poly1305`)
   const processServerPayload = useCallback(
@@ -5704,8 +5757,10 @@ export function App() {
                             <span className="flex items-center gap-1.5 text-[#34d399]">
                               <Lock className="h-3.5 w-3.5" />
                               <span>
-                                {pairTicket?.relay_url?.startsWith("wss://")
-                                  ? "公网 TLS 1.3 零信任盲中继已就绪"
+                                {pairTicket?.custom_relay_url
+                                  ? "固定域名私有盲中继已锁定（重启永久免重扫）"
+                                  : pairTicket?.relay_url?.startsWith("wss://")
+                                  ? "公网 TLS 1.3 零信任盲中继已就绪（临时隧道）"
                                   : pairTicket?.e2ee_status?.tunnel?.status === "starting"
                                   ? "正在建立公网 TLS 1.3 盲中继隧道…"
                                   : "X25519 + ChaCha20-Poly1305 盲中继"}
@@ -5822,6 +5877,73 @@ export function App() {
                           >
                             {copiedKey === "e2ee-uri" ? "已复制" : "复制"}
                           </button>
+                        </div>
+
+                        <div className="rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-2 text-[11.5px]">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5 font-medium text-[var(--v-fg-primary)]">
+                                <span
+                                  className="h-2 w-2 rounded-full"
+                                  style={{
+                                    background: serviceStatus?.plist_installed
+                                      ? "#34d399"
+                                      : "#71717a",
+                                  }}
+                                />
+                                <span>macOS 开机无感常驻 (LaunchAgent)</span>
+                                {serviceStatus?.launchd_pid && (
+                                  <span className="font-mono text-[10px] text-[var(--v-fg-muted)]">
+                                    PID {serviceStatus.launchd_pid}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="mt-0.5 text-[10.5px] text-[var(--v-fg-muted)]">
+                                关闭桌面窗口或重启 Mac 后后台守护进程自动常驻，手机随时跨网唤醒
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                disabled={serviceUpdating}
+                                onClick={() =>
+                                  handleUpdateSystemService({
+                                    prevent_idle_sleep: !(
+                                      serviceStatus?.prevent_idle_sleep ?? true
+                                    ),
+                                  })
+                                }
+                                title="使用 caffeinate -i 阻止空闲网络休眠（允许屏幕正常熄灭）"
+                                className={`rounded-md border px-2 py-1 text-[10.5px] cursor-pointer ${
+                                  serviceStatus?.prevent_idle_sleep
+                                    ? "border-[#34d399]/40 bg-[#34d399]/10 text-[#34d399]"
+                                    : "border-[var(--v-border-subtle)] text-[var(--v-fg-muted)]"
+                                }`}
+                              >
+                                {serviceStatus?.prevent_idle_sleep
+                                  ? "息屏不断连: 开"
+                                  : "息屏不断连: 关"}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={serviceUpdating}
+                                onClick={() =>
+                                  handleUpdateSystemService({
+                                    action: serviceStatus?.plist_installed
+                                      ? "uninstall"
+                                      : "install",
+                                  })
+                                }
+                                className="rounded-md bg-[var(--v-bg-active)] px-2.5 py-1 text-[11px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                              >
+                                {serviceUpdating
+                                  ? "配置中…"
+                                  : serviceStatus?.plist_installed
+                                  ? "已开启开机自启"
+                                  : "开启开机常驻"}
+                              </button>
+                            </div>
+                          </div>
                         </div>
 
                         <p className="rounded-lg bg-[var(--v-bg-sidebar)] px-3 py-2 text-[11.5px] leading-relaxed text-[var(--v-fg-muted)]">

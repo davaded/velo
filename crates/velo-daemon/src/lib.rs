@@ -36,6 +36,7 @@ use velo_worktree::{WorktreeManager, default_velo_home};
 pub mod automations;
 pub mod pr;
 pub mod relay_bridge;
+pub mod service;
 pub mod voice;
 
 pub struct DaemonInner {
@@ -788,6 +789,10 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/pair", get(pair_ticket_handler))
         .route("/api/relay/status", get(relay_status_handler))
         .route("/api/relay/rotate", post(rotate_relay_handler))
+        .route(
+            "/api/system/service",
+            get(get_system_service_handler).post(update_system_service_handler),
+        )
         .route("/api/pick-folder", post(pick_folder_handler))
         .route("/api/open-editor", post(open_editor_handler))
         .route("/api/worktrees/prune", post(prune_worktrees_handler))
@@ -887,6 +892,7 @@ pub fn build_router(state: DaemonState) -> Router {
 
 pub async fn run_daemon_server(addr: SocketAddr) -> Result<()> {
     let state = DaemonState::new().await?;
+    service::autostart_service_assertions().await;
     relay_bridge::autostart_background_e2ee_bridge(state.clone());
     let app = build_router(state);
 
@@ -4462,4 +4468,80 @@ async fn pair_ticket_handler(
         "web_qr_svg": web_qr_svg,
         "e2ee_status": e2ee_status,
     }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateSystemServiceRequest {
+    action: Option<String>,
+    prevent_idle_sleep: Option<bool>,
+}
+
+async fn get_system_service_handler() -> impl IntoResponse {
+    Json(json!(service::get_service_status().await))
+}
+
+async fn update_system_service_handler(
+    Json(req): Json<UpdateSystemServiceRequest>,
+) -> impl IntoResponse {
+    if let Some(prevent) = req.prevent_idle_sleep {
+        let mut cfg = service::load_service_config();
+        cfg.prevent_idle_sleep = prevent;
+        service::save_service_config(&cfg);
+        service::sync_caffeinate_assertion(prevent).await;
+    }
+
+    if let Some(ref action) = req.action {
+        match action.as_str() {
+            "install" => match service::stage_launch_agent_files(None) {
+                Ok(plist_path) => {
+                    let cur_cfg = service::load_service_config();
+                    service::sync_caffeinate_assertion(cur_cfg.prevent_idle_sleep).await;
+                    let under_launchd = std::env::var("VELO_LAUNCHD").as_deref() == Ok("1");
+                    if !under_launchd {
+                        let my_pid = std::process::id();
+                        let plist_str = plist_path.to_string_lossy().to_string();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                            let cmd_str = format!(
+                                "UID_NUM=$(id -u); kill {pid} 2>/dev/null || true; sleep 0.35; launchctl bootout gui/$UID_NUM/{label} 2>/dev/null || true; launchctl bootstrap gui/$UID_NUM '{plist}' 2>/dev/null || launchctl load -w '{plist}' 2>/dev/null || true; launchctl kickstart -k gui/$UID_NUM/{label} 2>/dev/null || true",
+                                pid = my_pid,
+                                label = service::LAUNCH_AGENT_LABEL,
+                                plist = plist_str.replace('\'', "'\\''"),
+                            );
+                            let _ = std::process::Command::new("sh")
+                                .args(["-c", &cmd_str])
+                                .spawn();
+                        });
+                    }
+                }
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "ok": false, "error": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            },
+            "uninstall" => {
+                let _ = service::bootout_and_remove_plist_sync(false);
+                service::sync_caffeinate_assertion(false).await;
+            }
+            "restart" => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    let _ = service::restart_launchd_service_sync();
+                });
+            }
+            _ => {}
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "service": service::get_service_status().await,
+        })),
+    )
+        .into_response()
 }
