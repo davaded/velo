@@ -786,6 +786,8 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/runtimes", get(list_runtimes_handler))
         .route("/api/models", get(list_models_handler))
         .route("/api/pair", get(pair_ticket_handler))
+        .route("/api/relay/status", get(relay_status_handler))
+        .route("/api/relay/rotate", post(rotate_relay_handler))
         .route("/api/pick-folder", post(pick_folder_handler))
         .route("/api/open-editor", post(open_editor_handler))
         .route("/api/worktrees/prune", post(prune_worktrees_handler))
@@ -885,6 +887,7 @@ pub fn build_router(state: DaemonState) -> Router {
 
 pub async fn run_daemon_server(addr: SocketAddr) -> Result<()> {
     let state = DaemonState::new().await?;
+    relay_bridge::autostart_background_e2ee_bridge(state.clone());
     let app = build_router(state);
 
     info!("Velo daemon listening on http://{}", addr);
@@ -941,6 +944,10 @@ async fn list_runtimes_handler() -> impl IntoResponse {
 }
 
 async fn list_models_handler() -> impl IntoResponse {
+    Json(build_models_catalog_json().await)
+}
+
+pub(crate) async fn build_models_catalog_json() -> Value {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/daiyudai".to_string());
     let home_path = PathBuf::from(&home);
     let mut models: Vec<Value> = Vec::new();
@@ -1241,12 +1248,12 @@ async fn list_models_handler() -> impl IntoResponse {
         }
     }
 
-    Json(json!({
+    json!({
         "models": models,
         "defaultCodexModel": default_codex_model,
         "defaultCodexEffort": default_codex_effort,
         "defaultClaudeModel": "claude-fable-5-2",
-    }))
+    })
 }
 
 async fn pick_folder_handler() -> impl IntoResponse {
@@ -3998,6 +4005,52 @@ mod tests {
 struct PairTicketQuery {
     relay: Option<String>,
     web: Option<String>,
+    rotate: Option<String>,
+}
+
+async fn relay_status_handler() -> impl IntoResponse {
+    Json(relay_bridge::get_e2ee_status_dto().await)
+}
+
+async fn rotate_relay_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    let lan_ip = match detect_interface_ipv4("en0").await {
+        Some(ip) => ip,
+        None => detect_interface_ipv4("en1")
+            .await
+            .unwrap_or_else(|| velo_protocol::DEFAULT_DAEMON_HOST.to_string()),
+    };
+    let identity = relay_bridge::rotate_pairing_identity();
+    let relay_url = if let Some(ref custom) = identity.custom_relay_url {
+        custom.clone()
+    } else {
+        let snap = relay_bridge::ensure_public_blind_tunnel(4500).await;
+        snap.public_wss_url
+            .unwrap_or_else(|| format!("ws://{}:{}", lan_ip, velo_relay::DEFAULT_RELAY_PORT))
+    };
+    let daemon_addr = format!("{}:{}", lan_ip, velo_protocol::DEFAULT_DAEMON_PORT);
+    let ticket = velo_relay::PairingTicket::from_existing(
+        identity.room_id,
+        identity.shared_key_hex,
+        identity.daemon_pubkey_hex,
+        &relay_url,
+        &daemon_addr,
+    );
+    relay_bridge::spawn_daemon_e2ee_bridge(state, ticket.clone());
+    let qr_svg = velo_relay::render_qr_svg(&ticket.pairing_uri, 184);
+    let web_qr_svg = velo_relay::render_qr_svg(&ticket.mobile_web_url, 184);
+    let e2ee_status = relay_bridge::get_e2ee_status_dto().await;
+    Json(json!({
+        "ok": true,
+        "room_id": ticket.room_id,
+        "shared_key_hex": ticket.shared_key_hex,
+        "daemon_pubkey_hex": ticket.daemon_pubkey_hex,
+        "relay_url": ticket.relay_url,
+        "pairing_uri": ticket.pairing_uri,
+        "uri": ticket.mobile_web_url,
+        "qr_svg": qr_svg,
+        "web_qr_svg": web_qr_svg,
+        "e2ee_status": e2ee_status,
+    }))
 }
 
 async fn detect_interface_ipv4(iface: &str) -> Option<String> {
@@ -4046,13 +4099,29 @@ async fn pair_ticket_handler(
 
     relay_bridge::ensure_local_relay_running().await;
 
-    let relay_url = query
-        .relay
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("ws://{}:{}", lan_ip, velo_relay::DEFAULT_RELAY_PORT));
+    let mut identity = if query.rotate.as_deref() == Some("1") {
+        relay_bridge::rotate_pairing_identity()
+    } else {
+        relay_bridge::load_or_create_pairing_identity()
+    };
+
+    if let Some(ref relay_param) = query.relay {
+        let trimmed = relay_param.trim();
+        if trimmed == "auto" || trimmed.is_empty() {
+            identity = relay_bridge::update_custom_relay_url(None);
+        } else {
+            identity = relay_bridge::update_custom_relay_url(Some(trimmed.to_string()));
+        }
+    }
+
+    let relay_url = if let Some(ref custom) = identity.custom_relay_url {
+        custom.clone()
+    } else {
+        let snap = relay_bridge::ensure_public_blind_tunnel(4500).await;
+        snap.public_wss_url
+            .unwrap_or_else(|| format!("ws://{}:{}", lan_ip, velo_relay::DEFAULT_RELAY_PORT))
+    };
+
     let daemon_addr = query
         .web
         .as_deref()
@@ -4073,12 +4142,22 @@ async fn pair_ticket_handler(
         None => (None, None),
     };
 
-    let ticket = velo_relay::PairingTicket::generate(&relay_url, &daemon_addr);
+    let ticket = velo_relay::PairingTicket::from_existing(
+        identity.room_id,
+        identity.shared_key_hex,
+        identity.daemon_pubkey_hex,
+        &relay_url,
+        &daemon_addr,
+    );
     let mobile_url = ticket.mobile_web_url.clone();
 
     relay_bridge::spawn_daemon_e2ee_bridge(state, ticket.clone());
 
-    let qr_svg = velo_relay::render_qr_svg(&mobile_url, 184);
+    // Primary E2EE QR encodes `velo://pair?relay=wss://...&room=...&key=...&pub=...`
+    // so both iOS Camera Deep Link AND Velo Native App QR Scanner connect over 5G with 0 local HTTP dependency!
+    let qr_svg = velo_relay::render_qr_svg(&ticket.pairing_uri, 184);
+    let web_qr_svg = velo_relay::render_qr_svg(&mobile_url, 184);
+    let e2ee_status = relay_bridge::get_e2ee_status_dto().await;
 
     Json(json!({
         "lan_ip": lan_ip,
@@ -4091,9 +4170,12 @@ async fn pair_ticket_handler(
         "shared_key_hex": ticket.shared_key_hex,
         "daemon_pubkey_hex": ticket.daemon_pubkey_hex,
         "relay_url": ticket.relay_url,
+        "custom_relay_url": identity.custom_relay_url,
         "daemon_addr": ticket.daemon_addr,
         "pairing_uri": ticket.pairing_uri,
         "uri": mobile_url,
         "qr_svg": qr_svg,
+        "web_qr_svg": web_qr_svg,
+        "e2ee_status": e2ee_status,
     }))
 }

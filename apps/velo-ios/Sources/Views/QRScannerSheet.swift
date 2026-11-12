@@ -137,11 +137,27 @@ public struct PairingSheetView: View {
                             Image(systemName: current.isEncryptedRelay ? "lock.shield.fill" : "wifi")
                                 .foregroundStyle(store.isConnected ? .green : .orange)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(current.displayTitle)
-                                    .font(.system(size: 13.5, weight: .semibold))
-                                Text(store.isConnected ? "已实时连接 WebSocket" : (store.connectionError ?? "正在重连…"))
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 6) {
+                                    Text(current.displayTitle)
+                                        .font(.system(size: 13.5, weight: .semibold))
+                                    if current.isEncryptedRelay && store.isForwardSecretRatcheted {
+                                        Text("X25519·FS")
+                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                            .foregroundStyle(.green)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1.5)
+                                            .background(Color.green.opacity(0.14), in: Capsule())
+                                    }
+                                }
+                                Text(
+                                    store.isConnected
+                                        ? (current.isEncryptedRelay
+                                            ? "零信任盲中继已加密连通（ChaCha20-Poly1305 AEAD）"
+                                            : "已实时连接局域网 WebSocket")
+                                        : (store.connectionError ?? "正在重连…")
+                                )
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
                             }
                             Spacer()
                             Button("断开", role: .destructive) {

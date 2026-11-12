@@ -91,6 +91,18 @@ type ModalKind =
   | "settings"
   | "automations";
 
+interface E2EEBridgeStatusDto {
+  bridge_connected: boolean;
+  ratchet_active: boolean;
+  peers_seen: number;
+  last_peer_seen_at?: string | null;
+  tunnel: {
+    status: string;
+    public_wss_url?: string | null;
+    detail?: string | null;
+  };
+}
+
 interface PairingTicketDto {
   lan_ip?: string;
   lan_uri?: string;
@@ -101,11 +113,14 @@ interface PairingTicketDto {
   room_id?: string;
   shared_key_hex?: string;
   daemon_pubkey_hex?: string;
+  custom_relay_url?: string | null;
   pairing_uri?: string;
   relay_url: string;
   daemon_addr: string;
   uri: string;
   qr_svg: string;
+  web_qr_svg?: string;
+  e2ee_status?: E2EEBridgeStatusDto;
 }
 
 interface LocalRuntimeDto {
@@ -564,8 +579,10 @@ export function App() {
   const directWsConnectedRef = useRef<boolean>(false);
   const initialDaemonSyncedRef = useRef<boolean>(false);
   const e2eeWsRef = useRef<WebSocket | null>(null);
-  const e2eeNonceRef = useRef<number>(1);
-  const [pairModeTab, setPairModeTab] = useState<"lan" | "e2ee">("lan");
+  const e2eeNonceRef = useRef<number>(Date.now() * 100);
+  const [pairModeTab, setPairModeTab] = useState<"lan" | "e2ee">("e2ee");
+  const [e2eeQrTarget, setE2eeQrTarget] = useState<"app" | "web">("app");
+  const [rotatingRelayKey, setRotatingRelayKey] = useState<boolean>(false);
   const [customRelayInput, setCustomRelayInput] = useState<string>("");
 
   // Stream disclosure states & Inline User Message Editing state
@@ -885,21 +902,61 @@ export function App() {
           : "";
       fetch(`${daemonUrl}/api/pair${qs}`)
         .then((r) => (r.ok ? r.json() : Promise.reject()))
-        .then((ticket: PairingTicketDto) => setPairTicket(ticket))
+        .then((ticket: PairingTicketDto) => {
+          setPairTicket(ticket);
+          if (typeof ticket.custom_relay_url === "string") {
+            setCustomRelayInput(ticket.custom_relay_url);
+          }
+        })
         .catch(() => {});
     },
     [daemonUrl]
   );
 
-  // Fetch Pairing Ticket when QR modal opens
+  const handleRotateRelayKey = useCallback(async () => {
+    setRotatingRelayKey(true);
+    try {
+      const res = await fetch(`${daemonUrl}/api/relay/rotate`, { method: "POST" });
+      if (res.ok) {
+        fetchPairTicket();
+      }
+    } catch {
+      // ignore
+    } finally {
+      setRotatingRelayKey(false);
+    }
+  }, [daemonUrl, fetchPairTicket]);
+
+  // Fetch Pairing Ticket & poll live E2EE bridge/tunnel status while QR modal is open
   useEffect(() => {
     if (activeModal !== "qr") return;
-    fetchPairTicket(customRelayInput || undefined);
-  }, [activeModal, customRelayInput, fetchPairTicket]);
+    fetchPairTicket();
+    const timer = window.setInterval(() => {
+      fetch(`${daemonUrl}/api/relay/status`)
+        .then((r) => (r.ok ? r.json() : Promise.reject()))
+        .then((st: E2EEBridgeStatusDto) => {
+          setPairTicket((prev) => {
+            if (!prev) return prev;
+            const prevReady = prev.e2ee_status?.tunnel?.public_wss_url;
+            const nextReady = st?.tunnel?.public_wss_url;
+            if (!prevReady && nextReady && !prev.custom_relay_url) {
+              fetchPairTicket();
+            }
+            return { ...prev, e2ee_status: st };
+          });
+        })
+        .catch(() => {});
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [activeModal, daemonUrl, fetchPairTicket]);
 
   // Shared event dispatcher for both direct Daemon `/ws` and E2EE `velo-relay` (`ChaCha20-Poly1305`)
   const processServerPayload = useCallback(
     (raw: Record<string, unknown>) => {
+      if (raw.type === "models_snapshot" && Array.isArray(raw.models)) {
+        setModelCatalog(raw.models as ModelOption[]);
+        return;
+      }
       if (raw.kind === "sessions_snapshot" && Array.isArray(raw.sessions)) {
         const normalized = raw.sessions.map((item, idx) => normalizeToVeloSession(item, idx));
         if (normalized.length > 0) {
@@ -5545,19 +5602,8 @@ export function App() {
                 </div>
                 {activeModal === "qr" ? (
                   <div className="space-y-3 text-[12px] text-[var(--v-fg-secondary)]">
-                    {/* Mode Switcher: Same Wi-Fi LAN vs Cross-Network E2EE Relay */}
+                    {/* Mode Switcher: Cross-Network Zero-Trust Blind E2EE Relay vs Same Wi-Fi LAN */}
                     <div className="grid grid-cols-2 gap-1 rounded-lg bg-[var(--v-bg-sidebar)] p-1">
-                      <button
-                        type="button"
-                        onClick={() => setPairModeTab("lan")}
-                        className={`rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors cursor-pointer ${
-                          pairModeTab === "lan"
-                            ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
-                            : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
-                        }`}
-                      >
-                        同一 Wi-Fi 秒连（推荐）
-                      </button>
                       <button
                         type="button"
                         onClick={() => setPairModeTab("e2ee")}
@@ -5567,7 +5613,18 @@ export function App() {
                             : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
                         }`}
                       >
-                        跨网 E2EE 加密中继
+                        跨网零信任 E2EE 盲中继（5G 直通）
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPairModeTab("lan")}
+                        className={`rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors cursor-pointer ${
+                          pairModeTab === "lan"
+                            ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                            : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                        }`}
+                      >
+                        同一 Wi-Fi / Tailscale 直连
                       </button>
                     </div>
 
@@ -5625,25 +5682,84 @@ export function App() {
                         )}
 
                         <p className="rounded-lg bg-[var(--v-bg-sidebar)] px-3 py-2 text-[11.5px] leading-relaxed text-[var(--v-fg-muted)]">
-                          手机与 Mac 连接同一 Wi-Fi 后，直接用<strong>系统相机</strong>扫上方二维码即可秒开（实时同步所有会话、流式输出、审批确认与代码 Diff）。在 iOS Safari 点<strong>「分享 → 添加到主屏幕」</strong>即可变成全屏独立 App。
+                          手机与 Mac 连接同一 Wi-Fi 后，直接用<strong>系统相机</strong>或 <strong>Velo iOS App</strong> 扫码即可秒连（实时同步所有会话、流式输出、审批确认与代码 Diff）。
                         </p>
                       </>
                     ) : (
                       <>
-                        <div className="flex items-center justify-between rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[11px]">
-                          <span className="flex items-center gap-1.5 text-[#34d399]">
-                            <Lock className="h-3.5 w-3.5" />
-                            <span>X25519 + ChaCha20-Poly1305</span>
-                          </span>
-                          <span className="text-[var(--v-fg-muted)]">
-                            Room: {pairTicket?.room_id?.slice(0, 12) || "initializing…"}
-                          </span>
+                        {/* Live Zero-Trust Blind Relay Telemetry Banner */}
+                        <div className="space-y-1.5 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[11px]">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="flex items-center gap-1.5 text-[#34d399]">
+                              <Lock className="h-3.5 w-3.5" />
+                              <span>
+                                {pairTicket?.relay_url?.startsWith("wss://")
+                                  ? "公网 TLS 1.3 零信任盲中继已就绪"
+                                  : pairTicket?.e2ee_status?.tunnel?.status === "starting"
+                                  ? "正在建立公网 TLS 1.3 盲中继隧道…"
+                                  : "X25519 + ChaCha20-Poly1305 盲中继"}
+                              </span>
+                            </span>
+                            <span className="text-[var(--v-fg-muted)]">
+                              Room: {pairTicket?.room_id?.slice(0, 8) || "init…"}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-[10.5px] text-[var(--v-fg-muted)]">
+                            <span className="truncate">
+                              Endpoint: {pairTicket?.relay_url || "ws://127.0.0.1:6768"}
+                            </span>
+                            <span className="flex items-center gap-2 shrink-0">
+                              {pairTicket?.e2ee_status?.ratchet_active && (
+                                <span className="rounded bg-[#34d399]/15 px-1.5 py-0.5 text-[#34d399]">
+                                  X25519·FS 前向安全
+                                </span>
+                              )}
+                              <span>
+                                已验证设备: {pairTicket?.e2ee_status?.peers_seen ?? 0}
+                              </span>
+                            </span>
+                          </div>
                         </div>
 
-                        {pairTicket?.qr_svg && (
+                        {/* QR Type Selector: Native iOS App DeepLink vs Mobile Browser */}
+                        <div className="flex items-center justify-center gap-1.5 text-[11px]">
+                          <button
+                            type="button"
+                            onClick={() => setE2eeQrTarget("app")}
+                            className={`rounded-md px-2.5 py-1 transition-colors cursor-pointer ${
+                              e2eeQrTarget === "app"
+                                ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                                : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                            }`}
+                          >
+                            iOS 原生 App 配对码（支持 5G 蜂窝直扫）
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setE2eeQrTarget("web")}
+                            className={`rounded-md px-2.5 py-1 transition-colors cursor-pointer ${
+                              e2eeQrTarget === "web"
+                                ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                                : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                            }`}
+                          >
+                            手机浏览器配对码
+                          </button>
+                        </div>
+
+                        {(e2eeQrTarget === "web"
+                          ? pairTicket?.web_qr_svg || pairTicket?.qr_svg
+                          : pairTicket?.qr_svg) && (
                           <div
                             className="mx-auto flex h-48 w-48 items-center justify-center rounded-xl bg-white p-2.5 shadow-sm"
-                            dangerouslySetInnerHTML={{ __html: pairTicket.qr_svg }}
+                            dangerouslySetInnerHTML={{
+                              __html:
+                                (e2eeQrTarget === "web"
+                                  ? pairTicket?.web_qr_svg
+                                  : pairTicket?.qr_svg) ||
+                                pairTicket?.qr_svg ||
+                                "",
+                            }}
                           />
                         )}
 
@@ -5651,33 +5767,55 @@ export function App() {
                           <input
                             value={customRelayInput}
                             onChange={(e) => setCustomRelayInput(e.target.value)}
-                            placeholder={`公网中继地址，默认 ${pairTicket?.relay_url || "ws://127.0.0.1:6768"}`}
+                            placeholder="自定义固定 wss:// 盲中继（留空默认使用内置 Cloudflare 公网盲中继）"
                             className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                           />
                           <button
                             type="button"
-                            onClick={() => fetchPairTicket(customRelayInput || undefined)}
+                            onClick={() =>
+                              fetchPairTicket(customRelayInput.trim() || "auto")
+                            }
                             className="shrink-0 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
                           >
-                            刷新中继码
+                            {customRelayInput.trim() ? "切换中继" : "自动公网隧道"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={rotatingRelayKey}
+                            onClick={handleRotateRelayKey}
+                            title="生成全新 256-bit 根密钥与房间号，立即吊销所有已配对手机"
+                            className="shrink-0 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-2.5 py-1.5 text-[11px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                          >
+                            {rotatingRelayKey ? "轮换中…" : "轮换密钥"}
                           </button>
                         </div>
 
                         <div className="flex items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] p-2.5 font-mono text-[11px] text-[var(--v-fg-primary)]">
                           <span className="flex-1 break-all">
-                            {pairTicket?.uri ||
-                              "http://127.0.0.1:6767/?mobile=1&relay=ws://127.0.0.1:6768"}
+                            {e2eeQrTarget === "app"
+                              ? pairTicket?.pairing_uri || "velo://pair"
+                              : pairTicket?.uri ||
+                                "http://127.0.0.1:6767/?mobile=1&relay=ws://127.0.0.1:6768"}
                           </span>
                           <button
                             type="button"
                             onClick={() =>
-                              copyText("e2ee-uri", pairTicket?.uri || "")
+                              copyText(
+                                "e2ee-uri",
+                                (e2eeQrTarget === "app"
+                                  ? pairTicket?.pairing_uri
+                                  : pairTicket?.uri) || ""
+                              )
                             }
                             className="shrink-0 rounded-md bg-[var(--v-bg-active)] px-2 py-1 font-sans text-[10.5px] hover:bg-[var(--v-bg-hover)] cursor-pointer"
                           >
                             {copiedKey === "e2ee-uri" ? "已复制" : "复制"}
                           </button>
                         </div>
+
+                        <p className="rounded-lg bg-[var(--v-bg-sidebar)] px-3 py-2 text-[11.5px] leading-relaxed text-[var(--v-fg-muted)]">
+                          <strong>零信任架构：</strong>中继层仅做无状态密文转发（0 数据库 · 强制校验 Poly1305 标签 · 断线即焚），256-bit 根密钥仅通过上方离线二维码传递，每次连接自动完成 <strong>X25519 临时密钥协商</strong>实现前向保密。手机切 5G 用系统相机或 Velo App 扫一次即可异地操控！
+                        </p>
                       </>
                     )}
 
@@ -5685,7 +5823,7 @@ export function App() {
                       <span className="text-[11px] text-[var(--v-fg-muted)]">
                         {pairModeTab === "lan"
                           ? "零配置 · 局域网低延迟 WebSocket 直连"
-                          : `零知识加密中继 (${pairTicket?.relay_url || "ws://127.0.0.1:6768"})`}
+                          : `零信任端到端盲中继 (${pairTicket?.relay_url || "ws://127.0.0.1:6768"})`}
                       </span>
                       <div className="flex items-center gap-1.5">
                         <button

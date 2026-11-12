@@ -10,9 +10,13 @@ public enum ConnectionModeConfig: Codable, Equatable, Sendable {
             return baseURL
                 .replacingOccurrences(of: "http://", with: "")
                 .replacingOccurrences(of: "https://", with: "")
-        case .e2eeRelay(_, let roomId, _):
-            let short = String(roomId.prefix(8))
-            return "E2EE Room \(short)"
+        case .e2eeRelay(let relayWsURL, let roomId, _):
+            let short = String(roomId.prefix(6))
+            if relayWsURL.contains(".lhr.life") || relayWsURL.contains(".trycloudflare.com") {
+                return "E2EE 盲中继 · Cloud (\(short))"
+            }
+            let cleanHost = URLComponents(string: relayWsURL)?.host ?? relayWsURL
+            return "E2EE 盲中继 · \(cleanHost) (\(short))"
         }
     }
 
@@ -41,8 +45,12 @@ public enum ConnectionModeConfig: Codable, Equatable, Sendable {
                let room, !room.isEmpty,
                let key, !key.isEmpty
             {
+                let normalizedRelay = relay
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    .replacingOccurrences(of: "https://", with: "wss://")
+                    .replacingOccurrences(of: "http://", with: "ws://")
                 return .e2eeRelay(
-                    relayWsURL: relay.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
+                    relayWsURL: normalizedRelay,
                     roomId: room,
                     sharedKeyHex: key
                 )

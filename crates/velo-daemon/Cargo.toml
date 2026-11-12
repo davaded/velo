@@ -19,6 +19,7 @@ sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true
 base64.workspace = true
+dirs.workspace = true
 velo-protocol.workspace = true
 velo-worktree.workspace = true
 velo-agent.workspace = true

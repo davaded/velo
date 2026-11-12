@@ -545,13 +545,38 @@ async fn main() -> Result<()> {
         }
         Commands::Pair { relay } => {
             ensure_daemon_running(addr).await?;
-            let ticket = PairingTicket::generate(&relay, addr);
-            println!("🔐 Velo End-to-End Encrypted (E2EE) Mobile/Remote Pairing");
-            println!("{}", ticket.render_terminal_qr());
-            println!("   Pairing URI:  {}", ticket.pairing_uri);
-            println!("   Relay Room:   {}", ticket.room_id);
-            println!("   Shared Key:   {}… (256-bit)", &ticket.shared_key_hex[..16]);
-            println!("   Local Web UI: http://{}", addr);
+            let path = if relay.contains("127.0.0.1:6768") {
+                "/api/pair".to_string()
+            } else {
+                format!("/api/pair?relay={}", relay)
+            };
+            if let Ok(dto) = http_get_json::<Value>(addr, &path).await {
+                let pairing_uri = dto
+                    .get("pairing_uri")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let relay_url = dto.get("relay_url").and_then(|v| v.as_str()).unwrap_or(&relay);
+                let room_id = dto.get("room_id").and_then(|v| v.as_str()).unwrap_or("");
+                let key_hex = dto
+                    .get("shared_key_hex")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                println!("🔐 Velo Zero-Trust Blind E2EE Pairing (X25519 + ChaCha20-Poly1305)");
+                println!("{}", velo_relay::render_qr_unicode(pairing_uri));
+                println!("   Relay Edge:   {}", relay_url);
+                println!("   Pairing URI:  {}", pairing_uri);
+                println!("   Relay Room:   {}", room_id);
+                if key_hex.len() >= 16 {
+                    println!("   Shared Key:   {}… (256-bit)", &key_hex[..16]);
+                }
+            } else {
+                let ticket = PairingTicket::generate(&relay, addr);
+                println!("🔐 Velo End-to-End Encrypted (E2EE) Mobile/Remote Pairing");
+                println!("{}", ticket.render_terminal_qr());
+                println!("   Pairing URI:  {}", ticket.pairing_uri);
+                println!("   Relay Room:   {}", ticket.room_id);
+                println!("   Shared Key:   {}… (256-bit)", &ticket.shared_key_hex[..16]);
+            }
         }
         Commands::Relay { listen } => {
             let sock_addr: SocketAddr = listen

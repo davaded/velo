@@ -28,7 +28,7 @@ public struct RootSessionsView: View {
                         Text("Velo Native iOS")
                             .font(.system(size: 22, weight: .bold))
 
-                        Text("扫描 Mac 端 Velo 的二维码，即可通过局域网、Tailscale 或 ChaCha20-Poly1305 端到端加密中继操控本地 Claude Code 与 Codex。")
+                        Text("扫描 Mac 端 Velo 的二维码，即可通过零信任端到端加密盲中继（5G / 异地直通）或局域网操控本地 Claude Code、Codex 与 Antigravity。")
                             .font(.system(size: 14))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -81,9 +81,16 @@ public struct RootSessionsView: View {
                                     .font(.system(size: 11.5, weight: .medium, design: .monospaced))
                                     .textCase(nil)
                                 if store.connectionConfig?.isEncryptedRelay == true {
-                                    Image(systemName: "lock.fill")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.green)
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "lock.shield.fill")
+                                            .font(.system(size: 9.5))
+                                        if store.isForwardSecretRatcheted {
+                                            Text("FS")
+                                                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                        }
+                                    }
+                                    .foregroundStyle(.green)
+                                    .textCase(nil)
                                 }
                             }
                         }

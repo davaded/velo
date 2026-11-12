@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SwiftUI
 import UIKit
@@ -7,6 +8,7 @@ import UserNotifications
 public final class VeloStore: ObservableObject {
     @Published public var connectionConfig: ConnectionModeConfig?
     @Published public var isConnected: Bool = false
+    @Published public var isForwardSecretRatcheted: Bool = false
     @Published public var connectionError: String?
 
     @Published public var sessions: [VeloSessionItem] = []
@@ -20,8 +22,14 @@ public final class VeloStore: ObservableObject {
 
     private var wsTask: URLSessionWebSocketTask?
     private var reconnectTask: Task<Void, Never>?
+    private var pingTask: Task<Void, Never>?
     private var stepStartedAtBySession: [String: Date] = [:]
-    private var e2eeNonceCounter: UInt64 = UInt64(Date().timeIntervalSince1970 * 1000)
+    private var e2eeNonceCounter: UInt64 = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+    private var ephemeralPrivateKey: Curve25519.KeyAgreement.PrivateKey?
+    private var e2eeActiveKeyHex: String?
+    private var clientSenderId: String = "ios-\(UUID().uuidString.prefix(8))"
+    private var maxDaemonNonce: UInt64?
+    private var pendingSelectNewestSession: Bool = false
 
     private static let savedConfigKey = "velo.ios.connectionConfig.v1"
 
@@ -76,9 +84,14 @@ public final class VeloStore: ObservableObject {
 
     public func disconnectAndClear() {
         reconnectTask?.cancel()
+        pingTask?.cancel()
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
         isConnected = false
+        isForwardSecretRatcheted = false
+        e2eeActiveKeyHex = nil
+        ephemeralPrivateKey = nil
+        maxDaemonNonce = nil
         connectionConfig = nil
         UserDefaults.standard.removeObject(forKey: Self.savedConfigKey)
     }
@@ -94,8 +107,14 @@ public final class VeloStore: ObservableObject {
 
     public func connect() {
         reconnectTask?.cancel()
+        pingTask?.cancel()
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
+        isForwardSecretRatcheted = false
+        e2eeActiveKeyHex = nil
+        ephemeralPrivateKey = nil
+        maxDaemonNonce = nil
+        clientSenderId = "ios-\(UUID().uuidString.prefix(8))"
 
         guard let config = connectionConfig else { return }
 
@@ -122,14 +141,22 @@ public final class VeloStore: ObservableObject {
 
         listenLoop(for: task, config: config)
 
+        pingTask = Task { [weak self, weak task] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard !Task.isCancelled, let self, let task, self.wsTask === task else { break }
+                task.sendPing { _ in }
+            }
+        }
+
         Task {
             switch config {
             case .direct:
                 await fetchModelsIfDirect()
                 await refreshSessionsAndActiveEvents()
             case .e2eeRelay:
-                try? await Task.sleep(nanoseconds: 180_000_000)
-                sendEncryptedCommand(["cmd": "sync"])
+                try? await Task.sleep(nanoseconds: 160_000_000)
+                sendEncryptedSync()
             }
         }
     }
@@ -165,6 +192,7 @@ public final class VeloStore: ObservableObject {
 
                 case .failure(let err):
                     self.isConnected = false
+                    self.isForwardSecretRatcheted = false
                     self.connectionError = err.localizedDescription
                     self.scheduleReconnect()
                 }
@@ -198,20 +226,13 @@ public final class VeloStore: ObservableObject {
                 self.connectionError = error.localizedDescription
             }
         case .e2eeRelay:
-            sendEncryptedCommand(["cmd": "sync"])
+            sendEncryptedSync()
         case .none:
             break
         }
     }
 
-    public func fetchModelsIfDirect() async {
-        guard case .direct(let baseURL) = connectionConfig,
-              let url = URL(string: "\(baseURL)/api/models")
-        else { return }
-        guard let (data, _) = try? await URLSession.shared.data(from: url),
-              let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
-        else { return }
-
+    private func applyModelsArray(_ arr: [[String: Any]]) {
         let parsed: [VeloModelOption] = arr.compactMap { item in
             guard let id = item["id"] as? String, !id.isEmpty else { return nil }
             let label = (item["label"] as? String) ?? id
@@ -222,6 +243,23 @@ public final class VeloStore: ObservableObject {
         }
         if !parsed.isEmpty {
             self.models = parsed
+        }
+    }
+
+    public func fetchModelsIfDirect() async {
+        guard case .direct(let baseURL) = connectionConfig,
+              let url = URL(string: "\(baseURL)/api/models")
+        else { return }
+        guard let (data, _) = try? await URLSession.shared.data(from: url),
+              let jsonObj = try? JSONSerialization.jsonObject(with: data)
+        else { return }
+
+        if let dict = jsonObj as? [String: Any],
+           let arr = dict["models"] as? [[String: Any]]
+        {
+            applyModelsArray(arr)
+        } else if let arr = jsonObj as? [[String: Any]] {
+            applyModelsArray(arr)
         }
     }
 
@@ -404,6 +442,7 @@ public final class VeloStore: ObservableObject {
             ]
             if let title, !title.isEmpty { payload["name"] = title }
             if let branch, !branch.isEmpty { payload["branch"] = branch }
+            pendingSelectNewestSession = true
             sendEncryptedCommand(payload)
             return nil
 
@@ -476,13 +515,25 @@ public final class VeloStore: ObservableObject {
         }
     }
 
+    /// Initiates or rotates X25519 Ephemeral Forward-Secrecy session key agreement & full state sync.
+    private func sendEncryptedSync() {
+        let eph = E2EERelayCrypto.generateEphemeralKeypair()
+        self.ephemeralPrivateKey = eph.privateKey
+        sendEncryptedCommand([
+            "cmd": "sync",
+            "client_ephemeral_pub": eph.publicHex,
+        ])
+    }
+
     private func sendEncryptedCommand(_ payload: [String: Any]) {
-        guard case .e2eeRelay(_, _, let sharedKeyHex) = connectionConfig,
+        guard case .e2eeRelay(_, _, let rootKeyHex) = connectionConfig,
               let wsTask
         else { return }
         e2eeNonceCounter += 1
+        let keyHex = e2eeActiveKeyHex ?? rootKeyHex
         guard let frameText = E2EERelayCrypto.sealJSON(
-            sharedKeyHex: sharedKeyHex,
+            sharedKeyHex: keyHex,
+            senderId: clientSenderId,
             nonce: e2eeNonceCounter,
             payload: payload
         ) else { return }
@@ -499,21 +550,81 @@ public final class VeloStore: ObservableObject {
             else { return }
             processServerPayload(json)
 
-        case .e2eeRelay(_, _, let sharedKeyHex):
-            guard let opened = E2EERelayCrypto.openFrame(sharedKeyHex: sharedKeyHex, rawFrameText: rawText),
-                  opened.senderId == "daemon"
-            else { return }
+        case .e2eeRelay(_, _, let rootKeyHex):
+            var openedViaRootFallback = false
+            let opened: (senderId: String, nonce: UInt64, json: [String: Any])? = {
+                if let activeKey = e2eeActiveKeyHex,
+                   let res = E2EERelayCrypto.openFrame(sharedKeyHex: activeKey, rawFrameText: rawText)
+                {
+                    return res
+                }
+                if let res = E2EERelayCrypto.openFrame(sharedKeyHex: rootKeyHex, rawFrameText: rawText) {
+                    openedViaRootFallback = (e2eeActiveKeyHex != nil)
+                    return res
+                }
+                return nil
+            }()
+
+            guard let opened, opened.senderId == "daemon" else { return }
+
+            let msgType = (opened.json["type"] as? String) ?? ""
+            if openedViaRootFallback && msgType != "e2ee_ratchet" {
+                // Daemon restarted and reset its session ratchet; accept snapshot and re-ratchet immediately
+                e2eeActiveKeyHex = nil
+                isForwardSecretRatcheted = false
+                maxDaemonNonce = opened.nonce
+                processServerPayload(opened.json)
+                sendEncryptedSync()
+                return
+            }
+
+            if let prevNonce = maxDaemonNonce, opened.nonce <= prevNonce {
+                return
+            }
+            maxDaemonNonce = opened.nonce
             processServerPayload(opened.json)
         }
     }
 
     private func processServerPayload(_ raw: [String: Any]) {
+        if let type = raw["type"] as? String {
+            if type == "e2ee_ratchet",
+               let daemonPubHex = raw["daemon_ephemeral_pub"] as? String,
+               let clientPriv = ephemeralPrivateKey,
+               case .e2eeRelay(_, _, let rootKeyHex) = connectionConfig,
+               let ratcheted = E2EERelayCrypto.deriveRatchetedKeyHex(
+                   rootSharedKeyHex: rootKeyHex,
+                   clientPrivateKey: clientPriv,
+                   daemonPublicHex: daemonPubHex
+               )
+            {
+                self.e2eeActiveKeyHex = ratcheted
+                self.isForwardSecretRatcheted = true
+                return
+            }
+
+            if type == "models_snapshot",
+               let arr = raw["models"] as? [[String: Any]]
+            {
+                applyModelsArray(arr)
+                return
+            }
+
+            if type == "pong" {
+                return
+            }
+        }
+
         if let kind = raw["kind"] as? String, kind == "sessions_snapshot",
            let rawArr = raw["sessions"] as? [[String: Any]]
         {
             let parsed = rawArr.compactMap(VeloSessionItem.fromJSON)
             self.sessions = parsed
-            if self.activeSessionId == nil, let first = parsed.first {
+            if pendingSelectNewestSession, let newest = parsed.first {
+                pendingSelectNewestSession = false
+                self.activeSessionId = newest.id
+                Task { await loadEventsForSession(newest.id) }
+            } else if self.activeSessionId == nil, let first = parsed.first {
                 self.activeSessionId = first.id
                 Task { await loadEventsForSession(first.id) }
             }

@@ -27,6 +27,52 @@ public enum E2EERelayCrypto {
         data.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Generates an ephemeral X25519 keypair for Forward-Secrecy session key negotiation.
+    public static func generateEphemeralKeypair() -> (
+        privateKey: Curve25519.KeyAgreement.PrivateKey,
+        publicHex: String
+    ) {
+        let priv = Curve25519.KeyAgreement.PrivateKey()
+        let pubHex = hexEncode(priv.publicKey.rawRepresentation)
+        return (priv, pubHex)
+    }
+
+    /// Matches Rust `X25519Keypair::derive_shared_key_hex` + `derive_ratcheted_session_key_hex`
+    /// in `crates/velo-relay/src/lib.rs`:
+    /// 1. `ecdh = SHA256("velo-x25519-v1:" || X25519(client_priv, daemon_pub))`
+    /// 2. `ratcheted = SHA256("velo-e2ee-ratchet-v1:" || root_key_bytes || ecdh)`
+    public static func deriveRatchetedKeyHex(
+        rootSharedKeyHex: String,
+        clientPrivateKey: Curve25519.KeyAgreement.PrivateKey,
+        daemonPublicHex: String
+    ) -> String? {
+        guard let pubData = hexDecode(daemonPublicHex),
+              pubData.count == 32,
+              let daemonPubKey = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: pubData),
+              let sharedSecret = try? clientPrivateKey.sharedSecretFromKeyAgreement(with: daemonPubKey)
+        else {
+            return nil
+        }
+
+        var ecdhInput = Data("velo-x25519-v1:".utf8)
+        sharedSecret.withUnsafeBytes { rawBuf in
+            ecdhInput.append(contentsOf: rawBuf)
+        }
+        let ecdhKeyBytes = Data(SHA256.hash(data: ecdhInput))
+
+        let rootKeyBytes: Data = {
+            if let raw = hexDecode(rootSharedKeyHex), raw.count == 32 {
+                return raw
+            }
+            return Data(SHA256.hash(data: Data(rootSharedKeyHex.utf8)))
+        }()
+
+        var ratchetInput = Data("velo-e2ee-ratchet-v1:".utf8)
+        ratchetInput.append(rootKeyBytes)
+        ratchetInput.append(ecdhKeyBytes)
+        return hexEncode(Data(SHA256.hash(data: ratchetInput)))
+    }
+
     /// Matches Rust `derive_aead_key` in `crates/velo-relay/src/lib.rs`
     private static func deriveKey(_ keyHex: String) -> SymmetricKey {
         if let raw = hexDecode(keyHex), raw.count == 32 {
@@ -81,7 +127,7 @@ public enum E2EERelayCrypto {
     public static func openFrame(
         sharedKeyHex: String,
         rawFrameText: String
-    ) -> (senderId: String, json: [String: Any])? {
+    ) -> (senderId: String, nonce: UInt64, json: [String: Any])? {
         guard let frameData = rawFrameText.data(using: .utf8),
               let frame = try? JSONDecoder().decode(EncryptedRelayFrameDto.self, from: frameData),
               let rawCipherAndTag = hexDecode(frame.ciphertext_hex),
@@ -104,6 +150,6 @@ public enum E2EERelayCrypto {
             return nil
         }
 
-        return (frame.sender_id, jsonObj)
+        return (frame.sender_id, frame.nonce, jsonObj)
     }
 }
