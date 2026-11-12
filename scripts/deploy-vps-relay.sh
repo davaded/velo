@@ -1,64 +1,81 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deploy Velo Zero-Trust Blind E2EE Relay (`velo relay`) to your own Linux SSH server + fixed domain (Caddy auto-TLS).
+# Cross-compile static Linux x86_64 `velo-relay` binary on macOS and deploy to your own Linux SSH server.
+# Automatically uses `hush ssh <host> --` if `hush` is installed, otherwise falls back to standard `ssh <host>`.
+#
 # Usage:
-#   ./scripts/deploy-vps-relay.sh <ssh-host> <relay-domain>
+#   ./scripts/deploy-vps-relay.sh <ssh-host> <wss-url-or-domain>
 # Example:
-#   ./scripts/deploy-vps-relay.sh sub2api-prod relay.yourdomain.com
+#   ./scripts/deploy-vps-relay.sh aliyun wss://daidaiyu.top/velo-relay
 
 if [ $# -lt 2 ]; then
-  echo "Usage: $0 <ssh-host> <relay-domain>"
-  echo "Example: $0 sub2api-prod relay.yourdomain.com"
+  echo "Usage: $0 <ssh-host> <wss-url-or-domain>"
+  echo "Example: $0 aliyun wss://daidaiyu.top/velo-relay"
   exit 1
 fi
 
 SSH_HOST="$1"
-RELAY_DOMAIN="$2"
-WSS_URL="wss://${RELAY_DOMAIN}"
-
-echo "🛰️  [1/3] Provisioning Velo Blind Relay source & systemd service on ${SSH_HOST}..."
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-ssh "${SSH_HOST}" "mkdir -p /opt/velo-relay"
-rsync -az --exclude 'target' --exclude 'node_modules' --exclude '.git' --exclude 'Velo.app' --exclude 'apps' \
-  "${ROOT_DIR}/Cargo.toml" "${ROOT_DIR}/Cargo.lock" "${ROOT_DIR}/crates" "${SSH_HOST}:/opt/velo-relay/"
-
-ssh "${SSH_HOST}" bash -s -- "${RELAY_DOMAIN}" <<'REMOTE_EOF'
-set -euo pipefail
-DOMAIN="$1"
-if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RAW_ENDPOINT="$2"
+if [[ "${RAW_ENDPOINT}" == wss://* || "${RAW_ENDPOINT}" == ws://* ]]; then
+  WSS_URL="${RAW_ENDPOINT%/}"
+else
+  WSS_URL="wss://${RAW_ENDPOINT%/}"
 fi
-source "$HOME/.cargo/env" 2>/dev/null || true
-cd /opt/velo-relay
-cargo build --release -p velo-cli
-install -m 0755 target/release/velo /usr/local/bin/velo-relay
 
-cat > /etc/systemd/system/velo-blind-relay.service <<EOF
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET="x86_64-unknown-linux-musl"
+RUST_LLD="$(find "$(rustc --print sysroot)" -name rust-lld 2>/dev/null | head -n 1)"
+
+echo "🦀 [1/4] Cross-compiling static Linux musl binary (velo-relay)..."
+rustup target add "${TARGET}" >/dev/null 2>&1 || true
+(
+  cd "${ROOT_DIR}"
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${RUST_LLD:-rust-lld}" \
+    cargo build --release --target "${TARGET}" -p velo-relay --bin velo-relay
+)
+
+BIN_PATH="${ROOT_DIR}/target/${TARGET}/release/velo-relay"
+
+run_remote() {
+  if command -v hush >/dev/null 2>&1; then
+    hush ssh "${SSH_HOST}" -- "$@"
+  elif [ -x "$HOME/.local/bin/hush" ]; then
+    "$HOME/.local/bin/hush" ssh "${SSH_HOST}" -- "$@"
+  else
+    ssh "${SSH_HOST}" "$@"
+  fi
+}
+
+echo "🛰️  [2/4] Uploading static velo-relay binary to ${SSH_HOST}:/usr/local/bin/velo-relay..."
+run_remote "cat > /usr/local/bin/velo-relay.new && chmod 0755 /usr/local/bin/velo-relay.new && mv -f /usr/local/bin/velo-relay.new /usr/local/bin/velo-relay" < "${BIN_PATH}"
+
+echo "⚙️  [3/4] Ensuring systemd service velo-blind-relay.service is active on ${SSH_HOST}..."
+run_remote "cat > /etc/systemd/system/velo-blind-relay.service <<'EOF'
 [Unit]
 Description=Velo Zero-Trust Blind E2EE Relay (ChaCha20-Poly1305)
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/velo-relay relay --listen 127.0.0.1:6768
+ExecStart=/usr/local/bin/velo-relay --listen 127.0.0.1:6768
 Restart=always
 RestartSec=2
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
-systemctl enable --now velo-blind-relay.service
-echo "Remote velo-blind-relay.service active on 127.0.0.1:6768 (reverse-proxy ${DOMAIN} -> 127.0.0.1:6768 via Caddy/Nginx)."
-REMOTE_EOF
+systemctl enable velo-blind-relay.service >/dev/null 2>&1 || true
+systemctl restart velo-blind-relay.service
+systemctl is-active velo-blind-relay.service"
 
-echo "🔒 [2/3] Locking permanent relay endpoint in local Velo Daemon: ${WSS_URL}"
+echo "🔒 [4/4] Locking permanent relay endpoint in local Velo Daemon: ${WSS_URL}"
 ENCODED_WSS="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "${WSS_URL}")"
-PAIR_JSON="$(curl -fsS "http://127.0.0.1:6767/api/pair?relay=${ENCODED_WSS}")"
+PAIR_JSON="$(curl -fsS --noproxy '*' "http://127.0.0.1:6767/api/pair?relay=${ENCODED_WSS}")"
 PAIR_URI="$(echo "${PAIR_JSON}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["pairing_uri"])')"
 
-echo "📲 [3/3] Permanent E2EE Pairing URI: ${PAIR_URI}"
-echo "✅ Done! Ensure ${RELAY_DOMAIN} TLS reverse-proxies WebSocket traffic to 127.0.0.1:6768 on ${SSH_HOST}."
+echo "✅ Deployed & bound! Permanent E2EE Pairing URI:"
+echo "   ${PAIR_URI}"
