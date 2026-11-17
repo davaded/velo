@@ -375,6 +375,9 @@ export interface VeloSession {
   approval_mode: ApprovalMode;
   preview_url?: string | null;
   tokens_used: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
   tokens_limit: number;
   cost_usd: number;
   files_changed: number;
@@ -399,6 +402,11 @@ export interface AgentEvent {
   started_at_ms?: number;
   duration_ms?: number;
   completed_at?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cost_usd?: number;
+  tps?: number;
 }
 
 export interface DiffHunkLine {
@@ -502,6 +510,23 @@ export const SLASH_SKILLS: SlashSkillItem[] = [
   },
 ];
 
+export function canonicalRepoPath(rawPath: string): string {
+  const trimmed = (rawPath || "").trim();
+  if (!trimmed) return "/Users/daiyudai/code/velo";
+  return trimmed.length > 1 ? trimmed.replace(/\/+$/, "") : trimmed;
+}
+
+export function repoIdFromPath(rawPath: string): string {
+  const clean = canonicalRepoPath(rawPath);
+  if (clean === "/Users/daiyudai/code/velo") return "repo-velo";
+  if (clean === "/Users/daiyudai/code/velo-cloud") return "repo-velo-cloud";
+  const slug = clean
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `repo-${slug || "workspace"}`;
+}
+
 export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
   const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const diff = (r.diff_stats && typeof r.diff_stats === "object" ? r.diff_stats : {}) as Record<
@@ -559,9 +584,18 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
   const rawMode = String(r.approval_mode ?? "auto_edit");
   const approvalMode: ApprovalMode =
     rawMode === "ask_before_edit" || rawMode === "bypass" ? rawMode : "auto_edit";
+  const projectPath = canonicalRepoPath(
+    String(r.project_path ?? r.repo_root ?? "/Users/daiyudai/code/velo")
+  );
+  const worktreePath = canonicalRepoPath(String(r.worktree_path ?? projectPath));
+  const resolvedRepoId =
+    typeof r.repo_id === "string" && r.repo_id.trim()
+      ? r.repo_id.trim()
+      : repoIdFromPath(projectPath);
+
   return {
     id: String(r.id ?? `daemon-${idx}`),
-    repo_id: String(r.repo_id ?? "repo-velo"),
+    repo_id: resolvedRepoId,
     title: String(r.title ?? r.name ?? r.prompt ?? branch),
     agent_kind: agentKind,
     model: modelId,
@@ -581,12 +615,15 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     effort,
     status,
     branch_name: branch,
-    worktree_path: String(r.worktree_path ?? `/Users/daiyudai/code/velo`),
-    project_path: String(r.project_path ?? r.repo_root ?? "/Users/daiyudai/code/velo"),
+    worktree_path: worktreePath,
+    project_path: projectPath,
     approval_mode: approvalMode,
     preview_url: typeof r.preview_url === "string" ? r.preview_url : null,
     tokens_used: Number(r.tokens_used ?? 0),
-    tokens_limit: Number(r.tokens_limit ?? 200000),
+    input_tokens: Number(r.input_tokens ?? 0),
+    output_tokens: Number(r.output_tokens ?? 0),
+    cache_read_tokens: Number(r.cache_read_tokens ?? 0),
+    tokens_limit: Number(r.context_window || r.tokens_limit || 200000),
     cost_usd: Number(r.cost_usd ?? 0),
     files_changed: Number(r.files_changed ?? diff.files_changed ?? 0),
     insertions: Number(r.insertions ?? diff.insertions ?? 0),

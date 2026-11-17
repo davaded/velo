@@ -12,29 +12,87 @@ public final class VeloStore: ObservableObject {
     @Published public var connectionError: String?
 
     @Published public var sessions: [VeloSessionItem] = []
+    @Published public var workspaces: [String] = []
     @Published public var activeSessionId: String?
     @Published public var eventsBySession: [String: [TimelineEventItem]] = [:]
     @Published public var pendingApprovals: [String: PendingApprovalPrompt] = [:]
     @Published public var pendingQuestions: [String: PendingQuestionPrompt] = [:]
     @Published public var diffsBySession: [String: [DiffFileSection]] = [:]
     @Published public var turnStartedAtBySession: [String: Date] = [:]
+    @Published public var liveTpsBySession: [String: Double] = [:]
     @Published public var models: [VeloModelOption] = VeloModelOption.defaults
     @Published public var latestCreatedOrHandoffSessionId: String?
+    @Published public var autoCollapseSteps: Bool = true {
+        didSet {
+            UserDefaults.standard.set(autoCollapseSteps, forKey: Self.autoCollapseKey)
+        }
+    }
+
+    private struct IncomingAttachmentBuffer {
+        var chunks: [Data?]
+    }
 
     private var wsTask: URLSessionWebSocketTask?
     private var reconnectTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
+    private var syncRetryTask: Task<Void, Never>?
+    private var cacheSaveTask: Task<Void, Never>?
+    private var resignActiveObserver: NSObjectProtocol?
     private var stepStartedAtBySession: [String: Date] = [:]
+    private var streamStatsBySession: [String: (firstChunkAt: Date, tokens: Int)] = [:]
+    private var attachmentDownloadWaiters: [String: [CheckedContinuation<Data?, Never>]] = [:]
+    private var attachmentChunkBuffers: [String: IncomingAttachmentBuffer] = [:]
+    private var attachmentUploadWaiters: [String: CheckedContinuation<(path: String, url: String)?, Never>] = [:]
     private var e2eeNonceCounter: UInt64 = UInt64(Date().timeIntervalSince1970 * 1_000_000)
     private var ephemeralPrivateKey: Curve25519.KeyAgreement.PrivateKey?
     private var e2eeActiveKeyHex: String?
     private var clientSenderId: String = "ios-\(UUID().uuidString.prefix(8))"
     private var maxDaemonNonce: UInt64?
     private var pendingSelectNewestSession: Bool = false
+    private var pendingEncryptedPayloads: [[String: Any]] = []
 
     private static let savedConfigKey = "velo.ios.connectionConfig.v1"
+    private static let autoCollapseKey = "velo.ios.autoCollapseSteps"
 
     public init() {
+        if let storedCollapse = UserDefaults.standard.object(forKey: Self.autoCollapseKey) as? Bool {
+            self.autoCollapseSteps = storedCollapse
+        }
+
+        // Frame-0 local disk cache hydration so sessions, folders, and message contents
+        // appear instantaneously on launch and never flash empty while offline or reconnecting.
+        if let cached = VeloLocalCacheSnapshot.load() {
+            self.sessions = cached.sessions.map { item in
+                var copy = item
+                if copy.status != .idle {
+                    copy.status = .idle
+                }
+                return copy
+            }
+            self.workspaces = cached.workspaces
+            if !cached.models.isEmpty {
+                self.models = cached.models
+            }
+            self.activeSessionId = cached.activeSessionId ?? cached.sessions.first?.id
+            var restoredEvents: [String: [TimelineEventItem]] = [:]
+            for (sid, list) in cached.eventsBySession {
+                let normalized = list.map { ev in
+                    var copy = ev
+                    switch copy.kind {
+                    case .thinking(let startedAt, let dur, true):
+                        copy.kind = .thinking(startedAt: startedAt, durationMs: dur, isStreaming: false)
+                    case .assistant(true):
+                        copy.kind = .assistant(isStreaming: false)
+                    default:
+                        break
+                    }
+                    return copy
+                }
+                restoredEvents[sid] = normalized
+            }
+            self.eventsBySession = restoredEvents
+        }
+
         if let data = UserDefaults.standard.data(forKey: Self.savedConfigKey),
            let decoded = try? JSONDecoder().decode(ConnectionModeConfig.self, from: data)
         {
@@ -50,15 +108,79 @@ public final class VeloStore: ObservableObject {
             #endif
         }
 
+        resignActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.flushCacheImmediately()
+            }
+        }
+
         requestNotificationPermissionIfNeeded()
         if connectionConfig != nil {
             connect()
         }
     }
 
+    private func scheduleCacheSave() {
+        cacheSaveTask?.cancel()
+        cacheSaveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.flushCacheImmediately()
+        }
+    }
+
+    public func flushCacheImmediately() {
+        cacheSaveTask?.cancel()
+        cacheSaveTask = nil
+        let snapshot = VeloLocalCacheSnapshot(
+            sessions: sessions,
+            workspaces: workspaces,
+            models: models,
+            activeSessionId: activeSessionId,
+            eventsBySession: eventsBySession
+        )
+        snapshot.writeToDisk()
+    }
+
     public var activeSession: VeloSessionItem? {
         guard let activeSessionId else { return sessions.first }
         return sessions.first(where: { $0.id == activeSessionId }) ?? sessions.first
+    }
+
+    /// Returns live streaming `tok/s` while running, or the latest turn's `tok/s` in the chat window
+    /// (strictly matching the active/latest turn footer so header and turn footer never disagree).
+    public func latestThroughput(for sessionId: String) -> Double? {
+        let isRunning = sessions.first(where: { $0.id == sessionId }).map {
+            $0.status == .running || $0.status == .waitingApproval
+        } ?? false
+        let lastUser = eventsBySession[sessionId]?.last(where: {
+            if case .user = $0.kind { return true }
+            return false
+        })
+        let rawTps = isRunning
+            ? (liveTpsBySession[sessionId] ?? lastUser?.telemetry?.tps)
+            : lastUser?.telemetry?.tps
+        if let tps = rawTps, tps >= 0.5 {
+            return tps
+        }
+        return nil
+    }
+
+    public static func estimateTextTokens(_ text: String) -> Int {
+        var cjk = 0
+        var other = 0
+        for scalar in text.unicodeScalars {
+            if scalar.value >= 0x2E80 && scalar.value <= 0x9FFF {
+                cjk += 1
+            } else {
+                other += 1
+            }
+        }
+        return max(1, Int((Double(cjk) * 0.72 + Double(other) * 0.27).rounded()))
     }
 
     // MARK: - Pairing & Connection Lifecycle
@@ -86,6 +208,8 @@ public final class VeloStore: ObservableObject {
     public func disconnectAndClear() {
         reconnectTask?.cancel()
         pingTask?.cancel()
+        syncRetryTask?.cancel()
+        cacheSaveTask?.cancel()
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
         isConnected = false
@@ -93,6 +217,21 @@ public final class VeloStore: ObservableObject {
         e2eeActiveKeyHex = nil
         ephemeralPrivateKey = nil
         maxDaemonNonce = nil
+        pendingEncryptedPayloads.removeAll()
+        for (_, waiters) in attachmentDownloadWaiters {
+            for w in waiters { w.resume(returning: nil) }
+        }
+        attachmentDownloadWaiters.removeAll()
+        attachmentChunkBuffers.removeAll()
+        for (_, waiter) in attachmentUploadWaiters {
+            waiter.resume(returning: nil)
+        }
+        attachmentUploadWaiters.removeAll()
+        sessions = []
+        workspaces = []
+        eventsBySession = [:]
+        activeSessionId = nil
+        VeloLocalCacheSnapshot.clear()
         connectionConfig = nil
         UserDefaults.standard.removeObject(forKey: Self.savedConfigKey)
     }
@@ -101,6 +240,8 @@ public final class VeloStore: ObservableObject {
         guard connectionConfig != nil else { return }
         if !isConnected || wsTask == nil || wsTask?.state != .running {
             connect()
+        } else if case .e2eeRelay = connectionConfig, !isForwardSecretRatcheted {
+            sendEncryptedSync()
         } else {
             Task { await refreshSessionsAndActiveEvents() }
         }
@@ -109,6 +250,7 @@ public final class VeloStore: ObservableObject {
     public func connect() {
         reconnectTask?.cancel()
         pingTask?.cancel()
+        syncRetryTask?.cancel()
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
         isForwardSecretRatcheted = false
@@ -137,6 +279,8 @@ public final class VeloStore: ObservableObject {
 
         let session = URLSession(configuration: .default)
         let task = session.webSocketTask(with: url)
+        // Raise from 1 MB default to 16 MB so large hex-encoded E2EE snapshots never fail or drop!
+        task.maximumMessageSize = 16 * 1024 * 1024
         self.wsTask = task
         task.resume()
 
@@ -150,14 +294,22 @@ public final class VeloStore: ObservableObject {
             }
         }
 
-        Task {
-            switch config {
-            case .direct:
+        switch config {
+        case .direct:
+            Task {
                 await fetchModelsIfDirect()
+                await fetchWorkspacesIfDirect()
                 await refreshSessionsAndActiveEvents()
-            case .e2eeRelay:
-                try? await Task.sleep(nanoseconds: 160_000_000)
-                sendEncryptedSync()
+            }
+        case .e2eeRelay:
+            syncRetryTask = Task { [weak self, weak task] in
+                try? await Task.sleep(nanoseconds: 140_000_000)
+                while !Task.isCancelled {
+                    guard let self, let task, self.wsTask === task else { break }
+                    if self.isForwardSecretRatcheted { break }
+                    self.sendEncryptedSync()
+                    try? await Task.sleep(nanoseconds: 1_800_000_000)
+                }
             }
         }
     }
@@ -206,6 +358,7 @@ public final class VeloStore: ObservableObject {
     public func refreshSessionsAndActiveEvents() async {
         switch connectionConfig {
         case .direct(let baseURL):
+            await fetchWorkspacesIfDirect()
             guard let url = URL(string: "\(baseURL)/api/sessions") else { return }
             do {
                 let (data, resp) = try await URLSession.shared.data(from: url)
@@ -219,6 +372,7 @@ public final class VeloStore: ObservableObject {
                     if self.activeSessionId == nil, let first = parsed.first {
                         self.activeSessionId = first.id
                     }
+                    self.scheduleCacheSave()
                     if let sid = self.activeSessionId {
                         await loadEventsForSession(sid)
                     }
@@ -256,6 +410,7 @@ public final class VeloStore: ObservableObject {
         }
         if !parsed.isEmpty {
             self.models = parsed
+            self.scheduleCacheSave()
         }
     }
 
@@ -276,8 +431,60 @@ public final class VeloStore: ObservableObject {
         }
     }
 
+    private func applyWorkspacesArray(_ rawPaths: [String]) {
+        var seen: Set<String> = []
+        var clean: [String] = []
+        for p in rawPaths {
+            let canon = VeloFormatting.canonicalWorkspacePath(p)
+            if !canon.isEmpty, seen.insert(canon).inserted {
+                clean.append(canon)
+            }
+        }
+        self.workspaces = clean
+        self.scheduleCacheSave()
+    }
+
+    public func fetchWorkspacesIfDirect() async {
+        guard case .direct(let baseURL) = connectionConfig,
+              let url = URL(string: "\(baseURL)/api/workspaces")
+        else { return }
+        guard let (data, _) = try? await URLSession.shared.data(from: url),
+              let jsonObj = try? JSONSerialization.jsonObject(with: data)
+        else { return }
+        if let dict = jsonObj as? [String: Any],
+           let arr = dict["workspaces"] as? [String]
+        {
+            applyWorkspacesArray(arr)
+        } else if let arr = jsonObj as? [String] {
+            applyWorkspacesArray(arr)
+        }
+    }
+
+    public func addWorkspace(_ rawPath: String) async {
+        let canon = VeloFormatting.canonicalWorkspacePath(rawPath)
+        guard !canon.isEmpty, !canon.hasSuffix("/.velo/workspace") else { return }
+        if !workspaces.contains(canon) {
+            workspaces.append(canon)
+            scheduleCacheSave()
+        }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/workspaces") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["path": canon])
+            _ = try? await URLSession.shared.data(for: req)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "add_workspace", "path": canon])
+        case .none:
+            break
+        }
+    }
+
     public func selectSession(_ sessionId: String) {
         activeSessionId = sessionId
+        scheduleCacheSave()
         Task {
             await loadEventsForSession(sessionId)
         }
@@ -290,14 +497,21 @@ public final class VeloStore: ObservableObject {
             guard let (data, _) = try? await URLSession.shared.data(from: url),
                   let rawList = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
             else { return }
-            let fallbackProv = sessions.first(where: { $0.id == sessionId })?.agentKind ?? "agy"
-            let items = Self.reconstructEventsFromHistory(
+            let sessionItem = sessions.first(where: { $0.id == sessionId })
+            let fallbackProv = sessionItem?.agentKind ?? "agy"
+            let (items, activeStart) = Self.reconstructEventsWithActiveTurn(
                 sessionId: sessionId,
                 rawList: rawList,
                 fallbackProvider: fallbackProv
             )
             if !items.isEmpty || self.eventsBySession[sessionId] == nil {
                 self.eventsBySession[sessionId] = items
+                self.scheduleCacheSave()
+            }
+            if sessionItem?.status == .running || sessionItem?.status == .waitingApproval,
+               let activeStart
+            {
+                self.turnStartedAtBySession[sessionId] = activeStart
             }
         case .e2eeRelay:
             sendEncryptedCommand(["cmd": "get_events", "session_id": sessionId])
@@ -327,15 +541,19 @@ public final class VeloStore: ObservableObject {
         text: String,
         model: String,
         effort: String,
+        images: [String] = [],
         approvalMode: String = "auto_edit"
     ) async {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
+        guard !clean.isEmpty || !images.isEmpty else { return }
+        let effectivePrompt = clean.isEmpty ? "请查看附图" : clean
 
         let now = Date()
         let timeStr = Self.shortTimeString(from: now)
         turnStartedAtBySession[sessionId] = now
         stepStartedAtBySession[sessionId] = now
+        liveTpsBySession.removeValue(forKey: sessionId)
+        streamStatsBySession.removeValue(forKey: sessionId)
 
         // Optimistically append user bubble & mark session running
         let userItem = TimelineEventItem(
@@ -343,7 +561,7 @@ public final class VeloStore: ObservableObject {
             sessionId: sessionId,
             timestamp: timeStr,
             content: clean,
-            kind: .user(images: [])
+            kind: .user(images: images)
         )
         var list = eventsBySession[sessionId] ?? []
         list.append(userItem)
@@ -360,36 +578,54 @@ public final class VeloStore: ObservableObject {
             sessions[idx].effort = effort
         }
         let providerKind = matchedOpt?.agentKind ?? sessions.first(where: { $0.id == sessionId })?.agentKind ?? "claude"
+        scheduleCacheSave()
         triggerHaptic(.light)
 
         switch connectionConfig {
         case .direct(let baseURL):
-            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/input") else { return }
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/input") else {
+                finalizeSessionTurnLocally(sessionId)
+                return
+            }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let body: [String: Any] = [
-                "input": clean,
+                "input": effectivePrompt,
                 "model": model,
                 "effort": effort,
                 "provider": providerKind,
+                "images": images,
                 "approval_mode": approvalMode,
             ]
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-            _ = try? await URLSession.shared.data(for: req)
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
+                    let errMsg = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["error"] as? String
+                        ?? "发送失败 (HTTP \(http.statusCode))"
+                    appendLocalErrorEvent(sessionId: sessionId, rawError: errMsg)
+                    finalizeSessionTurnLocally(sessionId)
+                }
+            } catch {
+                appendLocalErrorEvent(sessionId: sessionId, rawError: "请求发送失败：\(error.localizedDescription)")
+                finalizeSessionTurnLocally(sessionId)
+            }
 
         case .e2eeRelay:
             sendEncryptedCommand([
                 "cmd": "send_input",
                 "session_id": sessionId,
-                "input": clean,
+                "input": effectivePrompt,
                 "model": model,
                 "effort": effort,
                 "provider": providerKind,
+                "images": images,
                 "approval_mode": approvalMode,
             ])
         case .none:
-            break
+            appendLocalErrorEvent(sessionId: sessionId, rawError: "当前未连接主机")
+            finalizeSessionTurnLocally(sessionId)
         }
     }
 
@@ -400,9 +636,11 @@ public final class VeloStore: ObservableObject {
         branch: String?,
         modelOption: VeloModelOption,
         effort: String,
+        images: [String] = [],
         useWorktree: Bool = false
     ) async -> String? {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectivePrompt = (cleanPrompt.isEmpty && !images.isEmpty) ? "请查看附图" : cleanPrompt
         triggerHaptic(.medium)
 
         switch connectionConfig {
@@ -413,10 +651,11 @@ public final class VeloStore: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             var body: [String: Any] = [
                 "provider": modelOption.agentKind.isEmpty ? "claude" : modelOption.agentKind,
-                "prompt": cleanPrompt,
+                "prompt": effectivePrompt,
                 "repo_path": repoPath,
                 "model": modelOption.id,
                 "effort": effort,
+                "images": images,
                 "approval_mode": "auto_edit",
                 "use_worktree": useWorktree,
             ]
@@ -432,7 +671,7 @@ public final class VeloStore: ObservableObject {
                let created = VeloSessionItem.fromJSON(dict)
             {
                 let now = Date()
-                if !cleanPrompt.isEmpty {
+                if !effectivePrompt.isEmpty || !images.isEmpty {
                     turnStartedAtBySession[created.id] = now
                     stepStartedAtBySession[created.id] = now
                     eventsBySession[created.id] = [
@@ -441,7 +680,7 @@ public final class VeloStore: ObservableObject {
                             sessionId: created.id,
                             timestamp: Self.shortTimeString(from: now),
                             content: cleanPrompt,
-                            kind: .user(images: [])
+                            kind: .user(images: images)
                         )
                     ]
                 } else {
@@ -450,6 +689,7 @@ public final class VeloStore: ObservableObject {
                 sessions.insert(created, at: 0)
                 activeSessionId = created.id
                 latestCreatedOrHandoffSessionId = created.id
+                scheduleCacheSave()
                 return created.id
             }
             return nil
@@ -458,10 +698,11 @@ public final class VeloStore: ObservableObject {
             var payload: [String: Any] = [
                 "cmd": "create_session",
                 "provider": modelOption.agentKind.isEmpty ? "claude" : modelOption.agentKind,
-                "prompt": cleanPrompt,
+                "prompt": effectivePrompt,
                 "repo_path": repoPath,
                 "model": modelOption.id,
                 "effort": effort,
+                "images": images,
                 "approval_mode": "auto_edit",
                 "use_worktree": useWorktree,
             ]
@@ -473,6 +714,182 @@ public final class VeloStore: ObservableObject {
 
         case .none:
             return nil
+        }
+    }
+
+    // MARK: - Paseo-Style Tiered Attachment Lazy Fetch & Chunked E2EE Upload
+
+    public func loadAttachmentImage(ref rawRef: String, tier: AttachmentTier = .thumb) async -> UIImage? {
+        let ref = rawRef.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ref.isEmpty else { return nil }
+
+        if let cached = VeloAttachmentCache.shared.cachedImage(for: ref, tier: tier) {
+            return cached
+        }
+
+        if ref.hasPrefix("http://") || ref.hasPrefix("https://") {
+            guard let url = URL(string: ref),
+                  let (data, resp) = try? await URLSession.shared.data(from: url),
+                  (resp as? HTTPURLResponse)?.statusCode == 200
+            else { return nil }
+            return VeloAttachmentCache.shared.store(data: data, for: ref, tier: tier)
+        }
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            var comp = URLComponents(string: "\(baseURL)/api/attachments-resolve")
+            comp?.queryItems = [
+                URLQueryItem(name: "ref", value: ref),
+                URLQueryItem(name: "tier", value: tier.rawValue),
+            ]
+            guard let url = comp?.url,
+                  let (data, resp) = try? await URLSession.shared.data(from: url),
+                  (resp as? HTTPURLResponse)?.statusCode == 200
+            else { return nil }
+            return VeloAttachmentCache.shared.store(data: data, for: ref, tier: tier)
+
+        case .e2eeRelay:
+            let reqKey = "\(tier.rawValue):\(ref)"
+            let data: Data? = await withCheckedContinuation { cont in
+                let isFirst = (self.attachmentDownloadWaiters[reqKey] == nil)
+                self.attachmentDownloadWaiters[reqKey, default: []].append(cont)
+                if isFirst {
+                    self.sendEncryptedCommand([
+                        "cmd": "get_attachment",
+                        "request_id": reqKey,
+                        "ref": ref,
+                        "tier": tier.rawValue,
+                    ])
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 14_000_000_000)
+                        guard let self, let waiters = self.attachmentDownloadWaiters.removeValue(forKey: reqKey) else {
+                            return
+                        }
+                        self.attachmentChunkBuffers.removeValue(forKey: reqKey)
+                        for w in waiters {
+                            w.resume(returning: nil)
+                        }
+                    }
+                }
+            }
+            guard let data, !data.isEmpty else { return nil }
+            return VeloAttachmentCache.shared.store(data: data, for: ref, tier: tier)
+
+        case .none:
+            return nil
+        }
+    }
+
+    public func uploadAttachment(jpegData: Data, preview: UIImage, filename: String = "photo.jpg") async -> String? {
+        guard !jpegData.isEmpty else { return nil }
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/attachments") else { return nil }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = [
+                "filename": filename,
+                "mime_type": "image/jpeg",
+                "data_base64": jpegData.base64EncodedString(),
+            ]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let savedPath = obj["path"] as? String
+            else { return nil }
+            let savedURL = (obj["url"] as? String) ?? ""
+            VeloAttachmentCache.shared.storeUploaded(image: preview, jpegData: jpegData, refs: [savedPath, savedURL])
+            return savedPath
+
+        case .e2eeRelay:
+            let uploadId = "up-\(UUID().uuidString.prefix(12))"
+            let result: (path: String, url: String)? = await withCheckedContinuation { cont in
+                self.attachmentUploadWaiters[uploadId] = cont
+                let chunkSize = 160 * 1024
+                if jpegData.count <= chunkSize {
+                    self.sendEncryptedCommand([
+                        "cmd": "upload_attachment",
+                        "upload_id": uploadId,
+                        "filename": filename,
+                        "mime_type": "image/jpeg",
+                        "data_base64": jpegData.base64EncodedString(),
+                    ])
+                } else {
+                    var slices: [Data] = []
+                    var offset = 0
+                    while offset < jpegData.count {
+                        let end = min(jpegData.count, offset + chunkSize)
+                        slices.append(jpegData.subdata(in: offset..<end))
+                        offset = end
+                    }
+                    self.sendEncryptedCommand([
+                        "cmd": "upload_attachment_begin",
+                        "upload_id": uploadId,
+                        "filename": filename,
+                        "mime_type": "image/jpeg",
+                        "total_chunks": slices.count,
+                    ])
+                    for (idx, part) in slices.enumerated() {
+                        self.sendEncryptedCommand([
+                            "cmd": "upload_attachment_chunk",
+                            "upload_id": uploadId,
+                            "chunk_index": idx,
+                            "data_base64": part.base64EncodedString(),
+                        ])
+                    }
+                    self.sendEncryptedCommand([
+                        "cmd": "upload_attachment_complete",
+                        "upload_id": uploadId,
+                    ])
+                }
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 18_000_000_000)
+                    guard let self, let waiter = self.attachmentUploadWaiters.removeValue(forKey: uploadId) else {
+                        return
+                    }
+                    waiter.resume(returning: nil)
+                }
+            }
+            guard let result else { return nil }
+            VeloAttachmentCache.shared.storeUploaded(image: preview, jpegData: jpegData, refs: [result.path, result.url])
+            return result.path
+
+        case .none:
+            return nil
+        }
+    }
+
+    public func renameSession(_ sessionId: String, newTitle: String) async {
+        let cleanTitle = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanTitle.isEmpty else { return }
+
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[idx].title = cleanTitle
+            scheduleCacheSave()
+        }
+        triggerHaptic(.light)
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "PATCH"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["name": cleanTitle])
+            _ = try? await URLSession.shared.data(for: req)
+
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "update_session",
+                "session_id": sessionId,
+                "name": cleanTitle,
+            ])
+
+        case .none:
+            break
         }
     }
 
@@ -489,6 +906,7 @@ public final class VeloStore: ObservableObject {
             if !hasEvents && !modelOption.agentKind.isEmpty {
                 sessions[idx].agentKind = modelOption.agentKind
             }
+            scheduleCacheSave()
         }
         triggerHaptic(.light)
 
@@ -574,6 +992,7 @@ public final class VeloStore: ObservableObject {
                 } else {
                     eventsBySession[created.id] = []
                 }
+                scheduleCacheSave()
                 return created.id
             }
             return nil
@@ -605,6 +1024,7 @@ public final class VeloStore: ObservableObject {
         if activeSessionId == sessionId {
             activeSessionId = sessions.first?.id
         }
+        scheduleCacheSave()
 
         switch connectionConfig {
         case .direct(let baseURL):
@@ -624,6 +1044,7 @@ public final class VeloStore: ObservableObject {
 
     public func stopSession(_ sessionId: String) async {
         triggerHaptic(.rigid)
+        finalizeSessionTurnLocally(sessionId)
         switch connectionConfig {
         case .direct(let baseURL):
             guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/stop") else { return }
@@ -721,25 +1142,71 @@ public final class VeloStore: ObservableObject {
     private func sendEncryptedSync() {
         let eph = E2EERelayCrypto.generateEphemeralKeypair()
         self.ephemeralPrivateKey = eph.privateKey
-        sendEncryptedCommand([
+        self.e2eeActiveKeyHex = nil
+        self.isForwardSecretRatcheted = false
+        var payload: [String: Any] = [
             "cmd": "sync",
             "client_ephemeral_pub": eph.publicHex,
-        ])
+        ]
+        if let sid = activeSessionId, !sid.isEmpty {
+            payload["active_session_id"] = sid
+        }
+        sendEncryptedCommand(payload)
+    }
+
+    private func enqueuePendingPayload(_ payload: [String: Any]) {
+        let cmdName = payload["cmd"] as? String ?? ""
+        guard cmdName != "sync" else { return }
+        if cmdName == "get_events", let sid = payload["session_id"] as? String {
+            pendingEncryptedPayloads.removeAll {
+                ($0["cmd"] as? String) == "get_events" && ($0["session_id"] as? String) == sid
+            }
+        }
+        if pendingEncryptedPayloads.count >= 24 {
+            pendingEncryptedPayloads.removeFirst()
+        }
+        pendingEncryptedPayloads.append(payload)
     }
 
     private func sendEncryptedCommand(_ payload: [String: Any]) {
-        guard case .e2eeRelay(_, _, let rootKeyHex) = connectionConfig,
-              let wsTask
-        else { return }
+        guard case .e2eeRelay(_, _, let rootKeyHex) = connectionConfig else { return }
+        let cmdName = payload["cmd"] as? String ?? ""
+        if cmdName == "sync" {
+            if wsTask == nil || wsTask?.state == .canceling || wsTask?.state == .completed {
+                connect()
+                return
+            }
+        } else if wsTask == nil || wsTask?.state != .running || !isConnected || !isForwardSecretRatcheted {
+            enqueuePendingPayload(payload)
+            if wsTask == nil || wsTask?.state != .running {
+                connect()
+            } else if !isForwardSecretRatcheted && ephemeralPrivateKey == nil {
+                sendEncryptedSync()
+            }
+            return
+        }
+        guard let wsTask else { return }
         e2eeNonceCounter += 1
-        let keyHex = e2eeActiveKeyHex ?? rootKeyHex
+        let keyHex = (cmdName == "sync") ? rootKeyHex : (e2eeActiveKeyHex ?? rootKeyHex)
         guard let frameText = E2EERelayCrypto.sealJSON(
             sharedKeyHex: keyHex,
             senderId: clientSenderId,
             nonce: e2eeNonceCounter,
             payload: payload
         ) else { return }
-        wsTask.send(.string(frameText)) { _ in }
+        wsTask.send(.string(frameText)) { [weak self] err in
+            if err != nil {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.isConnected = false
+                    self.isForwardSecretRatcheted = false
+                    if cmdName != "sync" {
+                        self.enqueuePendingPayload(payload)
+                    }
+                    self.connect()
+                }
+            }
+        }
     }
 
     // MARK: - Incoming WebSocket Payload Processing
@@ -775,7 +1242,9 @@ public final class VeloStore: ObservableObject {
                 e2eeActiveKeyHex = nil
                 isForwardSecretRatcheted = false
                 maxDaemonNonce = opened.nonce
-                processServerPayload(opened.json)
+                if msgType != "rekey_required" {
+                    processServerPayload(opened.json)
+                }
                 sendEncryptedSync()
                 return
             }
@@ -790,6 +1259,13 @@ public final class VeloStore: ObservableObject {
 
     private func processServerPayload(_ raw: [String: Any]) {
         if let type = raw["type"] as? String {
+            if type == "rekey_required" {
+                self.e2eeActiveKeyHex = nil
+                self.isForwardSecretRatcheted = false
+                self.sendEncryptedSync()
+                return
+            }
+
             if type == "e2ee_ratchet",
                let daemonPubHex = raw["daemon_ephemeral_pub"] as? String,
                let clientPriv = ephemeralPrivateKey,
@@ -800,8 +1276,17 @@ public final class VeloStore: ObservableObject {
                    daemonPublicHex: daemonPubHex
                )
             {
+                syncRetryTask?.cancel()
+                syncRetryTask = nil
                 self.e2eeActiveKeyHex = ratcheted
                 self.isForwardSecretRatcheted = true
+                if !pendingEncryptedPayloads.isEmpty {
+                    let queued = pendingEncryptedPayloads
+                    pendingEncryptedPayloads.removeAll()
+                    for p in queued {
+                        sendEncryptedCommand(p)
+                    }
+                }
                 return
             }
 
@@ -812,13 +1297,76 @@ public final class VeloStore: ObservableObject {
                 return
             }
 
+            if type == "workspaces_snapshot",
+               let arr = raw["workspaces"] as? [String]
+            {
+                applyWorkspacesArray(arr)
+                return
+            }
+
             if type == "handoff_completed",
                let newSid = raw["new_session_id"] as? String, !newSid.isEmpty
             {
                 pendingSelectNewestSession = false
                 self.activeSessionId = newSid
                 self.latestCreatedOrHandoffSessionId = newSid
+                scheduleCacheSave()
                 Task { await loadEventsForSession(newSid) }
+                return
+            }
+
+            if type == "attachment_chunk",
+               let reqKey = raw["request_id"] as? String
+            {
+                let notFound = (raw["not_found"] as? Bool) ?? false
+                let total = (raw["total_chunks"] as? Int) ?? 0
+                let idx = (raw["chunk_index"] as? Int) ?? 0
+                let b64 = (raw["data_base64"] as? String) ?? ""
+                if notFound || total <= 0 {
+                    attachmentChunkBuffers.removeValue(forKey: reqKey)
+                    if let waiters = attachmentDownloadWaiters.removeValue(forKey: reqKey) {
+                        for w in waiters { w.resume(returning: nil) }
+                    }
+                    return
+                }
+                guard idx >= 0 && idx < total, let part = Data(base64Encoded: b64) else {
+                    return
+                }
+                var buf = attachmentChunkBuffers[reqKey] ?? IncomingAttachmentBuffer(
+                    chunks: Array(repeating: nil, count: total)
+                )
+                if buf.chunks.count != total {
+                    buf.chunks = Array(repeating: nil, count: total)
+                }
+                buf.chunks[idx] = part
+                if buf.chunks.allSatisfy({ $0 != nil }) {
+                    var fullData = Data()
+                    for c in buf.chunks {
+                        if let c { fullData.append(c) }
+                    }
+                    attachmentChunkBuffers.removeValue(forKey: reqKey)
+                    if let waiters = attachmentDownloadWaiters.removeValue(forKey: reqKey) {
+                        for w in waiters { w.resume(returning: fullData) }
+                    }
+                } else {
+                    attachmentChunkBuffers[reqKey] = buf
+                }
+                return
+            }
+
+            if type == "attachment_uploaded",
+               let uploadId = raw["upload_id"] as? String
+            {
+                let ok = (raw["ok"] as? Bool) ?? false
+                let path = raw["path"] as? String
+                let url = (raw["url"] as? String) ?? ""
+                if let waiter = attachmentUploadWaiters.removeValue(forKey: uploadId) {
+                    if ok, let path, !path.isEmpty {
+                        waiter.resume(returning: (path: path, url: url))
+                    } else {
+                        waiter.resume(returning: nil)
+                    }
+                }
                 return
             }
 
@@ -837,10 +1385,15 @@ public final class VeloStore: ObservableObject {
                 self.activeSessionId = newest.id
                 self.latestCreatedOrHandoffSessionId = newest.id
                 Task { await loadEventsForSession(newest.id) }
-            } else if self.activeSessionId == nil, let first = parsed.first {
+            } else if self.activeSessionId == nil || (!parsed.isEmpty && !parsed.contains(where: { $0.id == self.activeSessionId })),
+                      let first = parsed.first
+            {
                 self.activeSessionId = first.id
                 Task { await loadEventsForSession(first.id) }
+            } else if let sid = self.activeSessionId, self.eventsBySession[sid] == nil {
+                Task { await loadEventsForSession(sid) }
             }
+            scheduleCacheSave()
             return
         }
 
@@ -848,14 +1401,21 @@ public final class VeloStore: ObservableObject {
            let sid = raw["session_id"] as? String,
            let rawEvs = raw["events"] as? [[String: Any]]
         {
-            let fallbackProv = sessions.first(where: { $0.id == sid })?.agentKind ?? "agy"
-            let items = Self.reconstructEventsFromHistory(
+            let sessionItem = sessions.first(where: { $0.id == sid })
+            let fallbackProv = sessionItem?.agentKind ?? "agy"
+            let (items, activeStart) = Self.reconstructEventsWithActiveTurn(
                 sessionId: sid,
                 rawList: rawEvs,
                 fallbackProvider: fallbackProv
             )
             if !items.isEmpty || eventsBySession[sid] == nil {
                 eventsBySession[sid] = items
+                scheduleCacheSave()
+            }
+            if sessionItem?.status == .running || sessionItem?.status == .waitingApproval,
+               let activeStart
+            {
+                turnStartedAtBySession[sid] = activeStart
             }
             return
         }
@@ -882,22 +1442,36 @@ public final class VeloStore: ObservableObject {
         else { return }
 
         let now = Date()
-        let nowLabel = Self.shortTimeString(from: now)
+        let serverDate = Self.parseServerDate(evObj["timestamp"]) ?? now
+        let nowLabel = Self.shortTimeString(from: serverDate)
 
         switch evType {
         case "user_message":
             let text = (evObj["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !text.isEmpty else { return }
+            let imgs = (evObj["images"] as? [String]) ?? []
+            guard !text.isEmpty || !imgs.isEmpty else { return }
             if !sessions.contains(where: { $0.id == sid }) {
                 Task { await refreshSessionsAndActiveEvents() }
             }
+            // Authoritative turn reset: prevents accumulating elapsed time across turns!
+            turnStartedAtBySession[sid] = serverDate
+            stepStartedAtBySession[sid] = serverDate
+            liveTpsBySession.removeValue(forKey: sid)
+            streamStatsBySession.removeValue(forKey: sid)
+
             var list = eventsBySession[sid] ?? []
             if let localIdx = list.lastIndex(where: { item in
                 guard item.id.hasPrefix("u-local-") || item.id.hasPrefix("u-init-") else { return false }
-                if case .user = item.kind, item.content == text { return true }
+                if case .user = item.kind {
+                    return item.content == text || (text == "请查看附图" && item.content.isEmpty)
+                }
                 return false
             }) {
                 list[localIdx].id = "u-sync-\(UUID().uuidString.prefix(8))"
+                list[localIdx].timestamp = nowLabel
+                if !imgs.isEmpty {
+                    list[localIdx].kind = .user(images: imgs)
+                }
                 eventsBySession[sid] = list
             } else {
                 list.append(
@@ -906,7 +1480,7 @@ public final class VeloStore: ObservableObject {
                         sessionId: sid,
                         timestamp: nowLabel,
                         content: text,
-                        kind: .user(images: [])
+                        kind: .user(images: imgs)
                     )
                 )
                 eventsBySession[sid] = list
@@ -948,43 +1522,24 @@ public final class VeloStore: ObservableObject {
         case "status_changed":
             let st = ((evObj["status"] as? String) ?? "").lowercased()
             if st == "running" {
-                if turnStartedAtBySession[sid] == nil {
-                    turnStartedAtBySession[sid] = now
+                let lastUserCompleted: Bool = {
+                    guard let list = eventsBySession[sid],
+                          let lastUser = list.last(where: {
+                              if case .user = $0.kind { return true }
+                              return false
+                          })
+                    else { return true }
+                    return lastUser.durationMs != nil
+                }()
+                if turnStartedAtBySession[sid] == nil || lastUserCompleted {
+                    turnStartedAtBySession[sid] = serverDate
                 }
-                if stepStartedAtBySession[sid] == nil {
+                if stepStartedAtBySession[sid] == nil || lastUserCompleted {
                     stepStartedAtBySession[sid] = turnStartedAtBySession[sid]
                 }
                 updateSessionStatus(sid, .running)
             } else if st == "completed" || st == "failed" || st == "stopped" {
-                let startOrigin = turnStartedAtBySession[sid] ?? now.addingTimeInterval(-1)
-                let stepOrigin = stepStartedAtBySession[sid] ?? startOrigin
-                let totalMs = max(500, Int(now.timeIntervalSince(startOrigin) * 1000))
-                turnStartedAtBySession.removeValue(forKey: sid)
-                stepStartedAtBySession.removeValue(forKey: sid)
-
-                if var list = eventsBySession[sid] {
-                    if let lastUserIdx = list.lastIndex(where: {
-                        if case .user = $0.kind { return true }
-                        return false
-                    }) {
-                        list[lastUserIdx].durationMs = totalMs
-                        list[lastUserIdx].completedAt = nowLabel
-                    }
-                    for i in list.indices {
-                        switch list[i].kind {
-                        case .thinking(let startedAt, let dur, true):
-                            let finalDur = dur ?? max(500, Int(now.timeIntervalSince(startedAt ?? stepOrigin) * 1000))
-                            list[i].kind = .thinking(startedAt: startedAt, durationMs: finalDur, isStreaming: false)
-                        case .assistant(true):
-                            list[i].kind = .assistant(isStreaming: false)
-                        default:
-                            break
-                        }
-                    }
-                    eventsBySession[sid] = list
-                }
-
-                updateSessionStatus(sid, .idle)
+                let totalMs = finalizeSessionTurnLocally(sid, now: serverDate)
                 if st == "completed" {
                     triggerNotificationHaptic(.success)
                     let sessionTitle = sessions.first(where: { $0.id == sid })?.title ?? "Velo"
@@ -1135,11 +1690,53 @@ public final class VeloStore: ObservableObject {
                 sessions[idx].deletions = (stats["deletions"] as? Int) ?? sessions[idx].deletions
             }
 
+        case "usage_updated":
+            let inTok = VeloSessionItem.intValue(evObj["input_tokens"]) ?? 0
+            let outTok = VeloSessionItem.intValue(evObj["output_tokens"]) ?? 0
+            let cacheRead = VeloSessionItem.intValue(evObj["cache_read_tokens"]) ?? 0
+            let cacheWrite = VeloSessionItem.intValue(evObj["cache_write_tokens"]) ?? 0
+            let ctxWin = VeloSessionItem.intValue(evObj["context_window"]) ?? 0
+            let cost = VeloSessionItem.doubleValue(evObj["cost_usd"]) ?? 0.0
+            let outTps = VeloSessionItem.doubleValue(evObj["output_tps"]) ?? 0.0
+
+            if outTps >= 0.5 {
+                liveTpsBySession[sid] = outTps
+            }
+
+            if let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                if inTok > 0 { sessions[idx].inputTokens = inTok }
+                if outTok > 0 { sessions[idx].outputTokens = max(sessions[idx].outputTokens, outTok) }
+                if inTok + outTok > 0 { sessions[idx].tokensUsed = inTok + outTok }
+                if cacheRead > 0 { sessions[idx].cacheReadTokens = cacheRead }
+                if ctxWin > 0 { sessions[idx].contextWindow = ctxWin }
+                if cost > 0 { sessions[idx].costUsd = max(sessions[idx].costUsd, cost) }
+            }
+
+            if var list = eventsBySession[sid],
+               let lastUserIdx = list.lastIndex(where: {
+                   if case .user = $0.kind { return true }
+                   return false
+               })
+            {
+                let prevTel = list[lastUserIdx].telemetry
+                let resolvedTps: Double? = outTps >= 0.5 ? outTps : prevTel?.tps
+                list[lastUserIdx].telemetry = TurnUsageTelemetry(
+                    tps: resolvedTps,
+                    inputTokens: inTok > 0 ? inTok : (prevTel?.inputTokens ?? 0),
+                    outputTokens: outTok > 0 ? outTok : (prevTel?.outputTokens ?? 0),
+                    cacheReadTokens: cacheRead > 0 ? cacheRead : (prevTel?.cacheReadTokens ?? 0),
+                    cacheWriteTokens: cacheWrite > 0 ? cacheWrite : (prevTel?.cacheWriteTokens ?? 0),
+                    contextWindow: ctxWin > 0 ? ctxWin : (prevTel?.contextWindow ?? 0),
+                    costUsd: cost > 0 ? cost : (prevTel?.costUsd ?? 0.0)
+                )
+                eventsBySession[sid] = list
+            }
+
         case "message_chunk":
             let delta = (evObj["delta"] as? String) ?? ""
             let replace = (evObj["replace"] as? Bool) ?? false
             guard !delta.isEmpty else { return }
-            let origin = stepStartedAtBySession[sid] ?? turnStartedAtBySession[sid] ?? now
+            let origin = stepStartedAtBySession[sid] ?? turnStartedAtBySession[sid] ?? serverDate
 
             var list = eventsBySession[sid] ?? []
             if let last = list.last, case .assistant(true) = last.kind {
@@ -1204,6 +1801,7 @@ public final class VeloStore: ObservableObject {
                     list[targetIdx].content = nextContent
                     list[targetIdx].kind = .assistant(isStreaming: false)
                     eventsBySession[sid] = list
+                    scheduleCacheSave()
                     return
                 }
             }
@@ -1224,6 +1822,7 @@ public final class VeloStore: ObservableObject {
                 )
             )
             eventsBySession[sid] = list
+            scheduleCacheSave()
 
         case "error":
             let rawErr = ((evObj["error"] as? String) ?? "Agent 执行异常").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1280,10 +1879,85 @@ public final class VeloStore: ObservableObject {
                 )
             }
             eventsBySession[sid] = list
+            scheduleCacheSave()
 
         default:
             break
         }
+    }
+
+    @discardableResult
+    private func finalizeSessionTurnLocally(_ sid: String, now: Date = Date()) -> Int {
+        let startOrigin = turnStartedAtBySession[sid] ?? now.addingTimeInterval(-1)
+        let stepOrigin = stepStartedAtBySession[sid] ?? startOrigin
+        let totalMs = max(500, Int(now.timeIntervalSince(startOrigin) * 1000))
+        let nowLabel = Self.shortTimeString(from: now)
+        let finalLiveTps = liveTpsBySession[sid]
+        turnStartedAtBySession.removeValue(forKey: sid)
+        stepStartedAtBySession.removeValue(forKey: sid)
+        liveTpsBySession.removeValue(forKey: sid)
+        streamStatsBySession.removeValue(forKey: sid)
+        pendingApprovals.removeValue(forKey: sid)
+        pendingQuestions.removeValue(forKey: sid)
+
+        if var list = eventsBySession[sid] {
+            if let lastUserIdx = list.lastIndex(where: {
+                if case .user = $0.kind { return true }
+                return false
+            }) {
+                if list[lastUserIdx].durationMs == nil {
+                    list[lastUserIdx].durationMs = totalMs
+                    list[lastUserIdx].completedAt = nowLabel
+                }
+                var tel = list[lastUserIdx].telemetry ?? TurnUsageTelemetry()
+                if tel.tps == nil || (tel.tps ?? 0) < 0.5 {
+                    if let finalLiveTps, finalLiveTps >= 0.5 {
+                        tel.tps = finalLiveTps
+                        list[lastUserIdx].telemetry = tel
+                    }
+                }
+            }
+            for i in list.indices {
+                switch list[i].kind {
+                case .thinking(let startedAt, let dur, true):
+                    let finalDur = dur ?? max(500, Int(now.timeIntervalSince(startedAt ?? stepOrigin) * 1000))
+                    list[i].kind = .thinking(startedAt: startedAt, durationMs: finalDur, isStreaming: false)
+                case .assistant(true):
+                    list[i].kind = .assistant(isStreaming: false)
+                default:
+                    break
+                }
+            }
+            eventsBySession[sid] = list
+        }
+
+        updateSessionStatus(sid, .idle)
+        scheduleCacheSave()
+        return totalMs
+    }
+
+    private func appendLocalErrorEvent(sessionId sid: String, rawError: String) {
+        let clean = rawError.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        let fallbackProv = sessions.first(where: { $0.id == sid })?.agentKind ?? "agy"
+        let parsed = VeloFormatting.parseAgentError(clean, fallbackProvider: fallbackProv)
+        var list = eventsBySession[sid] ?? []
+        list.append(
+            TimelineEventItem(
+                id: "err-local-\(UUID().uuidString.prefix(8))",
+                sessionId: sid,
+                timestamp: Self.shortTimeString(from: Date()),
+                content: parsed.message,
+                kind: .error(
+                    isAuthRequired: parsed.isAuthRequired,
+                    provider: parsed.provider,
+                    loginCommand: parsed.loginCommand,
+                    authURL: parsed.authURL
+                )
+            )
+        )
+        eventsBySession[sid] = list
+        triggerNotificationHaptic(.error)
     }
 
     private func updateSessionStatus(_ sid: String, _ status: SessionRunState) {
@@ -1300,9 +1974,22 @@ public final class VeloStore: ObservableObject {
         rawList: [[String: Any]],
         fallbackProvider: String = "agy"
     ) -> [TimelineEventItem] {
+        reconstructEventsWithActiveTurn(
+            sessionId: sessionId,
+            rawList: rawList,
+            fallbackProvider: fallbackProvider
+        ).items
+    }
+
+    public static func reconstructEventsWithActiveTurn(
+        sessionId: String,
+        rawList: [[String: Any]],
+        fallbackProvider: String = "agy"
+    ) -> (items: [TimelineEventItem], activeRunningStart: Date?) {
         var out: [TimelineEventItem] = []
         var activeUserIdx: Int?
         var activeStartMs: Int64 = 0
+        var activeTurnClosed = false
         var lastStepMs: Int64 = 0
 
         let isoFrac = ISO8601DateFormatter()
@@ -1338,6 +2025,7 @@ public final class VeloStore: ObservableObject {
                     )
                     activeUserIdx = out.count - 1
                     activeStartMs = tsMs
+                    activeTurnClosed = false
                     lastStepMs = tsMs
                 }
 
@@ -1346,13 +2034,37 @@ public final class VeloStore: ObservableObject {
                 if st == "running" {
                     if activeStartMs == 0, tsMs > 0 { activeStartMs = tsMs }
                     if lastStepMs == 0, tsMs > 0 { lastStepMs = tsMs }
+                    activeTurnClosed = false
                 } else if st == "completed" || st == "failed" || st == "stopped",
                           let uIdx = activeUserIdx
                 {
                     if activeStartMs > 0, tsMs >= activeStartMs {
-                        out[uIdx].durationMs = max(500, Int(tsMs - activeStartMs))
+                        let dMs = max(500, Int(tsMs - activeStartMs))
+                        out[uIdx].durationMs = dMs
                     }
                     out[uIdx].completedAt = tsLabel
+                    activeTurnClosed = true
+                }
+
+            case "usage_updated":
+                if let uIdx = activeUserIdx {
+                    let inTok = VeloSessionItem.intValue(ev["input_tokens"]) ?? 0
+                    let outTok = VeloSessionItem.intValue(ev["output_tokens"]) ?? 0
+                    let cacheRead = VeloSessionItem.intValue(ev["cache_read_tokens"]) ?? 0
+                    let cacheWrite = VeloSessionItem.intValue(ev["cache_write_tokens"]) ?? 0
+                    let ctxWin = VeloSessionItem.intValue(ev["context_window"]) ?? 0
+                    let cost = VeloSessionItem.doubleValue(ev["cost_usd"]) ?? 0.0
+                    let outTps = VeloSessionItem.doubleValue(ev["output_tps"]) ?? 0.0
+                    let prevTel = out[uIdx].telemetry
+                    out[uIdx].telemetry = TurnUsageTelemetry(
+                        tps: outTps >= 0.5 ? outTps : prevTel?.tps,
+                        inputTokens: inTok > 0 ? inTok : (prevTel?.inputTokens ?? 0),
+                        outputTokens: outTok > 0 ? outTok : (prevTel?.outputTokens ?? 0),
+                        cacheReadTokens: cacheRead > 0 ? cacheRead : (prevTel?.cacheReadTokens ?? 0),
+                        cacheWriteTokens: cacheWrite > 0 ? cacheWrite : (prevTel?.cacheWriteTokens ?? 0),
+                        contextWindow: ctxWin > 0 ? ctxWin : (prevTel?.contextWindow ?? 0),
+                        costUsd: cost > 0 ? cost : (prevTel?.costUsd ?? 0.0)
+                    )
                 }
 
             case "thinking_delta":
@@ -1497,7 +2209,10 @@ public final class VeloStore: ObservableObject {
                 break
             }
         }
-        return out
+        let runningStart: Date? = (!activeTurnClosed && activeStartMs > 0)
+            ? Date(timeIntervalSince1970: Double(activeStartMs) / 1000.0)
+            : nil
+        return (out, runningStart)
     }
 
     public static func groupIntoTurns(_ events: [TimelineEventItem]) -> [ConversationTurnBlock] {
@@ -1515,6 +2230,15 @@ public final class VeloStore: ObservableObject {
     }
 
     // MARK: - Haptics & Native Local Notifications
+
+    private static func parseServerDate(_ raw: Any?) -> Date? {
+        guard let str = raw as? String, !str.isEmpty else { return nil }
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = isoFrac.date(from: str) { return d }
+        let isoPlain = ISO8601DateFormatter()
+        return isoPlain.date(from: str)
+    }
 
     private static func shortTimeString(from date: Date) -> String {
         let f = DateFormatter()

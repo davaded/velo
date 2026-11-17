@@ -262,7 +262,7 @@ public enum SessionRunState: String, Codable, Sendable {
     case idle
 }
 
-public struct VeloSessionItem: Identifiable, Equatable, Sendable {
+public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public var title: String
     public var agentKind: String
@@ -278,6 +278,12 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
     public var filesChanged: Int
     public var insertions: Int
     public var deletions: Int
+    public var tokensUsed: Int
+    public var inputTokens: Int
+    public var outputTokens: Int
+    public var cacheReadTokens: Int
+    public var contextWindow: Int
+    public var costUsd: Double
     public var updatedAtLabel: String
 
     public var engineCategory: VeloEngineCategory {
@@ -364,18 +370,30 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
         }()
 
         let diffStats = dict["diff_stats"] as? [String: Any]
-        let filesChanged = (diffStats?["files_changed"] as? Int) ?? (dict["files_changed"] as? Int) ?? 0
-        let insertions = (diffStats?["insertions"] as? Int) ?? (dict["insertions"] as? Int) ?? 0
-        let deletions = (diffStats?["deletions"] as? Int) ?? (dict["deletions"] as? Int) ?? 0
+        let filesChanged = Self.intValue(diffStats?["files_changed"]) ?? Self.intValue(dict["files_changed"]) ?? 0
+        let insertions = Self.intValue(diffStats?["insertions"]) ?? Self.intValue(dict["insertions"]) ?? 0
+        let deletions = Self.intValue(diffStats?["deletions"]) ?? Self.intValue(dict["deletions"]) ?? 0
 
-        let repoRoot = (dict["repo_root"] as? String)
+        let inputTokens = Self.intValue(dict["input_tokens"]) ?? 0
+        let outputTokens = Self.intValue(dict["output_tokens"]) ?? 0
+        let tokensUsed = Self.intValue(dict["tokens_used"]) ?? (inputTokens + outputTokens)
+        let cacheReadTokens = Self.intValue(dict["cache_read_tokens"]) ?? 0
+        let contextWindow = Self.intValue(dict["context_window"]) ?? 0
+        let costUsd = Self.doubleValue(dict["cost_usd"]) ?? 0.0
+
+        let rawRepoRoot = (dict["repo_root"] as? String)
             ?? (dict["project_path"] as? String)
             ?? "/Users/daiyudai/code/velo"
-        let worktreePath = (dict["worktree_path"] as? String) ?? repoRoot
+        let repoRoot = VeloFormatting.canonicalWorkspacePath(rawRepoRoot)
+        let rawWorktree = (dict["worktree_path"] as? String) ?? repoRoot
+        let worktreePath = VeloFormatting.canonicalWorkspacePath(rawWorktree)
 
         let updatedLabel: String = {
+            let isoFrac = ISO8601DateFormatter()
+            isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let isoPlain = ISO8601DateFormatter()
             if let rawUpdated = dict["updated_at"] as? String,
-               let date = ISO8601DateFormatter().date(from: rawUpdated)
+               let date = isoFrac.date(from: rawUpdated) ?? isoPlain.date(from: rawUpdated)
             {
                 let f = DateFormatter()
                 f.dateFormat = "HH:mm"
@@ -400,12 +418,32 @@ public struct VeloSessionItem: Identifiable, Equatable, Sendable {
             filesChanged: filesChanged,
             insertions: insertions,
             deletions: deletions,
+            tokensUsed: tokensUsed,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheReadTokens: cacheReadTokens,
+            contextWindow: contextWindow,
+            costUsd: costUsd,
             updatedAtLabel: updatedLabel
         )
     }
+
+    public static func intValue(_ any: Any?) -> Int? {
+        if let i = any as? Int { return i }
+        if let n = any as? NSNumber { return n.intValue }
+        if let s = any as? String, let i = Int(s) { return i }
+        return nil
+    }
+
+    public static func doubleValue(_ any: Any?) -> Double? {
+        if let d = any as? Double { return d }
+        if let n = any as? NSNumber { return n.doubleValue }
+        if let s = any as? String, let d = Double(s) { return d }
+        return nil
+    }
 }
 
-public struct VeloModelOption: Identifiable, Equatable, Sendable {
+public struct VeloModelOption: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public let label: String
     public let shortLabel: String
@@ -585,7 +623,7 @@ public enum AgentLivePhase: Equatable, Sendable {
     case waiting(label: String)
 }
 
-public enum TimelineEventKind: Equatable, Sendable {
+public enum TimelineEventKind: Codable, Equatable, Sendable {
     case user(images: [String])
     case thinking(startedAt: Date?, durationMs: Int?, isStreaming: Bool)
     case toolCall(
@@ -605,7 +643,44 @@ public enum TimelineEventKind: Equatable, Sendable {
     )
 }
 
-public struct TimelineEventItem: Identifiable, Equatable, Sendable {
+public struct TurnUsageTelemetry: Codable, Equatable, Sendable {
+    public var tps: Double?
+    public var inputTokens: Int
+    public var outputTokens: Int
+    public var cacheReadTokens: Int
+    public var cacheWriteTokens: Int
+    public var contextWindow: Int
+    public var costUsd: Double
+
+    public init(
+        tps: Double? = nil,
+        inputTokens: Int = 0,
+        outputTokens: Int = 0,
+        cacheReadTokens: Int = 0,
+        cacheWriteTokens: Int = 0,
+        contextWindow: Int = 0,
+        costUsd: Double = 0.0
+    ) {
+        self.tps = tps
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.contextWindow = contextWindow
+        self.costUsd = costUsd
+    }
+
+    public var totalTokens: Int {
+        inputTokens + outputTokens
+    }
+
+    public var cacheHitPercent: Int? {
+        guard inputTokens > 0, cacheReadTokens > 0 else { return nil }
+        return min(100, Int((Double(cacheReadTokens) / Double(inputTokens) * 100.0).rounded()))
+    }
+}
+
+public struct TimelineEventItem: Identifiable, Codable, Equatable, Sendable {
     public var id: String
     public var sessionId: String
     public var timestamp: String
@@ -613,6 +688,95 @@ public struct TimelineEventItem: Identifiable, Equatable, Sendable {
     public var kind: TimelineEventKind
     public var durationMs: Int?
     public var completedAt: String?
+    public var telemetry: TurnUsageTelemetry? = nil
+}
+
+public struct VeloLocalCacheSnapshot: Codable, Sendable {
+    public var sessions: [VeloSessionItem]
+    public var workspaces: [String]
+    public var models: [VeloModelOption]
+    public var activeSessionId: String?
+    public var eventsBySession: [String: [TimelineEventItem]]
+
+    public init(
+        sessions: [VeloSessionItem],
+        workspaces: [String],
+        models: [VeloModelOption],
+        activeSessionId: String?,
+        eventsBySession: [String: [TimelineEventItem]]
+    ) {
+        self.sessions = sessions
+        self.workspaces = workspaces
+        self.models = models
+        self.activeSessionId = activeSessionId
+        self.eventsBySession = eventsBySession
+    }
+
+    private static var cacheFileURL: URL? {
+        guard let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            return nil
+        }
+        let dir = base.appendingPathComponent("VeloLocalCache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("state-v1.json")
+    }
+
+    public static func load() -> VeloLocalCacheSnapshot? {
+        guard let url = cacheFileURL,
+              let data = try? Data(contentsOf: url)
+        else { return nil }
+        return try? JSONDecoder().decode(VeloLocalCacheSnapshot.self, from: data)
+    }
+
+    public func trimmedForDisk() -> VeloLocalCacheSnapshot {
+        let keepSessionIds = Set(sessions.prefix(40).map(\.id))
+        var compactEvents: [String: [TimelineEventItem]] = [:]
+        for (sid, list) in eventsBySession {
+            guard keepSessionIds.isEmpty || keepSessionIds.contains(sid) else { continue }
+            let slice = list.suffix(240).map { item -> TimelineEventItem in
+                var copy = item
+                if copy.content.count > 12_000 {
+                    copy.content = String(copy.content.prefix(12_000))
+                }
+                if case .toolCall(let tn, let dn, let wv, let sum, let out, let err) = copy.kind,
+                   let out, out.count > 3_000
+                {
+                    copy.kind = .toolCall(
+                        toolName: tn,
+                        displayName: dn,
+                        workingVerb: wv,
+                        summary: sum,
+                        output: String(out.prefix(3_000)) + "\n…",
+                        isError: err
+                    )
+                }
+                return copy
+            }
+            compactEvents[sid] = Array(slice)
+        }
+        return VeloLocalCacheSnapshot(
+            sessions: Array(sessions.prefix(60)),
+            workspaces: workspaces,
+            models: models,
+            activeSessionId: activeSessionId,
+            eventsBySession: compactEvents
+        )
+    }
+
+    public func writeToDisk() {
+        guard let url = Self.cacheFileURL else { return }
+        let slim = trimmedForDisk()
+        guard let data = try? JSONEncoder().encode(slim) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    public static func clear() {
+        guard let url = cacheFileURL else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
 }
 
 public struct ConversationTurnBlock: Identifiable, Equatable, Sendable {
@@ -656,6 +820,43 @@ public struct DiffFileSection: Identifiable, Equatable, Sendable {
 }
 
 public enum VeloFormatting {
+    public static func canonicalWorkspacePath(_ raw: String, macHomeHint: String? = nil) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return "/Users/daiyudai/code/velo" }
+        if s == "~" {
+            return macHomeHint ?? "/Users/daiyudai"
+        }
+        if s.hasPrefix("~/") {
+            let home = macHomeHint ?? "/Users/daiyudai"
+            s = home + String(s.dropFirst(1))
+        }
+        while s.count > 1 && s.hasSuffix("/") {
+            s.removeLast()
+        }
+        return s
+    }
+
+    public static func formatCompactTokens(_ count: Int) -> String {
+        if count >= 1_000_000 {
+            return String(format: "%.1fM", Double(count) / 1_000_000.0)
+        }
+        if count >= 1_000 {
+            let k = Double(count) / 1_000.0
+            return k >= 100 ? String(format: "%.0fk", k) : String(format: "%.1fk", k)
+        }
+        return "\(count)"
+    }
+
+    public static func formatUsd(_ usd: Double) -> String {
+        if usd >= 0.10 {
+            return String(format: "$%.2f", usd)
+        }
+        if usd >= 0.001 {
+            return String(format: "$%.3f", usd)
+        }
+        return String(format: "$%.4f", usd)
+    }
+
     public static func formatDuration(ms: Int) -> String {
         let totalSec = max(1, Int((Double(ms) / 1000.0).rounded()))
         if totalSec < 60 {
@@ -753,12 +954,94 @@ public enum VeloFormatting {
                 "magnifyingglass"
             )
         }
+        if lower.hasPrefix("mcp__") || lower.hasPrefix("mcp:") || lower.contains(":") {
+            let cleanMcp: String = {
+                if toolName.hasPrefix("mcp__") {
+                    let parts = toolName.dropFirst(5).components(separatedBy: "__")
+                    if parts.count >= 2 {
+                        return "\(parts[0]):\(parts.dropFirst().joined(separator: "_"))"
+                    }
+                    return String(toolName.dropFirst(5))
+                }
+                if toolName.lowercased().hasPrefix("mcp:") {
+                    return String(toolName.dropFirst(4))
+                }
+                return toolName
+            }()
+            let argSnippet = shortPath.isEmpty ? (command.isEmpty ? query : String(command.prefix(36))) : shortPath
+            return (
+                "MCP · \(cleanMcp)",
+                "MCP · \(cleanMcp)",
+                argSnippet,
+                "puzzlepiece.extension"
+            )
+        }
         return (
             toolName,
             "Running \(toolName)",
             shortPath.isEmpty ? (command.isEmpty ? query : command) : shortPath,
             "wrench.and.screwdriver"
         )
+    }
+
+    public static func summarizeExecutionTrace(_ items: [TimelineEventItem]) -> (
+        title: String,
+        activeLabel: String?,
+        hasError: Bool,
+        isRunning: Bool,
+        thoughtCount: Int,
+        toolCount: Int
+    ) {
+        var thoughts = 0
+        var mcpCount = 0
+        var reads = 0
+        var edits = 0
+        var commands = 0
+        var searches = 0
+        var others = 0
+        var hasError = false
+        var activeLabel: String?
+
+        for item in items {
+            switch item.kind {
+            case .thinking(_, _, let isStreaming):
+                thoughts += 1
+                if isStreaming {
+                    let parsed = parseReasoning(item.content)
+                    activeLabel = parsed.summary.isEmpty ? "正在思考…" : "思考中 · \(parsed.summary)"
+                }
+            case .toolCall(_, let displayName, let verb, _, let output, let err):
+                if err { hasError = true }
+                if output == nil { activeLabel = verb }
+                if displayName.hasPrefix("MCP") {
+                    mcpCount += 1
+                } else {
+                    switch displayName {
+                    case "Read": reads += 1
+                    case "Edit": edits += 1
+                    case "Shell": commands += 1
+                    case "Search": searches += 1
+                    default: others += 1
+                    }
+                }
+            default:
+                break
+            }
+        }
+
+        let toolTotal = mcpCount + reads + edits + commands + searches + others
+        var parts: [String] = []
+        if thoughts > 0 { parts.append("思考 \(thoughts) 次") }
+        if mcpCount > 0 { parts.append("MCP \(mcpCount) 次") }
+        if reads > 0 { parts.append("读取 \(reads)") }
+        if searches > 0 { parts.append("搜索 \(searches)") }
+        if edits > 0 { parts.append("编辑 \(edits)") }
+        if commands > 0 { parts.append("命令 \(commands)") }
+        if others > 0 { parts.append("工具 \(others)") }
+
+        let summaryDetail = parts.isEmpty ? "执行完毕" : parts.joined(separator: " · ")
+        let title = "已收起 \(items.count) 步 · \(summaryDetail)"
+        return (title, activeLabel, hasError, activeLabel != nil, thoughts, toolTotal)
     }
 
     public static func summarizeToolBatch(_ items: [TimelineEventItem]) -> (title: String, activeVerb: String?, hasError: Bool, isRunning: Bool) {

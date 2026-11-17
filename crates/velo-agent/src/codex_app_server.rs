@@ -244,6 +244,8 @@ pub async fn spawn_codex_app_server(
             })
         };
 
+        let mut saw_turn_activity = false;
+
         loop {
             tokio::select! {
                 _ = &mut kill_rx => {
@@ -392,6 +394,7 @@ pub async fn spawn_codex_app_server(
                     let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
                     match method {
                         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                            saw_turn_activity = true;
                             if let Some(delta) = msg.pointer("/params/delta").and_then(|v| v.as_str()) {
                                 if !delta.is_empty() {
                                     accumulated_reasoning.push_str(delta);
@@ -405,6 +408,7 @@ pub async fn spawn_codex_app_server(
                             }
                         }
                         "item/reasoning/summaryPartAdded" => {
+                            saw_turn_activity = true;
                             if !accumulated_reasoning.is_empty() && !accumulated_reasoning.ends_with('\n') {
                                 accumulated_reasoning.push('\n');
                                 let _ = event_tx.send(AgentEvent::ThinkingChunk {
@@ -416,6 +420,7 @@ pub async fn spawn_codex_app_server(
                             }
                         }
                         "item/agentMessage/delta" => {
+                            saw_turn_activity = true;
                             if let Some(delta) = msg.pointer("/params/delta").and_then(|v| v.as_str()) {
                                 if !delta.is_empty() {
                                     accumulated_message.push_str(delta);
@@ -429,6 +434,7 @@ pub async fn spawn_codex_app_server(
                             }
                         }
                         "item/started" => {
+                            saw_turn_activity = true;
                             if let Some(item) = msg.pointer("/params/item") {
                                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                                 match item_type {
@@ -541,6 +547,7 @@ pub async fn spawn_codex_app_server(
                             }
                         }
                         "item/completed" => {
+                            saw_turn_activity = true;
                             if let Some(item) = msg.pointer("/params/item") {
                                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                                 match item_type {
@@ -683,12 +690,24 @@ pub async fn spawn_codex_app_server(
                             }
                         }
                         "thread/tokenUsage/updated" => {
+                            if !saw_turn_activity {
+                                // Ignore stale `thread/resume` echo of the previous turn's usage before this turn starts
+                                continue;
+                            }
+                            let ctx_win = msg
+                                .pointer("/params/tokenUsage/modelContextWindow")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(200_000);
                             if let Some(usage) = msg
                                 .pointer("/params/tokenUsage/last")
                                 .or_else(|| msg.pointer("/params/tokenUsage/total"))
                             {
                                 let input_tokens = usage
                                     .get("inputTokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let cache_read_tokens = usage
+                                    .get("cachedInputTokens")
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0);
                                 let output_tokens = usage
@@ -700,14 +719,21 @@ pub async fn spawn_codex_app_server(
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(input_tokens.saturating_add(output_tokens));
                                 if total_tokens > 0 {
-                                    let cost_usd = (input_tokens as f64 * 0.000_0025)
+                                    let uncached_in = input_tokens.saturating_sub(cache_read_tokens);
+                                    let cost_usd = (uncached_in as f64 * 0.000_0025)
+                                        + (cache_read_tokens as f64 * 0.000_00025)
                                         + (output_tokens as f64 * 0.000_01);
                                     let _ = event_tx.send(AgentEvent::UsageUpdated {
                                         session_id,
                                         input_tokens,
                                         output_tokens,
                                         total_tokens,
+                                        cache_read_tokens,
+                                        cache_write_tokens: 0,
+                                        context_window: ctx_win,
                                         cost_usd,
+                                        output_tps: 0.0,
+                                        is_turn_total: false,
                                         timestamp: Utc::now(),
                                     });
                                 }

@@ -39,27 +39,601 @@ pub mod relay_bridge;
 pub mod service;
 pub mod voice;
 
+pub fn canonical_workspace_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return velo_worktree::default_general_workspace()
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
+    }
+    let expanded = velo_worktree::expand_tilde_path(Path::new(trimmed));
+    let s = expanded.to_string_lossy().to_string();
+    if s.len() > 1 {
+        s.trim_end_matches('/').to_string()
+    } else {
+        s
+    }
+}
+
+pub fn round_tps(tps: f64) -> f64 {
+    if !tps.is_finite() || tps < 0.5 {
+        0.0
+    } else {
+        ((tps.min(999.9)) * 10.0).round() / 10.0
+    }
+}
+
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let mut explicit_thinking_tokens = 0u64;
+    let mut cleaned = trimmed.to_string();
+    while let Some(end_idx) = cleaned.find(" thinking tokens)") {
+        if let Some(open_idx) = cleaned[..end_idx].rfind('(') {
+            let num_str = cleaned[open_idx + 1..end_idx].trim();
+            if let Ok(n) = num_str.parse::<u64>() {
+                explicit_thinking_tokens += n;
+            }
+            let after = end_idx + " thinking tokens)".len();
+            cleaned.replace_range(open_idx..after, "");
+        } else {
+            break;
+        }
+    }
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for ch in cleaned.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ('\u{2E80}'..='\u{9FFF}').contains(&ch) || ('\u{F900}'..='\u{FAFF}').contains(&ch) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    let text_tok = if cjk == 0 && other == 0 {
+        0
+    } else {
+        ((cjk as f64 * 0.72) + (other as f64 * 0.27)).round().max(1.0) as u64
+    };
+    explicit_thinking_tokens + text_tok
+}
+
+fn event_timestamp_ms(ev: &AgentEvent) -> i64 {
+    match ev {
+        AgentEvent::StatusChanged { timestamp, .. }
+        | AgentEvent::UserMessage { timestamp, .. }
+        | AgentEvent::ProviderSessionBound { timestamp, .. }
+        | AgentEvent::PtyOutput { timestamp, .. }
+        | AgentEvent::ThinkingChunk { timestamp, .. }
+        | AgentEvent::ThinkingDelta { timestamp, .. }
+        | AgentEvent::MessageChunk { timestamp, .. }
+        | AgentEvent::MessageDelta { timestamp, .. }
+        | AgentEvent::UsageUpdated { timestamp, .. }
+        | AgentEvent::TerminalOutput { timestamp, .. }
+        | AgentEvent::ToolCallRequested { timestamp, .. }
+        | AgentEvent::ToolCallCompleted { timestamp, .. }
+        | AgentEvent::PermissionRequested { timestamp, .. }
+        | AgentEvent::PermissionResolved { timestamp, .. }
+        | AgentEvent::UserQuestionRequested { timestamp, .. }
+        | AgentEvent::UserQuestionAnswered { timestamp, .. }
+        | AgentEvent::BrowserCommand { timestamp, .. }
+        | AgentEvent::SetupHookOutput { timestamp, .. }
+        | AgentEvent::DiffUpdated { timestamp, .. }
+        | AgentEvent::Error { timestamp, .. } => timestamp.timestamp_millis(),
+    }
+}
+
+fn is_terminal_status_event(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::StatusChanged {
+            status: SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Stopped,
+            ..
+        }
+    )
+}
+
+fn upsert_turn_usage_event(hist: &mut Vec<AgentEvent>, usage_ev: AgentEvent) {
+    let turn_start = hist
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::UserMessage { .. }))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+
+    let mut existing_indices: Vec<usize> = hist[turn_start..]
+        .iter()
+        .enumerate()
+        .filter_map(|(off, e)| {
+            if matches!(e, AgentEvent::UsageUpdated { .. }) {
+                Some(turn_start + off)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if let Some(first_idx) = existing_indices.first().copied() {
+        hist[first_idx] = usage_ev;
+        for dup_idx in existing_indices.drain(1..).rev() {
+            hist.remove(dup_idx);
+        }
+        return;
+    }
+
+    if hist.len() > turn_start && is_terminal_status_event(&hist[hist.len() - 1]) {
+        hist.insert(hist.len() - 1, usage_ev);
+    } else {
+        hist.push(usage_ev);
+    }
+}
+
+/// Normalizes turn-level `UsageUpdated` events across historical event logs so every completed or
+/// multi-step turn carries a single authoritative `UsageUpdated { is_turn_total: true, output_tps, ... }`,
+/// ensuring Mac Desktop and iOS Mobile always render identical `tok/s` and token counts even after
+/// blind E2EE relay compaction.
+pub fn enrich_history_turn_metrics(events: &[AgentEvent]) -> Vec<AgentEvent> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+
+    #[derive(Clone, Debug)]
+    struct RawUsageStep {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        context_window: u64,
+        cost_usd: f64,
+        net_llm_sec: f64,
+        timestamp: chrono::DateTime<Utc>,
+    }
+
+    let mut user_positions: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            if matches!(e, AgentEvent::UserMessage { .. }) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if user_positions.is_empty() {
+        return events.to_vec();
+    }
+
+    let mut out: Vec<AgentEvent> = Vec::with_capacity(events.len());
+    if user_positions[0] > 0 {
+        out.extend_from_slice(&events[..user_positions[0]]);
+    }
+    user_positions.push(events.len());
+
+    for win in user_positions.windows(2) {
+        let turn_slice = &events[win[0]..win[1]];
+        let session_id = turn_slice[0].session_id();
+        let user_ts_ms = event_timestamp_ms(&turn_slice[0]);
+
+        let usage_events: Vec<&AgentEvent> = turn_slice
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::UsageUpdated { .. }))
+            .collect();
+
+        let already_normalized = !usage_events.is_empty()
+            && usage_events.iter().all(|e| {
+                matches!(
+                    e,
+                    AgentEvent::UsageUpdated {
+                        is_turn_total: true,
+                        ..
+                    }
+                )
+            })
+            && matches!(
+                usage_events.last(),
+                Some(AgentEvent::UsageUpdated { output_tps, .. }) if *output_tps >= 0.5
+            );
+
+        if already_normalized {
+            let final_usage = (*usage_events.last().unwrap()).clone();
+            let mut turn_out: Vec<AgentEvent> = turn_slice
+                .iter()
+                .filter(|e| !matches!(e, AgentEvent::UsageUpdated { .. }))
+                .cloned()
+                .collect();
+            if turn_out.len() > 1 && is_terminal_status_event(&turn_out[turn_out.len() - 1]) {
+                turn_out.insert(turn_out.len() - 1, final_usage);
+            } else {
+                turn_out.push(final_usage);
+            }
+            out.extend(turn_out);
+            continue;
+        }
+
+        let mut raw_steps: Vec<RawUsageStep> = Vec::new();
+        let mut step_anchor_ms = user_ts_ms;
+        let mut est_anchor_ms = user_ts_ms;
+        let mut tool_start_ms: Option<i64> = None;
+        let mut step_tool_wait_ms: i64 = 0;
+        let mut saw_item_in_turn = false;
+        let mut prev_was_thinking = false;
+        let mut est_tokens_total: u64 = 0;
+        let mut post_thinking_tok: u64 = 0;
+        let mut post_thinking_sec: f64 = 0.0;
+        let mut last_ts = match &turn_slice[0] {
+            AgentEvent::UserMessage { timestamp, .. } => *timestamp,
+            _ => Utc::now(),
+        };
+
+        for ev in &turn_slice[1..] {
+            let ts_ms = event_timestamp_ms(ev);
+            match ev {
+                AgentEvent::ThinkingDelta { text, timestamp, .. } => {
+                    saw_item_in_turn = true;
+                    last_ts = *timestamp;
+                    let tok = estimate_text_tokens(text);
+                    if tok > 0 {
+                        est_tokens_total += tok;
+                        est_anchor_ms = ts_ms;
+                        prev_was_thinking = true;
+                    }
+                }
+                AgentEvent::MessageDelta { text, timestamp, .. } => {
+                    saw_item_in_turn = true;
+                    last_ts = *timestamp;
+                    if !text.starts_with("[stderr]") {
+                        let tok = estimate_text_tokens(text);
+                        if tok > 0 {
+                            est_tokens_total += tok;
+                            if prev_was_thinking && tok >= 12 {
+                                let raw_sec = ((ts_ms - est_anchor_ms).max(0) as f64) / 1000.0;
+                                if (0.15..=60.0).contains(&raw_sec) {
+                                    let transition = (raw_sec * 0.18).min(0.8);
+                                    post_thinking_tok += tok;
+                                    post_thinking_sec += (raw_sec - transition).max(0.15);
+                                }
+                            }
+                            est_anchor_ms = ts_ms;
+                            prev_was_thinking = false;
+                        }
+                    }
+                }
+                AgentEvent::ToolCallRequested {
+                    arguments,
+                    timestamp,
+                    ..
+                } => {
+                    saw_item_in_turn = true;
+                    prev_was_thinking = false;
+                    last_ts = *timestamp;
+                    if tool_start_ms.is_none() {
+                        tool_start_ms = Some(ts_ms);
+                    }
+                    let arg_str = arguments.to_string();
+                    let tok = estimate_text_tokens(&arg_str).min(600);
+                    if tok >= 4 {
+                        est_tokens_total += tok;
+                    }
+                    est_anchor_ms = ts_ms;
+                }
+                AgentEvent::ToolCallCompleted { timestamp, .. } => {
+                    prev_was_thinking = false;
+                    last_ts = *timestamp;
+                    if let Some(t0) = tool_start_ms.take() {
+                        step_tool_wait_ms += (ts_ms - t0).max(0);
+                    }
+                    est_anchor_ms = ts_ms;
+                }
+                AgentEvent::PermissionRequested { .. }
+                | AgentEvent::UserQuestionRequested { .. } => {
+                    if tool_start_ms.is_none() {
+                        tool_start_ms = Some(ts_ms);
+                    }
+                }
+                AgentEvent::PermissionResolved { .. }
+                | AgentEvent::UserQuestionAnswered { .. } => {
+                    if let Some(t0) = tool_start_ms.take() {
+                        step_tool_wait_ms += (ts_ms - t0).max(0);
+                    }
+                    est_anchor_ms = ts_ms;
+                }
+                AgentEvent::UsageUpdated {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    context_window,
+                    cost_usd,
+                    timestamp,
+                    ..
+                } => {
+                    last_ts = *timestamp;
+                    if let Some(t0) = tool_start_ms.take() {
+                        step_tool_wait_ms += (ts_ms - t0).max(0);
+                    }
+                    let raw_dt_sec = ((ts_ms - step_anchor_ms).max(0) as f64) / 1000.0;
+                    let tool_sec = (step_tool_wait_ms.max(0) as f64) / 1000.0;
+                    let net_llm_sec = (raw_dt_sec - tool_sec).max(0.05);
+
+                    step_anchor_ms = ts_ms;
+                    est_anchor_ms = ts_ms;
+                    step_tool_wait_ms = 0;
+
+                    // Drop stale Codex `thread/resume` step-0 echo before any item starts in this turn
+                    if raw_steps.is_empty()
+                        && !saw_item_in_turn
+                        && raw_dt_sec < 1.2
+                        && *input_tokens > 20_000
+                        && *output_tokens >= 100
+                    {
+                        continue;
+                    }
+
+                    raw_steps.push(RawUsageStep {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        cache_read_tokens: *cache_read_tokens,
+                        cache_write_tokens: *cache_write_tokens,
+                        context_window: *context_window,
+                        cost_usd: *cost_usd,
+                        net_llm_sec,
+                        timestamp: *timestamp,
+                    });
+                }
+                AgentEvent::StatusChanged { timestamp, .. } => {
+                    last_ts = *timestamp;
+                }
+                _ => {}
+            }
+        }
+
+        let synthesized_usage: Option<AgentEvent> = if !raw_steps.is_empty() {
+            let n = raw_steps.len();
+            let is_claude_summary_tail = n >= 2
+                && raw_steps[..n - 1].iter().all(|s| s.cost_usd == 0.0)
+                && raw_steps[n - 1].cost_usd > 0.0;
+
+            let (turn_out, turn_cost, timing_steps) = if is_claude_summary_tail {
+                let sum_prior: u64 = raw_steps[..n - 1].iter().map(|s| s.output_tokens).sum();
+                let out_tok = raw_steps[n - 1].output_tokens.max(sum_prior);
+                let slice_end = if raw_steps[n - 1].net_llm_sec < 0.5 {
+                    n - 1
+                } else {
+                    n
+                };
+                (out_tok, raw_steps[n - 1].cost_usd, &raw_steps[..slice_end])
+            } else {
+                (
+                    raw_steps.iter().map(|s| s.output_tokens).sum(),
+                    raw_steps.iter().map(|s| s.cost_usd).sum(),
+                    &raw_steps[..],
+                )
+            };
+
+            let turn_in = raw_steps
+                .iter()
+                .rev()
+                .map(|s| s.input_tokens)
+                .find(|v| *v > 0)
+                .unwrap_or(0);
+            let turn_cache_read = raw_steps
+                .iter()
+                .rev()
+                .map(|s| s.cache_read_tokens)
+                .find(|v| *v > 0)
+                .unwrap_or(0);
+            let turn_cache_write = raw_steps
+                .iter()
+                .rev()
+                .map(|s| s.cache_write_tokens)
+                .find(|v| *v > 0)
+                .unwrap_or(0);
+            let turn_ctx_win = raw_steps
+                .iter()
+                .rev()
+                .map(|s| s.context_window)
+                .find(|v| *v > 0)
+                .unwrap_or(0);
+            let final_ts = raw_steps.last().map(|s| s.timestamp).unwrap_or(last_ts);
+
+            let mut big_tok = 0u64;
+            let mut big_sec = 0.0f64;
+            for s in timing_steps {
+                if s.output_tokens >= 600 && s.net_llm_sec >= 1.8 {
+                    let ttft =
+                        (1.8 + (s.input_tokens as f64) / 16_000.0).min(s.net_llm_sec * 0.45);
+                    big_tok += s.output_tokens;
+                    big_sec += (s.net_llm_sec - ttft).max(0.25);
+                }
+            }
+
+            let computed_tps = if big_tok > 0 && big_sec >= 0.25 {
+                round_tps(big_tok as f64 / big_sec)
+            } else {
+                let mut med_tok = 0u64;
+                let mut med_sec = 0.0f64;
+                for s in timing_steps {
+                    if s.output_tokens >= 140 && s.net_llm_sec >= 0.8 {
+                        let ttft =
+                            (1.8 + (s.input_tokens as f64) / 15_000.0).min(s.net_llm_sec * 0.68);
+                        med_tok += s.output_tokens;
+                        med_sec += (s.net_llm_sec - ttft).max(0.20);
+                    }
+                }
+                if med_tok > 0 && med_sec >= 0.20 {
+                    round_tps(med_tok as f64 / med_sec)
+                } else if post_thinking_tok > 0 && post_thinking_sec >= 0.15 {
+                    round_tps(post_thinking_tok as f64 / post_thinking_sec)
+                } else {
+                    0.0
+                }
+            };
+
+            Some(AgentEvent::UsageUpdated {
+                session_id,
+                input_tokens: turn_in,
+                output_tokens: turn_out,
+                total_tokens: turn_in.saturating_add(turn_out),
+                cache_read_tokens: turn_cache_read,
+                cache_write_tokens: turn_cache_write,
+                context_window: turn_ctx_win,
+                cost_usd: turn_cost,
+                output_tps: computed_tps,
+                is_turn_total: true,
+                timestamp: final_ts,
+            })
+        } else if est_tokens_total >= 6 {
+            let legacy_tps = if post_thinking_tok >= 12 && post_thinking_sec >= 0.15 {
+                round_tps(post_thinking_tok as f64 / post_thinking_sec)
+            } else {
+                0.0
+            };
+            Some(AgentEvent::UsageUpdated {
+                session_id,
+                input_tokens: 0,
+                output_tokens: est_tokens_total,
+                total_tokens: est_tokens_total,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                context_window: 0,
+                cost_usd: 0.0,
+                output_tps: legacy_tps,
+                is_turn_total: true,
+                timestamp: last_ts,
+            })
+        } else {
+            None
+        };
+
+        let mut turn_out: Vec<AgentEvent> = turn_slice
+            .iter()
+            .filter(|e| !matches!(e, AgentEvent::UsageUpdated { .. }))
+            .cloned()
+            .collect();
+        if let Some(usage_ev) = synthesized_usage {
+            if turn_out.len() > 1 && is_terminal_status_event(&turn_out[turn_out.len() - 1]) {
+                turn_out.insert(turn_out.len() - 1, usage_ev);
+            } else {
+                turn_out.push(usage_ev);
+            }
+        }
+        out.extend(turn_out);
+    }
+
+    out
+}
+
+pub struct LiveTurnMetrics {
+    pub base_session_output_tokens: u64,
+    pub base_session_cost_usd: f64,
+    pub step_started_at: std::time::Instant,
+    pub step_item_started_at: Option<std::time::Instant>,
+    pub step_first_token_at: Option<std::time::Instant>,
+    pub last_token_chunk_at: Option<std::time::Instant>,
+    pub pause_started_at: Option<std::time::Instant>,
+    pub step_pause_ms_since_item: u64,
+    pub step_pause_ms_since_token: u64,
+    pub step_pause_ms_total: u64,
+    pub step_stream_thinking: String,
+    pub step_stream_message: String,
+    pub turn_est_tokens: u64,
+    pub turn_est_decode_ms: u64,
+    pub turn_input_tokens: u64,
+    pub turn_output_tokens: u64,
+    pub turn_cache_read_tokens: u64,
+    pub turn_cache_write_tokens: u64,
+    pub turn_context_window: u64,
+    pub turn_cost_usd: f64,
+    pub turn_tps_tokens: u64,
+    pub turn_tps_decode_ms: u64,
+    pub last_live_emit_at: Option<std::time::Instant>,
+    pub last_computed_tps: f64,
+    pub provider_emitted_usage: bool,
+}
+
+impl LiveTurnMetrics {
+    pub fn new(base_session_output_tokens: u64, base_session_cost_usd: f64) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            base_session_output_tokens,
+            base_session_cost_usd,
+            step_started_at: now,
+            step_item_started_at: None,
+            step_first_token_at: None,
+            last_token_chunk_at: None,
+            pause_started_at: None,
+            step_pause_ms_since_item: 0,
+            step_pause_ms_since_token: 0,
+            step_pause_ms_total: 0,
+            step_stream_thinking: String::new(),
+            step_stream_message: String::new(),
+            turn_est_tokens: 0,
+            turn_est_decode_ms: 0,
+            turn_input_tokens: 0,
+            turn_output_tokens: 0,
+            turn_cache_read_tokens: 0,
+            turn_cache_write_tokens: 0,
+            turn_context_window: 0,
+            turn_cost_usd: 0.0,
+            turn_tps_tokens: 0,
+            turn_tps_decode_ms: 0,
+            last_live_emit_at: None,
+            last_computed_tps: 0.0,
+            provider_emitted_usage: false,
+        }
+    }
+
+    fn current_step_stream_tokens(&self) -> u64 {
+        estimate_text_tokens(&self.step_stream_thinking)
+            + estimate_text_tokens(&self.step_stream_message)
+    }
+
+    fn reset_step_window(&mut self, now: std::time::Instant) {
+        self.step_started_at = now;
+        self.step_item_started_at = None;
+        self.step_first_token_at = None;
+        self.last_token_chunk_at = None;
+        self.pause_started_at = None;
+        self.step_pause_ms_since_item = 0;
+        self.step_pause_ms_since_token = 0;
+        self.step_pause_ms_total = 0;
+        self.step_stream_thinking.clear();
+        self.step_stream_message.clear();
+    }
+}
+
 pub struct DaemonInner {
     pub sessions: HashMap<Uuid, SessionInfo>,
     pub event_history: HashMap<Uuid, Vec<AgentEvent>>,
+    pub live_turns: HashMap<Uuid, LiveTurnMetrics>,
     pub handles: HashMap<Uuid, AgentHandle>,
     pub shells: HashMap<Uuid, InteractiveShellHandle>,
     pub pending_approvals: HashMap<String, oneshot::Sender<String>>,
     pub pending_questions: HashMap<String, oneshot::Sender<Vec<String>>>,
     pub automations: Vec<automations::AutomationRule>,
     pub repo_hooks: HashMap<String, String>,
+    pub workspaces: Vec<String>,
 }
 
 #[derive(Clone)]
 pub struct DaemonState {
     pub inner: Arc<RwLock<DaemonInner>>,
+    pub agent_event_tx: broadcast::Sender<AgentEvent>,
     pub event_tx: broadcast::Sender<AgentEvent>,
+    pub snapshot_tx: broadcast::Sender<Vec<SessionInfo>>,
     pub worktree_mgr: WorktreeManager,
     pub state_file: PathBuf,
     pub events_dir: PathBuf,
     pub attachments_dir: PathBuf,
     pub automations_file: PathBuf,
     pub hooks_file: PathBuf,
+    pub workspaces_file: PathBuf,
     pub daemon_http_base: Option<String>,
 }
 
@@ -72,6 +646,7 @@ impl DaemonState {
         let attachments_dir = velo_home.join("attachments");
         let automations_file = velo_home.join("automations.json");
         let hooks_file = velo_home.join("repo_hooks.json");
+        let workspaces_file = velo_home.join("workspaces.json");
         tokio::fs::create_dir_all(&events_dir).await?;
         tokio::fs::create_dir_all(&attachments_dir).await?;
 
@@ -81,6 +656,8 @@ impl DaemonState {
             if let Ok(raw) = tokio::fs::read_to_string(&state_file).await {
                 if let Ok(saved) = serde_json::from_str::<Vec<SessionInfo>>(&raw) {
                     for mut s in saved {
+                        s.repo_root = canonical_workspace_path(&s.repo_root);
+                        s.worktree_path = canonical_workspace_path(&s.worktree_path);
                         if matches!(
                             s.status,
                             SessionStatus::Starting
@@ -92,7 +669,27 @@ impl DaemonState {
                         let ev_path = events_dir.join(format!("{}.json", s.id));
                         if let Ok(ev_raw) = tokio::fs::read_to_string(&ev_path).await {
                             if let Ok(evs) = serde_json::from_str::<Vec<AgentEvent>>(&ev_raw) {
-                                event_history.insert(s.id, evs);
+                                let enriched = enrich_history_turn_metrics(&evs);
+                                let mut sum_out = 0u64;
+                                let mut sum_cost = 0.0f64;
+                                for e in &enriched {
+                                    if let AgentEvent::UsageUpdated {
+                                        output_tokens,
+                                        cost_usd,
+                                        ..
+                                    } = e
+                                    {
+                                        sum_out += *output_tokens;
+                                        sum_cost += *cost_usd;
+                                    }
+                                }
+                                if sum_out > s.output_tokens {
+                                    s.output_tokens = sum_out;
+                                }
+                                if sum_cost > s.cost_usd {
+                                    s.cost_usd = sum_cost;
+                                }
+                                event_history.insert(s.id, enriched);
                             }
                         }
                         sessions.insert(s.id, s);
@@ -113,25 +710,57 @@ impl DaemonState {
             HashMap::new()
         };
 
-        let (event_tx, _) = broadcast::channel(2048);
+        let mut workspaces_list: Vec<String> =
+            if let Ok(raw) = tokio::fs::read_to_string(&workspaces_file).await {
+                serde_json::from_str::<Vec<String>>(&raw)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| canonical_workspace_path(&p))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let mut ordered_sessions: Vec<&SessionInfo> = sessions.values().collect();
+        ordered_sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        for s in ordered_sessions {
+            let clean = canonical_workspace_path(&s.repo_root);
+            if !clean.is_empty() && !workspaces_list.contains(&clean) {
+                workspaces_list.push(clean);
+            }
+        }
+        if workspaces_list.is_empty() {
+            let def_ws = canonical_workspace_path(
+                &velo_worktree::default_general_workspace().to_string_lossy(),
+            );
+            workspaces_list.push(def_ws);
+        }
+
+        let (agent_event_tx, _) = broadcast::channel(4096);
+        let (event_tx, _) = broadcast::channel(4096);
+        let (snapshot_tx, _) = broadcast::channel(128);
         let state = Self {
             inner: Arc::new(RwLock::new(DaemonInner {
                 sessions,
                 event_history,
+                live_turns: HashMap::new(),
                 handles: HashMap::new(),
                 shells: HashMap::new(),
                 pending_approvals: HashMap::new(),
                 pending_questions: HashMap::new(),
                 automations: automations_list,
                 repo_hooks: repo_hooks_map,
+                workspaces: workspaces_list,
             })),
+            agent_event_tx,
             event_tx,
+            snapshot_tx,
             worktree_mgr: WorktreeManager::default(),
             state_file,
             events_dir,
             attachments_dir,
             automations_file,
             hooks_file,
+            workspaces_file,
             daemon_http_base: Some(format!(
                 "http://127.0.0.1:{}",
                 velo_protocol::DEFAULT_DAEMON_PORT
@@ -144,73 +773,471 @@ impl DaemonState {
     }
 
     fn spawn_event_supervisor(&self) {
-        let mut rx = self.event_tx.subscribe();
+        let mut rx = self.agent_event_tx.subscribe();
         let state = self.clone();
 
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
                 let session_id = event.session_id();
+                let now = std::time::Instant::now();
                 let mut should_refresh_diff = false;
                 let mut should_persist_events = false;
                 let mut should_persist_sessions = false;
+                let mut outbound_events: Vec<AgentEvent> = Vec::with_capacity(2);
 
                 {
                     let mut guard = state.inner.write().await;
-                    if !matches!(
-                        event,
-                        AgentEvent::UserMessage { .. }
-                            | AgentEvent::ProviderSessionBound { .. }
-                            | AgentEvent::ThinkingChunk { .. }
-                            | AgentEvent::MessageChunk { .. }
-                            | AgentEvent::TerminalOutput { .. }
-                            | AgentEvent::UsageUpdated { .. }
-                    ) {
-                        guard
-                            .event_history
-                            .entry(session_id)
-                            .or_default()
-                            .push(event.clone());
-                        should_persist_events = true;
+                    let is_codex = guard
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| matches!(s.provider, AgentProvider::Codex))
+                        .unwrap_or(false);
+                    let (base_out, base_cost) = guard
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| (s.output_tokens, s.cost_usd))
+                        .unwrap_or((0, 0.0));
+
+                    let metrics = guard
+                        .live_turns
+                        .entry(session_id)
+                        .or_insert_with(|| LiveTurnMetrics::new(base_out, base_cost));
+
+                    match &event {
+                        AgentEvent::ThinkingChunk { delta, replace, .. } => {
+                            if is_codex && metrics.step_item_started_at.is_none() {
+                                metrics.step_item_started_at = Some(now);
+                                metrics.step_pause_ms_since_item = 0;
+                            }
+                            if !delta.is_empty() {
+                                if let Some(prev_tok_at) = metrics.last_token_chunk_at {
+                                    if now.duration_since(prev_tok_at).as_millis() > 4_500
+                                        && metrics.pause_started_at.is_none()
+                                        && metrics.current_step_stream_tokens() == 0
+                                    {
+                                        metrics.step_first_token_at = Some(now);
+                                        metrics.step_pause_ms_since_token = 0;
+                                    }
+                                }
+                                if metrics.step_first_token_at.is_none() {
+                                    metrics.step_first_token_at = Some(now);
+                                    metrics.step_pause_ms_since_token = 0;
+                                }
+                                metrics.last_token_chunk_at = Some(now);
+                                if *replace {
+                                    metrics.step_stream_thinking = delta.clone();
+                                } else {
+                                    metrics.step_stream_thinking.push_str(delta);
+                                }
+                            }
+                        }
+                        AgentEvent::MessageChunk { delta, replace, .. } => {
+                            if !delta.is_empty() {
+                                if metrics.step_first_token_at.is_none() {
+                                    metrics.step_first_token_at = Some(now);
+                                    metrics.step_pause_ms_since_token = 0;
+                                }
+                                metrics.last_token_chunk_at = Some(now);
+                                if *replace {
+                                    metrics.step_stream_message = delta.clone();
+                                } else {
+                                    metrics.step_stream_message.push_str(delta);
+                                }
+                            }
+                        }
+                        AgentEvent::ThinkingDelta { text, .. } => {
+                            if metrics.step_stream_thinking.is_empty() {
+                                let tok = estimate_text_tokens(text);
+                                if tok > 0 {
+                                    let raw_ms = (now
+                                        .duration_since(
+                                            metrics.step_item_started_at.unwrap_or(metrics.step_started_at),
+                                        )
+                                        .as_millis() as u64)
+                                        .saturating_sub(metrics.step_pause_ms_total);
+                                    let decode_ms = if metrics.step_item_started_at.is_some() {
+                                        raw_ms.max(120)
+                                    } else {
+                                        raw_ms.saturating_sub((raw_ms / 2).min(1_800)).max(150)
+                                    };
+                                    metrics.turn_est_tokens += tok;
+                                    metrics.turn_est_decode_ms += decode_ms;
+                                }
+                            }
+                        }
+                        AgentEvent::MessageDelta { text, .. } => {
+                            if !text.starts_with("[stderr]") && metrics.step_stream_message.is_empty() {
+                                let tok = estimate_text_tokens(text);
+                                if tok > 0 {
+                                    let raw_ms = (now
+                                        .duration_since(
+                                            metrics.step_item_started_at.unwrap_or(metrics.step_started_at),
+                                        )
+                                        .as_millis() as u64)
+                                        .saturating_sub(metrics.step_pause_ms_total);
+                                    let decode_ms = if metrics.step_item_started_at.is_some() {
+                                        raw_ms.max(120)
+                                    } else {
+                                        raw_ms.saturating_sub((raw_ms * 2 / 5).min(1_600)).max(150)
+                                    };
+                                    metrics.turn_est_tokens += tok;
+                                    metrics.turn_est_decode_ms += decode_ms;
+                                }
+                            }
+                        }
+                        AgentEvent::ToolCallRequested { .. }
+                        | AgentEvent::PermissionRequested { .. }
+                        | AgentEvent::UserQuestionRequested { .. } => {
+                            if metrics.pause_started_at.is_none() {
+                                metrics.pause_started_at = Some(now);
+                            }
+                        }
+                        AgentEvent::ToolCallCompleted { .. }
+                        | AgentEvent::PermissionResolved { .. }
+                        | AgentEvent::UserQuestionAnswered { .. } => {
+                            if let Some(p0) = metrics.pause_started_at.take() {
+                                let dt = now.duration_since(p0).as_millis() as u64;
+                                metrics.step_pause_ms_total += dt;
+                                if metrics.step_item_started_at.is_some() {
+                                    metrics.step_pause_ms_since_item += dt;
+                                }
+                                if metrics.step_first_token_at.is_some() {
+                                    metrics.step_pause_ms_since_token += dt;
+                                }
+                            }
+                            if matches!(event, AgentEvent::ToolCallCompleted { .. })
+                                && !is_codex
+                                && !metrics.provider_emitted_usage
+                            {
+                                let stream_tok = metrics.current_step_stream_tokens();
+                                if stream_tok > 0 {
+                                    if let Some(t0) = metrics.step_first_token_at {
+                                        let dec_ms = (now.duration_since(t0).as_millis() as u64)
+                                            .saturating_sub(metrics.step_pause_ms_since_token)
+                                            .max(120);
+                                        metrics.turn_est_tokens += stream_tok;
+                                        metrics.turn_est_decode_ms += dec_ms;
+                                    }
+                                    metrics.reset_step_window(now);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
 
-                    if let Some(session) = guard.sessions.get_mut(&session_id) {
-                        session.updated_at = Utc::now();
-                        match &event {
-                            AgentEvent::StatusChanged { status, .. } => {
-                                session.status = *status;
-                                should_refresh_diff = true;
-                                should_persist_sessions = true;
-                            }
-                            AgentEvent::ProviderSessionBound {
-                                provider_session_id,
-                                ..
-                            } => {
-                                session.provider_session_id = Some(provider_session_id.clone());
-                                should_persist_sessions = true;
-                            }
-                            AgentEvent::UsageUpdated {
-                                total_tokens,
-                                cost_usd,
-                                ..
-                            } => {
-                                if *total_tokens > 0 {
-                                    session.tokens_used = *total_tokens;
+                    // Live streaming TPS tick (~350ms cadence) while non-empty chunks are flowing
+                    if matches!(
+                        &event,
+                        AgentEvent::ThinkingChunk { delta, .. } | AgentEvent::MessageChunk { delta, .. }
+                            if !delta.is_empty()
+                    ) {
+                        if let Some(t0) = metrics.step_first_token_at {
+                            let step_dec_ms = (now.duration_since(t0).as_millis() as u64)
+                                .saturating_sub(metrics.step_pause_ms_since_token);
+                            let step_tok = metrics.current_step_stream_tokens();
+                            let due = metrics
+                                .last_live_emit_at
+                                .map(|prev| now.duration_since(prev).as_millis() >= 350)
+                                .unwrap_or(true);
+                            if step_dec_ms >= 280 && step_tok >= 3 && due {
+                                let base_tok = if metrics.turn_tps_tokens > 0 {
+                                    metrics.turn_tps_tokens
+                                } else {
+                                    metrics.turn_est_tokens
+                                };
+                                let base_ms = if metrics.turn_tps_tokens > 0 {
+                                    metrics.turn_tps_decode_ms
+                                } else {
+                                    metrics.turn_est_decode_ms
+                                };
+                                let tot_tok = base_tok + step_tok;
+                                let tot_ms = (base_ms + step_dec_ms).max(200);
+                                let live_tps =
+                                    round_tps(tot_tok as f64 / (tot_ms as f64 / 1000.0));
+                                if live_tps >= 0.5 {
+                                    metrics.last_live_emit_at = Some(now);
+                                    metrics.last_computed_tps = live_tps;
+                                    let live_out = metrics.turn_output_tokens + step_tok;
+                                    outbound_events.push(event.clone());
+                                    outbound_events.push(AgentEvent::UsageUpdated {
+                                        session_id,
+                                        input_tokens: metrics.turn_input_tokens,
+                                        output_tokens: live_out,
+                                        total_tokens: metrics
+                                            .turn_input_tokens
+                                            .saturating_add(live_out),
+                                        cache_read_tokens: metrics.turn_cache_read_tokens,
+                                        cache_write_tokens: metrics.turn_cache_write_tokens,
+                                        context_window: metrics.turn_context_window,
+                                        cost_usd: metrics.turn_cost_usd,
+                                        output_tps: live_tps,
+                                        is_turn_total: true,
+                                        timestamp: Utc::now(),
+                                    });
                                 }
-                                if *cost_usd > 0.0 {
-                                    session.cost_usd += *cost_usd;
-                                }
-                                should_persist_sessions = true;
                             }
-                            AgentEvent::ToolCallCompleted { .. } => {
-                                should_refresh_diff = true;
-                            }
-                            AgentEvent::DiffUpdated { stats, .. } => {
-                                session.diff_stats = stats.clone();
-                                should_persist_sessions = true;
-                            }
-                            _ => {}
                         }
                     }
+
+                    if let AgentEvent::UsageUpdated {
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                        context_window,
+                        cost_usd,
+                        is_turn_total,
+                        timestamp,
+                        ..
+                    } = &event
+                    {
+                        metrics.provider_emitted_usage = true;
+                        if let Some(p0) = metrics.pause_started_at.take() {
+                            let dt = now.duration_since(p0).as_millis() as u64;
+                            metrics.step_pause_ms_total += dt;
+                            if metrics.step_item_started_at.is_some() {
+                                metrics.step_pause_ms_since_item += dt;
+                            }
+                            if metrics.step_first_token_at.is_some() {
+                                metrics.step_pause_ms_since_token += dt;
+                            }
+                        }
+
+                        if *input_tokens > 0 {
+                            metrics.turn_input_tokens = *input_tokens;
+                        }
+                        if *cache_read_tokens > 0 {
+                            metrics.turn_cache_read_tokens = *cache_read_tokens;
+                        }
+                        if *cache_write_tokens > 0 {
+                            metrics.turn_cache_write_tokens = *cache_write_tokens;
+                        }
+                        if *context_window > 0 {
+                            metrics.turn_context_window = *context_window;
+                        }
+
+                        let step_delta_tokens = if *is_turn_total {
+                            let delta = output_tokens.saturating_sub(metrics.turn_output_tokens);
+                            metrics.turn_output_tokens =
+                                metrics.turn_output_tokens.max(*output_tokens);
+                            if *cost_usd > 0.0 {
+                                metrics.turn_cost_usd = *cost_usd;
+                            }
+                            delta
+                        } else {
+                            metrics.turn_output_tokens += *output_tokens;
+                            metrics.turn_cost_usd += *cost_usd;
+                            *output_tokens
+                        };
+
+                        if step_delta_tokens > 0 {
+                            let obs_decode_ms = if let Some(t_item) = metrics.step_item_started_at {
+                                Some(
+                                    (now.duration_since(t_item).as_millis() as u64)
+                                        .saturating_sub(metrics.step_pause_ms_since_item),
+                                )
+                            } else if let Some(t_tok) = metrics.step_first_token_at {
+                                Some(
+                                    (now.duration_since(t_tok).as_millis() as u64)
+                                        .saturating_sub(metrics.step_pause_ms_since_token),
+                                )
+                            } else {
+                                None
+                            };
+
+                            if let Some(dec_ms) = obs_decode_ms {
+                                if dec_ms >= 140 {
+                                    metrics.turn_tps_tokens += step_delta_tokens;
+                                    metrics.turn_tps_decode_ms += dec_ms;
+                                }
+                            } else if step_delta_tokens >= 180 {
+                                let raw_ms = (now
+                                    .duration_since(metrics.step_started_at)
+                                    .as_millis() as u64)
+                                    .saturating_sub(metrics.step_pause_ms_total);
+                                let est_ttft_ms = (1_400
+                                    + (metrics.turn_input_tokens / 22))
+                                    .min((raw_ms * 3) / 10);
+                                let dec_ms = raw_ms.saturating_sub(est_ttft_ms).max(250);
+                                metrics.turn_tps_tokens += step_delta_tokens;
+                                metrics.turn_tps_decode_ms += dec_ms;
+                            }
+                        }
+
+                        if metrics.turn_tps_tokens > 0 && metrics.turn_tps_decode_ms >= 140 {
+                            metrics.last_computed_tps = round_tps(
+                                metrics.turn_tps_tokens as f64
+                                    / (metrics.turn_tps_decode_ms as f64 / 1000.0),
+                            );
+                        } else if metrics.last_computed_tps < 0.5 && metrics.turn_output_tokens > 0 {
+                            let raw_ms = (now
+                                .duration_since(metrics.step_started_at)
+                                .as_millis() as u64)
+                                .saturating_sub(metrics.step_pause_ms_total);
+                            let est_ttft_ms = (1_400 + (metrics.turn_input_tokens / 18))
+                                .min((raw_ms * 7) / 10);
+                            let dec_ms = raw_ms.saturating_sub(est_ttft_ms).max(200);
+                            metrics.last_computed_tps = round_tps(
+                                metrics.turn_output_tokens as f64 / (dec_ms as f64 / 1000.0),
+                            );
+                        }
+
+                        metrics.reset_step_window(now);
+
+                        let norm_usage = AgentEvent::UsageUpdated {
+                            session_id,
+                            input_tokens: metrics.turn_input_tokens,
+                            output_tokens: metrics.turn_output_tokens,
+                            total_tokens: metrics
+                                .turn_input_tokens
+                                .saturating_add(metrics.turn_output_tokens),
+                            cache_read_tokens: metrics.turn_cache_read_tokens,
+                            cache_write_tokens: metrics.turn_cache_write_tokens,
+                            context_window: metrics.turn_context_window,
+                            cost_usd: metrics.turn_cost_usd,
+                            output_tps: metrics.last_computed_tps,
+                            is_turn_total: true,
+                            timestamp: *timestamp,
+                        };
+
+                        let base_out_snap = metrics.base_session_output_tokens;
+                        let base_cost_snap = metrics.base_session_cost_usd;
+                        let turn_in_snap = metrics.turn_input_tokens;
+                        let turn_out_snap = metrics.turn_output_tokens;
+                        let turn_cache_snap = metrics.turn_cache_read_tokens;
+                        let turn_ctx_snap = metrics.turn_context_window;
+                        let turn_cost_snap = metrics.turn_cost_usd;
+
+                        let hist = guard.event_history.entry(session_id).or_default();
+                        upsert_turn_usage_event(hist, norm_usage.clone());
+                        should_persist_events = true;
+
+                        if let Some(session) = guard.sessions.get_mut(&session_id) {
+                            session.updated_at = Utc::now();
+                            if turn_in_snap > 0 {
+                                session.input_tokens = turn_in_snap;
+                            }
+                            session.output_tokens = base_out_snap.saturating_add(turn_out_snap);
+                            if turn_cache_snap > 0 {
+                                session.cache_read_tokens = turn_cache_snap;
+                            }
+                            if turn_ctx_snap > 0 {
+                                session.context_window = turn_ctx_snap;
+                            }
+                            session.tokens_used = turn_in_snap.saturating_add(turn_out_snap);
+                            session.cost_usd = base_cost_snap + turn_cost_snap;
+                            should_persist_sessions = true;
+                        }
+
+                        outbound_events.push(norm_usage);
+                    } else {
+                        // Synthesize end-of-turn UsageUpdated for providers (AGY / Cursor / Grok) that didn't emit UsageUpdated
+                        if is_terminal_status_event(&event) {
+                            let rem_stream_tok = metrics.current_step_stream_tokens();
+                            if rem_stream_tok > 0 {
+                                if let Some(t0) = metrics.step_first_token_at {
+                                    let dec_ms = (now.duration_since(t0).as_millis() as u64)
+                                        .saturating_sub(metrics.step_pause_ms_since_token)
+                                        .max(120);
+                                    metrics.turn_est_tokens += rem_stream_tok;
+                                    metrics.turn_est_decode_ms += dec_ms;
+                                }
+                            }
+                            if !metrics.provider_emitted_usage && metrics.turn_est_tokens > 0 {
+                                let final_tps = if metrics.turn_est_decode_ms >= 140 {
+                                    round_tps(
+                                        metrics.turn_est_tokens as f64
+                                            / (metrics.turn_est_decode_ms as f64 / 1000.0),
+                                    )
+                                } else {
+                                    metrics.last_computed_tps
+                                };
+                                let synth_usage = AgentEvent::UsageUpdated {
+                                    session_id,
+                                    input_tokens: metrics.turn_input_tokens,
+                                    output_tokens: metrics.turn_est_tokens,
+                                    total_tokens: metrics
+                                        .turn_input_tokens
+                                        .saturating_add(metrics.turn_est_tokens),
+                                    cache_read_tokens: metrics.turn_cache_read_tokens,
+                                    cache_write_tokens: metrics.turn_cache_write_tokens,
+                                    context_window: metrics.turn_context_window,
+                                    cost_usd: 0.0,
+                                    output_tps: final_tps,
+                                    is_turn_total: true,
+                                    timestamp: Utc::now(),
+                                };
+                                let base_out_snap = metrics.base_session_output_tokens;
+                                let est_out_snap = metrics.turn_est_tokens;
+                                let hist = guard.event_history.entry(session_id).or_default();
+                                upsert_turn_usage_event(hist, synth_usage.clone());
+                                if let Some(session) = guard.sessions.get_mut(&session_id) {
+                                    session.output_tokens =
+                                        base_out_snap.saturating_add(est_out_snap);
+                                }
+                                outbound_events.push(synth_usage);
+                                should_persist_events = true;
+                                should_persist_sessions = true;
+                            }
+                            guard.live_turns.remove(&session_id);
+                        }
+
+                        if !matches!(
+                            event,
+                            AgentEvent::UserMessage { .. }
+                                | AgentEvent::ProviderSessionBound { .. }
+                                | AgentEvent::ThinkingChunk { .. }
+                                | AgentEvent::MessageChunk { .. }
+                                | AgentEvent::TerminalOutput { .. }
+                        ) {
+                            guard
+                                .event_history
+                                .entry(session_id)
+                                .or_default()
+                                .push(event.clone());
+                            should_persist_events = true;
+                        }
+
+                        if let Some(session) = guard.sessions.get_mut(&session_id) {
+                            session.updated_at = Utc::now();
+                            match &event {
+                                AgentEvent::StatusChanged { status, .. } => {
+                                    session.status = *status;
+                                    should_refresh_diff = true;
+                                    should_persist_sessions = true;
+                                }
+                                AgentEvent::ProviderSessionBound {
+                                    provider_session_id,
+                                    ..
+                                } => {
+                                    session.provider_session_id =
+                                        Some(provider_session_id.clone());
+                                    should_persist_sessions = true;
+                                }
+                                AgentEvent::ToolCallCompleted { .. } => {
+                                    should_refresh_diff = true;
+                                }
+                                AgentEvent::DiffUpdated { stats, .. } => {
+                                    session.diff_stats = stats.clone();
+                                    should_persist_sessions = true;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if outbound_events.is_empty()
+                            || !matches!(
+                                outbound_events.first(),
+                                Some(AgentEvent::ThinkingChunk { .. } | AgentEvent::MessageChunk { .. })
+                            )
+                        {
+                            outbound_events.push(event);
+                        }
+                    }
+                }
+
+                for out_ev in outbound_events {
+                    let _ = state.event_tx.send(out_ev);
                 }
 
                 if should_refresh_diff {
@@ -265,6 +1292,7 @@ impl DaemonState {
         };
         let json_str = serde_json::to_string_pretty(&list)?;
         tokio::fs::write(&self.state_file, json_str).await?;
+        let _ = self.snapshot_tx.send(list);
         Ok(())
     }
 
@@ -288,6 +1316,51 @@ impl DaemonState {
         Ok(())
     }
 
+    pub async fn persist_workspaces(&self) -> Result<()> {
+        let list = {
+            let guard = self.inner.read().await;
+            guard.workspaces.clone()
+        };
+        let json_str = serde_json::to_string_pretty(&list)?;
+        tokio::fs::write(&self.workspaces_file, json_str).await?;
+        Ok(())
+    }
+
+    pub async fn list_workspaces(&self) -> Vec<String> {
+        let guard = self.inner.read().await;
+        let mut out = guard.workspaces.clone();
+        for s in guard.sessions.values() {
+            let clean = canonical_workspace_path(&s.repo_root);
+            if !clean.is_empty() && !out.contains(&clean) {
+                out.push(clean);
+            }
+        }
+        out
+    }
+
+    pub async fn add_workspace(&self, raw_path: &str) -> Vec<String> {
+        let clean = canonical_workspace_path(raw_path);
+        let _ = velo_worktree::ensure_usable_workspace_dir(Path::new(&clean)).await;
+        {
+            let mut guard = self.inner.write().await;
+            if !clean.is_empty() && !guard.workspaces.contains(&clean) {
+                guard.workspaces.push(clean);
+            }
+        }
+        let _ = self.persist_workspaces().await;
+        self.list_workspaces().await
+    }
+
+    pub async fn remove_workspace(&self, raw_path: &str) -> Vec<String> {
+        let clean = canonical_workspace_path(raw_path);
+        {
+            let mut guard = self.inner.write().await;
+            guard.workspaces.retain(|w| w != &clean);
+        }
+        let _ = self.persist_workspaces().await;
+        self.list_workspaces().await
+    }
+
     pub async fn await_permission_gate(
         &self,
         session_id: Uuid,
@@ -305,13 +1378,13 @@ impl DaemonState {
                 s.updated_at = Utc::now();
             }
         }
-        let _ = self.event_tx.send(AgentEvent::StatusChanged {
+        let _ = self.agent_event_tx.send(AgentEvent::StatusChanged {
             session_id,
             status: SessionStatus::WaitingForPermission,
             message: Some(format!("Waiting for approval: {}", tool_name)),
             timestamp: Utc::now(),
         });
-        let _ = self.event_tx.send(AgentEvent::PermissionRequested {
+        let _ = self.agent_event_tx.send(AgentEvent::PermissionRequested {
             session_id,
             request_id: request_id.clone(),
             tool_name: tool_name.to_string(),
@@ -344,13 +1417,13 @@ impl DaemonState {
             guard.pending_approvals.remove(request_id)
         };
         let _ = self.persist_sessions().await;
-        let _ = self.event_tx.send(AgentEvent::PermissionResolved {
+        let _ = self.agent_event_tx.send(AgentEvent::PermissionResolved {
             session_id,
             request_id: request_id.to_string(),
             decision: decision.to_string(),
             timestamp: Utc::now(),
         });
-        let _ = self.event_tx.send(AgentEvent::StatusChanged {
+        let _ = self.agent_event_tx.send(AgentEvent::StatusChanged {
             session_id,
             status: SessionStatus::Running,
             message: Some(format!("Permission {}", decision)),
@@ -381,13 +1454,13 @@ impl DaemonState {
                 s.updated_at = Utc::now();
             }
         }
-        let _ = self.event_tx.send(AgentEvent::StatusChanged {
+        let _ = self.agent_event_tx.send(AgentEvent::StatusChanged {
             session_id,
             status: SessionStatus::WaitingForPermission,
             message: Some("Waiting for user answer".to_string()),
             timestamp: Utc::now(),
         });
-        let _ = self.event_tx.send(AgentEvent::UserQuestionRequested {
+        let _ = self.agent_event_tx.send(AgentEvent::UserQuestionRequested {
             session_id,
             question_id: question_id.clone(),
             question,
@@ -420,13 +1493,13 @@ impl DaemonState {
             }
             guard.pending_questions.remove(question_id)
         };
-        let _ = self.event_tx.send(AgentEvent::UserQuestionAnswered {
+        let _ = self.agent_event_tx.send(AgentEvent::UserQuestionAnswered {
             session_id,
             question_id: question_id.to_string(),
             answers: answers.clone(),
             timestamp: Utc::now(),
         });
-        let _ = self.event_tx.send(AgentEvent::StatusChanged {
+        let _ = self.agent_event_tx.send(AgentEvent::StatusChanged {
             session_id,
             status: SessionStatus::Running,
             message: Some("User answered question".to_string()),
@@ -440,18 +1513,61 @@ impl DaemonState {
         }
     }
 
-    pub async fn stop_session_by_id(&self, id: Uuid) {
+    async fn mark_session_spawn_failed(&self, id: Uuid, err_msg: &str) {
         {
             let mut guard = self.inner.write().await;
-            if let Some(mut handle) = guard.handles.remove(&id) {
-                handle.stop();
-            }
             if let Some(session) = guard.sessions.get_mut(&id) {
-                session.status = SessionStatus::Stopped;
+                session.status = SessionStatus::Failed;
+                session.pid = None;
                 session.updated_at = Utc::now();
             }
         }
         let _ = self.persist_sessions().await;
+        let _ = self.agent_event_tx.send(AgentEvent::Error {
+            session_id: id,
+            error: err_msg.to_string(),
+            timestamp: Utc::now(),
+        });
+        let _ = self.agent_event_tx.send(AgentEvent::StatusChanged {
+            session_id: id,
+            status: SessionStatus::Failed,
+            message: Some(err_msg.to_string()),
+            timestamp: Utc::now(),
+        });
+    }
+
+    pub async fn stop_session_by_id(&self, id: Uuid) {
+        let (old_handle, orphan_pid) = {
+            let mut guard = self.inner.write().await;
+            let h = guard.handles.remove(&id);
+            let mut pid = None;
+            if let Some(session) = guard.sessions.get_mut(&id) {
+                pid = session.pid.take();
+                session.status = SessionStatus::Stopped;
+                session.updated_at = Utc::now();
+            }
+            (h, pid)
+        };
+
+        if let Some(mut handle) = old_handle {
+            handle.stop();
+        } else if let Some(p) = orphan_pid {
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .args(["-9", &format!("-{}", p)])
+                    .status()
+                    .await;
+            }
+        }
+
+        let _ = self.persist_sessions().await;
+        let _ = self.agent_event_tx.send(AgentEvent::StatusChanged {
+            session_id: id,
+            status: SessionStatus::Stopped,
+            message: Some("Session stopped by user".to_string()),
+            timestamp: Utc::now(),
+        });
     }
 
     fn spawn_cron_scheduler(&self) {
@@ -595,7 +1711,7 @@ impl DaemonState {
             .await?;
 
         if let Some(hook_res) = hook_outcome {
-            let _ = self.event_tx.send(AgentEvent::SetupHookOutput {
+            let _ = self.agent_event_tx.send(AgentEvent::SetupHookOutput {
                 session_id: sess.id,
                 command: hook_res.command,
                 output: hook_res.output,
@@ -658,6 +1774,17 @@ impl DaemonState {
         images: Vec<String>,
         approval_mode: String,
     ) -> Result<SessionInfo> {
+        let worktree_path = velo_worktree::ensure_usable_workspace_dir(&worktree_path).await;
+        let repo_root = if tokio::fs::metadata(&repo_root)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            repo_root
+        } else {
+            worktree_path.clone()
+        };
+
         let short_id = &session_id.to_string()[..8];
         let name = custom_name
             .filter(|n| !n.trim().is_empty())
@@ -668,13 +1795,15 @@ impl DaemonState {
             .unwrap_or_default();
 
         let now = Utc::now();
+        let canonical_repo = canonical_workspace_path(&repo_root.to_string_lossy());
+        let canonical_wt = canonical_workspace_path(&worktree_path.to_string_lossy());
         let mut session = SessionInfo {
             id: session_id,
             name,
             provider: provider.clone(),
             prompt: prompt.clone(),
-            repo_root: repo_root.to_string_lossy().to_string(),
-            worktree_path: worktree_path.to_string_lossy().to_string(),
+            repo_root: canonical_repo.clone(),
+            worktree_path: canonical_wt,
             branch,
             status: SessionStatus::Starting,
             pid: None,
@@ -686,6 +1815,10 @@ impl DaemonState {
             model: model.clone(),
             effort: effort.clone(),
             tokens_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            context_window: 0,
             cost_usd: 0.0,
             approval_mode: approval_mode.clone(),
             preview_url: None,
@@ -702,9 +1835,17 @@ impl DaemonState {
             None
         };
 
+        let mut ws_added = false;
         {
             let mut guard = self.inner.write().await;
+            if !canonical_repo.is_empty() && !guard.workspaces.contains(&canonical_repo) {
+                guard.workspaces.insert(0, canonical_repo);
+                ws_added = true;
+            }
             guard.sessions.insert(session_id, session.clone());
+            guard
+                .live_turns
+                .insert(session_id, LiveTurnMetrics::new(0, 0.0));
             if let Some(ref uev) = initial_user_ev {
                 guard
                     .event_history
@@ -712,6 +1853,9 @@ impl DaemonState {
                     .or_default()
                     .push(uev.clone());
             }
+        }
+        if ws_added {
+            let _ = self.persist_workspaces().await;
         }
         let _ = self.persist_session_events(session_id).await;
         if let Some(uev) = initial_user_ev {
@@ -725,6 +1869,7 @@ impl DaemonState {
             session.status = SessionStatus::Completed;
             {
                 let mut guard = self.inner.write().await;
+                guard.live_turns.remove(&session_id);
                 if let Some(s) = guard.sessions.get_mut(&session_id) {
                     s.status = SessionStatus::Completed;
                 }
@@ -733,7 +1878,7 @@ impl DaemonState {
             return Ok(session);
         }
 
-        let handle = AgentSpawner::spawn_agent_turn_configured(
+        let handle = match AgentSpawner::spawn_agent_turn_configured(
             session_id,
             provider,
             prompt,
@@ -745,9 +1890,17 @@ impl DaemonState {
             images,
             approval_mode,
             self.daemon_http_base.clone(),
-            self.event_tx.clone(),
+            self.agent_event_tx.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                self.mark_session_spawn_failed(session_id, &err.to_string())
+                    .await;
+                return Err(err);
+            }
+        };
 
         session.pid = handle.pid;
         session.status = SessionStatus::Running;
@@ -812,10 +1965,17 @@ pub fn build_router(state: DaemonState) -> Router {
             post(provider_cli_login_handler),
         )
         .route("/api/pick-folder", post(pick_folder_handler))
+        .route(
+            "/api/workspaces",
+            get(list_workspaces_handler)
+                .post(add_workspace_handler)
+                .delete(remove_workspace_handler),
+        )
         .route("/api/open-editor", post(open_editor_handler))
         .route("/api/worktrees/prune", post(prune_worktrees_handler))
         .route("/api/attachments", post(upload_attachment_handler))
         .route("/api/attachments/{file}", get(get_attachment_handler))
+        .route("/api/attachments-resolve", get(resolve_attachment_handler))
         .route(
             "/api/sessions",
             get(list_sessions_handler).post(create_session_handler),
@@ -1558,6 +2718,32 @@ pub(crate) async fn build_models_catalog_json() -> Value {
     })
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct WorkspaceMutationRequest {
+    path: String,
+}
+
+async fn list_workspaces_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    let list = state.list_workspaces().await;
+    Json(json!({ "workspaces": list }))
+}
+
+async fn add_workspace_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<WorkspaceMutationRequest>,
+) -> impl IntoResponse {
+    let list = state.add_workspace(&req.path).await;
+    Json(json!({ "workspaces": list }))
+}
+
+async fn remove_workspace_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<WorkspaceMutationRequest>,
+) -> impl IntoResponse {
+    let list = state.remove_workspace(&req.path).await;
+    Json(json!({ "workspaces": list }))
+}
+
 async fn pick_folder_handler() -> impl IntoResponse {
     let out = Command::new("osascript")
         .args([
@@ -1916,7 +3102,7 @@ async fn prune_worktrees_handler(State(state): State<DaemonState>) -> impl IntoR
     }))
 }
 
-fn decode_base64_payload(input: &str) -> Result<Vec<u8>> {
+pub(crate) fn decode_base64_payload(input: &str) -> Result<Vec<u8>> {
     let raw = match input.find(";base64,") {
         Some(idx) => &input[idx + 8..],
         None => input,
@@ -1953,6 +3139,266 @@ struct UploadAttachmentRequest {
     data_base64: String,
 }
 
+fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn mime_for_image_ext(ext_or_name: &str) -> &'static str {
+    let lower = ext_or_name.to_ascii_lowercase();
+    if lower.ends_with("jpg") || lower.ends_with("jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with("webp") {
+        "image/webp"
+    } else if lower.ends_with("gif") {
+        "image/gif"
+    } else if lower.ends_with("svg") {
+        "image/svg+xml"
+    } else if lower.ends_with("heic") {
+        "image/heic"
+    } else {
+        "image/png"
+    }
+}
+
+fn is_allowed_image_ext(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "heic" | "svg"
+    )
+}
+
+impl DaemonState {
+    /// Saves raw image bytes into persistent content-addressed storage (`~/.velo/attachments/<sha256>.<ext>`).
+    /// Avoids OS temporary directories (`os.tmpdir()`) that macOS `dirhelper` sweeps after 3 days.
+    pub async fn save_attachment_bytes(
+        &self,
+        bytes: &[u8],
+        filename: Option<&str>,
+        mime_type: Option<&str>,
+    ) -> Result<(String, PathBuf), String> {
+        if bytes.is_empty() {
+            return Err("Empty attachment payload".to_string());
+        }
+        let ext = filename
+            .and_then(|f| Path::new(f).extension().and_then(|e| e.to_str()))
+            .or_else(|| match mime_type {
+                Some("image/jpeg") | Some("image/jpg") => Some("jpg"),
+                Some("image/webp") => Some("webp"),
+                Some("image/gif") => Some("gif"),
+                Some("image/svg+xml") => Some("svg"),
+                Some("image/heic") => Some("heic"),
+                _ => Some("jpg"),
+            })
+            .unwrap_or("jpg")
+            .to_ascii_lowercase();
+
+        let clean_ext: String = ext
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        let final_ext = if clean_ext.is_empty() { "jpg" } else { &clean_ext };
+
+        use sha2::{Digest, Sha256};
+        let digest_hex = hex::encode(Sha256::digest(bytes));
+        let saved_name = format!("{}.{}", &digest_hex[..32], final_ext);
+        let _ = tokio::fs::create_dir_all(&self.attachments_dir).await;
+        let dest_path = self.attachments_dir.join(&saved_name);
+
+        if !tokio::fs::try_exists(&dest_path).await.unwrap_or(false) {
+            tokio::fs::write(&dest_path, bytes)
+                .await
+                .map_err(|e| format!("Failed to write attachment: {}", e))?;
+        }
+        Ok((saved_name, dest_path))
+    }
+
+    /// Safely resolves an attachment reference (`/api/attachments/...`, filename, `file://...`, or Mac image path).
+    /// Automatically materializes temporary `/tmp` or `/var/folders` screenshots into `~/.velo/attachments/`
+    /// so historical images never break after macOS temporary directory cleanup.
+    pub async fn resolve_local_image_path(&self, raw_ref: &str) -> Option<PathBuf> {
+        let trimmed = raw_ref.trim();
+        if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return None;
+        }
+        let stripped = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+        let decoded = percent_decode_utf8(stripped);
+
+        if let Some(rest) = decoded.strip_prefix("/api/attachments/") {
+            let clean = Path::new(rest).file_name()?.to_str()?;
+            let candidate = self.attachments_dir.join(clean);
+            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                return Some(candidate);
+            }
+        }
+
+        if !decoded.contains('/') {
+            let clean = Path::new(&decoded).file_name()?.to_str()?;
+            let candidate = self.attachments_dir.join(clean);
+            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                return Some(candidate);
+            }
+        }
+
+        let expanded = velo_worktree::expand_tilde_path(Path::new(&decoded));
+        if expanded
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        if !is_allowed_image_ext(&expanded) {
+            return None;
+        }
+
+        let path_str = expanded.to_string_lossy();
+        let is_ephemeral_tmp = path_str.starts_with("/tmp/")
+            || path_str.starts_with("/private/tmp/")
+            || path_str.starts_with("/var/folders/")
+            || path_str.starts_with("/private/var/folders/");
+
+        use sha2::{Digest, Sha256};
+        let ext = expanded
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_ascii_lowercase();
+        let mat_hash = hex::encode(Sha256::digest(path_str.as_bytes()));
+        let mat_path = self
+            .attachments_dir
+            .join(format!("mat-{}.{}", &mat_hash[..24], ext));
+
+        if tokio::fs::try_exists(&expanded).await.unwrap_or(false) {
+            if is_ephemeral_tmp && !tokio::fs::try_exists(&mat_path).await.unwrap_or(false) {
+                let _ = tokio::fs::create_dir_all(&self.attachments_dir).await;
+                let _ = tokio::fs::copy(&expanded, &mat_path).await;
+                if tokio::fs::try_exists(&mat_path).await.unwrap_or(false) {
+                    return Some(mat_path);
+                }
+            }
+            return Some(expanded);
+        }
+
+        // Fallback if OS swept `/var/folders` or `/tmp` after we materialized it earlier
+        if tokio::fs::try_exists(&mat_path).await.unwrap_or(false) {
+            return Some(mat_path);
+        }
+
+        // Fallback by basename inside `~/.velo/attachments`
+        if let Some(fname) = expanded.file_name().and_then(|s| s.to_str()) {
+            let candidate = self.attachments_dir.join(fname);
+            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Loads image bytes at requested tier (`"thumb"` ~800px JPEG ~60KB, or `"full"` <= 2200px HD).
+    /// Caches generated thumbnails on disk under `~/.velo/attachments/.thumbs/` for sub-millisecond reuse.
+    pub async fn load_attachment_tier(&self, raw_ref: &str, tier: &str) -> Option<(Vec<u8>, String)> {
+        let src_path = self.resolve_local_image_path(raw_ref).await?;
+        let meta = tokio::fs::metadata(&src_path).await.ok()?;
+        let len = meta.len();
+        let ext = src_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_ascii_lowercase();
+
+        if ext == "svg" || ext == "gif" {
+            let bytes = tokio::fs::read(&src_path).await.ok()?;
+            return Some((bytes, mime_for_image_ext(&ext).to_string()));
+        }
+
+        let want_thumb = tier.eq_ignore_ascii_case("thumb");
+        // Fast path: already compact web-friendly image
+        if ext != "heic" && ((want_thumb && len <= 95_000) || (!want_thumb && len <= 2_600_000)) {
+            let bytes = tokio::fs::read(&src_path).await.ok()?;
+            return Some((bytes, mime_for_image_ext(&ext).to_string()));
+        }
+
+        if Path::new("/usr/bin/sips").is_file() {
+            let thumbs_dir = self.attachments_dir.join(".thumbs");
+            let _ = tokio::fs::create_dir_all(&thumbs_dir).await;
+            use sha2::{Digest, Sha256};
+            let mtime_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let cache_seed = format!(
+                "{}:{}:{}:{}",
+                src_path.to_string_lossy(),
+                len,
+                mtime_secs,
+                if want_thumb { "thumb800" } else { "full2200" }
+            );
+            let cache_hash = hex::encode(Sha256::digest(cache_seed.as_bytes()));
+            let out_path = thumbs_dir.join(format!("{}.jpg", &cache_hash[..28]));
+
+            if let Ok(cached) = tokio::fs::read(&out_path).await {
+                if !cached.is_empty() {
+                    return Some((cached, "image/jpeg".to_string()));
+                }
+            }
+
+            let max_px = if want_thumb { "800" } else { "2200" };
+            let quality = if want_thumb { "76" } else { "85" };
+            let status = Command::new("/usr/bin/sips")
+                .args([
+                    "-Z",
+                    max_px,
+                    "-s",
+                    "format",
+                    "jpeg",
+                    "-s",
+                    "formatOptions",
+                    quality,
+                    src_path.to_str().unwrap_or(""),
+                    "--out",
+                    out_path.to_str().unwrap_or(""),
+                ])
+                .output()
+                .await;
+
+            if let Ok(res) = status {
+                if res.status.success() {
+                    if let Ok(converted) = tokio::fs::read(&out_path).await {
+                        if !converted.is_empty() {
+                            return Some((converted, "image/jpeg".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let bytes = tokio::fs::read(&src_path).await.ok()?;
+        Some((bytes, mime_for_image_ext(&ext).to_string()))
+    }
+}
+
 async fn upload_attachment_handler(
     State(state): State<DaemonState>,
     Json(req): Json<UploadAttachmentRequest>,
@@ -1975,32 +3421,11 @@ async fn upload_attachment_handler(
         }
     };
 
-    let ext = req
-        .filename
-        .as_deref()
-        .and_then(|f| Path::new(f).extension().and_then(|e| e.to_str()))
-        .or_else(|| match req.mime_type.as_deref() {
-            Some("image/jpeg") | Some("image/jpg") => Some("jpg"),
-            Some("image/webp") => Some("webp"),
-            Some("image/gif") => Some("gif"),
-            Some("image/svg+xml") => Some("svg"),
-            _ => Some("png"),
-        })
-        .unwrap_or("png")
-        .to_ascii_lowercase();
-
-    let clean_ext: String = ext
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(8)
-        .collect();
-    let final_ext = if clean_ext.is_empty() { "png" } else { &clean_ext };
-    let saved_name = format!("{}.{}", Uuid::new_v4(), final_ext);
-    let _ = tokio::fs::create_dir_all(&state.attachments_dir).await;
-    let dest_path = state.attachments_dir.join(&saved_name);
-
-    match tokio::fs::write(&dest_path, &bytes).await {
-        Ok(()) => (
+    match state
+        .save_attachment_bytes(&bytes, req.filename.as_deref(), req.mime_type.as_deref())
+        .await
+    {
+        Ok((saved_name, dest_path)) => (
             StatusCode::CREATED,
             Json(json!({
                 "ok": true,
@@ -2013,47 +3438,58 @@ async fn upload_attachment_handler(
             .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to write attachment: {}", err) })),
+            Json(json!({ "error": err })),
         )
             .into_response(),
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct AttachmentTierQuery {
+    tier: Option<String>,
+    #[serde(rename = "ref")]
+    raw_ref: Option<String>,
+}
+
 async fn get_attachment_handler(
     State(state): State<DaemonState>,
     AxumPath(file): AxumPath<String>,
+    Query(q): Query<AttachmentTierQuery>,
 ) -> impl IntoResponse {
-    let clean_name = Path::new(&file)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if clean_name.is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let full_path = state.attachments_dir.join(clean_name);
-    let content_type = if clean_name.ends_with(".jpg") || clean_name.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if clean_name.ends_with(".webp") {
-        "image/webp"
-    } else if clean_name.ends_with(".gif") {
-        "image/gif"
-    } else if clean_name.ends_with(".svg") {
-        "image/svg+xml"
-    } else {
-        "image/png"
-    };
-
-    match tokio::fs::read(&full_path).await {
-        Ok(bytes) => (
+    let tier = q.tier.as_deref().unwrap_or("full");
+    match state.load_attachment_tier(&file, tier).await {
+        Some((bytes, content_type)) => (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, content_type),
+                (header::CONTENT_TYPE, content_type.as_str()),
                 (header::CACHE_CONTROL, "public, max-age=86400"),
             ],
             bytes,
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn resolve_attachment_handler(
+    State(state): State<DaemonState>,
+    Query(q): Query<AttachmentTierQuery>,
+) -> impl IntoResponse {
+    let Some(raw_ref) = q.raw_ref.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let tier = q.tier.as_deref().unwrap_or("full");
+    match state.load_attachment_tier(raw_ref, tier).await {
+        Some((bytes, content_type)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type.as_str()),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -2214,7 +3650,11 @@ async fn get_session_events_handler(
     AxumPath(id): AxumPath<Uuid>,
 ) -> impl IntoResponse {
     let guard = state.inner.read().await;
-    let events = guard.event_history.get(&id).cloned().unwrap_or_default();
+    let events = guard
+        .event_history
+        .get(&id)
+        .map(|evs| enrich_history_turn_metrics(evs))
+        .unwrap_or_default();
     Json(events)
 }
 
@@ -2543,6 +3983,14 @@ impl DaemonState {
         };
         {
             let mut guard = self.inner.write().await;
+            let (base_out, base_cost) = guard
+                .sessions
+                .get(&id)
+                .map(|s| (s.output_tokens, s.cost_usd))
+                .unwrap_or((0, 0.0));
+            guard
+                .live_turns
+                .insert(id, LiveTurnMetrics::new(base_out, base_cost));
             guard
                 .event_history
                 .entry(id)
@@ -2570,9 +4018,20 @@ impl DaemonState {
             .approval_mode
             .clone()
             .unwrap_or_else(|| session.approval_mode.clone());
-        let wt_path = PathBuf::from(&session.worktree_path);
+        let wt_path =
+            velo_worktree::ensure_usable_workspace_dir(Path::new(&session.worktree_path)).await;
+        let healed_wt_str = wt_path.to_string_lossy().to_string();
+        if healed_wt_str != session.worktree_path {
+            let mut guard = self.inner.write().await;
+            if let Some(s) = guard.sessions.get_mut(&id) {
+                if s.repo_root == s.worktree_path {
+                    s.repo_root = healed_wt_str.clone();
+                }
+                s.worktree_path = healed_wt_str;
+            }
+        }
 
-        let new_handle = AgentSpawner::spawn_agent_turn_configured(
+        let new_handle = match AgentSpawner::spawn_agent_turn_configured(
             id,
             target_provider.clone(),
             effective_prompt,
@@ -2584,9 +4043,16 @@ impl DaemonState {
             req.images.clone(),
             effective_approval.clone(),
             self.daemon_http_base.clone(),
-            self.event_tx.clone(),
+            self.agent_event_tx.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                self.mark_session_spawn_failed(id, &err.to_string()).await;
+                return Err(err);
+            }
+        };
 
         let pid = new_handle.pid;
         {
@@ -3234,7 +4700,7 @@ async fn loop_handler(
             }
 
             // Execute acceptance check command inside the worktree
-            let _ = loop_state.event_tx.send(AgentEvent::ToolCallRequested {
+            let _ = loop_state.agent_event_tx.send(AgentEvent::ToolCallRequested {
                 session_id: current_session_id,
                 tool_id: format!("velo-check-{}", iter),
                 tool_name: "velo_acceptance_check".to_string(),
@@ -3251,7 +4717,7 @@ async fn loop_handler(
             match check_out {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                    let _ = loop_state.event_tx.send(AgentEvent::ToolCallCompleted {
+                    let _ = loop_state.agent_event_tx.send(AgentEvent::ToolCallCompleted {
                         session_id: current_session_id,
                         tool_id: format!("velo-check-{}", iter),
                         output: format!("✅ Acceptance check `{}` PASSED!\n{}", check_cmd, stdout),
@@ -3266,7 +4732,7 @@ async fn loop_handler(
                         String::from_utf8_lossy(&out.stdout),
                         String::from_utf8_lossy(&out.stderr)
                     );
-                    let _ = loop_state.event_tx.send(AgentEvent::ToolCallCompleted {
+                    let _ = loop_state.agent_event_tx.send(AgentEvent::ToolCallCompleted {
                         session_id: current_session_id,
                         tool_id: format!("velo-check-{}", iter),
                         output: format!(
@@ -4219,6 +5685,7 @@ async fn ws_handler(
 async fn handle_ws_client(socket: WebSocket, state: DaemonState) {
     let (mut sender, mut receiver) = socket.split();
     let mut event_rx = state.event_tx.subscribe();
+    let mut snapshot_rx = state.snapshot_tx.subscribe();
 
     {
         let guard = state.inner.read().await;
@@ -4232,6 +5699,13 @@ async fn handle_ws_client(socket: WebSocket, state: DaemonState) {
     let state_for_recv = state.clone();
     loop {
         tokio::select! {
+            Ok(sessions) = snapshot_rx.recv() => {
+                if let Ok(payload) = serde_json::to_string(&WsServerMessage::SessionsSnapshot { sessions }) {
+                    if sender.send(Message::Text(payload.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
             Ok(event) = event_rx.recv() => {
                 if let Ok(payload) = serde_json::to_string(&WsServerMessage::Event { event }) {
                     if sender.send(Message::Text(payload.into())).await.is_err() {
@@ -4418,25 +5892,32 @@ mod tests {
             .output()
             .await?;
 
+        let (agent_event_tx, _) = broadcast::channel(256);
         let (event_tx, _) = broadcast::channel(256);
+        let (snapshot_tx, _) = broadcast::channel(32);
         let state = DaemonState {
             inner: Arc::new(RwLock::new(DaemonInner {
                 sessions: HashMap::new(),
                 event_history: HashMap::new(),
+                live_turns: HashMap::new(),
                 handles: HashMap::new(),
                 shells: HashMap::new(),
                 pending_approvals: HashMap::new(),
                 pending_questions: HashMap::new(),
                 automations: Vec::new(),
                 repo_hooks: HashMap::new(),
+                workspaces: Vec::new(),
             })),
+            agent_event_tx,
             event_tx,
+            snapshot_tx,
             worktree_mgr: WorktreeManager::new(wt_dir),
             state_file: temp_base.join("sessions.json"),
             events_dir: temp_base.join("events"),
             attachments_dir: temp_base.join("attachments"),
             automations_file: temp_base.join("automations.json"),
             hooks_file: temp_base.join("repo_hooks.json"),
+            workspaces_file: temp_base.join("workspaces.json"),
             daemon_http_base: None,
         };
         state.spawn_event_supervisor();
@@ -4527,8 +6008,242 @@ mod tests {
             .unwrap_or("");
         assert!(mcp_text.contains("feat/auto-edit"));
 
+        // Verify non-existent workspace heals cleanly on create_session and stop_session_by_id broadcasts StatusChanged(Stopped)
+        let mut rx = state.event_tx.subscribe();
+        let missing_dir = temp_base.join("nonexistent-project-dir");
+        let missing_sess = state
+            .create_session(CreateSessionRequest {
+                name: Some("missing-dir-heal".to_string()),
+                provider: velo_protocol::AgentProvider::Custom("sleep 30".to_string()),
+                prompt: "stay running".to_string(),
+                repo_path: missing_dir.to_string_lossy().to_string(),
+                branch: None,
+                use_pty: false,
+                parent_session_id: None,
+                model: None,
+                effort: None,
+                images: Vec::new(),
+                approval_mode: None,
+                setup_command: None,
+                use_worktree: false,
+            })
+            .await?;
+        assert!(missing_dir.is_dir(), "missing workspace dir should auto-create");
+
+        state.stop_session_by_id(missing_sess.id).await;
+        let mut saw_stopped = false;
+        for _ in 0..16 {
+            if let Ok(Ok(ev)) =
+                tokio::time::timeout(std::time::Duration::from_millis(120), rx.recv()).await
+            {
+                if let AgentEvent::StatusChanged {
+                    session_id,
+                    status: SessionStatus::Stopped,
+                    ..
+                } = ev
+                {
+                    if session_id == missing_sess.id {
+                        saw_stopped = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(saw_stopped, "stop_session_by_id must broadcast StatusChanged::Stopped");
+
         let _ = tokio::fs::remove_dir_all(&temp_base).await;
         Ok(())
+    }
+
+    #[test]
+    fn test_turn_metrics_enrichment_and_relay_parity() {
+        let sid = Uuid::new_v4();
+        let t0 = Utc::now();
+        let ms = |offset_ms: i64| t0 + chrono::Duration::milliseconds(offset_ms);
+
+        // Simulate a multi-step Codex turn with:
+        // 1) Stale resume echo at +350ms before any item starts (should be dropped)
+        // 2) Small MCP step (`out=45`) with 14s prefill + 3s tool execution
+        // 3) Substantial decode step (`out=2000` in 56s including ~8s prefill -> ~41.7 tok/s)
+        // 4) Final tiny wrap-up step (`out=60` in 4s)
+        let mut raw_events = vec![
+            AgentEvent::UserMessage {
+                session_id: sid,
+                text: "Analyze CUA state and fix TPS".to_string(),
+                images: Vec::new(),
+                timestamp: ms(0),
+            },
+            AgentEvent::UsageUpdated {
+                session_id: sid,
+                input_tokens: 127_000,
+                output_tokens: 1_184,
+                total_tokens: 128_184,
+                cache_read_tokens: 120_000,
+                cache_write_tokens: 0,
+                context_window: 200_000,
+                cost_usd: 0.05,
+                output_tps: 0.0,
+                is_turn_total: false,
+                timestamp: ms(350),
+            },
+            AgentEvent::ThinkingDelta {
+                session_id: sid,
+                text: "Checking state".to_string(),
+                timestamp: ms(14_000),
+            },
+            AgentEvent::ToolCallRequested {
+                session_id: sid,
+                tool_id: "mcp-1".to_string(),
+                tool_name: "MCP · cua_repl:js".to_string(),
+                arguments: json!({ "code": "1+1" }),
+                timestamp: ms(14_010),
+            },
+            AgentEvent::ToolCallCompleted {
+                session_id: sid,
+                tool_id: "mcp-1".to_string(),
+                output: "x".repeat(4_000),
+                is_error: false,
+                timestamp: ms(17_010),
+            },
+            AgentEvent::UsageUpdated {
+                session_id: sid,
+                input_tokens: 150_000,
+                output_tokens: 45,
+                total_tokens: 150_045,
+                cache_read_tokens: 140_000,
+                cache_write_tokens: 0,
+                context_window: 200_000,
+                cost_usd: 0.01,
+                output_tps: 0.0,
+                is_turn_total: false,
+                timestamp: ms(17_020),
+            },
+            AgentEvent::ThinkingDelta {
+                session_id: sid,
+                text: "Synthesizing architecture".to_string(),
+                timestamp: ms(73_000),
+            },
+            AgentEvent::UsageUpdated {
+                session_id: sid,
+                input_tokens: 156_000,
+                output_tokens: 2_000,
+                total_tokens: 158_000,
+                cache_read_tokens: 148_000,
+                cache_write_tokens: 0,
+                context_window: 200_000,
+                cost_usd: 0.03,
+                output_tps: 0.0,
+                is_turn_total: false,
+                timestamp: ms(73_020),
+            },
+            AgentEvent::MessageDelta {
+                session_id: sid,
+                text: "Done!".to_string(),
+                timestamp: ms(77_000),
+            },
+            AgentEvent::UsageUpdated {
+                session_id: sid,
+                input_tokens: 158_000,
+                output_tokens: 60,
+                total_tokens: 158_060,
+                cache_read_tokens: 150_000,
+                cache_write_tokens: 0,
+                context_window: 200_000,
+                cost_usd: 0.01,
+                output_tps: 0.0,
+                is_turn_total: false,
+                timestamp: ms(77_020),
+            },
+            AgentEvent::StatusChanged {
+                session_id: sid,
+                status: SessionStatus::Completed,
+                message: None,
+                timestamp: ms(77_030),
+            },
+            // Turn 2: AGY turn with explicit `(207 thinking tokens)` and no provider UsageUpdated
+            AgentEvent::UserMessage {
+                session_id: sid,
+                text: "Quick AGY check".to_string(),
+                images: Vec::new(),
+                timestamp: ms(90_000),
+            },
+            AgentEvent::ThinkingDelta {
+                session_id: sid,
+                text: "**Reasoning completed (207 thinking tokens)**".to_string(),
+                timestamp: ms(95_000),
+            },
+            AgentEvent::MessageDelta {
+                session_id: sid,
+                text: "一切正常，吞吐率已完全统一，桌面端和移动端现在完全使用同一套服务端指标数据源。".to_string(),
+                timestamp: ms(95_800),
+            },
+            AgentEvent::StatusChanged {
+                session_id: sid,
+                status: SessionStatus::Completed,
+                message: None,
+                timestamp: ms(95_850),
+            },
+        ];
+
+        // Pad with 160 tool calls in Turn 1 to force `compact_history_for_relay` second-pass trimming
+        for k in 0..160 {
+            raw_events.insert(
+                4,
+                AgentEvent::ToolCallCompleted {
+                    session_id: sid,
+                    tool_id: format!("pad-{}", k),
+                    output: "y".repeat(3_500),
+                    is_error: false,
+                    timestamp: ms(15_000),
+                },
+            );
+        }
+
+        let desktop_enriched = enrich_history_turn_metrics(&raw_events);
+        let relay_compacted = relay_bridge::compact_history_for_relay(&raw_events);
+
+        let desktop_usages: Vec<(u64, f64, bool)> = desktop_enriched
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::UsageUpdated {
+                    output_tokens,
+                    output_tps,
+                    is_turn_total,
+                    ..
+                } => Some((*output_tokens, *output_tps, *is_turn_total)),
+                _ => None,
+            })
+            .collect();
+
+        let relay_usages: Vec<(u64, f64, bool)> = relay_compacted
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::UsageUpdated {
+                    output_tokens,
+                    output_tps,
+                    is_turn_total,
+                    ..
+                } => Some((*output_tokens, *output_tps, *is_turn_total)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(desktop_usages.len(), 2, "each turn must have 1 authoritative UsageUpdated");
+        assert_eq!(
+            desktop_usages, relay_usages,
+            "Desktop and E2EE Relay must produce 100% identical output_tokens and output_tps"
+        );
+        // Turn 1: 45 + 2000 + 60 = 2105 (stale 1184 resume echo dropped!)
+        assert_eq!(desktop_usages[0].0, 2_105);
+        assert!(
+            desktop_usages[0].1 >= 35.0 && desktop_usages[0].1 <= 50.0,
+            "Turn 1 TPS should reflect ~42 tok/s decode speed, got {}",
+            desktop_usages[0].1
+        );
+        assert!(desktop_usages[0].2);
+        // Turn 2: 207 thinking tokens + ~15 message tokens
+        assert!(desktop_usages[1].0 >= 215);
+        assert!(desktop_usages[1].1 >= 30.0);
     }
 }
 

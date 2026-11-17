@@ -41,6 +41,57 @@ pub fn default_velo_home() -> PathBuf {
         .join(".velo")
 }
 
+/// Returns the default general workspace (`~/.velo/workspace`), creating it if needed.
+pub fn default_general_workspace() -> PathBuf {
+    let dir = default_velo_home().join("workspace");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Expands empty paths, `"default"`, or leading `~/` references into concrete filesystem paths.
+pub fn expand_tilde_path(raw: &Path) -> PathBuf {
+    let s = raw.to_string_lossy();
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "default" || trimmed == "~/.velo/workspace" {
+        return default_general_workspace();
+    }
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    raw.to_path_buf()
+}
+
+/// Ensures `path` resolves to an existing directory, auto-creating it or falling back to `~/.velo/workspace`.
+pub async fn ensure_usable_workspace_dir(path: &Path) -> PathBuf {
+    let expanded = expand_tilde_path(path);
+    if tokio::fs::metadata(&expanded)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return expanded;
+    }
+
+    if tokio::fs::create_dir_all(&expanded).await.is_ok() {
+        info!("Auto-created missing workspace directory: {}", expanded.display());
+        return expanded;
+    }
+
+    let fallback = default_general_workspace();
+    let _ = tokio::fs::create_dir_all(&fallback).await;
+    warn!(
+        "Workspace `{}` could not be created; falling back to {}",
+        expanded.display(),
+        fallback.display()
+    );
+    fallback
+}
+
 impl WorktreeManager {
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
@@ -72,9 +123,10 @@ impl WorktreeManager {
     /// Resolves an in-place workspace directly inside the real repository root (no isolated Git worktree).
     /// This ensures normal interactive sessions belong natively to the user's real project directory.
     pub async fn resolve_in_place_workspace(repo_path: &Path) -> WorktreeProvision {
-        let repo_root = match Self::resolve_repo_root(repo_path).await {
+        let usable_path = ensure_usable_workspace_dir(repo_path).await;
+        let repo_root = match Self::resolve_repo_root(&usable_path).await {
             Ok(root) => root,
-            Err(_) => repo_path.to_path_buf(),
+            Err(_) => usable_path,
         };
 
         let detected_branch = match Command::new("git")

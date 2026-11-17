@@ -153,6 +153,17 @@ export const PaseoLiveElapsed: React.FC<{
 export interface PaseoTurnTelemetry {
   insertions?: number;
   deletions?: number;
+  tps?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  costUsd?: number;
+}
+
+function formatCompactTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${Math.round(n)}`;
 }
 
 export const PaseoTurnFooter: React.FC<{
@@ -265,6 +276,14 @@ export const PaseoTurnFooter: React.FC<{
               </span>
             </>
           )}
+          {telemetry?.tps !== undefined && telemetry.tps > 0.5 && (
+            <span
+              className="ml-1 font-mono-code text-[11.5px] tabular-nums"
+              style={{ color: "var(--fg-extra-muted)" }}
+            >
+              · {telemetry.tps.toFixed(1)} tok/s
+            </span>
+          )}
         </div>
       </div>
     );
@@ -281,14 +300,23 @@ export const PaseoTurnFooter: React.FC<{
 
   const ins = telemetry?.insertions || 0;
   const del = telemetry?.deletions || 0;
+  const inTok = telemetry?.inputTokens || 0;
+  const outTok = telemetry?.outputTokens || 0;
+  const totalTok = inTok + outTok;
+  const cacheRead = telemetry?.cacheReadTokens || 0;
+  const cacheHitPct =
+    inTok > 0 && cacheRead > 0 ? Math.min(100, Math.round((cacheRead / inTok) * 100)) : 0;
+  const computedTps =
+    telemetry?.tps && telemetry.tps >= 0.5 ? telemetry.tps : 0;
+  const costUsd = telemetry?.costUsd || 0;
 
-  if (!assistantContent && !onRetry && !durationText) {
+  if (!assistantContent && !onRetry && !durationText && totalTok === 0) {
     return null;
   }
 
   return (
     <div
-      className="mt-1 flex min-h-[24px] items-center gap-1.5"
+      className="mt-1 flex min-h-[24px] flex-wrap items-center gap-1.5"
       data-testid="turn-footer"
     >
       {assistantContent && (
@@ -321,6 +349,45 @@ export const PaseoTurnFooter: React.FC<{
           style={{ color: "var(--fg-muted)" }}
         >
           {hoveredTiming && canSwapTimestamp ? completedAtLabel : durationText}
+        </span>
+      )}
+
+      {computedTps > 0.5 && (
+        <span
+          className="font-mono-code text-[11.5px] font-medium tabular-nums select-none text-[#a78bfa]"
+          title="Output generation throughput (tokens/sec)"
+        >
+          · ⚡ {computedTps.toFixed(1)} tok/s
+        </span>
+      )}
+
+      {totalTok > 0 && (
+        <span
+          className="font-mono-code text-[11px] tabular-nums select-none"
+          style={{ color: "var(--fg-extra-muted)" }}
+          title={`Input: ${inTok.toLocaleString()} · Output: ${outTok.toLocaleString()}`}
+        >
+          · {formatCompactTokens(totalTok)} tok
+        </span>
+      )}
+
+      {cacheHitPct > 0 && (
+        <span
+          className="font-mono-code text-[11px] tabular-nums select-none"
+          style={{ color: "var(--status-success)" }}
+          title={`Prompt Cache Hit: ${cacheRead.toLocaleString()} / ${inTok.toLocaleString()} input tokens`}
+        >
+          · 缓存 {cacheHitPct}%
+        </span>
+      )}
+
+      {costUsd > 0 && (
+        <span
+          className="font-mono-code text-[11px] tabular-nums select-none"
+          style={{ color: "var(--fg-extra-muted)" }}
+          title="Estimated API cost for this turn"
+        >
+          · ${costUsd < 0.01 ? costUsd.toFixed(4) : costUsd.toFixed(3)}
         </span>
       )}
 
@@ -956,38 +1023,121 @@ function summarizeToolGroup(items: PaseoToolGroupItem[]): {
   };
 }
 
-export const PaseoToolCallGroup: React.FC<{
-  items: PaseoToolGroupItem[];
+export interface PaseoTraceStepItem {
+  id: string;
+  kind: "thinking" | "tool_call";
+  text?: string;
+  isStreamingThinking?: boolean;
+  startedAtMs?: number;
+  durationMs?: number;
+  toolName?: string;
+  input?: unknown;
+  output?: string;
+  isError?: boolean;
+  fileArg?: string;
+}
+
+export const PaseoExecutionTraceGroup: React.FC<{
+  steps: PaseoTraceStepItem[];
+  defaultExpanded?: boolean;
   onOpenDiffForFile?: (fileArg?: string) => void;
-}> = ({ items, onOpenDiffForFile }) => {
-  const [expanded, setExpanded] = useState(false);
-  const { label, secondaryLabel, hasError, isAnyRunning } = useMemo(
-    () => summarizeToolGroup(items),
-    [items]
-  );
+}> = ({ steps, defaultExpanded = false, onOpenDiffForFile }) => {
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
+  const expanded = userExpanded ?? defaultExpanded;
+
+  const meta = useMemo(() => {
+    let thinkCount = 0;
+    let toolCount = 0;
+    let hasError = false;
+    let isAnyRunning = false;
+    let latestStepHint = "";
+
+    for (const st of steps) {
+      if (st.kind === "thinking") {
+        thinkCount++;
+        const parsed = parseReasoningContent(st.text || "");
+        if (parsed.summary) {
+          latestStepHint = parsed.summary;
+        }
+        if (st.isStreamingThinking) {
+          isAnyRunning = true;
+        }
+      } else {
+        toolCount++;
+        if (st.isError) hasError = true;
+        const pres = resolvePaseoToolPresentation(
+          st.toolName || "Tool",
+          st.input,
+          st.output
+        );
+        if (st.output === undefined) {
+          isAnyRunning = true;
+          latestStepHint = pres.summary
+            ? `${pres.displayName} · ${pres.summary}`
+            : pres.workingVerb;
+        } else {
+          latestStepHint = pres.summary
+            ? `${pres.displayName} · ${pres.summary}`
+            : pres.displayName;
+        }
+      }
+    }
+
+    const parts: string[] = [];
+    if (thinkCount > 0) parts.push(`思考 ${thinkCount} 次`);
+    if (toolCount > 0) parts.push(`工具/MCP ${toolCount} 次`);
+    const countsText = parts.join(" · ");
+
+    const label = isAnyRunning
+      ? `执行中 (${steps.length} 步)`
+      : `已收起 ${steps.length} 步执行过程`;
+    const secondaryLabel = isAnyRunning
+      ? latestStepHint
+        ? `· ${latestStepHint}`
+        : `· ${countsText}`
+      : `· ${countsText}${latestStepHint ? ` · ${latestStepHint}` : ""}`;
+
+    return {
+      label,
+      secondaryLabel,
+      hasError,
+      isAnyRunning,
+    };
+  }, [steps]);
 
   return (
     <PaseoExpandableBadge
-      label={label}
-      secondaryLabel={secondaryLabel}
-      icon={Wrench}
+      label={meta.label}
+      secondaryLabel={meta.secondaryLabel}
+      icon={meta.isAnyRunning ? Sparkles : Wrench}
       isExpanded={expanded}
-      onToggle={() => setExpanded((v) => !v)}
-      isLoading={isAnyRunning}
-      isError={hasError}
+      onToggle={() => setUserExpanded((prev) => !(prev ?? defaultExpanded))}
+      isLoading={meta.isAnyRunning}
+      isError={meta.hasError}
       borderlessWhenExpanded
     >
-      <PaseoIndentRail className="space-y-0.5">
-        {items.map((item) => (
-          <BeautifulToolCallCard
-            key={item.id}
-            toolName={item.toolName}
-            input={item.input}
-            output={item.output}
-            isError={item.isError}
-            onOpenDiffTab={() => onOpenDiffForFile?.(item.fileArg)}
-          />
-        ))}
+      <PaseoIndentRail className="space-y-0.5 py-0.5">
+        {steps.map((st) =>
+          st.kind === "thinking" ? (
+            <BeautifulThinkingBlock
+              key={st.id}
+              text={st.text || ""}
+              isStreaming={st.isStreamingThinking}
+              startedAtMs={st.startedAtMs}
+              durationMs={st.durationMs}
+              defaultExpanded={false}
+            />
+          ) : (
+            <BeautifulToolCallCard
+              key={st.id}
+              toolName={st.toolName || "Tool"}
+              input={st.input}
+              output={st.output}
+              isError={st.isError}
+              onOpenDiffTab={() => onOpenDiffForFile?.(st.fileArg)}
+            />
+          )
+        )}
       </PaseoIndentRail>
     </PaseoExpandableBadge>
   );

@@ -171,6 +171,14 @@ pub struct SessionInfo {
     #[serde(default)]
     pub tokens_used: u64,
     #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub context_window: u64,
+    #[serde(default)]
     pub cost_usd: f64,
     #[serde(default = "default_approval_mode")]
     pub approval_mode: String,
@@ -229,7 +237,17 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
         total_tokens: u64,
+        #[serde(default)]
+        cache_read_tokens: u64,
+        #[serde(default)]
+        cache_write_tokens: u64,
+        #[serde(default)]
+        context_window: u64,
         cost_usd: f64,
+        #[serde(default)]
+        output_tps: f64,
+        #[serde(default)]
+        is_turn_total: bool,
         timestamp: DateTime<Utc>,
     },
     TerminalOutput {

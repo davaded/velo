@@ -1750,14 +1750,16 @@ pub fn parse_agent_stdout_line(
                                     });
                                 }
                                 if let Some(usage) = res.get("usage") {
+                                    let cache_read = usage
+                                        .get("cache_read_tokens")
+                                        .or_else(|| usage.get("cache_read_input_tokens"))
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
                                     let in_tok = usage
                                         .get("input_tokens")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0)
-                                        + usage
-                                            .get("cache_read_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
+                                        + cache_read;
                                     let out_tok = usage
                                         .get("output_tokens")
                                         .and_then(|v| v.as_u64())
@@ -1772,7 +1774,12 @@ pub fn parse_agent_stdout_line(
                                             input_tokens: in_tok,
                                             output_tokens: out_tok,
                                             total_tokens: total_tok,
+                                            cache_read_tokens: cache_read,
+                                            cache_write_tokens: 0,
+                                            context_window: 0,
                                             cost_usd: 0.0,
+                                            output_tps: 0.0,
+                                            is_turn_total: true,
                                             timestamp: Utc::now(),
                                         });
                                     }
@@ -1840,6 +1847,11 @@ pub fn parse_agent_stdout_line(
                     }
                     if msg_type == "turn.completed" {
                         if let Some(usage) = json.get("usage") {
+                            let cache_read = usage
+                                .get("cached_input_tokens")
+                                .or_else(|| usage.get("cache_read_input_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
                             let input_tokens = usage
                                 .get("input_tokens")
                                 .and_then(|v| v.as_u64())
@@ -1850,14 +1862,21 @@ pub fn parse_agent_stdout_line(
                                 .unwrap_or(0);
                             let total_tokens = input_tokens.saturating_add(output_tokens);
                             if total_tokens > 0 {
-                                let cost_usd = (input_tokens as f64 * 0.000_0025)
+                                let uncached_in = input_tokens.saturating_sub(cache_read);
+                                let cost_usd = (uncached_in as f64 * 0.000_0025)
+                                    + (cache_read as f64 * 0.000_00025)
                                     + (output_tokens as f64 * 0.000_01);
                                 events.push(AgentEvent::UsageUpdated {
                                     session_id,
                                     input_tokens,
                                     output_tokens,
                                     total_tokens,
+                                    cache_read_tokens: cache_read,
+                                    cache_write_tokens: 0,
+                                    context_window: 0,
                                     cost_usd,
+                                    output_tps: 0.0,
+                                    is_turn_total: true,
                                     timestamp: Utc::now(),
                                 });
                             }
@@ -1959,18 +1978,20 @@ pub fn parse_agent_stdout_line(
                         }
                     }
                     if let Some(usage) = json.pointer("/message/usage") {
+                        let cache_read = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cache_write = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         let in_tok = usage
                             .get("input_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0)
-                            + usage
-                                .get("cache_read_input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                            + usage
-                                .get("cache_creation_input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
+                            + cache_read
+                            + cache_write;
                         let out_tok = usage
                             .get("output_tokens")
                             .and_then(|v| v.as_u64())
@@ -1981,7 +2002,12 @@ pub fn parse_agent_stdout_line(
                                 input_tokens: in_tok,
                                 output_tokens: out_tok,
                                 total_tokens: in_tok + out_tok,
+                                cache_read_tokens: cache_read,
+                                cache_write_tokens: cache_write,
+                                context_window: 200_000,
                                 cost_usd: 0.0,
+                                output_tps: 0.0,
+                                is_turn_total: false,
                                 timestamp: Utc::now(),
                             });
                         }
@@ -2212,18 +2238,20 @@ pub fn parse_agent_stdout_line(
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
                     if let Some(usage) = json.get("usage") {
+                        let cache_read = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cache_write = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         let in_tok = usage
                             .get("input_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0)
-                            + usage
-                                .get("cache_read_input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                            + usage
-                                .get("cache_creation_input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
+                            + cache_read
+                            + cache_write;
                         let out_tok = usage
                             .get("output_tokens")
                             .and_then(|v| v.as_u64())
@@ -2234,7 +2262,12 @@ pub fn parse_agent_stdout_line(
                                 input_tokens: in_tok,
                                 output_tokens: out_tok,
                                 total_tokens: in_tok + out_tok,
+                                cache_read_tokens: cache_read,
+                                cache_write_tokens: cache_write,
+                                context_window: 200_000,
                                 cost_usd,
+                                output_tps: 0.0,
+                                is_turn_total: true,
                                 timestamp: Utc::now(),
                             });
                         }

@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -11,6 +12,8 @@ public struct RootSessionsView: View {
     @State private var selectedEngineFilter: VeloEngineCategory?
     @State private var collapsedProjects: Set<String> = []
     @State private var navigationPath: [String] = []
+    @State private var renamingSessionId: String?
+    @State private var renameDraftTitle: String = ""
 
     public init(store: VeloStore) {
         self.store = store
@@ -27,10 +30,23 @@ public struct RootSessionsView: View {
         var order: [String] = []
         var bucket: [String: [VeloSessionItem]] = [:]
         for s in filteredSessions {
-            if bucket[s.repoRoot] == nil {
-                order.append(s.repoRoot)
+            let root = VeloFormatting.canonicalWorkspacePath(s.repoRoot)
+            if bucket[root] == nil {
+                order.append(root)
             }
-            bucket[s.repoRoot, default: []].append(s)
+            bucket[root, default: []].append(s)
+        }
+        // Include synced daemon workspaces when viewing all engines so iOS & Desktop folders match 1:1
+        if selectedEngineFilter == nil {
+            for rawWs in store.workspaces {
+                let root = VeloFormatting.canonicalWorkspacePath(rawWs)
+                guard !root.isEmpty,
+                      !root.hasSuffix("/.velo/workspace"),
+                      bucket[root] == nil
+                else { continue }
+                order.append(root)
+                bucket[root] = []
+            }
         }
         return order.map { root in
             let list = bucket[root] ?? []
@@ -51,7 +67,7 @@ public struct RootSessionsView: View {
 
                 if store.connectionConfig == nil {
                     unpairedWelcomeState
-                } else if store.sessions.isEmpty {
+                } else if store.sessions.isEmpty && store.workspaces.isEmpty {
                     emptyConnectedState
                 } else {
                     ScrollView {
@@ -152,6 +168,27 @@ public struct RootSessionsView: View {
                         navigationPath = [createdId]
                     }
                 }
+            }
+            .alert(
+                "重命名会话",
+                isPresented: Binding(
+                    get: { renamingSessionId != nil },
+                    set: { if !$0 { renamingSessionId = nil } }
+                )
+            ) {
+                TextField("输入会话名称", text: $renameDraftTitle)
+                Button("取消", role: .cancel) {
+                    renamingSessionId = nil
+                }
+                Button("保存") {
+                    if let sid = renamingSessionId {
+                        let newName = renameDraftTitle
+                        renamingSessionId = nil
+                        Task { await store.renameSession(sid, newTitle: newName) }
+                    }
+                }
+            } message: {
+                Text("修改后将自动同步至 Mac 桌面端")
             }
             .onChange(of: store.latestCreatedOrHandoffSessionId) { _, newSid in
                 guard let newSid, !newSid.isEmpty else { return }
@@ -377,28 +414,62 @@ public struct RootSessionsView: View {
             .padding(.horizontal, 4)
 
             if !isCollapsed {
-                VStack(spacing: 9) {
-                    ForEach(group.sessions) { session in
-                        NavigationLink(value: session.id) {
-                            SessionCardView(session: session)
+                if group.sessions.isEmpty {
+                    Button {
+                        prefillRepoForNewSession = group.repoRoot
+                        showNewThreadSheet = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus.circle")
+                                .font(.system(size: 12, weight: .medium))
+                            Text("此目录暂无会话 · 点击新建")
+                                .font(.system(size: 12.5))
+                            Spacer()
                         }
-                        .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
-                        .contextMenu {
-                            Button {
-                                navigationPath.append(session.id)
-                            } label: {
-                                Label("进入对话", systemImage: "bubble.left.and.bubble.right")
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(
+                            VeloTheme.cardSurface(colorScheme).opacity(0.65),
+                            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7)
+                        )
+                    }
+                    .buttonStyle(VeloPressableButtonStyle(scale: 0.99))
+                } else {
+                    VStack(spacing: 9) {
+                        ForEach(group.sessions) { session in
+                            NavigationLink(value: session.id) {
+                                SessionCardView(session: session)
                             }
+                            .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
+                            .contextMenu {
+                                Button {
+                                    renameDraftTitle = session.title
+                                    renamingSessionId = session.id
+                                } label: {
+                                    Label("重命名会话", systemImage: "pencil")
+                                }
 
-                            Button(role: .destructive) {
-                                Task { await store.deleteSession(session.id) }
-                            } label: {
-                                Label("删除此会话", systemImage: "trash")
+                                Button {
+                                    navigationPath.append(session.id)
+                                } label: {
+                                    Label("进入对话", systemImage: "bubble.left.and.bubble.right")
+                                }
+
+                                Button(role: .destructive) {
+                                    Task { await store.deleteSession(session.id) }
+                                } label: {
+                                    Label("删除此会话", systemImage: "trash")
+                                }
                             }
                         }
                     }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
     }
@@ -606,6 +677,12 @@ private struct SessionCardView: View {
 
                 Spacer(minLength: 2)
 
+                if session.tokensUsed > 0 {
+                    Text("\(VeloFormatting.formatCompactTokens(session.tokensUsed)) tok")
+                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+
                 if session.insertions > 0 || session.deletions > 0 {
                     HStack(spacing: 3.5) {
                         Text("+\(session.insertions)")
@@ -658,7 +735,10 @@ private struct NewSessionSheetView: View {
     @State private var repoPath: String = "/Users/daiyudai/code/velo"
     @State private var useWorktree: Bool = false
     @State private var branch: String = ""
+    @State private var customTitle: String = ""
     @State private var prompt: String = ""
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var pendingImages: [PendingComposerImage] = []
     @State private var isCreating: Bool = false
 
     private var categoryModels: [VeloModelOption] {
@@ -676,9 +756,16 @@ private struct NewSessionSheetView: View {
     private var recentRepos: [String] {
         var seen: Set<String> = []
         var result: [String] = []
+        for ws in store.workspaces {
+            let canon = VeloFormatting.canonicalWorkspacePath(ws)
+            if !canon.isEmpty, !canon.hasSuffix("/.velo/workspace"), seen.insert(canon).inserted {
+                result.append(canon)
+            }
+        }
         for s in store.sessions {
-            if !s.repoRoot.isEmpty, seen.insert(s.repoRoot).inserted {
-                result.append(s.repoRoot)
+            let canon = VeloFormatting.canonicalWorkspacePath(s.repoRoot)
+            if !canon.isEmpty, !canon.hasSuffix("/.velo/workspace"), seen.insert(canon).inserted {
+                result.append(canon)
             }
         }
         if result.isEmpty {
@@ -705,19 +792,7 @@ private struct NewSessionSheetView: View {
                                         let isSelected = selectedCategory == cat
                                         let count = store.models.filter { $0.category == cat }.count
                                         Button {
-                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                            withAnimation(.spring(response: 0.26, dampingFraction: 0.8)) {
-                                                selectedCategory = cat
-                                                if let def = store.models.first(where: { $0.category == cat && $0.isDefault })
-                                                    ?? store.models.first(where: { $0.category == cat })
-                                                    ?? VeloModelOption.defaults.first(where: { $0.category == cat })
-                                                {
-                                                    selectedModelId = def.id
-                                                }
-                                                if !cat.supportedEfforts.contains(effort) {
-                                                    effort = cat.supportedEfforts.contains("high") ? "high" : "medium"
-                                                }
-                                            }
+                                            selectEngineCategory(cat)
                                         } label: {
                                             VStack(alignment: .leading, spacing: 8) {
                                                 HStack {
@@ -869,33 +944,52 @@ private struct NewSessionSheetView: View {
 
                         // 4. Project Ownership & Optional Git Worktree
                         VStack(alignment: .leading, spacing: 9) {
-                            sectionHeader("4. 所属项目目录", subtitle: "默认直接在真实项目目录运行，确保桌面端原生归属该项目")
+                            sectionHeader("4. 所属项目目录", subtitle: "默认直接在真实项目目录运行，或点「快速对话」零目录直接开聊")
 
-                            if recentRepos.count > 1 {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 6) {
-                                        ForEach(recentRepos, id: \.self) { rp in
-                                            let name = URL(fileURLWithPath: rp).lastPathComponent
-                                            let isCur = repoPath == rp
-                                            Button {
-                                                repoPath = rp
-                                            } label: {
-                                                HStack(spacing: 4) {
-                                                    Image(systemName: "folder.fill")
-                                                        .font(.system(size: 10.5))
-                                                    Text(name)
-                                                        .font(.system(size: 12, weight: .semibold))
-                                                }
-                                                .foregroundStyle(isCur ? VeloTheme.accentVioletSoft : .secondary)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 6)
-                                                .background(
-                                                    isCur ? VeloTheme.accentViolet.opacity(0.14) : VeloTheme.cardSurface(colorScheme),
-                                                    in: Capsule()
-                                                )
-                                            }
-                                            .buttonStyle(.plain)
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    let quickPath = "~/.velo/workspace"
+                                    let isQuick = repoPath == quickPath
+                                    Button {
+                                        repoPath = quickPath
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "bolt.fill")
+                                                .font(.system(size: 10.5))
+                                            Text("快速对话（默认空间）")
+                                                .font(.system(size: 12, weight: .semibold))
                                         }
+                                        .foregroundStyle(isQuick ? VeloTheme.emerald : .secondary)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(
+                                            isQuick ? VeloTheme.emerald.opacity(0.14) : VeloTheme.cardSurface(colorScheme),
+                                            in: Capsule()
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    ForEach(recentRepos.filter { $0 != quickPath }, id: \.self) { rp in
+                                        let name = URL(fileURLWithPath: rp).lastPathComponent
+                                        let isCur = repoPath == rp
+                                        Button {
+                                            repoPath = rp
+                                        } label: {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "folder.fill")
+                                                    .font(.system(size: 10.5))
+                                                Text(name)
+                                                    .font(.system(size: 12, weight: .semibold))
+                                            }
+                                            .foregroundStyle(isCur ? VeloTheme.accentVioletSoft : .secondary)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 6)
+                                            .background(
+                                                isCur ? VeloTheme.accentViolet.opacity(0.14) : VeloTheme.cardSurface(colorScheme),
+                                                in: Capsule()
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
                                     }
                                 }
                             }
@@ -936,20 +1030,8 @@ private struct NewSessionSheetView: View {
                             )
                         }
 
-                        // 5. Optional Initial Task Prompt
-                        VStack(alignment: .leading, spacing: 9) {
-                            sectionHeader("5. 首条消息（选填）", subtitle: "留空将直接创建干净会话进入聊天框")
-
-                            TextField("输入任务需求，或留空直接进入对话…", text: $prompt, axis: .vertical)
-                                .lineLimit(3...6)
-                                .font(.system(size: 14.5))
-                                .padding(13)
-                                .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
-                                )
-                        }
+                        // 5. Optional Session Title & Initial Task Prompt
+                        initialPromptSection
                     }
                     .padding(16)
                 }
@@ -961,46 +1043,198 @@ private struct NewSessionSheetView: View {
                     Button("取消") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    let hasPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    Button(isCreating ? "创建中…" : (hasPrompt ? "立即启动" : "进入对话")) {
-                        isCreating = true
-                        Task {
-                            let createdId = await store.createNewSession(
-                                title: nil,
-                                prompt: prompt,
-                                repoPath: repoPath,
-                                branch: (useWorktree && !branch.isEmpty) ? branch : nil,
-                                modelOption: selectedModelOption,
-                                effort: effort,
-                                useWorktree: useWorktree
-                            )
-                            isCreating = false
-                            dismiss()
-                            onCreated(createdId)
-                        }
-                    }
-                    .fontWeight(.semibold)
-                    .disabled(isCreating || repoPath.trimmingCharacters(in: .whitespaces).isEmpty)
+                    confirmToolbarButton
                 }
+            }
+            .onChange(of: pickerItems) { _, newItems in
+                handlePickedItems(newItems)
             }
             .onAppear {
-                if let initRepo = initialRepoPath, !initRepo.isEmpty {
-                    repoPath = initRepo
-                } else if let activeRepo = store.sessions.first?.repoRoot, !activeRepo.isEmpty {
-                    repoPath = activeRepo
-                }
-                if let activeCat = store.sessions.first?.engineCategory, activeCat != .other {
-                    selectedCategory = activeCat
-                }
-                if let def = store.models.first(where: { $0.category == selectedCategory && $0.isDefault })
-                    ?? store.models.first(where: { $0.category == selectedCategory })
-                {
-                    selectedModelId = def.id
-                }
-                if selectedCategory == .codex || selectedCategory == .grok {
-                    effort = "high"
+                handleOnAppear()
+            }
+        }
+    }
+
+    private func selectEngineCategory(_ cat: VeloEngineCategory) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        let defModel: VeloModelOption? = {
+            if let m = store.models.first(where: { $0.category == cat && $0.isDefault }) { return m }
+            if let m = store.models.first(where: { $0.category == cat }) { return m }
+            return VeloModelOption.defaults.first(where: { $0.category == cat })
+        }()
+        withAnimation(.spring(response: 0.26, dampingFraction: 0.8)) {
+            selectedCategory = cat
+            if let defModel {
+                selectedModelId = defModel.id
+            }
+            if !cat.supportedEfforts.contains(effort) {
+                effort = cat.supportedEfforts.contains("high") ? "high" : "medium"
+            }
+        }
+    }
+
+    private var initialPromptSection: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            sectionHeader("5. 会话名称与首条消息（选填）", subtitle: "名称留空将按首条消息自动命名；消息留空将创建干净会话")
+
+            TextField("会话名称（选填，例如：修复登录鉴权）", text: $customTitle)
+                .font(.system(size: 14))
+                .padding(12)
+                .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
+                )
+
+            TextField("输入任务需求，或留空直接进入对话…", text: $prompt, axis: .vertical)
+                .lineLimit(3...6)
+                .font(.system(size: 14.5))
+                .padding(13)
+                .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
+                )
+
+            if !pendingImages.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(pendingImages) { item in
+                            ZStack(alignment: .topTrailing) {
+                                Image(uiImage: item.preview)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 60, height: 60)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    .overlay {
+                                        if item.isUploading {
+                                            ZStack {
+                                                Color.black.opacity(0.35)
+                                                ProgressView().tint(.white).scaleEffect(0.75)
+                                            }
+                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                        }
+                                    }
+                                Button {
+                                    pendingImages.removeAll { $0.id == item.id }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 16))
+                                        .symbolRenderingMode(.palette)
+                                        .foregroundStyle(.white, Color.black.opacity(0.72))
+                                }
+                                .offset(x: 4, y: -4)
+                            }
+                            .padding(.top, 4)
+                            .padding(.trailing, 4)
+                        }
+                    }
                 }
             }
+
+            PhotosPicker(
+                selection: $pickerItems,
+                maxSelectionCount: max(1, 4 - pendingImages.count),
+                matching: .images
+            ) {
+                HStack(spacing: 6) {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Text("添加截图 / 参考图（自动压缩加密直传）")
+                        .font(.system(size: 12.5, weight: .medium))
+                }
+                .foregroundStyle(VeloTheme.accentVioletSoft)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(VeloTheme.accentViolet.opacity(0.11), in: Capsule())
+            }
+            .disabled(pendingImages.count >= 4)
+        }
+    }
+
+    private var confirmToolbarButton: some View {
+        let uploadedPaths = pendingImages.compactMap(\.uploadedPath)
+        let isUploadingAny = pendingImages.contains(where: \.isUploading)
+        let hasPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !uploadedPaths.isEmpty
+        let label = isCreating ? "创建中…" : (hasPrompt ? "立即启动" : "进入对话")
+        let isDisabled = isCreating || isUploadingAny || repoPath.trimmingCharacters(in: .whitespaces).isEmpty
+        return Button(label) {
+            isCreating = true
+            Task {
+                await store.addWorkspace(repoPath)
+                let cleanCustomTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                let createdId = await store.createNewSession(
+                    title: cleanCustomTitle.isEmpty ? nil : cleanCustomTitle,
+                    prompt: prompt,
+                    repoPath: repoPath,
+                    branch: (useWorktree && !branch.isEmpty) ? branch : nil,
+                    modelOption: selectedModelOption,
+                    effort: effort,
+                    images: uploadedPaths,
+                    useWorktree: useWorktree
+                )
+                isCreating = false
+                dismiss()
+                onCreated(createdId)
+            }
+        }
+        .fontWeight(.semibold)
+        .disabled(isDisabled)
+    }
+
+    private func handlePickedItems(_ newItems: [PhotosPickerItem]) {
+        guard !newItems.isEmpty else { return }
+        let picked = newItems
+        pickerItems = []
+        Task {
+            for (i, item) in picked.enumerated() {
+                guard pendingImages.count < 4,
+                      let rawData = try? await item.loadTransferable(type: Data.self),
+                      let rawImg = UIImage(data: rawData),
+                      let compressed = VeloAttachmentCache.compressForAgentUpload(rawImg)
+                else { continue }
+                let fname = "init-\(Int(Date().timeIntervalSince1970))-\(i).jpg"
+                let entry = PendingComposerImage(
+                    preview: compressed.preview,
+                    jpegData: compressed.jpegData,
+                    filename: fname
+                )
+                let eid = entry.id
+                pendingImages.append(entry)
+                Task {
+                    let savedPath = await store.uploadAttachment(
+                        jpegData: compressed.jpegData,
+                        preview: compressed.preview,
+                        filename: fname
+                    )
+                    if let idx = pendingImages.firstIndex(where: { $0.id == eid }) {
+                        if let savedPath {
+                            pendingImages[idx].uploadedPath = savedPath
+                        } else {
+                            pendingImages[idx].uploadFailed = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleOnAppear() {
+        if let initRepo = initialRepoPath, !initRepo.isEmpty {
+            repoPath = initRepo
+        } else if let activeRepo = store.sessions.first?.repoRoot, !activeRepo.isEmpty {
+            repoPath = activeRepo
+        }
+        if let activeCat = store.sessions.first?.engineCategory, activeCat != .other {
+            selectedCategory = activeCat
+        }
+        let defModel = store.models.first(where: { $0.category == selectedCategory && $0.isDefault })
+            ?? store.models.first(where: { $0.category == selectedCategory })
+        if let defModel {
+            selectedModelId = defModel.id
+        }
+        if selectedCategory == .codex || selectedCategory == .grok {
+            effort = "high"
         }
     }
 

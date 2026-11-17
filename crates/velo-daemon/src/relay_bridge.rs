@@ -17,7 +17,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
 use tracing::{info, warn};
 use uuid::Uuid;
 use velo_protocol::{
-    AgentProvider, CreateSessionRequest, SessionInfo, SessionInputRequest, WsServerMessage,
+    AgentEvent, AgentProvider, CreateSessionRequest, SessionInfo, SessionInputRequest,
+    SessionStatus, WsServerMessage,
 };
 use velo_relay::{
     DEFAULT_RELAY_PORT, EncryptedRelayFrame, PairingTicket, X25519Keypair, build_encrypted_frame,
@@ -42,6 +43,157 @@ pub struct TunnelStatusSnapshot {
 }
 
 static TUNNEL_STATUS: OnceLock<RwLock<TunnelStatusSnapshot>> = OnceLock::new();
+
+fn truncate_utf8_chars(s: &str, max_chars: usize, suffix: &str) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    format!("{}{}", head, suffix)
+}
+
+fn compact_json_value(val: &Value, max_str_chars: usize) -> Value {
+    match val {
+        Value::String(s) => Value::String(truncate_utf8_chars(s, max_str_chars, "… [已截断]")),
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .take(32)
+                .map(|v| compact_json_value(v, max_str_chars))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map.iter().take(32) {
+                out.insert(k.clone(), compact_json_value(v, max_str_chars));
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Compacts a single `AgentEvent` for mobile E2EE relay transport so multi-hundred-KB
+/// MCP / shell outputs never blow past WebSocket frame limits or stall mobile cellular/Wi-Fi.
+fn compact_event_for_relay(ev: &AgentEvent, max_tool_output_chars: usize) -> AgentEvent {
+    match ev {
+        AgentEvent::ToolCallCompleted {
+            session_id,
+            tool_id,
+            output,
+            is_error,
+            timestamp,
+        } => AgentEvent::ToolCallCompleted {
+            session_id: *session_id,
+            tool_id: tool_id.clone(),
+            output: truncate_utf8_chars(
+                output,
+                max_tool_output_chars,
+                "\n… [完整长输出保存在 Mac 桌面端]",
+            ),
+            is_error: *is_error,
+            timestamp: *timestamp,
+        },
+        AgentEvent::ToolCallRequested {
+            session_id,
+            tool_id,
+            tool_name,
+            arguments,
+            timestamp,
+        } => AgentEvent::ToolCallRequested {
+            session_id: *session_id,
+            tool_id: tool_id.clone(),
+            tool_name: tool_name.clone(),
+            arguments: compact_json_value(arguments, 800),
+            timestamp: *timestamp,
+        },
+        AgentEvent::UserMessage {
+            session_id,
+            text,
+            images,
+            timestamp,
+        } => AgentEvent::UserMessage {
+            session_id: *session_id,
+            text: text.clone(),
+            // Strip multi-MB inline base64 data URIs over blind relay; keep lightweight URLs/names
+            images: images
+                .iter()
+                .filter(|img| img.len() < 4096)
+                .cloned()
+                .collect(),
+            timestamp: *timestamp,
+        },
+        other => other.clone(),
+    }
+}
+
+/// Compacts a full session `event_history` so the serialized JSON stays strictly under ~440 KB
+/// (< 920 KB hex-sealed frame, safely inside any 2 MB WebSocket/relay limit) while preserving
+/// 100% of user prompts, AI replies, errors, status transitions, and recent execution traces.
+pub(crate) fn compact_history_for_relay(evs: &[AgentEvent]) -> Vec<AgentEvent> {
+    let normalized = crate::enrich_history_turn_metrics(evs);
+    // Drop noisy terminal/pty/browser raw lines not rendered in mobile chat timeline
+    let mut filtered: Vec<AgentEvent> = Vec::with_capacity(normalized.len());
+    for ev in &normalized {
+        if matches!(
+            ev,
+            AgentEvent::TerminalOutput { .. }
+                | AgentEvent::PtyOutput { .. }
+                | AgentEvent::BrowserCommand { .. }
+                | AgentEvent::ProviderSessionBound { .. }
+        ) {
+            continue;
+        }
+        filtered.push(compact_event_for_relay(ev, 2400));
+    }
+
+    const MAX_SNAPSHOT_JSON_BYTES: usize = 440_000;
+    if let Ok(bytes) = serde_json::to_vec(&filtered) {
+        if bytes.len() <= MAX_SNAPSHOT_JSON_BYTES {
+            return filtered;
+        }
+    }
+
+    // Second pass for very long 900+ event threads: tighter tool output cap (360 chars) on older steps,
+    // and keep all core conversation events (`UserMessage`, `MessageDelta`, `StatusChanged`, `UsageUpdated`, `Error`)
+    // plus the most recent 120 process (`ThinkingDelta` / `ToolCall*`) events.
+    let total_process = filtered
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::ThinkingDelta { .. }
+                    | AgentEvent::ToolCallRequested { .. }
+                    | AgentEvent::ToolCallCompleted { .. }
+            )
+        })
+        .count();
+    let skip_process = total_process.saturating_sub(120);
+    let mut seen_process = 0usize;
+    let mut slim: Vec<AgentEvent> = Vec::with_capacity(filtered.len().min(260));
+
+    for ev in filtered {
+        let is_proc = matches!(
+            ev,
+            AgentEvent::ThinkingDelta { .. }
+                | AgentEvent::ToolCallRequested { .. }
+                | AgentEvent::ToolCallCompleted { .. }
+        );
+        if is_proc {
+            seen_process += 1;
+            if seen_process <= skip_process {
+                continue;
+            }
+            slim.push(compact_event_for_relay(&ev, 420));
+        } else {
+            slim.push(ev);
+        }
+    }
+    slim
+}
 static LAST_PEER_SEEN: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 static BRIDGE_CONFIG_TX: OnceLock<watch::Sender<BridgeTargetConfig>> = OnceLock::new();
 
@@ -458,9 +610,20 @@ async fn run_supervised_e2ee_bridge(
 
                 let (mut writer, mut reader) = ws_stream.split();
                 let mut event_rx = state.event_tx.subscribe();
+                let mut snapshot_rx = state.snapshot_tx.subscribe();
                 let mut out_nonce: u64 = (Utc::now().timestamp_millis() as u64).saturating_mul(1000);
                 let mut active_key_hex = cfg.root_key_hex.clone();
                 let mut max_nonce_by_sender: HashMap<String, u64> = HashMap::new();
+                struct PendingE2EEUpload {
+                    filename: Option<String>,
+                    mime_type: Option<String>,
+                    chunks: Vec<Option<Vec<u8>>>,
+                    total_bytes: usize,
+                }
+                let mut pending_uploads: HashMap<String, PendingE2EEUpload> = HashMap::new();
+                let mut last_rekey_hint_at = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(std::time::Instant::now);
                 let mut ping_interval =
                     tokio::time::interval(std::time::Duration::from_secs(20));
                 ping_interval.tick().await; // consume immediate first tick
@@ -500,8 +663,20 @@ async fn run_supervised_e2ee_bridge(
                                 break;
                             }
                         }
+                        Ok(sessions) = snapshot_rx.recv() => {
+                            if let Ok(val) = serde_json::to_value(WsServerMessage::SessionsSnapshot { sessions }) {
+                                if let Some(frame_txt) =
+                                    send_sealed_with_key(&val, &active_key_hex, &mut out_nonce)
+                                {
+                                    if writer.send(WsMsg::Text(frame_txt.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         Ok(ev) = event_rx.recv() => {
-                            if let Ok(val) = serde_json::to_value(WsServerMessage::Event { event: ev }) {
+                            let compact_ev = compact_event_for_relay(&ev, 2800);
+                            if let Ok(val) = serde_json::to_value(WsServerMessage::Event { event: compact_ev }) {
                                 if let Some(frame_txt) =
                                     send_sealed_with_key(&val, &active_key_hex, &mut out_nonce)
                                 {
@@ -545,9 +720,23 @@ async fn run_supervised_e2ee_bridge(
 
                             let Some(pt_bytes) = opened else {
                                 warn!(
-                                    "Rejected unauthenticated/tampered E2EE frame on room {}",
+                                    "Rejected unauthenticated/stale-key E2EE frame on room {}; sending root-sealed rekey hint",
                                     cfg.room_id
                                 );
+                                if last_rekey_hint_at.elapsed() >= std::time::Duration::from_secs(2) {
+                                    last_rekey_hint_at = std::time::Instant::now();
+                                    let hint = json!({
+                                        "type": "rekey_required",
+                                        "ts": Utc::now().to_rfc3339(),
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &hint,
+                                        &cfg.root_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
                                 continue;
                             };
 
@@ -626,12 +815,34 @@ async fn run_supervised_e2ee_bridge(
                                         }
                                     }
 
+                                    let ws_list = state.list_workspaces().await;
+                                    let ws_snap = json!({
+                                        "type": "workspaces_snapshot",
+                                        "workspaces": ws_list,
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &ws_snap,
+                                        &active_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+
                                     let guard = state.inner.read().await;
                                     let mut sessions: Vec<SessionInfo> =
                                         guard.sessions.values().cloned().collect();
                                     sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                    let top_ids: Vec<Uuid> =
+                                    let mut top_ids: Vec<Uuid> =
                                         sessions.iter().take(8).map(|s| s.id).collect();
+                                    if let Some(active_s) = cmd_val
+                                        .get("active_session_id")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| Uuid::parse_str(s).ok())
+                                    {
+                                        if !top_ids.contains(&active_s) {
+                                            top_ids.insert(0, active_s);
+                                        }
+                                    }
                                     if let Ok(snap) = serde_json::to_value(
                                         WsServerMessage::SessionsSnapshot { sessions },
                                     ) {
@@ -645,10 +856,11 @@ async fn run_supervised_e2ee_bridge(
                                     }
                                     for sid in top_ids {
                                         if let Some(evs) = guard.event_history.get(&sid) {
+                                            let compact_evs = compact_history_for_relay(evs);
                                             let ev_snap = json!({
                                                 "type": "events_snapshot",
                                                 "session_id": sid,
-                                                "events": evs,
+                                                "events": compact_evs,
                                             });
                                             if let Some(frame_txt) = send_sealed_with_key(
                                                 &ev_snap,
@@ -667,15 +879,15 @@ async fn run_supervised_e2ee_bridge(
                                     {
                                         if let Ok(sid) = Uuid::parse_str(sid_s) {
                                             let guard = state.inner.read().await;
-                                            let evs = guard
+                                            let compact_evs = guard
                                                 .event_history
                                                 .get(&sid)
-                                                .cloned()
+                                                .map(|v| compact_history_for_relay(v))
                                                 .unwrap_or_default();
                                             let ev_snap = json!({
                                                 "type": "events_snapshot",
                                                 "session_id": sid,
-                                                "events": evs,
+                                                "events": compact_evs,
                                             });
                                             if let Some(frame_txt) = send_sealed_with_key(
                                                 &ev_snap,
@@ -750,7 +962,16 @@ async fn run_supervised_e2ee_bridge(
                                                 .and_then(|v| v.as_str())
                                                 .filter(|s| !s.trim().is_empty())
                                                 .map(AgentProvider::from_str_loose);
-                                            let _ = state
+                                            let images: Vec<String> = cmd_val
+                                                .get("images")
+                                                .and_then(|v| v.as_array())
+                                                .map(|arr| {
+                                                    arr.iter()
+                                                        .filter_map(|x| x.as_str().map(str::to_string))
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                            if let Err(err) = state
                                                 .dispatch_session_input(
                                                     sid,
                                                     SessionInputRequest {
@@ -760,11 +981,49 @@ async fn run_supervised_e2ee_bridge(
                                                         provider,
                                                         reset_thread: false,
                                                         truncate_to_user_turn: None,
-                                                        images: Vec::new(),
+                                                        images,
                                                         approval_mode,
                                                     },
                                                 )
-                                                .await;
+                                                .await
+                                            {
+                                                let err_str = err.to_string();
+                                                warn!("E2EE send_input failed for {}: {}", sid, err_str);
+                                                if err_str.contains("not found") {
+                                                    let now = Utc::now();
+                                                    for ev in [
+                                                        AgentEvent::Error {
+                                                            session_id: sid,
+                                                            error: err_str.clone(),
+                                                            timestamp: now,
+                                                        },
+                                                        AgentEvent::StatusChanged {
+                                                            session_id: sid,
+                                                            status: SessionStatus::Failed,
+                                                            message: Some(err_str),
+                                                            timestamp: now,
+                                                        },
+                                                    ] {
+                                                        if let Ok(val) = serde_json::to_value(
+                                                            WsServerMessage::Event { event: ev },
+                                                        ) {
+                                                            if let Some(frame_txt) =
+                                                                send_sealed_with_key(
+                                                                    &val,
+                                                                    &active_key_hex,
+                                                                    &mut out_nonce,
+                                                                )
+                                                            {
+                                                                let _ = writer
+                                                                    .send(WsMsg::Text(
+                                                                        frame_txt.into(),
+                                                                    ))
+                                                                    .await;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -774,6 +1033,37 @@ async fn run_supervised_e2ee_bridge(
                                     {
                                         if let Ok(sid) = Uuid::parse_str(sid_s) {
                                             state.stop_session_by_id(sid).await;
+                                            let ws_list = state.list_workspaces().await;
+                                    let ws_snap = json!({
+                                        "type": "workspaces_snapshot",
+                                        "workspaces": ws_list,
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &ws_snap,
+                                        &active_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+
+                                    let guard = state.inner.read().await;
+                                            let mut sessions: Vec<SessionInfo> =
+                                                guard.sessions.values().cloned().collect();
+                                            sessions
+                                                .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                            if let Ok(snap) = serde_json::to_value(
+                                                WsServerMessage::SessionsSnapshot { sessions },
+                                            ) {
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &snap,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -783,6 +1073,40 @@ async fn run_supervised_e2ee_bridge(
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("agy");
                                     let _ = crate::launch_provider_cli_login(prov).await;
+                                }
+                                "add_workspace" => {
+                                    if let Some(p) = cmd_val.get("path").and_then(|v| v.as_str()) {
+                                        let ws_list = state.add_workspace(p).await;
+                                        let ws_snap = json!({
+                                            "type": "workspaces_snapshot",
+                                            "workspaces": ws_list,
+                                        });
+                                        if let Some(frame_txt) = send_sealed_with_key(
+                                            &ws_snap,
+                                            &active_key_hex,
+                                            &mut out_nonce,
+                                        ) {
+                                            let _ =
+                                                writer.send(WsMsg::Text(frame_txt.into())).await;
+                                        }
+                                    }
+                                }
+                                "remove_workspace" => {
+                                    if let Some(p) = cmd_val.get("path").and_then(|v| v.as_str()) {
+                                        let ws_list = state.remove_workspace(p).await;
+                                        let ws_snap = json!({
+                                            "type": "workspaces_snapshot",
+                                            "workspaces": ws_list,
+                                        });
+                                        if let Some(frame_txt) = send_sealed_with_key(
+                                            &ws_snap,
+                                            &active_key_hex,
+                                            &mut out_nonce,
+                                        ) {
+                                            let _ =
+                                                writer.send(WsMsg::Text(frame_txt.into())).await;
+                                        }
+                                    }
                                 }
                                 "create_session" => {
                                     let prompt = cmd_val
@@ -799,7 +1123,9 @@ async fn run_supervised_e2ee_bridge(
                                             .next()
                                             .map(|s| s.repo_root.clone())
                                             .unwrap_or_else(|| {
-                                                "/Users/daiyudai/code/velo".to_string()
+                                                velo_worktree::default_general_workspace()
+                                                    .to_string_lossy()
+                                                    .to_string()
                                             })
                                     };
                                     let repo_path = cmd_val
@@ -839,7 +1165,15 @@ async fn run_supervised_e2ee_bridge(
                                             .get("effort")
                                             .and_then(|v| v.as_str())
                                             .map(str::to_string),
-                                        images: Vec::new(),
+                                        images: cmd_val
+                                            .get("images")
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default(),
                                         approval_mode: cmd_val
                                             .get("approval_mode")
                                             .and_then(|v| v.as_str())
@@ -847,23 +1181,42 @@ async fn run_supervised_e2ee_bridge(
                                         setup_command: None,
                                         use_worktree,
                                     };
-                                    if state.create_session(req).await.is_ok() {
-                                        let guard = state.inner.read().await;
-                                        let mut sessions: Vec<SessionInfo> =
-                                            guard.sessions.values().cloned().collect();
-                                        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                        if let Ok(snap) = serde_json::to_value(
-                                            WsServerMessage::SessionsSnapshot { sessions },
-                                        ) {
-                                            if let Some(frame_txt) = send_sealed_with_key(
-                                                &snap,
-                                                &active_key_hex,
-                                                &mut out_nonce,
+                                    match state.create_session(req).await {
+                                        Ok(_) => {
+                                            let ws_list = state.list_workspaces().await;
+                                    let ws_snap = json!({
+                                        "type": "workspaces_snapshot",
+                                        "workspaces": ws_list,
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &ws_snap,
+                                        &active_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+
+                                    let guard = state.inner.read().await;
+                                            let mut sessions: Vec<SessionInfo> =
+                                                guard.sessions.values().cloned().collect();
+                                            sessions
+                                                .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                            if let Ok(snap) = serde_json::to_value(
+                                                WsServerMessage::SessionsSnapshot { sessions },
                                             ) {
-                                                let _ = writer
-                                                    .send(WsMsg::Text(frame_txt.into()))
-                                                    .await;
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &snap,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
                                             }
+                                        }
+                                        Err(err) => {
+                                            warn!("E2EE create_session failed: {}", err);
                                         }
                                     }
                                 }
@@ -900,7 +1253,20 @@ async fn run_supervised_e2ee_bridge(
                                                 state.handoff_session(sid, req).await
                                             {
                                                 let sessions: Vec<SessionInfo> = {
-                                                    let guard = state.inner.read().await;
+                                                    let ws_list = state.list_workspaces().await;
+                                    let ws_snap = json!({
+                                        "type": "workspaces_snapshot",
+                                        "workspaces": ws_list,
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &ws_snap,
+                                        &active_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+
+                                    let guard = state.inner.read().await;
                                                     let mut list: Vec<SessionInfo> =
                                                         guard.sessions.values().cloned().collect();
                                                     list.sort_by(|a, b| {
@@ -978,7 +1344,20 @@ async fn run_supervised_e2ee_bridge(
                                                 .await
                                                 .is_some()
                                             {
-                                                let guard = state.inner.read().await;
+                                                let ws_list = state.list_workspaces().await;
+                                    let ws_snap = json!({
+                                        "type": "workspaces_snapshot",
+                                        "workspaces": ws_list,
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &ws_snap,
+                                        &active_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+
+                                    let guard = state.inner.read().await;
                                                 let mut sessions: Vec<SessionInfo> =
                                                     guard.sessions.values().cloned().collect();
                                                 sessions.sort_by(|a, b| {
@@ -1007,7 +1386,20 @@ async fn run_supervised_e2ee_bridge(
                                     {
                                         if let Ok(sid) = Uuid::parse_str(sid_s) {
                                             let _ = state.delete_session_by_id(sid, true).await;
-                                            let guard = state.inner.read().await;
+                                            let ws_list = state.list_workspaces().await;
+                                    let ws_snap = json!({
+                                        "type": "workspaces_snapshot",
+                                        "workspaces": ws_list,
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &ws_snap,
+                                        &active_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+
+                                    let guard = state.inner.read().await;
                                             let mut sessions: Vec<SessionInfo> =
                                                 guard.sessions.values().cloned().collect();
                                             sessions
@@ -1067,6 +1459,247 @@ async fn run_supervised_e2ee_bridge(
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                                "get_attachment" => {
+                                    let req_id = cmd_val
+                                        .get("request_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let raw_ref = cmd_val
+                                        .get("ref")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let tier = cmd_val
+                                        .get("tier")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("thumb")
+                                        .to_string();
+                                    if !raw_ref.is_empty() {
+                                        use base64::{Engine as _, engine::general_purpose::STANDARD};
+                                        match state.load_attachment_tier(&raw_ref, &tier).await {
+                                            Some((bytes, mime_type)) if !bytes.is_empty() => {
+                                                // Chunk at 180 KB raw (~240 KB base64 -> < 500 KB encrypted hex frame)
+                                                const CHUNK_RAW_BYTES: usize = 180 * 1024;
+                                                let slices: Vec<&[u8]> =
+                                                    bytes.chunks(CHUNK_RAW_BYTES).collect();
+                                                let total_chunks = slices.len();
+                                                for (idx, chunk) in slices.into_iter().enumerate() {
+                                                    let msg = json!({
+                                                        "type": "attachment_chunk",
+                                                        "request_id": req_id,
+                                                        "ref": raw_ref,
+                                                        "tier": tier,
+                                                        "mime_type": mime_type,
+                                                        "chunk_index": idx,
+                                                        "total_chunks": total_chunks,
+                                                        "data_base64": STANDARD.encode(chunk),
+                                                    });
+                                                    if let Some(frame_txt) = send_sealed_with_key(
+                                                        &msg,
+                                                        &active_key_hex,
+                                                        &mut out_nonce,
+                                                    ) {
+                                                        if writer
+                                                            .send(WsMsg::Text(frame_txt.into()))
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                let msg = json!({
+                                                    "type": "attachment_chunk",
+                                                    "request_id": req_id,
+                                                    "ref": raw_ref,
+                                                    "tier": tier,
+                                                    "not_found": true,
+                                                    "chunk_index": 0,
+                                                    "total_chunks": 0,
+                                                });
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &msg,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "upload_attachment" => {
+                                    let upload_id = cmd_val
+                                        .get("upload_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let filename =
+                                        cmd_val.get("filename").and_then(|v| v.as_str());
+                                    let mime_type =
+                                        cmd_val.get("mime_type").and_then(|v| v.as_str());
+                                    let data_b64 = cmd_val
+                                        .get("data_base64")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let resp = match crate::decode_base64_payload(data_b64) {
+                                        Ok(bytes) if !bytes.is_empty() => {
+                                            match state
+                                                .save_attachment_bytes(&bytes, filename, mime_type)
+                                                .await
+                                            {
+                                                Ok((saved_name, dest_path)) => json!({
+                                                    "type": "attachment_uploaded",
+                                                    "upload_id": upload_id,
+                                                    "ok": true,
+                                                    "filename": saved_name,
+                                                    "path": dest_path.to_string_lossy().to_string(),
+                                                    "url": format!("/api/attachments/{}", saved_name),
+                                                }),
+                                                Err(err) => json!({
+                                                    "type": "attachment_uploaded",
+                                                    "upload_id": upload_id,
+                                                    "ok": false,
+                                                    "error": err,
+                                                }),
+                                            }
+                                        }
+                                        _ => json!({
+                                            "type": "attachment_uploaded",
+                                            "upload_id": upload_id,
+                                            "ok": false,
+                                            "error": "Invalid attachment payload",
+                                        }),
+                                    };
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "upload_attachment_begin" => {
+                                    let upload_id = cmd_val
+                                        .get("upload_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let total_chunks = cmd_val
+                                        .get("total_chunks")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as usize;
+                                    if !upload_id.is_empty() && (1..=80).contains(&total_chunks) {
+                                        if pending_uploads.len() >= 16 {
+                                            pending_uploads.clear();
+                                        }
+                                        pending_uploads.insert(
+                                            upload_id,
+                                            PendingE2EEUpload {
+                                                filename: cmd_val
+                                                    .get("filename")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(str::to_string),
+                                                mime_type: cmd_val
+                                                    .get("mime_type")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(str::to_string),
+                                                chunks: vec![None; total_chunks],
+                                                total_bytes: 0,
+                                            },
+                                        );
+                                    }
+                                }
+                                "upload_attachment_chunk" => {
+                                    let upload_id = cmd_val
+                                        .get("upload_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let idx = cmd_val
+                                        .get("chunk_index")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as usize;
+                                    let data_b64 = cmd_val
+                                        .get("data_base64")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if let Some(entry) = pending_uploads.get_mut(upload_id) {
+                                        if idx < entry.chunks.len() {
+                                            if let Ok(bytes) =
+                                                crate::decode_base64_payload(data_b64)
+                                            {
+                                                if entry.total_bytes + bytes.len()
+                                                    <= 12 * 1024 * 1024
+                                                {
+                                                    entry.total_bytes += bytes.len();
+                                                    entry.chunks[idx] = Some(bytes);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "upload_attachment_complete" => {
+                                    let upload_id = cmd_val
+                                        .get("upload_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let resp = if let Some(entry) =
+                                        pending_uploads.remove(&upload_id)
+                                    {
+                                        if entry.chunks.iter().all(|c| c.is_some()) {
+                                            let mut full = Vec::with_capacity(entry.total_bytes);
+                                            for part in entry.chunks.into_iter().flatten() {
+                                                full.extend_from_slice(&part);
+                                            }
+                                            match state
+                                                .save_attachment_bytes(
+                                                    &full,
+                                                    entry.filename.as_deref(),
+                                                    entry.mime_type.as_deref(),
+                                                )
+                                                .await
+                                            {
+                                                Ok((saved_name, dest_path)) => json!({
+                                                    "type": "attachment_uploaded",
+                                                    "upload_id": upload_id,
+                                                    "ok": true,
+                                                    "filename": saved_name,
+                                                    "path": dest_path.to_string_lossy().to_string(),
+                                                    "url": format!("/api/attachments/{}", saved_name),
+                                                }),
+                                                Err(err) => json!({
+                                                    "type": "attachment_uploaded",
+                                                    "upload_id": upload_id,
+                                                    "ok": false,
+                                                    "error": err,
+                                                }),
+                                            }
+                                        } else {
+                                            json!({
+                                                "type": "attachment_uploaded",
+                                                "upload_id": upload_id,
+                                                "ok": false,
+                                                "error": "Missing attachment chunks",
+                                            })
+                                        }
+                                    } else {
+                                        json!({
+                                            "type": "attachment_uploaded",
+                                            "upload_id": upload_id,
+                                            "ok": false,
+                                            "error": "Upload session not found",
+                                        })
+                                    };
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
                                     }
                                 }
                                 _ => {}

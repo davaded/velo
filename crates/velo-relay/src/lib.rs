@@ -271,7 +271,7 @@ pub async fn run_relay_server(addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-const MAX_BLIND_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BLIND_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PEERS_PER_ROOM: usize = 8;
 
 /// Verifies at the blind edge that a text frame is strictly an opaque `EncryptedRelayFrame`

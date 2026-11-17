@@ -15,11 +15,13 @@
 		97D055905EB279BECD30AE6E /* RootSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */; };
 		C2256A61C8C4F603B293EDF5 /* QRScannerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D65ECD2C5F1E76064D249E2D /* QRScannerSheet.swift */; };
 		C4B831DBDF9BB144D624EEE3 /* VeloMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79284B976E54269E8F2EB68C /* VeloMobileApp.swift */; };
+		C8B327742DD8C80D4FFDDCCB /* VeloAttachmentCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */; };
 		E97A462096D560AACC4C4D15 /* E2EERelayCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = EACCFB84DE2C81BDE5B763D5 /* E2EERelayCrypto.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootSessionsView.swift; sourceTree = "<group>"; };
+		462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloAttachmentCache.swift; sourceTree = "<group>"; };
 		4B23793B28F46BDB8C60A104 /* VeloModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloModels.swift; sourceTree = "<group>"; };
 		79284B976E54269E8F2EB68C /* VeloMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloMobileApp.swift; sourceTree = "<group>"; };
 		CC020058B3917BAE9C4C26A5 /* VeloStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloStore.swift; sourceTree = "<group>"; };
@@ -83,6 +85,7 @@
 		D3C784906D8D66941735FB50 /* Networking */ = {
 			isa = PBXGroup;
 			children = (
+				462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */,
 				CC020058B3917BAE9C4C26A5 /* VeloStore.swift */,
 			);
 			path = Networking;
@@ -172,6 +175,7 @@
 				C2256A61C8C4F603B293EDF5 /* QRScannerSheet.swift in Sources */,
 				97D055905EB279BECD30AE6E /* RootSessionsView.swift in Sources */,
 				50FFA3CFDF1E34DD3EA7133E /* ShimmerAndStatusViews.swift in Sources */,
+				C8B327742DD8C80D4FFDDCCB /* VeloAttachmentCache.swift in Sources */,
 				C4B831DBDF9BB144D624EEE3 /* VeloMobileApp.swift in Sources */,
 				43C9F9C5CA2C460BEB9DF8A0 /* VeloModels.swift in Sources */,
 				00EF0E4CAD7E2FEBB6F1E847 /* VeloStore.swift in Sources */,
@@ -240,7 +244,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 7;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = 76S2FLMS7Q;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -261,7 +265,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.2.0;
+				MARKETING_VERSION = 0.2.6;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -308,7 +312,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 7;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = 76S2FLMS7Q;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -323,7 +327,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.2.0;
+				MARKETING_VERSION = 0.2.6;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";

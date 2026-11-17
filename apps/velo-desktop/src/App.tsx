@@ -14,7 +14,9 @@ import {
   SLASH_SKILLS,
   VeloRepo,
   VeloSession,
+  canonicalRepoPath,
   normalizeToVeloSession,
+  repoIdFromPath,
 } from "./mockData";
 import { parseUnifiedDiff } from "./utils/diffParser";
 import {
@@ -24,9 +26,9 @@ import {
   BeautifulQuestionCard,
   BeautifulThinkingBlock,
   BeautifulToolCallCard,
+  PaseoExecutionTraceGroup,
   PaseoMarkdown,
-  PaseoToolCallGroup,
-  PaseoToolGroupItem,
+  PaseoTraceStepItem,
   PaseoTurnFooter,
   PaseoTurnTelemetry,
   resolvePaseoToolPresentation,
@@ -220,8 +222,8 @@ function reconstructEventsFromHistory(
     } else if (evType === "thinking_delta") {
       const text = String(ev.text ?? "").trim();
       if (!text) continue;
-      const stepDeltaMs =
-        lastStepMs > 0 && tsMs >= lastStepMs ? Math.max(500, tsMs - lastStepMs) : undefined;
+      const rawStep = lastStepMs > 0 && tsMs >= lastStepMs ? tsMs - lastStepMs : 0;
+      const stepDeltaMs = rawStep > 0 ? Math.max(500, rawStep) : undefined;
       if (tsMs > 0) {
         lastStepMs = tsMs;
       }
@@ -343,6 +345,22 @@ function reconstructEventsFromHistory(
         kind: "assistant",
         content: text,
       });
+    } else if (evType === "usage_updated") {
+      if (activeHistUserIdx >= 0) {
+        const inTok = Number(ev.input_tokens ?? 0);
+        const outTok = Number(ev.output_tokens ?? 0);
+        const cacheRead = Number(ev.cache_read_tokens ?? 0);
+        const costUsd = Number(ev.cost_usd ?? 0);
+        const outTps = Number(ev.output_tps ?? 0);
+        reconstructed[activeHistUserIdx] = {
+          ...reconstructed[activeHistUserIdx],
+          tps: outTps >= 0.5 ? outTps : reconstructed[activeHistUserIdx].tps,
+          input_tokens: inTok || reconstructed[activeHistUserIdx].input_tokens,
+          output_tokens: outTok || reconstructed[activeHistUserIdx].output_tokens,
+          cache_read_tokens: cacheRead || reconstructed[activeHistUserIdx].cache_read_tokens,
+          cost_usd: costUsd || reconstructed[activeHistUserIdx].cost_usd,
+        };
+      }
     } else if (evType === "error") {
       const errText = String(ev.error ?? "Agent execution error");
       const prevItem = reconstructed[reconstructed.length - 1];
@@ -509,6 +527,13 @@ export function App() {
     return true;
   });
   const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
+  const [autoCollapseSteps, setAutoCollapseSteps] = useState<boolean>(() => {
+    const saved = localStorage.getItem("velo.autoCollapseSteps");
+    return saved === null ? true : saved !== "false";
+  });
+  useEffect(() => {
+    localStorage.setItem("velo.autoCollapseSteps", String(autoCollapseSteps));
+  }, [autoCollapseSteps]);
   const [repos, setRepos] = useState<VeloRepo[]>(() => {
     try {
       const saved =
@@ -711,6 +736,7 @@ export function App() {
   const termSeqRef = useRef<number>(0);
   const turnStartMsRef = useRef<Record<string, number>>({});
   const stepStartMsRef = useRef<Record<string, number>>({});
+  const streamOutCharsRef = useRef<Record<string, { startedAtMs: number; chars: number }>>({});
   const [turnTimingBySession, setTurnTimingBySession] = useState<
     Record<
       string,
@@ -722,6 +748,7 @@ export function App() {
         bootStage?: "provisioning" | "spawned" | "bound";
         agentPid?: number;
         providerThreadShort?: string;
+        liveTps?: number;
       }
     >
   >({});
@@ -794,28 +821,53 @@ export function App() {
             return true;
           });
           const normalized = realItems.map((item, idx) => normalizeToVeloSession(item, idx));
-          if (normalized.length > 0) {
-            // Auto-register any project paths from the Mac daemon so mobile browsers see all workspaces
-            setRepos((prevRepos) => {
-              const knownPaths = new Set(prevRepos.map((r) => r.path));
-              const extra: VeloRepo[] = [];
-              for (const s of normalized) {
-                if (s.project_path && !knownPaths.has(s.project_path)) {
-                  knownPaths.add(s.project_path);
-                  const folder =
-                    s.project_path.split("/").filter(Boolean).pop() || "workspace";
-                  extra.push({
-                    id: `repo-${folder.toLowerCase().replace(/[^a-z0-9]/g, "-")}`,
-                    code: folder.slice(0, 2).toUpperCase(),
-                    name: folder,
-                    path: s.project_path,
-                    default_branch: "main",
-                  });
-                }
-              }
-              return extra.length > 0 ? [...prevRepos, ...extra] : prevRepos;
-            });
+          // Fetch canonical workspace list from daemon so Desktop & iOS share identical folders
+          fetch(`${daemonUrl}/api/workspaces`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((wsObj: { workspaces?: string[] } | null) => {
+              const daemonPaths = Array.isArray(wsObj?.workspaces)
+                ? wsObj!.workspaces.map(canonicalRepoPath)
+                : [];
+              const allPaths = [
+                ...daemonPaths,
+                ...normalized.map((s) => canonicalRepoPath(s.project_path)),
+              ].filter(Boolean);
+              if (allPaths.length === 0) return;
 
+              setRepos((prevRepos) => {
+                const sessionPathSet = new Set(
+                  normalized.map((s) => canonicalRepoPath(s.project_path))
+                );
+                // Drop unused demo placeholder `velo-cloud` once real daemon workspaces exist
+                const cleanedPrev = prevRepos.filter(
+                  (r) =>
+                    canonicalRepoPath(r.path) !== "/Users/daiyudai/code/velo-cloud" ||
+                    sessionPathSet.has("/Users/daiyudai/code/velo-cloud") ||
+                    daemonPaths.includes("/Users/daiyudai/code/velo-cloud")
+                );
+                const byPath = new Map<string, VeloRepo>();
+                for (const r of cleanedPrev) {
+                  const cp = canonicalRepoPath(r.path);
+                  byPath.set(cp, { ...r, id: repoIdFromPath(cp), path: cp });
+                }
+                for (const cp of allPaths) {
+                  if (!byPath.has(cp)) {
+                    const folder = cp.split("/").filter(Boolean).pop() || "workspace";
+                    byPath.set(cp, {
+                      id: repoIdFromPath(cp),
+                      code: folder.slice(0, 2).toUpperCase(),
+                      name: folder,
+                      path: cp,
+                      default_branch: "main",
+                    });
+                  }
+                }
+                return Array.from(byPath.values());
+              });
+            })
+            .catch(() => {});
+
+          if (normalized.length > 0) {
             // On a fresh mobile/browser open where activeId is still the empty placeholder, jump straight to the latest active thread
             if (!initialDaemonSyncedRef.current) {
               initialDaemonSyncedRef.current = true;
@@ -834,12 +886,14 @@ export function App() {
               if (!existing) return n;
               return {
                 ...n,
-                title: existing.title || n.title,
-                repo_id: existing.repo_id || n.repo_id,
-                agent_kind: existing.agent_kind || n.agent_kind,
-                model: existing.model || n.model,
-                model_short: existing.model_short || n.model_short,
-                effort: existing.effort || n.effort,
+                title: n.title || existing.title,
+                // Always trust canonical repo_id & project_path from daemon so Desktop & iOS folders never diverge!
+                repo_id: n.repo_id,
+                project_path: n.project_path,
+                agent_kind: n.agent_kind || existing.agent_kind,
+                model: n.model || existing.model,
+                model_short: n.model_short || existing.model_short,
+                effort: n.effort || existing.effort,
               };
             });
             const mergedIds = new Set(merged.map((s) => s.id));
@@ -1112,9 +1166,47 @@ export function App() {
         setModelCatalog(raw.models as ModelOption[]);
         return;
       }
+      if (raw.type === "workspaces_snapshot" && Array.isArray(raw.workspaces)) {
+        const wsPaths = (raw.workspaces as string[]).map(canonicalRepoPath).filter(Boolean);
+        if (wsPaths.length > 0) {
+          setRepos((prev) => {
+            const byPath = new Map<string, VeloRepo>();
+            for (const cp of wsPaths) {
+              const existing = prev.find((r) => canonicalRepoPath(r.path) === cp);
+              const folder = cp.split("/").filter(Boolean).pop() || "workspace";
+              byPath.set(cp, {
+                id: repoIdFromPath(cp),
+                code: existing?.code || folder.slice(0, 2).toUpperCase(),
+                name: existing?.name || folder,
+                path: cp,
+                default_branch: existing?.default_branch || "main",
+              });
+            }
+            return Array.from(byPath.values());
+          });
+        }
+        return;
+      }
       if (raw.kind === "sessions_snapshot" && Array.isArray(raw.sessions)) {
         const normalized = raw.sessions.map((item, idx) => normalizeToVeloSession(item, idx));
         if (normalized.length > 0) {
+          setRepos((prev) => {
+            const byPath = new Map(prev.map((r) => [canonicalRepoPath(r.path), { ...r, id: repoIdFromPath(r.path), path: canonicalRepoPath(r.path) }]));
+            for (const s of normalized) {
+              const cp = canonicalRepoPath(s.project_path);
+              if (cp && !byPath.has(cp)) {
+                const folder = cp.split("/").filter(Boolean).pop() || "workspace";
+                byPath.set(cp, {
+                  id: repoIdFromPath(cp),
+                  code: folder.slice(0, 2).toUpperCase(),
+                  name: folder,
+                  path: cp,
+                  default_branch: "main",
+                });
+              }
+            }
+            return Array.from(byPath.values());
+          });
           setSessions(normalized);
           if (!initialDaemonSyncedRef.current) {
             initialDaemonSyncedRef.current = true;
@@ -1158,8 +1250,20 @@ export function App() {
         const text = String(evObj.text ?? "").trim();
         const imgs = Array.isArray(evObj.images) ? evObj.images.map(String).filter(Boolean) : [];
         if (!text && imgs.length === 0) return;
-        turnStartMsRef.current[sid] = Date.now();
-        stepStartMsRef.current[sid] = Date.now();
+        const parsedTs =
+          typeof evObj.timestamp === "string" ? new Date(evObj.timestamp).getTime() : NaN;
+        const turnOriginMs = Number.isNaN(parsedTs) ? Date.now() : parsedTs;
+        turnStartMsRef.current[sid] = turnOriginMs;
+        stepStartMsRef.current[sid] = turnOriginMs;
+        delete streamOutCharsRef.current[sid];
+        // Reset per-turn timing immediately so messages sent from iOS NEVER accumulate the previous turn's duration!
+        setTurnTimingBySession((prev) => ({
+          ...prev,
+          [sid]: {
+            startedAtMs: turnOriginMs,
+            bootStage: "spawned",
+          },
+        }));
         setSessions((prev) => {
           if (!prev.some((s) => s.id === sid)) {
             refreshSessions();
@@ -1333,38 +1437,48 @@ export function App() {
       if (evType === "status_changed") {
         const st = String(evObj.status ?? "");
         const statusMsg = String(evObj.message ?? "");
+        const parsedStatusTs =
+          typeof evObj.timestamp === "string" ? new Date(evObj.timestamp).getTime() : NaN;
+        const statusTsMs = Number.isNaN(parsedStatusTs) ? Date.now() : parsedStatusTs;
         if (st === "running") {
           const pidMatch = statusMsg.match(/PID\s+(?:Some\()?(\d+)/i);
           const parsedPid = pidMatch ? Number(pidMatch[1]) : undefined;
           if (!turnStartMsRef.current[sid]) {
-            turnStartMsRef.current[sid] = Date.now();
+            turnStartMsRef.current[sid] = statusTsMs;
           }
           if (!stepStartMsRef.current[sid]) {
             stepStartMsRef.current[sid] = turnStartMsRef.current[sid];
           }
           setTurnTimingBySession((prev) => {
             const cur = prev[sid];
+            const isFreshTurn = !cur || cur.durationMs !== undefined;
+            const freshStart = turnStartMsRef.current[sid] || statusTsMs;
             return {
               ...prev,
               [sid]: {
-                startedAtMs: cur?.startedAtMs || turnStartMsRef.current[sid] || Date.now(),
-                ttftMs: cur?.ttftMs,
-                bootStage: cur?.bootStage === "bound" ? "bound" : "spawned",
+                startedAtMs: isFreshTurn ? freshStart : cur.startedAtMs || freshStart,
+                ttftMs: isFreshTurn ? undefined : cur.ttftMs,
+                bootStage: !isFreshTurn && cur.bootStage === "bound" ? "bound" : "spawned",
                 agentPid: parsedPid ?? cur?.agentPid,
                 providerThreadShort: cur?.providerThreadShort,
+                liveTps: isFreshTurn ? undefined : cur.liveTps,
               },
             };
           });
         } else if (st === "completed" || st === "failed" || st === "stopped") {
-          const nowDoneMs = Date.now();
+          const nowDoneMs = statusTsMs;
           const startedAtMs = turnStartMsRef.current[sid] || nowDoneMs - 1000;
           const stepOriginMs = stepStartMsRef.current[sid] || startedAtMs;
           delete turnStartMsRef.current[sid];
           delete stepStartMsRef.current[sid];
+          delete streamOutCharsRef.current[sid];
           const computedDur = Math.max(500, nowDoneMs - startedAtMs);
           setTurnTimingBySession((prev) => {
             const cur = prev[sid];
-            const sMs = cur?.startedAtMs || startedAtMs;
+            const sMs =
+              cur && cur.durationMs === undefined && cur.startedAtMs
+                ? cur.startedAtMs
+                : startedAtMs;
             return {
               ...prev,
               [sid]: {
@@ -1666,19 +1780,56 @@ export function App() {
       }
 
       if (evType === "usage_updated") {
-        const totalTok = Number(evObj.total_tokens ?? 0);
+        const inTok = Number(evObj.input_tokens ?? 0);
+        const outTok = Number(evObj.output_tokens ?? 0);
+        const totalTok = Number(evObj.total_tokens ?? 0) || inTok + outTok;
+        const cacheRead = Number(evObj.cache_read_tokens ?? 0);
+        const ctxWin = Number(evObj.context_window ?? 0);
         const costDelta = Number(evObj.cost_usd ?? 0);
+        const outTps = Number(evObj.output_tps ?? 0);
+        if (outTps >= 0.5) {
+          setTurnTimingBySession((prev) => {
+            const cur = prev[sid] || { startedAtMs: Date.now() };
+            return { ...prev, [sid]: { ...cur, liveTps: outTps } };
+          });
+        }
         setSessions((prev) =>
           prev.map((s) =>
             s.id === sid
               ? {
                   ...s,
                   tokens_used: totalTok > 0 ? totalTok : s.tokens_used,
-                  cost_usd: costDelta > 0 ? (s.cost_usd || 0) + costDelta : s.cost_usd,
+                  input_tokens: inTok > 0 ? inTok : s.input_tokens,
+                  output_tokens: outTok > 0 ? Math.max(s.output_tokens || 0, outTok) : s.output_tokens,
+                  cache_read_tokens: cacheRead > 0 ? cacheRead : s.cache_read_tokens,
+                  tokens_limit: ctxWin > 0 ? ctxWin : s.tokens_limit,
+                  cost_usd: costDelta > 0 ? Math.max(s.cost_usd || 0, costDelta) : s.cost_usd,
                 }
               : s
           )
         );
+        setEventsBySession((prev) => {
+          const list = prev[sid];
+          if (!list || list.length === 0) return prev;
+          let lastUserIdx = -1;
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].kind === "user") {
+              lastUserIdx = i;
+              break;
+            }
+          }
+          if (lastUserIdx === -1) return prev;
+          const next = [...list];
+          next[lastUserIdx] = {
+            ...next[lastUserIdx],
+            tps: outTps >= 0.5 ? outTps : next[lastUserIdx].tps,
+            input_tokens: inTok || next[lastUserIdx].input_tokens,
+            output_tokens: outTok || next[lastUserIdx].output_tokens,
+            cache_read_tokens: cacheRead || next[lastUserIdx].cache_read_tokens,
+            cost_usd: costDelta || next[lastUserIdx].cost_usd,
+          };
+          return { ...prev, [sid]: next };
+        });
         return;
       }
 
@@ -2082,6 +2233,9 @@ export function App() {
       }
       if (imgRef.startsWith("/api/attachments/")) {
         return `${daemonUrl}${imgRef}`;
+      }
+      if (imgRef.startsWith("/") || imgRef.startsWith("file://") || imgRef.startsWith("~/")) {
+        return `${daemonUrl}/api/attachments-resolve?ref=${encodeURIComponent(imgRef)}`;
       }
       const basename = imgRef.split("/").pop() || imgRef;
       return `${daemonUrl}/api/attachments/${basename}`;
@@ -2749,9 +2903,21 @@ export function App() {
   const handleRemoveRepo = (repoId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (repos.length <= 1) return;
+    const target = repos.find((r) => r.id === repoId);
+    if (target) {
+      fetch(`${daemonUrl}/api/workspaces`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: target.path }),
+      }).catch(() => {});
+    }
     setRepos((prev) => prev.filter((r) => r.id !== repoId));
     setSessions((prev) => {
-      const remaining = prev.filter((s) => s.repo_id !== repoId);
+      const remaining = prev.filter(
+        (s) =>
+          s.repo_id !== repoId &&
+          (!target || canonicalRepoPath(s.project_path) !== canonicalRepoPath(target.path))
+      );
       if (remaining.length > 0 && activeSession.repo_id === repoId) {
         setActiveId(remaining[0].id);
       }
@@ -3179,10 +3345,10 @@ export function App() {
   };
 
   const handleCreateRepo = () => {
-    const cleanPath = newRepoPath.trim() || "/Users/daiyudai/code/new-repo";
+    const cleanPath = canonicalRepoPath(newRepoPath.trim() || "/Users/daiyudai/code/new-repo");
     const name = cleanPath.split("/").filter(Boolean).pop() || "repo";
     const code = name.slice(0, 2).toUpperCase();
-    const id = `repo-${Date.now().toString().slice(-4)}`;
+    const id = repoIdFromPath(cleanPath);
     const newRepo: VeloRepo = {
       id,
       code,
@@ -3190,7 +3356,14 @@ export function App() {
       path: cleanPath,
       default_branch: "main",
     };
-    setRepos((prev) => [...prev, newRepo]);
+    setRepos((prev) =>
+      prev.some((r) => canonicalRepoPath(r.path) === cleanPath) ? prev : [...prev, newRepo]
+    );
+    fetch(`${daemonUrl}/api/workspaces`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: cleanPath }),
+    }).catch(() => {});
     setActiveModal(null);
   };
 
@@ -3451,7 +3624,11 @@ export function App() {
           {/* Scrollable Project -> Thread Hierarchy (Borderless, Clean Rows) */}
           <div className="flex-1 space-y-3 overflow-y-auto px-2 py-1">
             {repos.map((repo) => {
-              const repoItems = sessions.filter((s) => s.repo_id === repo.id);
+              const canonRepoPath = canonicalRepoPath(repo.path);
+              const repoItems = sessions.filter(
+                (s) =>
+                  canonicalRepoPath(s.project_path) === canonRepoPath || s.repo_id === repo.id
+              );
               const isCollapsed = !!collapsedRepos[repo.id];
 
               return (
@@ -3737,10 +3914,48 @@ export function App() {
               <GitBranch className="h-3 w-3 text-[var(--v-fg-muted)]" />
               {activeSession.branch_name}
             </span>
+            {(() => {
+              const isRunning =
+                activeSession.status === "running" ||
+                activeSession.status === "waiting_approval";
+              const lastTurnUser = [...activeEvents]
+                .reverse()
+                .find((e) => e.kind === "user");
+              const displayTps = isRunning
+                ? turnTimingBySession[activeSession.id]?.liveTps ?? lastTurnUser?.tps
+                : lastTurnUser?.tps;
+              if (!displayTps || displayTps < 0.5) return null;
+              return (
+                <span
+                  title="模型输出生成速率 (Tokens / Sec)"
+                  className="inline-flex items-center gap-1 rounded-md bg-[#8b5cf6]/12 px-2 py-0.5 font-mono text-[11px] font-medium text-[#a78bfa] tabular-nums"
+                >
+                  <span>⚡ {displayTps.toFixed(1)} tok/s</span>
+                </span>
+              );
+            })()}
           </div>
 
-          {/* Right Header Controls: E2EE Badge, Open in IDE, Diff, PR, Preview & xterm Terminal */}
+          {/* Right Header Controls: Auto-Collapse Toggle, E2EE Badge, Open in IDE, Diff, PR, Preview & xterm Terminal */}
           <div className="relative flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setAutoCollapseSteps((v) => !v)}
+              title={
+                autoCollapseSteps
+                  ? "当前：连续思考与 MCP/工具执行默认折叠收起（点击切换为默认展开）"
+                  : "当前：执行过程默认展开（点击切换为默认折叠收起）"
+              }
+              className={`hidden sm:inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] transition-colors cursor-pointer ${
+                autoCollapseSteps
+                  ? "bg-[var(--v-bg-hover)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
+                  : "bg-[#8b5cf6]/15 text-[#a78bfa] hover:bg-[#8b5cf6]/25"
+              }`}
+            >
+              <Layers className="h-3 w-3" />
+              <span>{autoCollapseSteps ? "过程默认收起" : "过程默认展开"}</span>
+            </button>
+
             {e2eeConnected && (
               <span
                 title="End-to-End Encrypted Relay Active (X25519 + ChaCha20-Poly1305)"
@@ -4172,60 +4387,90 @@ export function App() {
                                 );
                               })()}
 
-                            {/* 2. Chronological Agent Turn Items (Thinking -> Tools -> Markdown Reply) */}
+                            {/* 2. Chronological Agent Turn Items (Consecutive Thinking + MCP/Tools grouped into collapsible Trace) */}
                             {turn.items.map((ev, idx) => {
                               const isLastTurnItem = idx === turn.items.length - 1;
+                              const isProcessStep = (item: AgentEvent) =>
+                                item.kind === "thinking" || item.kind === "tool_call";
 
-                              if (ev.kind === "thinking") {
-                                const isStreamingThinking = Boolean(
-                                  ev.is_streaming_chunk && isTurnRunning && isLastTurnItem
-                                );
-                                return (
-                                  <BeautifulThinkingBlock
-                                    key={ev.id}
-                                    text={ev.content}
-                                    isStreaming={isStreamingThinking}
-                                    startedAtMs={
-                                      ev.started_at_ms ??
-                                      (isLatestTurn ? activeTurnTiming?.startedAtMs : undefined)
-                                    }
-                                    durationMs={ev.duration_ms}
-                                    defaultExpanded={false}
-                                  />
-                                );
-                              }
-
-                              if (ev.kind === "tool_call") {
-                                if (idx > 0 && turn.items[idx - 1].kind === "tool_call") {
+                              if (isProcessStep(ev)) {
+                                if (idx > 0 && isProcessStep(turn.items[idx - 1])) {
                                   return null;
                                 }
                                 let endIdx = idx;
                                 while (
                                   endIdx + 1 < turn.items.length &&
-                                  turn.items[endIdx + 1].kind === "tool_call"
+                                  isProcessStep(turn.items[endIdx + 1])
                                 ) {
                                   endIdx++;
                                 }
                                 if (endIdx > idx) {
-                                  const groupItems: PaseoToolGroupItem[] = turn.items
+                                  const traceSteps: PaseoTraceStepItem[] = turn.items
                                     .slice(idx, endIdx + 1)
-                                    .map((tev) => ({
-                                      id: tev.id,
-                                      toolName: tev.tool_name || "Tool",
-                                      input:
-                                        tev.tool_input ??
-                                        (tev.tool_args ? { target: tev.tool_args } : tev.content),
-                                      output:
-                                        tev.tool_output ??
-                                        (tev.tool_input === undefined ? tev.content : undefined),
-                                      isError: tev.tool_is_error,
-                                      fileArg: tev.tool_args,
-                                    }));
+                                    .map((stepEv, relIdx) => {
+                                      const absIdx = idx + relIdx;
+                                      const isLastInTurn = absIdx === turn.items.length - 1;
+                                      if (stepEv.kind === "thinking") {
+                                        return {
+                                          id: stepEv.id,
+                                          kind: "thinking",
+                                          text: stepEv.content,
+                                          isStreamingThinking: Boolean(
+                                            stepEv.is_streaming_chunk &&
+                                              isTurnRunning &&
+                                              isLastInTurn
+                                          ),
+                                          startedAtMs:
+                                            stepEv.started_at_ms ??
+                                            (isLatestTurn
+                                              ? activeTurnTiming?.startedAtMs
+                                              : undefined),
+                                          durationMs: stepEv.duration_ms,
+                                        };
+                                      }
+                                      return {
+                                        id: stepEv.id,
+                                        kind: "tool_call",
+                                        toolName: stepEv.tool_name || "Tool",
+                                        input:
+                                          stepEv.tool_input ??
+                                          (stepEv.tool_args
+                                            ? { target: stepEv.tool_args }
+                                            : stepEv.content),
+                                        output:
+                                          stepEv.tool_output ??
+                                          (stepEv.tool_input === undefined
+                                            ? stepEv.content
+                                            : undefined),
+                                        isError: stepEv.tool_is_error,
+                                        fileArg: stepEv.tool_args,
+                                      };
+                                    });
                                   return (
-                                    <PaseoToolCallGroup
-                                      key={ev.id}
-                                      items={groupItems}
+                                    <PaseoExecutionTraceGroup
+                                      key={`trace-${ev.id}-${autoCollapseSteps ? "c" : "e"}`}
+                                      steps={traceSteps}
+                                      defaultExpanded={!autoCollapseSteps}
                                       onOpenDiffForFile={openDiffForFile}
+                                    />
+                                  );
+                                }
+
+                                if (ev.kind === "thinking") {
+                                  const isStreamingThinking = Boolean(
+                                    ev.is_streaming_chunk && isTurnRunning && isLastTurnItem
+                                  );
+                                  return (
+                                    <BeautifulThinkingBlock
+                                      key={ev.id}
+                                      text={ev.content}
+                                      isStreaming={isStreamingThinking}
+                                      startedAtMs={
+                                        ev.started_at_ms ??
+                                        (isLatestTurn ? activeTurnTiming?.startedAtMs : undefined)
+                                      }
+                                      durationMs={ev.duration_ms}
+                                      defaultExpanded={false}
                                     />
                                   );
                                 }
@@ -4408,14 +4653,22 @@ export function App() {
                                 lastTurnItem?.timestamp
                               }
                               assistantContent={lastTurnAssistant?.content}
-                              telemetry={
-                                isLatestTurn
-                                  ? {
-                                      insertions: activeSession.insertions,
-                                      deletions: activeSession.deletions,
-                                    }
-                                  : undefined
-                              }
+                              telemetry={{
+                                insertions: isLatestTurn ? activeSession.insertions : 0,
+                                deletions: isLatestTurn ? activeSession.deletions : 0,
+                                tps:
+                                  isLatestTurn && isTurnRunning
+                                    ? activeTurnTiming?.liveTps ?? turn.userEv?.tps
+                                    : turn.userEv?.tps,
+                                inputTokens:
+                                  turn.userEv?.input_tokens ??
+                                  (isLatestTurn ? activeSession.input_tokens : undefined),
+                                outputTokens: turn.userEv?.output_tokens,
+                                cacheReadTokens:
+                                  turn.userEv?.cache_read_tokens ??
+                                  (isLatestTurn ? activeSession.cache_read_tokens : undefined),
+                                costUsd: turn.userEv?.cost_usd,
+                              }}
                               onOpenDiff={() => openDiffForFile()}
                               onRetry={
                                 turn.userEv && !isSessionRunning

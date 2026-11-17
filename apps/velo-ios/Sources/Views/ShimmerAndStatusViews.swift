@@ -51,14 +51,12 @@ public struct EngineBadgePill: View {
     }
 }
 
-// MARK: - 3. High-Contrast 120Hz Specular Shimmer Text (Beautiful UI)
+// MARK: - 3. Stateless TimelineView Specular Shimmer Text (Never Freezes on Recycle/Transition)
 
 public struct ShimmerTextView: View {
     public let text: String
     public var font: Font = .system(size: 13.5, weight: .medium)
     public var accent: Color = VeloTheme.accentVioletSoft
-
-    @State private var phase: CGFloat = -0.55
 
     public init(
         _ text: String,
@@ -71,111 +69,98 @@ public struct ShimmerTextView: View {
     }
 
     public var body: some View {
-        Text(text)
-            .font(font)
-            .foregroundStyle(Color.secondary.opacity(0.82))
-            .overlay {
-                GeometryReader { geo in
-                    LinearGradient(
-                        stops: [
-                            .init(color: .clear, location: 0.0),
-                            .init(color: accent.opacity(0.55), location: 0.35),
-                            .init(color: Color.primary.opacity(0.95), location: 0.5),
-                            .init(color: accent.opacity(0.55), location: 0.65),
-                            .init(color: .clear, location: 1.0),
-                        ],
-                        startPoint: UnitPoint(x: 0, y: 0.2),
-                        endPoint: UnitPoint(x: 1, y: 0.8)
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { ctx in
+            let cycle = ctx.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: 1.65) / 1.65
+            let phase = -0.55 + CGFloat(cycle) * 1.90
+
+            Text(text)
+                .font(font)
+                .foregroundStyle(Color.secondary.opacity(0.82))
+                .overlay {
+                    GeometryReader { geo in
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.0),
+                                .init(color: accent.opacity(0.55), location: 0.35),
+                                .init(color: Color.primary.opacity(0.95), location: 0.5),
+                                .init(color: accent.opacity(0.55), location: 0.65),
+                                .init(color: .clear, location: 1.0),
+                            ],
+                            startPoint: UnitPoint(x: 0, y: 0.2),
+                            endPoint: UnitPoint(x: 1, y: 0.8)
+                        )
+                        .frame(width: max(68, geo.size.width * 0.58))
+                        .offset(x: phase * (geo.size.width + 88))
+                    }
+                    .mask(
+                        Text(text)
+                            .font(font)
                     )
-                    .frame(width: max(68, geo.size.width * 0.58))
-                    .offset(x: phase * (geo.size.width + 88))
                 }
-                .mask(
-                    Text(text)
-                        .font(font)
-                )
-            }
-            .onAppear {
-                phase = -0.55
-                withAnimation(.linear(duration: 1.65).repeatForever(autoreverses: false)) {
-                    phase = 1.35
-                }
-            }
+        }
     }
 }
 
-// MARK: - 4. Dual-Ring Orbital Status Icon + Breathing Sparkles
+// MARK: - 4. Stateless Dual-Ring Orbital Status Icon + Breathing Sparkles
 
 public struct OrbitalStatusIcon: View {
     public let phase: AgentLivePhase
-    @State private var spinning = false
-    @State private var counterSpinning = false
-    @State private var pulsing = false
 
     public init(phase: AgentLivePhase) {
         self.phase = phase
     }
 
     public var body: some View {
-        switch phase {
-        case .waiting:
-            Image(systemName: "exclamationmark.shield.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(VeloTheme.amber)
-                .scaleEffect(pulsing ? 1.1 : 0.92)
-                .onAppear {
-                    withAnimation(.easeInOut(duration: 0.95).repeatForever(autoreverses: true)) {
-                        pulsing = true
-                    }
-                }
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate
+            let wave = (sin(t * .pi * 2.0 / 1.85) + 1.0) * 0.5 // smooth 0...1
 
-        case .thinking:
-            Image(systemName: "sparkles")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(VeloTheme.accentVioletSoft)
-                .scaleEffect(pulsing ? 1.14 : 0.86)
-                .rotationEffect(.degrees(pulsing ? 8 : -8))
-                .opacity(pulsing ? 1.0 : 0.62)
-                .onAppear {
-                    withAnimation(.easeInOut(duration: 1.05).repeatForever(autoreverses: true)) {
-                        pulsing = true
-                    }
-                }
+            switch phase {
+            case .waiting:
+                Image(systemName: "exclamationmark.shield.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(VeloTheme.amber)
+                    .scaleEffect(0.92 + 0.18 * wave)
 
-        case .tool, .working, .writing:
-            ZStack {
-                Circle()
-                    .stroke(VeloTheme.accentViolet.opacity(0.18), lineWidth: 1.5)
-                    .frame(width: 15, height: 15)
+            case .thinking:
+                Image(systemName: "sparkles")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                    .scaleEffect(0.86 + 0.26 * wave)
+                    .rotationEffect(.degrees(-8.0 + 16.0 * wave))
+                    .opacity(0.62 + 0.38 * wave)
 
-                Circle()
-                    .trim(from: 0.0, to: 0.36)
-                    .stroke(
-                        VeloTheme.accentVioletSoft,
-                        style: StrokeStyle(lineWidth: 1.75, lineCap: .round)
-                    )
-                    .frame(width: 15, height: 15)
-                    .rotationEffect(.degrees(spinning ? 360 : 0))
+            case .tool, .working, .writing:
+                let spinDeg = (t / 0.92).truncatingRemainder(dividingBy: 1.0) * 360.0
+                let counterDeg = -(t / 1.45).truncatingRemainder(dividingBy: 1.0) * 360.0
 
-                Circle()
-                    .trim(from: 0.5, to: 0.72)
-                    .stroke(
-                        Color.primary.opacity(0.55),
-                        style: StrokeStyle(lineWidth: 1.2, lineCap: .round)
-                    )
-                    .frame(width: 10.5, height: 10.5)
-                    .rotationEffect(.degrees(counterSpinning ? -360 : 0))
+                ZStack {
+                    Circle()
+                        .stroke(VeloTheme.accentViolet.opacity(0.18), lineWidth: 1.5)
+                        .frame(width: 15, height: 15)
 
-                Circle()
-                    .fill(VeloTheme.accentVioletSoft)
-                    .frame(width: 3.2, height: 3.2)
-            }
-            .onAppear {
-                withAnimation(.linear(duration: 0.92).repeatForever(autoreverses: false)) {
-                    spinning = true
-                }
-                withAnimation(.linear(duration: 1.45).repeatForever(autoreverses: false)) {
-                    counterSpinning = true
+                    Circle()
+                        .trim(from: 0.0, to: 0.36)
+                        .stroke(
+                            VeloTheme.accentVioletSoft,
+                            style: StrokeStyle(lineWidth: 1.75, lineCap: .round)
+                        )
+                        .frame(width: 15, height: 15)
+                        .rotationEffect(.degrees(spinDeg))
+
+                    Circle()
+                        .trim(from: 0.5, to: 0.72)
+                        .stroke(
+                            Color.primary.opacity(0.55),
+                            style: StrokeStyle(lineWidth: 1.2, lineCap: .round)
+                        )
+                        .frame(width: 10.5, height: 10.5)
+                        .rotationEffect(.degrees(counterDeg))
+
+                    Circle()
+                        .fill(VeloTheme.accentVioletSoft)
+                        .frame(width: 3.2, height: 3.2)
                 }
             }
         }
@@ -316,6 +301,149 @@ public struct ReasoningRowView: View {
 }
 
 // MARK: - 7. Grouped Consecutive Tool Calls Row (PaseoToolCallGroup Parity)
+
+// MARK: - 7. Unified Collapsible Execution Trace Group (Consecutive `Thought` + `MCP` / Tool Calls)
+
+public struct ExecutionTraceGroupView: View {
+    public let items: [TimelineEventItem]
+    public let isTurnRunning: Bool
+    public let turnStartedAt: Date?
+    public let defaultExpanded: Bool
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var expanded: Bool
+
+    public init(
+        items: [TimelineEventItem],
+        isTurnRunning: Bool = false,
+        turnStartedAt: Date? = nil,
+        defaultExpanded: Bool = false
+    ) {
+        self.items = items
+        self.isTurnRunning = isTurnRunning
+        self.turnStartedAt = turnStartedAt
+        self.defaultExpanded = defaultExpanded
+        self._expanded = State(initialValue: defaultExpanded)
+    }
+
+    public var body: some View {
+        let meta = VeloFormatting.summarizeExecutionTrace(items)
+        let activelyRunning = isTurnRunning && meta.isRunning
+
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                    expanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    if activelyRunning {
+                        OrbitalStatusIcon(phase: .working)
+                            .frame(width: 16)
+                    } else {
+                        Image(
+                            systemName: meta.hasError
+                                ? "exclamationmark.triangle.fill"
+                                : "square.stack.3d.up.fill"
+                        )
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(meta.hasError ? VeloTheme.coral : VeloTheme.accentVioletSoft.opacity(0.9))
+                        .frame(width: 16)
+                    }
+
+                    if activelyRunning, let activeLabel = meta.activeLabel {
+                        ShimmerTextView(
+                            activeLabel,
+                            font: .system(size: 12.5, weight: .medium)
+                        )
+                        .lineLimit(1)
+                    } else {
+                        Text(expanded ? "执行过程明细 (\(items.count) 步)" : meta.title)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    if activelyRunning {
+                        Text("\(items.count) 步")
+                            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(VeloTheme.accentVioletSoft)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(VeloTheme.accentViolet.opacity(0.14), in: Capsule())
+                    }
+
+                    Text(expanded ? "收起" : "展开")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.tertiary)
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6.5)
+                .background(
+                    VeloTheme.elevatedSurface(colorScheme).opacity(0.62),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(
+                            activelyRunning
+                                ? VeloTheme.accentViolet.opacity(0.32)
+                                : VeloTheme.hairline(colorScheme),
+                            lineWidth: 0.75
+                        )
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
+            .onChange(of: defaultExpanded) { _, newDefault in
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                    expanded = newDefault
+                }
+            }
+
+            if expanded {
+                IndentRailContainer {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
+                            let isLastInBatch = idx == items.count - 1
+                            switch item.kind {
+                            case .thinking(let startedAt, let durationMs, let isStreaming):
+                                ReasoningRowView(
+                                    rawText: item.content,
+                                    startedAt: startedAt ?? turnStartedAt,
+                                    durationMs: durationMs,
+                                    isStreaming: isStreaming && isTurnRunning && isLastInBatch
+                                )
+                            case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isError):
+                                ToolCallRowView(
+                                    toolName: toolName,
+                                    displayName: displayName,
+                                    workingVerb: workingVerb,
+                                    summary: summary,
+                                    output: output,
+                                    isError: isError,
+                                    nested: true
+                                )
+                            default:
+                                EmptyView()
+                            }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+}
 
 public struct ToolCallGroupRowView: View {
     public let items: [TimelineEventItem]
@@ -543,31 +671,28 @@ public struct ToolCallRowView: View {
     }
 }
 
-// MARK: - 9. Pulsing Streaming Cursor Indicator
+// MARK: - 9. Stateless Pulsing Streaming Cursor Indicator
 
 public struct StreamingCursorDot: View {
-    @State private var visible = true
-
     public init() {}
 
     public var body: some View {
-        HStack(spacing: 5) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(VeloTheme.accentVioletSoft)
-                .frame(width: 7, height: 14)
-                .opacity(visible ? 0.95 : 0.2)
-            Spacer(minLength: 0)
-        }
-        .padding(.top, 1)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.55).repeatForever(autoreverses: true)) {
-                visible = false
+        TimelineView(.animation(minimumInterval: 1.0 / 20.0)) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate
+            let wave = (sin(t * .pi * 2.0 / 1.1) + 1.0) * 0.5
+            HStack(spacing: 5) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(VeloTheme.accentVioletSoft)
+                    .frame(width: 7, height: 14)
+                    .opacity(0.2 + 0.75 * wave)
+                Spacer(minLength: 0)
             }
+            .padding(.top, 1)
         }
     }
 }
 
-// MARK: - 10. Phase-Morphing Live Turn Status Footer (Transitions.dev + Vercel AI Elements)
+// MARK: - 10. Phase-Morphing Live Turn Status & Industry Telemetry Footer
 
 public struct TurnStatusFooterView: View {
     public let isRunning: Bool
@@ -575,6 +700,8 @@ public struct TurnStatusFooterView: View {
     public let startedAt: Date?
     public let durationMs: Int?
     public let completedAt: String?
+    public let liveTps: Double?
+    public let telemetry: TurnUsageTelemetry?
     public let assistantText: String?
     public let onRetry: (() -> Void)?
 
@@ -588,6 +715,8 @@ public struct TurnStatusFooterView: View {
         startedAt: Date?,
         durationMs: Int?,
         completedAt: String?,
+        liveTps: Double? = nil,
+        telemetry: TurnUsageTelemetry? = nil,
         assistantText: String?,
         onRetry: (() -> Void)?
     ) {
@@ -596,6 +725,8 @@ public struct TurnStatusFooterView: View {
         self.startedAt = startedAt
         self.durationMs = durationMs
         self.completedAt = completedAt
+        self.liveTps = liveTps
+        self.telemetry = telemetry
         self.assistantText = assistantText
         self.onRetry = onRetry
     }
@@ -654,80 +785,126 @@ public struct TurnStatusFooterView: View {
                     .id(phaseIdentity)
                     .transition(.opacity.combined(with: .offset(y: 3)))
 
+                    let runningTps = liveTps ?? telemetry?.tps
+                    if let runningTps, runningTps >= 0.5 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "bolt.fill")
+                                .font(.system(size: 9.5, weight: .bold))
+                            Text(String(format: "%.1f tok/s", runningTps))
+                                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                                .contentTransition(.numericText())
+                        }
+                        .foregroundStyle(VeloTheme.accentVioletSoft)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2.5)
+                        .background(VeloTheme.accentViolet.opacity(0.13), in: Capsule())
+                    }
+
                     Spacer(minLength: 0)
                 }
                 .animation(.snappy(duration: 0.22), value: phaseIdentity)
                 .padding(.top, 4)
             }
-        } else if assistantText != nil || durationMs != nil || onRetry != nil {
-            HStack(spacing: 8) {
-                if let assistantText, !assistantText.isEmpty {
-                    Button {
-                        UIPasteboard.general.string = assistantText
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        withAnimation(.snappy(duration: 0.18)) {
-                            copied = true
+        } else if assistantText != nil || durationMs != nil || telemetry != nil || onRetry != nil {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    if let tps = telemetry?.tps, tps >= 0.5 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "bolt.fill")
+                                .font(.system(size: 9.5, weight: .bold))
+                            Text(String(format: "%.1f tok/s", tps))
+                                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                         }
-                        Task {
-                            try? await Task.sleep(nanoseconds: 1_500_000_000)
-                            withAnimation(.snappy(duration: 0.18)) {
-                                copied = false
+                        .foregroundStyle(VeloTheme.accentVioletSoft)
+                        .padding(.horizontal, 7.5)
+                        .padding(.vertical, 3.5)
+                        .background(VeloTheme.accentViolet.opacity(0.11), in: Capsule())
+                    }
+
+                    if let durationMs, durationMs > 0 {
+                        Button {
+                            withAnimation(.snappy(duration: 0.2)) {
+                                showTimestampInstead.toggle()
                             }
+                        } label: {
+                            Text(
+                                showTimestampInstead && (completedAt?.isEmpty == false)
+                                    ? "完成于 \(completedAt!)"
+                                    : "耗时 \(VeloFormatting.formatDuration(ms: durationMs))"
+                            )
+                            .font(.system(size: 11.5, weight: .medium).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .contentTransition(.numericText())
                         }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                                .font(.system(size: 11, weight: .semibold))
-                            Text(copied ? "已复制" : "复制")
-                                .font(.system(size: 11.5, weight: .medium))
-                        }
-                        .foregroundStyle(copied ? VeloTheme.emerald : .secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                        .buttonStyle(.plain)
+                    } else if let completedAt, !completedAt.isEmpty {
+                        Text(completedAt)
+                            .font(.system(size: 11.5).monospacedDigit())
+                            .foregroundStyle(.tertiary)
                     }
-                    .buttonStyle(VeloPressableButtonStyle())
-                }
 
-                if let onRetry {
-                    Button(action: onRetry) {
-                        HStack(spacing: 3.5) {
-                            Image(systemName: "arrow.counterclockwise")
-                                .font(.system(size: 11, weight: .semibold))
-                            Text("重试")
-                                .font(.system(size: 11.5, weight: .medium))
+                    if let tel = telemetry {
+                        if tel.totalTokens > 0 {
+                            Text("· \(VeloFormatting.formatCompactTokens(tel.totalTokens)) tok")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.tertiary)
                         }
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
-                    }
-                    .buttonStyle(VeloPressableButtonStyle())
-                }
-
-                if let durationMs, durationMs > 0 {
-                    Button {
-                        withAnimation(.snappy(duration: 0.2)) {
-                            showTimestampInstead.toggle()
+                        if let hitPct = tel.cacheHitPercent, hitPct > 0 {
+                            Text("· 缓存 \(hitPct)%")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundStyle(VeloTheme.emerald.opacity(0.85))
                         }
-                    } label: {
-                        Text(
-                            showTimestampInstead && (completedAt?.isEmpty == false)
-                                ? "完成于 \(completedAt!)"
-                                : "耗时 \(VeloFormatting.formatDuration(ms: durationMs))"
-                        )
-                        .font(.system(size: 11.5, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                        .contentTransition(.numericText())
+                        if tel.costUsd >= 0.0001 {
+                            Text("· \(VeloFormatting.formatUsd(tel.costUsd))")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
                     }
-                    .buttonStyle(.plain)
-                } else if let completedAt, !completedAt.isEmpty {
-                    Text(completedAt)
-                        .font(.system(size: 11.5).monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
 
-                Spacer(minLength: 0)
+                    if let assistantText, !assistantText.isEmpty {
+                        Button {
+                            UIPasteboard.general.string = assistantText
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            withAnimation(.snappy(duration: 0.18)) {
+                                copied = true
+                            }
+                            Task {
+                                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                                withAnimation(.snappy(duration: 0.18)) {
+                                    copied = false
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                Text(copied ? "已复制" : "复制")
+                                    .font(.system(size: 11.5, weight: .medium))
+                            }
+                            .foregroundStyle(copied ? VeloTheme.emerald : .secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
+                    }
+
+                    if let onRetry {
+                        Button(action: onRetry) {
+                            HStack(spacing: 3.5) {
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                Text("重试")
+                                    .font(.system(size: 11.5, weight: .medium))
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
+                    }
+                }
             }
             .padding(.top, 3)
         }

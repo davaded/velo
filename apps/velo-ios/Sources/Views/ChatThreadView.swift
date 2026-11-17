@@ -1,5 +1,11 @@
+import PhotosUI
 import SwiftUI
 import UIKit
+
+private struct PreviewImageTarget: Identifiable {
+    let id = UUID()
+    let ref: String
+}
 
 public struct ChatThreadView: View {
     @ObservedObject var store: VeloStore
@@ -12,6 +18,11 @@ public struct ChatThreadView: View {
     @State private var selectedEffort: String = "medium"
     @State private var showDiffSheet: Bool = false
     @State private var showModelSheet: Bool = false
+    @State private var showRenameAlert: Bool = false
+    @State private var renameDraftTitle: String = ""
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var pendingImages: [PendingComposerImage] = []
+    @State private var previewImageItem: PreviewImageTarget?
     @FocusState private var composerFocused: Bool
 
     public init(
@@ -82,22 +93,33 @@ public struct ChatThreadView: View {
                                 let turnRunning = isLatest && isSessionRunning
 
                                 TurnBlockView(
+                                    store: store,
                                     turn: turn,
                                     isTurnRunning: turnRunning,
                                     turnStartedAt: isLatest ? store.turnStartedAtBySession[sessionId] : nil,
+                                    liveTps: isLatest ? store.liveTpsBySession[sessionId] : nil,
+                                    autoCollapseSteps: store.autoCollapseSteps,
                                     waitingApproval: isLatest ? store.pendingApprovals[sessionId] : nil,
                                     waitingQuestion: isLatest ? store.pendingQuestions[sessionId] : nil,
+                                    onPreviewImage: { ref in
+                                        previewImageItem = PreviewImageTarget(ref: ref)
+                                    },
                                     onRequestMacLogin: { provider in
                                         await store.requestMacCLILogin(provider: provider)
                                     },
                                     onRetry: (!isSessionRunning && turn.userEvent != nil) ? {
-                                        if let text = turn.userEvent?.content {
+                                        if let userEv = turn.userEvent {
+                                            let retryImages: [String] = {
+                                                if case .user(let imgs) = userEv.kind { return imgs }
+                                                return []
+                                            }()
                                             Task {
                                                 await store.sendPrompt(
                                                     sessionId: sessionId,
-                                                    text: text,
+                                                    text: userEv.content,
                                                     model: selectedModelId,
-                                                    effort: selectedEffort
+                                                    effort: selectedEffort,
+                                                    images: retryImages
                                                 )
                                             }
                                         }
@@ -139,8 +161,20 @@ public struct ChatThreadView: View {
                     }
                     .scrollDismissesKeyboard(.interactively)
                     .onChange(of: store.eventsBySession[sessionId]?.count ?? 0) { _, _ in
-                        withAnimation(.easeOut(duration: 0.22)) {
-                            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                        guard let lastEv = store.eventsBySession[sessionId]?.last else { return }
+                        let shouldScroll: Bool = {
+                            if !store.autoCollapseSteps { return true }
+                            switch lastEv.kind {
+                            case .user, .assistant, .error:
+                                return true
+                            case .thinking, .toolCall:
+                                return false
+                            }
+                        }()
+                        if shouldScroll {
+                            withAnimation(.easeOut(duration: 0.22)) {
+                                proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                            }
                         }
                     }
                     .onChange(of: session?.model) { _, newModel in
@@ -177,8 +211,44 @@ public struct ChatThreadView: View {
         .navigationTitle(session?.title ?? "对话")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    renameDraftTitle = session?.title ?? ""
+                    showRenameAlert = true
+                } label: {
+                    HStack(spacing: 4.5) {
+                        Text(session?.title ?? "对话")
+                            .font(.system(size: 15.5, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Image(systemName: "pencil")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .frame(maxWidth: 210)
+                }
+                .buttonStyle(.plain)
+            }
+
             ToolbarItem(placement: .topBarTrailing) {
                 HStack(spacing: 8) {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                            store.autoCollapseSteps.toggle()
+                        }
+                    } label: {
+                        Image(
+                            systemName: store.autoCollapseSteps
+                                ? "rectangle.compress.vertical"
+                                : "rectangle.expand.vertical"
+                        )
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(store.autoCollapseSteps ? VeloTheme.accentVioletSoft : .secondary)
+                    }
+                    .accessibilityLabel(store.autoCollapseSteps ? "默认收起执行流" : "默认展开执行流")
+
                     Button {
                         showModelSheet = true
                     } label: {
@@ -195,6 +265,16 @@ public struct ChatThreadView: View {
                     }
                 }
             }
+        }
+        .alert("重命名会话", isPresented: $showRenameAlert) {
+            TextField("输入会话名称", text: $renameDraftTitle)
+            Button("取消", role: .cancel) {}
+            Button("保存") {
+                let newName = renameDraftTitle
+                Task { await store.renameSession(sessionId, newTitle: newName) }
+            }
+        } message: {
+            Text("修改后将自动同步至 Mac 桌面端")
         }
         .sheet(isPresented: $showDiffSheet) {
             DiffViewerSheet(
@@ -239,6 +319,77 @@ public struct ChatThreadView: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         }
+        .fullScreenCover(item: $previewImageItem) { target in
+            FullscreenImagePreviewSheet(store: store, ref: target.ref)
+        }
+        .onChange(of: pickerItems) { _, newItems in
+            guard !newItems.isEmpty else { return }
+            let picked = newItems
+            pickerItems = []
+            Task {
+                for (i, item) in picked.enumerated() {
+                    if let rawData = try? await item.loadTransferable(type: Data.self),
+                       let rawUIImage = UIImage(data: rawData)
+                    {
+                        enqueueComposerImage(rawUIImage, filename: "photo-\(Int(Date().timeIntervalSince1970))-\(i).jpg")
+                    }
+                }
+            }
+        }
+    }
+
+    private func enqueueComposerImage(_ rawImage: UIImage, filename: String) {
+        guard pendingImages.count < 4,
+              let compressed = VeloAttachmentCache.compressForAgentUpload(rawImage)
+        else { return }
+        let entry = PendingComposerImage(
+            preview: compressed.preview,
+            jpegData: compressed.jpegData,
+            filename: filename
+        )
+        let entryId = entry.id
+        pendingImages.append(entry)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+
+        Task {
+            let uploadedPath = await store.uploadAttachment(
+                jpegData: compressed.jpegData,
+                preview: compressed.preview,
+                filename: filename
+            )
+            if let idx = pendingImages.firstIndex(where: { $0.id == entryId }) {
+                if let uploadedPath {
+                    pendingImages[idx].uploadedPath = uploadedPath
+                    pendingImages[idx].uploadFailed = false
+                } else {
+                    pendingImages[idx].uploadFailed = true
+                }
+            }
+        }
+    }
+
+    private func retryComposerImageUpload(_ entryId: UUID) {
+        guard let idx = pendingImages.firstIndex(where: { $0.id == entryId }) else { return }
+        pendingImages[idx].uploadFailed = false
+        pendingImages[idx].uploadedPath = nil
+        let jpegData = pendingImages[idx].jpegData
+        let preview = pendingImages[idx].preview
+        let filename = pendingImages[idx].filename
+        Task {
+            let uploadedPath = await store.uploadAttachment(
+                jpegData: jpegData,
+                preview: preview,
+                filename: filename
+            )
+            if let curIdx = pendingImages.firstIndex(where: { $0.id == entryId }) {
+                if let uploadedPath {
+                    pendingImages[curIdx].uploadedPath = uploadedPath
+                    pendingImages[curIdx].uploadFailed = false
+                } else {
+                    pendingImages[curIdx].uploadFailed = true
+                }
+            }
+        }
     }
 
     // MARK: - Subviews
@@ -267,6 +418,36 @@ public struct ChatThreadView: View {
             }
 
             Spacer(minLength: 4)
+
+            if let tps = store.latestThroughput(for: sessionId), tps >= 0.5 {
+                HStack(spacing: 2.5) {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 9, weight: .bold))
+                    Text(String(format: "%.1f tok/s", tps))
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .contentTransition(.numericText())
+                }
+                .foregroundStyle(VeloTheme.accentVioletSoft)
+                .padding(.horizontal, 6.5)
+                .padding(.vertical, 2.5)
+                .background(
+                    VeloTheme.accentViolet.opacity(isSessionRunning ? 0.18 : 0.11),
+                    in: Capsule()
+                )
+            }
+
+            if s.tokensUsed > 0 {
+                let ctxPct: String = {
+                    guard s.contextWindow > 0 else { return "" }
+                    let pct = min(100, Int((Double(s.inputTokens > 0 ? s.inputTokens : s.tokensUsed) / Double(s.contextWindow) * 100.0).rounded()))
+                    return pct > 0 ? " · \(pct)%" : ""
+                }()
+                let costPart = s.costUsd >= 0.001 ? " · \(VeloFormatting.formatUsd(s.costUsd))" : ""
+                Text("\(VeloFormatting.formatCompactTokens(s.tokensUsed)) tok\(ctxPct)\(costPart)")
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
 
             if s.insertions > 0 || s.deletions > 0 {
                 Button {
@@ -335,37 +516,143 @@ public struct ChatThreadView: View {
     private var floatingComposerDock: some View {
         let cat = activeModelOption.category
         let supportedEfforts = cat.supportedEfforts
-        let canSend = !draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasText = !draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let uploadedPaths = pendingImages.compactMap(\.uploadedPath)
+        let isUploadingAny = pendingImages.contains(where: \.isUploading)
+        let canSend = (hasText || !uploadedPaths.isEmpty) && !isUploadingAny
 
         return VStack(spacing: 10) {
-            TextField("向 \(cat.shortBadge) 发送指令…", text: $draftPrompt, axis: .vertical)
+            if !pendingImages.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 9) {
+                        ForEach(pendingImages) { item in
+                            ZStack(alignment: .topTrailing) {
+                                Image(uiImage: item.preview)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 64, height: 64)
+                                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                            .stroke(
+                                                item.uploadFailed
+                                                    ? AnyShapeStyle(VeloTheme.coral)
+                                                    : AnyShapeStyle(VeloTheme.specularRim(colorScheme)),
+                                                lineWidth: item.uploadFailed ? 1.3 : 0.85
+                                            )
+                                    )
+                                    .overlay {
+                                        if item.isUploading {
+                                            ZStack {
+                                                Color.black.opacity(0.35)
+                                                ProgressView()
+                                                    .tint(.white)
+                                                    .scaleEffect(0.8)
+                                            }
+                                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                        } else if item.uploadFailed {
+                                            Button {
+                                                retryComposerImageUpload(item.id)
+                                            } label: {
+                                                ZStack {
+                                                    Color.black.opacity(0.55)
+                                                    VStack(spacing: 2) {
+                                                        Image(systemName: "arrow.clockwise")
+                                                            .font(.system(size: 13, weight: .bold))
+                                                        Text("重试")
+                                                            .font(.system(size: 9.5, weight: .semibold))
+                                                    }
+                                                    .foregroundStyle(.white)
+                                                }
+                                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                    .onTapGesture {
+                                        if let ref = item.uploadedPath {
+                                            previewImageItem = PreviewImageTarget(ref: ref)
+                                        }
+                                    }
+
+                                Button {
+                                    withAnimation(.snappy(duration: 0.18)) {
+                                        pendingImages.removeAll { $0.id == item.id }
+                                    }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 17))
+                                        .symbolRenderingMode(.palette)
+                                        .foregroundStyle(.white, Color.black.opacity(0.72))
+                                }
+                                .offset(x: 5, y: -5)
+                            }
+                            .padding(.top, 5)
+                            .padding(.trailing, 5)
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+            }
+
+            TextField("向 \(cat.shortBadge) 发送指令或附图…", text: $draftPrompt, axis: .vertical)
                 .lineLimit(1...5)
                 .focused($composerFocused)
                 .font(.system(size: 15))
                 .padding(.horizontal, 4)
                 .padding(.top, 2)
 
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
+                // Paseo-Style Compressed Photo / Screenshot Picker
+                PhotosPicker(
+                    selection: $pickerItems,
+                    maxSelectionCount: max(1, 4 - pendingImages.count),
+                    matching: .images
+                ) {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(pendingImages.isEmpty ? Color.secondary : VeloTheme.accentVioletSoft)
+                        .frame(width: 31, height: 31)
+                        .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                }
+                .disabled(pendingImages.count >= 4)
+
+                if UIPasteboard.general.hasImages && pendingImages.count < 4 {
+                    Button {
+                        if let pasted = UIPasteboard.general.image {
+                            enqueueComposerImage(pasted, filename: "clipboard-\(Int(Date().timeIntervalSince1970)).jpg")
+                        }
+                    } label: {
+                        Image(systemName: "doc.on.clipboard")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(VeloTheme.accentVioletSoft)
+                            .frame(width: 31, height: 31)
+                            .background(VeloTheme.accentViolet.opacity(0.12), in: Circle())
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+                    .accessibilityLabel("粘贴剪贴板图片")
+                }
+
                 // Categorized Model & Handoff Sheet Trigger
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     showModelSheet = true
                 } label: {
-                    HStack(spacing: 5.5) {
+                    HStack(spacing: 5) {
                         Image(systemName: cat.iconName)
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(cat.accentColor)
 
                         Text(activeModelOption.cleanTitle)
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(.system(size: 11.5, weight: .semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
 
                         Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.system(size: 8.5, weight: .bold))
                             .foregroundStyle(.tertiary)
                     }
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, 9)
                     .padding(.vertical, 6)
                     .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                     .overlay(
@@ -397,22 +684,22 @@ public struct ChatThreadView: View {
                         }
                     }
                 } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3.5) {
                         Image(systemName: "dial.medium.fill")
-                            .font(.system(size: 10.5))
+                            .font(.system(size: 10))
                         Text(selectedEffort.uppercased())
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                     }
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 9)
+                    .padding(.horizontal, 8)
                     .padding(.vertical, 6)
                     .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                 }
 
-                Spacer(minLength: 4)
+                Spacer(minLength: 2)
 
                 // Tactile Send / Stop Button
-                if isSessionRunning && !canSend {
+                if isSessionRunning && !canSend && pendingImages.isEmpty {
                     Button {
                         Task { await store.stopSession(sessionId) }
                     } label: {
@@ -426,33 +713,43 @@ public struct ChatThreadView: View {
                 } else {
                     Button {
                         let toSend = draftPrompt
+                        let attached = uploadedPaths
                         draftPrompt = ""
+                        pendingImages.removeAll()
                         composerFocused = false
                         Task {
                             await store.sendPrompt(
                                 sessionId: sessionId,
                                 text: toSend,
                                 model: selectedModelId,
-                                effort: selectedEffort
+                                effort: selectedEffort,
+                                images: attached
                             )
                         }
                     } label: {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 14.5, weight: .bold))
-                            .foregroundStyle(canSend ? .white : .secondary.opacity(0.55))
-                            .frame(width: 34, height: 34)
-                            .background(
-                                canSend
-                                    ? AnyShapeStyle(
-                                        LinearGradient(
-                                            colors: [VeloTheme.accentViolet, cat.accentColor],
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
+                        if isUploadingAny {
+                            ProgressView()
+                                .tint(VeloTheme.accentVioletSoft)
+                                .frame(width: 34, height: 34)
+                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                        } else {
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 14.5, weight: .bold))
+                                .foregroundStyle(canSend ? .white : .secondary.opacity(0.55))
+                                .frame(width: 34, height: 34)
+                                .background(
+                                    canSend
+                                        ? AnyShapeStyle(
+                                            LinearGradient(
+                                                colors: [VeloTheme.accentViolet, cat.accentColor],
+                                                startPoint: .topLeading,
+                                                endPoint: .bottomTrailing
+                                            )
                                         )
-                                    )
-                                    : AnyShapeStyle(VeloTheme.elevatedSurface(colorScheme)),
-                                in: Circle()
-                            )
+                                        : AnyShapeStyle(VeloTheme.elevatedSurface(colorScheme)),
+                                    in: Circle()
+                                )
+                        }
                     }
                     .buttonStyle(VeloPressableButtonStyle())
                     .disabled(!canSend)
@@ -675,11 +972,15 @@ private struct ModelAndHandoffSheet: View {
 // MARK: - Single Conversation Turn Block (With Grouped Consecutive Tool Calls!)
 
 private struct TurnBlockView: View {
+    @ObservedObject var store: VeloStore
     let turn: ConversationTurnBlock
     let isTurnRunning: Bool
     let turnStartedAt: Date?
+    let liveTps: Double?
+    let autoCollapseSteps: Bool
     let waitingApproval: PendingApprovalPrompt?
     let waitingQuestion: PendingQuestionPrompt?
+    let onPreviewImage: (String) -> Void
     let onRequestMacLogin: (String) async -> Bool
     let onRetry: (() -> Void)?
 
@@ -687,13 +988,22 @@ private struct TurnBlockView: View {
 
     fileprivate enum RenderSegment: Identifiable {
         case single(item: TimelineEventItem, isLastItem: Bool)
-        case toolGroup(id: String, items: [TimelineEventItem])
+        case traceGroup(id: String, items: [TimelineEventItem])
 
         var id: String {
             switch self {
             case .single(let item, _): return item.id
-            case .toolGroup(let id, _): return id
+            case .traceGroup(let id, _): return id
             }
+        }
+    }
+
+    private func isProcessStep(_ kind: TimelineEventKind) -> Bool {
+        switch kind {
+        case .thinking, .toolCall:
+            return true
+        default:
+            return false
         }
     }
 
@@ -704,15 +1014,15 @@ private struct TurnBlockView: View {
 
         while idx < total {
             let item = turn.items[idx]
-            if case .toolCall = item.kind {
+            if isProcessStep(item.kind) {
                 var batch: [TimelineEventItem] = [item]
                 var j = idx + 1
-                while j < total, case .toolCall = turn.items[j].kind {
+                while j < total, isProcessStep(turn.items[j].kind) {
                     batch.append(turn.items[j])
                     j += 1
                 }
                 if batch.count >= 2 {
-                    out.append(.toolGroup(id: "tg-\(item.id)", items: batch))
+                    out.append(.traceGroup(id: "trace-\(item.id)", items: batch))
                 } else {
                     out.append(.single(item: item, isLastItem: idx == total - 1))
                 }
@@ -766,43 +1076,89 @@ private struct TurnBlockView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // 1. User Specular Right-Aligned Bubble
+            // 1. User Specular Right-Aligned Bubble (With Attached Screenshots / Photos)
             if let userEv = turn.userEvent {
-                HStack {
-                    Spacer(minLength: 42)
-                    Text(userEv.content)
-                        .font(.system(size: 15))
-                        .foregroundStyle(.primary)
-                        .lineSpacing(3)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            VeloTheme.userBubble(colorScheme),
-                            in: UnevenRoundedRectangle(
-                                topLeadingRadius: 18,
-                                bottomLeadingRadius: 18,
-                                bottomTrailingRadius: 18,
-                                topTrailingRadius: 5
-                            )
-                        )
-                        .overlay(
-                            UnevenRoundedRectangle(
-                                topLeadingRadius: 18,
-                                bottomLeadingRadius: 18,
-                                bottomTrailingRadius: 18,
-                                topTrailingRadius: 5
-                            )
-                            .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.9)
-                        )
-                        .textSelection(.enabled)
+                let userImages: [String] = {
+                    if case .user(let imgs) = userEv.kind { return imgs }
+                    return []
+                }()
+                let cleanUserText = userEv.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                let shouldShowText = !cleanUserText.isEmpty && !(cleanUserText == "请查看附图" && !userImages.isEmpty)
+
+                VStack(alignment: .trailing, spacing: 7) {
+                    if !userImages.isEmpty {
+                        HStack {
+                            Spacer(minLength: 42)
+                            if userImages.count == 1, let singleRef = userImages.first {
+                                VeloRemoteImageView(
+                                    store: store,
+                                    ref: singleRef,
+                                    maxWidth: 236,
+                                    maxHeight: 196,
+                                    onTapFull: onPreviewImage
+                                )
+                            } else {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 7) {
+                                        ForEach(Array(userImages.enumerated()), id: \.offset) { _, imgRef in
+                                            VeloRemoteImageView(
+                                                store: store,
+                                                ref: imgRef,
+                                                maxWidth: 124,
+                                                maxHeight: 124,
+                                                squareCrop: true,
+                                                onTapFull: onPreviewImage
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if shouldShowText {
+                        HStack {
+                            Spacer(minLength: 42)
+                            Text(userEv.content)
+                                .font(.system(size: 15))
+                                .foregroundStyle(.primary)
+                                .lineSpacing(3)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(
+                                    VeloTheme.userBubble(colorScheme),
+                                    in: UnevenRoundedRectangle(
+                                        topLeadingRadius: 18,
+                                        bottomLeadingRadius: 18,
+                                        bottomTrailingRadius: 18,
+                                        topTrailingRadius: 5
+                                    )
+                                )
+                                .overlay(
+                                    UnevenRoundedRectangle(
+                                        topLeadingRadius: 18,
+                                        bottomLeadingRadius: 18,
+                                        bottomTrailingRadius: 18,
+                                        topTrailingRadius: 5
+                                    )
+                                    .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.9)
+                                )
+                                .textSelection(.enabled)
+                        }
+                    }
                 }
             }
 
-            // 2. Chronological Agent Segments (Reasoning + Grouped Tools + Editorial Markdown)
+            // 2. Chronological Agent Segments (Unified Collapsible Execution Trace + Editorial Markdown)
             ForEach(segments) { seg in
                 switch seg {
-                case .toolGroup(_, let batch):
-                    ToolCallGroupRowView(items: batch)
+                case .traceGroup(_, let batch):
+                    ExecutionTraceGroupView(
+                        items: batch,
+                        isTurnRunning: isTurnRunning,
+                        turnStartedAt: turnStartedAt,
+                        defaultExpanded: !autoCollapseSteps
+                    )
 
                 case .single(let item, let isLast):
                     switch item.kind {
@@ -826,7 +1182,11 @@ private struct TurnBlockView: View {
 
                     case .assistant(let isStreaming):
                         VStack(alignment: .leading, spacing: 4) {
-                            NativeMarkdownView(markdown: item.content)
+                            NativeMarkdownView(
+                                store: store,
+                                markdown: item.content,
+                                onPreviewImage: onPreviewImage
+                            )
                             if isStreaming && isTurnRunning && isLast {
                                 StreamingCursorDot()
                             }
@@ -849,7 +1209,7 @@ private struct TurnBlockView: View {
                 }
             }
 
-            // 3. Live / Completed Turn Status Footer
+            // 3. Live / Completed Turn Status & Telemetry Footer
             if !hasErrorWithoutAnswer || isTurnRunning {
                 TurnStatusFooterView(
                     isRunning: isTurnRunning,
@@ -857,6 +1217,8 @@ private struct TurnBlockView: View {
                     startedAt: turnStartedAt,
                     durationMs: hasErrorWithoutAnswer ? nil : turn.userEvent?.durationMs,
                     completedAt: hasErrorWithoutAnswer ? nil : (turn.userEvent?.completedAt ?? turn.items.last?.timestamp),
+                    liveTps: isTurnRunning ? liveTps : nil,
+                    telemetry: hasErrorWithoutAnswer ? nil : turn.userEvent?.telemetry,
                     assistantText: lastAssistantText,
                     onRetry: onRetry
                 )
@@ -1021,7 +1383,9 @@ private struct AgentErrorBannerView: View {
 // MARK: - Editorial Native Block + Inline GFM Markdown Renderer
 
 private struct NativeMarkdownView: View {
+    @ObservedObject var store: VeloStore
     let markdown: String
+    let onPreviewImage: (String) -> Void
     @Environment(\.colorScheme) private var colorScheme
 
     fileprivate enum ListMarker: Equatable {
@@ -1040,6 +1404,7 @@ private struct NativeMarkdownView: View {
     fileprivate enum Block: Identifiable, Equatable {
         case heading(id: Int, level: Int, text: String)
         case paragraph(id: Int, text: String)
+        case image(id: Int, alt: String, ref: String)
         case list(id: Int, items: [ListEntry])
         case blockquote(id: Int, text: String)
         case codeBlock(id: Int, language: String, code: String)
@@ -1050,6 +1415,7 @@ private struct NativeMarkdownView: View {
             switch self {
             case .heading(let id, _, _),
                  .paragraph(let id, _),
+                 .image(let id, _, _),
                  .list(let id, _),
                  .blockquote(let id, _),
                  .codeBlock(let id, _, _),
@@ -1073,6 +1439,23 @@ private struct NativeMarkdownView: View {
 
                 case .paragraph(_, let text):
                     InlineMarkdownText(text: text, baseSize: 15.2, baseWeight: .regular, lineSpacing: 4.2)
+
+                case .image(_, let alt, let ref):
+                    VStack(alignment: .leading, spacing: 5) {
+                        VeloRemoteImageView(
+                            store: store,
+                            ref: ref,
+                            maxWidth: 300,
+                            maxHeight: 230,
+                            onTapFull: onPreviewImage
+                        )
+                        if !alt.isEmpty && alt.lowercased() != "image" && alt.lowercased() != "screenshot" {
+                            Text(alt)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
 
                 case .list(_, let items):
                     VStack(alignment: .leading, spacing: 7) {
@@ -1129,8 +1512,20 @@ private struct NativeMarkdownView: View {
         func flushParagraph() {
             let joined = paragraphBuffer.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
             if !joined.isEmpty {
-                result.append(.paragraph(id: nextId, text: joined))
-                nextId += 1
+                let segments = splitInlineMarkdownImages(joined)
+                for seg in segments {
+                    switch seg {
+                    case .text(let txt):
+                        let clean = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !clean.isEmpty {
+                            result.append(.paragraph(id: nextId, text: clean))
+                            nextId += 1
+                        }
+                    case .image(let alt, let ref):
+                        result.append(.image(id: nextId, alt: alt, ref: ref))
+                        nextId += 1
+                    }
+                }
             }
             paragraphBuffer.removeAll()
         }
@@ -1141,6 +1536,14 @@ private struct NativeMarkdownView: View {
 
             if trimmed.isEmpty {
                 flushParagraph()
+                idx += 1
+                continue
+            }
+
+            if let (alt, imgRef) = parseStandaloneImage(trimmed) {
+                flushParagraph()
+                result.append(.image(id: nextId, alt: alt, ref: imgRef))
+                nextId += 1
                 idx += 1
                 continue
             }
@@ -1419,6 +1822,64 @@ private struct NativeMarkdownView: View {
         }
         return out
     }
+
+    private enum InlineImageSegment {
+        case text(String)
+        case image(alt: String, ref: String)
+    }
+
+    private static func cleanMarkdownImageRef(_ rawTarget: String) -> String {
+        var s = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("<") && s.hasSuffix(">") && s.count > 2 {
+            s.removeFirst()
+            s.removeLast()
+        }
+        if let quoteRange = s.range(of: " \"") ?? s.range(of: " '") {
+            s = String(s[..<quoteRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+        }
+        return s
+    }
+
+    private static func parseStandaloneImage(_ trimmed: String) -> (alt: String, ref: String)? {
+        guard trimmed.hasPrefix("!["), trimmed.hasSuffix(")"),
+              let midRange = trimmed.range(of: "](")
+        else { return nil }
+        let altStart = trimmed.index(trimmed.startIndex, offsetBy: 2)
+        let alt = String(trimmed[altStart..<midRange.lowerBound])
+        let refEnd = trimmed.index(before: trimmed.endIndex)
+        guard midRange.upperBound < refEnd else { return nil }
+        let rawRef = String(trimmed[midRange.upperBound..<refEnd])
+        if rawRef.contains("](") { return nil }
+        let cleanRef = cleanMarkdownImageRef(rawRef)
+        return cleanRef.isEmpty ? nil : (alt, cleanRef)
+    }
+
+    private static func splitInlineMarkdownImages(_ raw: String) -> [InlineImageSegment] {
+        guard raw.contains("![") && raw.contains("](") else {
+            return [.text(raw)]
+        }
+        var out: [InlineImageSegment] = []
+        var cursor = raw.startIndex
+        while cursor < raw.endIndex {
+            guard let bangRange = raw.range(of: "![", range: cursor..<raw.endIndex),
+                  let midRange = raw.range(of: "](", range: bangRange.upperBound..<raw.endIndex),
+                  let closeRange = raw.range(of: ")", range: midRange.upperBound..<raw.endIndex)
+            else {
+                out.append(.text(String(raw[cursor..<raw.endIndex])))
+                break
+            }
+            if bangRange.lowerBound > cursor {
+                out.append(.text(String(raw[cursor..<bangRange.lowerBound])))
+            }
+            let alt = String(raw[bangRange.upperBound..<midRange.lowerBound])
+            let cleanRef = cleanMarkdownImageRef(String(raw[midRange.upperBound..<closeRange.lowerBound]))
+            if !cleanRef.isEmpty {
+                out.append(.image(alt: alt, ref: cleanRef))
+            }
+            cursor = closeRange.upperBound
+        }
+        return out
+    }
 }
 
 private struct HeadingBlockView: View {
@@ -1578,6 +2039,31 @@ private struct MarkdownTableCardView: View {
     let rows: [[String]]
     @Environment(\.colorScheme) private var colorScheme
 
+    private static let minColumnWidth: CGFloat = 74
+    private static let maxColumnWidth: CGFloat = 260
+    private static let cellHorizontalPadding: CGFloat = 22
+
+    // A horizontal ScrollView proposes no width, so cells need an explicit width to wrap instead of overflowing into neighbors.
+    private var columnWidths: [CGFloat] {
+        headers.indices.map { col in
+            var widest = Self.measure(headers[col], weight: .semibold)
+            for row in rows {
+                if let cell = row[safe: col] {
+                    widest = max(widest, Self.measure(cell, weight: .regular))
+                }
+            }
+            let width = ceil(widest * 1.08) + Self.cellHorizontalPadding
+            return min(max(width, Self.minColumnWidth), Self.maxColumnWidth)
+        }
+    }
+
+    private static func measure(_ text: String, weight: UIFont.Weight) -> CGFloat {
+        let plain = text
+            .replacingOccurrences(of: "`", with: "")
+            .replacingOccurrences(of: "**", with: "")
+        return (plain as NSString).size(withAttributes: [.font: UIFont.systemFont(ofSize: 13, weight: weight)]).width
+    }
+
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
@@ -1591,7 +2077,7 @@ private struct MarkdownTableCardView: View {
                         )
                         .padding(.horizontal, 11)
                         .padding(.vertical, 8)
-                        .frame(minWidth: 74, maxWidth: 260, alignment: alignments[safe: colIdx] ?? .leading)
+                        .frame(width: columnWidths[safe: colIdx] ?? Self.minColumnWidth, alignment: alignments[safe: colIdx] ?? .leading)
                     }
                 }
                 .background(VeloTheme.codeHeader(colorScheme))
@@ -1610,7 +2096,7 @@ private struct MarkdownTableCardView: View {
                             )
                             .padding(.horizontal, 11)
                             .padding(.vertical, 7.5)
-                            .frame(minWidth: 74, maxWidth: 260, alignment: alignments[safe: colIdx] ?? .leading)
+                            .frame(width: columnWidths[safe: colIdx] ?? Self.minColumnWidth, alignment: alignments[safe: colIdx] ?? .leading)
                         }
                     }
                     .background(rowIdx.isMultiple(of: 2) ? Color.clear : VeloTheme.elevatedSurface(colorScheme).opacity(0.35))
@@ -1890,6 +2376,326 @@ private struct DiffViewerSheet: View {
         case .deletion: return VeloTheme.coral.opacity(0.11)
         case .header: return VeloTheme.accentViolet.opacity(0.10)
         case .context: return .clear
+        }
+    }
+}
+
+// MARK: - Paseo-Style Tiered E2EE Remote Image & Fullscreen Pinch-to-Zoom HD Viewer
+
+private struct VeloRemoteImageView: View {
+    @ObservedObject var store: VeloStore
+    let ref: String
+    var maxWidth: CGFloat = 260
+    var maxHeight: CGFloat = 200
+    var squareCrop: Bool = false
+    let onTapFull: (String) -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var loadedImage: UIImage?
+    @State private var didFail: Bool = false
+
+    init(
+        store: VeloStore,
+        ref: String,
+        maxWidth: CGFloat = 260,
+        maxHeight: CGFloat = 200,
+        squareCrop: Bool = false,
+        onTapFull: @escaping (String) -> Void
+    ) {
+        self.store = store
+        self.ref = ref
+        self.maxWidth = maxWidth
+        self.maxHeight = maxHeight
+        self.squareCrop = squareCrop
+        self.onTapFull = onTapFull
+        _loadedImage = State(initialValue: VeloAttachmentCache.shared.cachedImage(for: ref, tier: .thumb))
+    }
+
+    var body: some View {
+        Group {
+            if let uiImg = loadedImage {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onTapFull(ref)
+                } label: {
+                    if squareCrop {
+                        Image(uiImage: uiImg)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: maxWidth, height: maxHeight)
+                            .clipped()
+                    } else {
+                        let ratio = max(0.35, min(2.6, uiImg.size.width / max(1, uiImg.size.height)))
+                        Image(uiImage: uiImg)
+                            .resizable()
+                            .aspectRatio(ratio, contentMode: .fit)
+                            .frame(maxWidth: maxWidth, maxHeight: maxHeight)
+                    }
+                }
+                .buttonStyle(VeloPressableButtonStyle(scale: 0.98))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.9)
+                )
+            } else if didFail {
+                Button {
+                    didFail = false
+                    Task {
+                        if let img = await store.loadAttachmentImage(ref: ref, tier: .thumb) {
+                            loadedImage = img
+                        } else {
+                            didFail = true
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "photo.badge.exclamationmark")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1.5) {
+                            Text("图片加载失败 · 点击重试")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.primary)
+                            Text(URL(fileURLWithPath: ref).lastPathComponent)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 13, style: .continuous)
+                            .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
+                    )
+                }
+                .buttonStyle(.plain)
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(VeloTheme.cardSurface(colorScheme))
+                    VStack(spacing: 7) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("加密拉取缩略图…")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .frame(width: squareCrop ? maxWidth : min(210, maxWidth), height: squareCrop ? maxHeight : 136)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
+                )
+            }
+        }
+        .task(id: ref) {
+            guard loadedImage == nil else { return }
+            if let cached = VeloAttachmentCache.shared.cachedImage(for: ref, tier: .thumb) {
+                loadedImage = cached
+                return
+            }
+            if let fetched = await store.loadAttachmentImage(ref: ref, tier: .thumb) {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    loadedImage = fetched
+                }
+            } else {
+                didFail = true
+            }
+        }
+    }
+}
+
+private struct FullscreenImagePreviewSheet: View {
+    @ObservedObject var store: VeloStore
+    let ref: String
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var displayImage: UIImage?
+    @State private var isLoadingHD: Bool = false
+    @State private var savedToPhotos: Bool = false
+
+    @State private var steadyScale: CGFloat = 1.0
+    @State private var gestureScale: CGFloat = 1.0
+    @State private var steadyOffset: CGSize = .zero
+    @State private var gestureOffset: CGSize = .zero
+
+    init(store: VeloStore, ref: String) {
+        self.store = store
+        self.ref = ref
+        let initial = VeloAttachmentCache.shared.cachedImage(for: ref, tier: .full)
+            ?? VeloAttachmentCache.shared.cachedImage(for: ref, tier: .thumb)
+        _displayImage = State(initialValue: initial)
+    }
+
+    private var currentScale: CGFloat {
+        max(1.0, min(5.0, steadyScale * gestureScale))
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black
+                .ignoresSafeArea()
+
+            if let uiImage = displayImage {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .scaledToFit()
+                    .scaleEffect(currentScale)
+                    .offset(
+                        x: steadyOffset.width + gestureOffset.width,
+                        y: steadyOffset.height + gestureOffset.height
+                    )
+                    .gesture(
+                        MagnificationGesture()
+                            .onChanged { val in
+                                gestureScale = val
+                            }
+                            .onEnded { val in
+                                let next = max(1.0, min(5.0, steadyScale * val))
+                                gestureScale = 1.0
+                                withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                                    steadyScale = next
+                                    if next <= 1.02 {
+                                        steadyScale = 1.0
+                                        steadyOffset = .zero
+                                    }
+                                }
+                            }
+                    )
+                    .simultaneousGesture(
+                        DragGesture()
+                            .onChanged { value in
+                                if steadyScale > 1.01 {
+                                    gestureOffset = value.translation
+                                } else if value.translation.height > 0 {
+                                    gestureOffset = CGSize(width: 0, height: value.translation.height)
+                                }
+                            }
+                            .onEnded { value in
+                                if steadyScale > 1.01 {
+                                    steadyOffset = CGSize(
+                                        width: steadyOffset.width + value.translation.width,
+                                        height: steadyOffset.height + value.translation.height
+                                    )
+                                    gestureOffset = .zero
+                                } else {
+                                    if value.translation.height > 110 {
+                                        dismiss()
+                                    } else {
+                                        withAnimation(.spring(response: 0.24, dampingFraction: 0.8)) {
+                                            gestureOffset = .zero
+                                        }
+                                    }
+                                }
+                            }
+                    )
+                    .onTapGesture(count: 2) {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                            if steadyScale > 1.1 {
+                                steadyScale = 1.0
+                                steadyOffset = .zero
+                            } else {
+                                steadyScale = 2.4
+                            }
+                        }
+                    }
+            } else {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .tint(.white)
+                    Text("正在拉取高清原图…")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+            }
+
+            // Top Chrome Bar
+            VStack {
+                HStack(spacing: 10) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 36, height: 36)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+
+                    if isLoadingHD {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(.white)
+                            Text("HD")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundStyle(.white.opacity(0.9))
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(.ultraThinMaterial, in: Capsule())
+                    }
+
+                    Spacer()
+
+                    if let uiImage = displayImage {
+                        Button {
+                            UIImageWriteToSavedPhotosAlbum(uiImage, nil, nil, nil)
+                            UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            withAnimation(.snappy(duration: 0.2)) {
+                                savedToPhotos = true
+                            }
+                            Task {
+                                try? await Task.sleep(nanoseconds: 1_800_000_000)
+                                withAnimation(.snappy(duration: 0.2)) {
+                                    savedToPhotos = false
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: savedToPhotos ? "checkmark" : "square.and.arrow.down")
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                Text(savedToPhotos ? "已保存" : "保存")
+                                    .font(.system(size: 12.5, weight: .semibold))
+                            }
+                            .foregroundStyle(savedToPhotos ? VeloTheme.emerald : .white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: Capsule())
+                        }
+
+                        ShareLink(
+                            item: Image(uiImage: uiImage),
+                            preview: SharePreview(URL(fileURLWithPath: ref).lastPathComponent, image: Image(uiImage: uiImage))
+                        ) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 36, height: 36)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
+
+                Spacer()
+            }
+        }
+        .task(id: ref) {
+            if let cachedFull = VeloAttachmentCache.shared.cachedImage(for: ref, tier: .full) {
+                displayImage = cachedFull
+                return
+            }
+            isLoadingHD = true
+            if let full = await store.loadAttachmentImage(ref: ref, tier: .full) {
+                displayImage = full
+            }
+            isLoadingHD = false
         }
     }
 }
