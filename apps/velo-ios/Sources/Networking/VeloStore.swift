@@ -22,6 +22,15 @@ public final class VeloStore: ObservableObject {
     @Published public var liveTpsBySession: [String: Double] = [:]
     @Published public var models: [VeloModelOption] = VeloModelOption.defaults
     @Published public var latestCreatedOrHandoffSessionId: String?
+    @Published public var deepLinkTargetSessionId: String?
+    @Published public var prBySession: [String: VeloPrSnapshot] = [:]
+    @Published public var usageAnalytics: VeloUsageAnalytics?
+    @Published public var globalSearchHits: [VeloSearchHit] = []
+    @Published public var pushConfig: VeloPushConfig = VeloPushConfig()
+    @Published public var automations: [VeloAutomationItem] = []
+    @Published public var lastActionBanner: String?
+    @Published public var oldestSeqBySession: [String: Int] = [:]
+    @Published public var hasMoreHistoryBySession: [String: Bool] = [:]
     @Published public var autoCollapseSteps: Bool = true {
         didSet {
             UserDefaults.standard.set(autoCollapseSteps, forKey: Self.autoCollapseKey)
@@ -43,6 +52,7 @@ public final class VeloStore: ObservableObject {
     private var attachmentDownloadWaiters: [String: [CheckedContinuation<Data?, Never>]] = [:]
     private var attachmentChunkBuffers: [String: IncomingAttachmentBuffer] = [:]
     private var attachmentUploadWaiters: [String: CheckedContinuation<(path: String, url: String)?, Never>] = [:]
+    private var transcriptionWaiters: [String: CheckedContinuation<String?, Never>] = [:]
     private var e2eeNonceCounter: UInt64 = UInt64(Date().timeIntervalSince1970 * 1_000_000)
     private var ephemeralPrivateKey: Curve25519.KeyAgreement.PrivateKey?
     private var e2eeActiveKeyHex: String?
@@ -99,12 +109,9 @@ public final class VeloStore: ObservableObject {
             self.connectionConfig = decoded
         } else {
             #if targetEnvironment(simulator)
-            let simDefault = ConnectionModeConfig.direct(baseURL: "http://127.0.0.1:6767")
-            self.connectionConfig = simDefault
+            self.connectionConfig = ConnectionModeConfig.direct(baseURL: "http://127.0.0.1:6767")
             #else
-            // Pre-configured with your Mac's LAN daemon address (can also scan QR anytime)
-            let lanDefault = ConnectionModeConfig.direct(baseURL: "http://192.168.10.3:6767")
-            self.connectionConfig = lanDefault
+            self.connectionConfig = nil
             #endif
         }
 
@@ -183,7 +190,21 @@ public final class VeloStore: ObservableObject {
         return max(1, Int((Double(cjk) * 0.72 + Double(other) * 0.27).rounded()))
     }
 
-    // MARK: - Pairing & Connection Lifecycle
+    // MARK: - Pairing, Deep Link & Connection Lifecycle
+
+    public func handleIncomingURL(_ url: URL) {
+        let raw = url.absoluteString
+        if url.scheme?.lowercased() == "velo", url.host?.lowercased() == "session" {
+            let sid = url.pathComponents.dropFirst().first ?? ""
+            if !sid.isEmpty {
+                activeSessionId = sid
+                deepLinkTargetSessionId = sid
+                Task { await loadEventsForSession(sid) }
+                return
+            }
+        }
+        applyPairingString(raw)
+    }
 
     @discardableResult
     public func applyPairingString(_ raw: String) -> Bool {
@@ -542,7 +563,8 @@ public final class VeloStore: ObservableObject {
         model: String,
         effort: String,
         images: [String] = [],
-        approvalMode: String = "auto_edit"
+        approvalMode: String = "auto_edit",
+        truncateToUserTurn: Int? = nil
     ) async {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty || !images.isEmpty else { return }
@@ -555,6 +577,24 @@ public final class VeloStore: ObservableObject {
         liveTpsBySession.removeValue(forKey: sessionId)
         streamStatsBySession.removeValue(forKey: sessionId)
 
+        var list = eventsBySession[sessionId] ?? []
+        if let truncIdx = truncateToUserTurn, truncIdx >= 0 {
+            var seenUsers = 0
+            var cutPos: Int?
+            for (i, item) in list.enumerated() {
+                if case .user = item.kind {
+                    if seenUsers == truncIdx {
+                        cutPos = i
+                        break
+                    }
+                    seenUsers += 1
+                }
+            }
+            if let cutPos {
+                list.removeSubrange(cutPos..<list.count)
+            }
+        }
+
         // Optimistically append user bubble & mark session running
         let userItem = TimelineEventItem(
             id: "u-local-\(UUID().uuidString.prefix(8))",
@@ -563,7 +603,6 @@ public final class VeloStore: ObservableObject {
             content: clean,
             kind: .user(images: images)
         )
-        var list = eventsBySession[sessionId] ?? []
         list.append(userItem)
         eventsBySession[sessionId] = list
 
@@ -576,6 +615,14 @@ public final class VeloStore: ObservableObject {
                 sessions[idx].agentKind = ak
             }
             sessions[idx].effort = effort
+            VeloLiveActivityManager.shared.startOrUpdate(
+                sessionId: sessionId,
+                title: sessions[idx].title,
+                engineBadge: sessions[idx].engineCategory.shortBadge,
+                statusLabel: "思考与执行中…",
+                tps: nil,
+                startedAt: now
+            )
         }
         let providerKind = matchedOpt?.agentKind ?? sessions.first(where: { $0.id == sessionId })?.agentKind ?? "claude"
         scheduleCacheSave()
@@ -590,7 +637,7 @@ public final class VeloStore: ObservableObject {
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let body: [String: Any] = [
+            var body: [String: Any] = [
                 "input": effectivePrompt,
                 "model": model,
                 "effort": effort,
@@ -598,6 +645,10 @@ public final class VeloStore: ObservableObject {
                 "images": images,
                 "approval_mode": approvalMode,
             ]
+            if let truncIdx = truncateToUserTurn {
+                body["truncate_to_user_turn"] = truncIdx
+                body["reset_thread"] = true
+            }
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             do {
                 let (data, resp) = try await URLSession.shared.data(for: req)
@@ -613,7 +664,7 @@ public final class VeloStore: ObservableObject {
             }
 
         case .e2eeRelay:
-            sendEncryptedCommand([
+            var payload: [String: Any] = [
                 "cmd": "send_input",
                 "session_id": sessionId,
                 "input": effectivePrompt,
@@ -622,10 +673,478 @@ public final class VeloStore: ObservableObject {
                 "provider": providerKind,
                 "images": images,
                 "approval_mode": approvalMode,
-            ])
+            ]
+            if let truncIdx = truncateToUserTurn {
+                payload["truncate_to_user_turn"] = truncIdx
+                payload["reset_thread"] = true
+            }
+            sendEncryptedCommand(payload)
         case .none:
             appendLocalErrorEvent(sessionId: sessionId, rawError: "当前未连接主机")
             finalizeSessionTurnLocally(sessionId)
+        }
+    }
+
+    // MARK: - Git, PR, Advisor, Voice, Pagination, Search, Analytics & Push RPCs
+
+    public func gitCommit(sessionId: String, message: String, push: Bool) async {
+        lastActionBanner = nil
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/git/commit") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["message": message, "push": push])
+            if let (data, _) = try? await URLSession.shared.data(for: req),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            {
+                let ok = (obj["ok"] as? Bool) ?? false
+                lastActionBanner = ok ? (push ? "✅ 已提交并推送到远端" : "✅ 已完成本地 Git Commit") : "⚠️ 提交未成功（可能无新增改动）"
+                await fetchDiff(for: sessionId)
+            }
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "git_commit",
+                "session_id": sessionId,
+                "message": message,
+                "push": push,
+            ])
+        case .none:
+            break
+        }
+    }
+
+    public func gitDiscard(sessionId: String, filePath: String? = nil, all: Bool = false) async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/git/discard") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            var body: [String: Any] = ["all": all]
+            if let fp = filePath { body["file_path"] = fp }
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            _ = try? await URLSession.shared.data(for: req)
+            lastActionBanner = "✅ 已回滚未提交变更"
+            await fetchDiff(for: sessionId)
+        case .e2eeRelay:
+            var payload: [String: Any] = ["cmd": "git_discard", "session_id": sessionId, "all": all]
+            if let fp = filePath { payload["file_path"] = fp }
+            sendEncryptedCommand(payload)
+        case .none:
+            break
+        }
+    }
+
+    public func gitMerge(sessionId: String) async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/git/merge") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            if let (data, _) = try? await URLSession.shared.data(for: req),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            {
+                let ok = (obj["ok"] as? Bool) ?? false
+                lastActionBanner = ok ? "✅ 分支已合并回主目录" : "⚠️ 合并存在冲突或失败"
+            }
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "git_merge", "session_id": sessionId])
+        case .none:
+            break
+        }
+    }
+
+    public func fetchPrStatus(for sessionId: String) async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/pr"),
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return }
+            prBySession[sessionId] = VeloPrSnapshot.fromJSON(obj)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "get_pr", "session_id": sessionId])
+        case .none:
+            break
+        }
+    }
+
+    public func createPullRequest(sessionId: String, title: String, body: String, draft: Bool = false) async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/pr/create") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "title": title,
+                "body": body,
+                "draft": draft,
+            ])
+            _ = try? await URLSession.shared.data(for: req)
+            await fetchPrStatus(for: sessionId)
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "create_pr",
+                "session_id": sessionId,
+                "title": title,
+                "body": body,
+                "draft": draft,
+            ])
+        case .none:
+            break
+        }
+    }
+
+    public func mergePullRequest(sessionId: String, method: String = "squash") async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/pr/merge") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["method": method])
+            _ = try? await URLSession.shared.data(for: req)
+            await fetchPrStatus(for: sessionId)
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "merge_pr",
+                "session_id": sessionId,
+                "method": method,
+            ])
+        case .none:
+            break
+        }
+    }
+
+    public func requestAdvisorReview(sessionId: String, advisorProvider: String = "codex") async -> String? {
+        latestCreatedOrHandoffSessionId = nil
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/advisor") else { return nil }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["advisor_provider": advisorProvider])
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 201,
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let created = VeloSessionItem.fromJSON(obj)
+            else { return nil }
+            sessions.insert(created, at: 0)
+            activeSessionId = created.id
+            return created.id
+        case .e2eeRelay:
+            pendingSelectNewestSession = true
+            sendEncryptedCommand([
+                "cmd": "advisor_session",
+                "session_id": sessionId,
+                "advisor_provider": advisorProvider,
+            ])
+            for _ in 0..<24 {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                if let newId = latestCreatedOrHandoffSessionId {
+                    return newId
+                }
+            }
+            return nil
+        case .none:
+            return nil
+        }
+    }
+
+    public func transcribeVoiceData(_ audioData: Data) async -> String? {
+        guard !audioData.isEmpty else { return nil }
+        let b64 = audioData.base64EncodedString()
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/transcribe") else { return nil }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "audio_base64": b64,
+                "mime_type": "audio/m4a",
+                "language": "zh",
+            ])
+            guard let (data, _) = try? await URLSession.shared.data(for: req),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  (obj["ok"] as? Bool) == true,
+                  let text = obj["text"] as? String,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        case .e2eeRelay:
+            let reqId = "tr-\(UUID().uuidString.prefix(10))"
+            return await withCheckedContinuation { cont in
+                self.transcriptionWaiters[reqId] = cont
+                self.sendEncryptedCommand([
+                    "cmd": "transcribe_audio",
+                    "request_id": reqId,
+                    "audio_base64": b64,
+                    "mime_type": "audio/m4a",
+                    "language": "zh",
+                ])
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 25_000_000_000)
+                    if let waiter = self?.transcriptionWaiters.removeValue(forKey: reqId) {
+                        waiter.resume(returning: nil)
+                    }
+                }
+            }
+        case .none:
+            return nil
+        }
+    }
+
+    public func loadOlderEventsPage(for sessionId: String) async {
+        let beforeSeq = oldestSeqBySession[sessionId]
+        switch connectionConfig {
+        case .direct(let baseURL):
+            var comp = URLComponents(string: "\(baseURL)/api/sessions/\(sessionId)/events")
+            var qItems = [URLQueryItem(name: "limit", value: "160")]
+            if let beforeSeq {
+                qItems.append(URLQueryItem(name: "before_seq", value: "\(beforeSeq)"))
+            }
+            comp?.queryItems = qItems
+            guard let url = comp?.url,
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let rawEvs = obj["events"] as? [[String: Any]]
+            else { return }
+            mergeOlderEventsPage(
+                sessionId: sessionId,
+                rawEvents: rawEvs,
+                oldestSeq: VeloSessionItem.intValue(obj["oldest_seq"]),
+                hasMore: (obj["has_more"] as? Bool) ?? false
+            )
+        case .e2eeRelay:
+            var payload: [String: Any] = ["cmd": "get_events_page", "session_id": sessionId, "limit": 140]
+            if let beforeSeq { payload["before_seq"] = beforeSeq }
+            sendEncryptedCommand(payload)
+        case .none:
+            break
+        }
+    }
+
+    private func mergeOlderEventsPage(
+        sessionId: String,
+        rawEvents: [[String: Any]],
+        oldestSeq: Int?,
+        hasMore: Bool
+    ) {
+        if let oldestSeq { oldestSeqBySession[sessionId] = oldestSeq }
+        hasMoreHistoryBySession[sessionId] = hasMore
+        let prov = sessions.first(where: { $0.id == sessionId })?.agentKind ?? "claude"
+        let parsed = Self.reconstructEventsFromHistory(sessionId: sessionId, rawList: rawEvents, fallbackProvider: prov)
+        guard !parsed.isEmpty else { return }
+        let existing = eventsBySession[sessionId] ?? []
+        if existing.isEmpty {
+            eventsBySession[sessionId] = parsed
+            return
+        }
+        let existingContents = Set(existing.prefix(8).map { "\($0.timestamp)|\($0.content.prefix(64))" })
+        let uniqueOlder = parsed.filter { !existingContents.contains("\($0.timestamp)|\($0.content.prefix(64))") }
+        if !uniqueOlder.isEmpty {
+            eventsBySession[sessionId] = uniqueOlder + existing
+        }
+    }
+
+    public func fetchUsageAnalytics() async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/analytics/usage"),
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return }
+            usageAnalytics = VeloUsageAnalytics.fromJSON(obj)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "get_usage_analytics"])
+        case .none:
+            break
+        }
+    }
+
+    public func searchGlobalSessions(query: String) async {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            globalSearchHits = []
+            return
+        }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            var comp = URLComponents(string: "\(baseURL)/api/search")
+            comp?.queryItems = [URLQueryItem(name: "q", value: q), URLQueryItem(name: "limit", value: "35")]
+            guard let url = comp?.url,
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let arr = obj["hits"] as? [[String: Any]]
+            else { return }
+            globalSearchHits = arr.enumerated().compactMap { VeloSearchHit.fromJSON($0.element, index: $0.offset) }
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "search_sessions", "query": q, "limit": 35])
+        case .none:
+            break
+        }
+    }
+
+    public func fetchPushConfig() async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/push/config"),
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let cfgObj = obj["config"] as? [String: Any]
+            else { return }
+            pushConfig = VeloPushConfig.fromJSON(cfgObj)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "get_push_config"])
+        case .none:
+            break
+        }
+    }
+
+    public func savePushConfig(_ cfg: VeloPushConfig) async {
+        pushConfig = cfg
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/push/config") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: cfg.toJSON())
+            _ = try? await URLSession.shared.data(for: req)
+            lastActionBanner = "✅ 已保存远程锁屏推送配置"
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "set_push_config", "config": cfg.toJSON()])
+            lastActionBanner = "✅ 已同步远程锁屏推送配置"
+        case .none:
+            break
+        }
+    }
+
+    public func sendTestPush() async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/push/test") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            if let (data, _) = try? await URLSession.shared.data(for: req),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            {
+                let ok = (obj["ok"] as? Bool) ?? false
+                lastActionBanner = ok ? "✅ 测试推送已发送，请查看锁屏" : "⚠️ \((obj["error"] as? String) ?? "推送失败")"
+            }
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "test_push"])
+        case .none:
+            break
+        }
+    }
+
+    public func fetchAutomations() async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/automations"),
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let arr = obj["automations"] as? [[String: Any]]
+            else { return }
+            automations = arr.compactMap(VeloAutomationItem.fromJSON)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "list_automations"])
+        case .none:
+            break
+        }
+    }
+
+    public func toggleAutomation(id: String, enabled: Bool) async {
+        if let idx = automations.firstIndex(where: { $0.id == id }) {
+            automations[idx].enabled = enabled
+        }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/automations/\(id)") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "PATCH"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": enabled])
+            _ = try? await URLSession.shared.data(for: req)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "toggle_automation", "id": id, "enabled": enabled])
+        case .none:
+            break
+        }
+    }
+
+    public func triggerAutomation(id: String) async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/automations/\(id)/trigger") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            _ = try? await URLSession.shared.data(for: req)
+            await refreshSessionsAndActiveEvents()
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "trigger_automation", "id": id])
+        case .none:
+            break
+        }
+    }
+
+    public func deleteAutomation(id: String) async {
+        automations.removeAll { $0.id == id }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/automations/\(id)") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "DELETE"
+            _ = try? await URLSession.shared.data(for: req)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "delete_automation", "id": id])
+        case .none:
+            break
+        }
+    }
+
+    public func createAutomation(
+        name: String,
+        cronExpr: String,
+        repoPath: String,
+        provider: String,
+        promptTemplate: String
+    ) async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/automations") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "name": name,
+                "enabled": true,
+                "trigger_type": "cron",
+                "cron_expr": cronExpr,
+                "repo_path": repoPath,
+                "provider": provider,
+                "prompt_template": promptTemplate,
+            ])
+            _ = try? await URLSession.shared.data(for: req)
+            await fetchAutomations()
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "create_automation",
+                "name": name,
+                "cron_expr": cronExpr,
+                "repo_path": repoPath,
+                "provider": provider,
+                "prompt_template": promptTemplate,
+            ])
+        case .none:
+            break
         }
     }
 
@@ -1428,6 +1947,76 @@ public final class VeloStore: ObservableObject {
             return
         }
 
+        if let type = raw["type"] as? String {
+            switch type {
+            case "git_action_result":
+                let action = (raw["action"] as? String) ?? "git"
+                let resObj = (raw["result"] as? [String: Any]) ?? [:]
+                let ok = (resObj["ok"] as? Bool) ?? false
+                lastActionBanner = ok ? "✅ Git \(action) 执行成功" : "⚠️ Git \(action) 未成功"
+                return
+            case "pr_snapshot":
+                if let sid = raw["session_id"] as? String,
+                   let dataObj = raw["data"] as? [String: Any]
+                {
+                    prBySession[sid] = VeloPrSnapshot.fromJSON(dataObj)
+                }
+                return
+            case "usage_analytics_snapshot":
+                if let aObj = raw["analytics"] as? [String: Any] {
+                    usageAnalytics = VeloUsageAnalytics.fromJSON(aObj)
+                }
+                return
+            case "search_results":
+                if let arr = raw["hits"] as? [[String: Any]] {
+                    globalSearchHits = arr.enumerated().compactMap {
+                        VeloSearchHit.fromJSON($0.element, index: $0.offset)
+                    }
+                }
+                return
+            case "push_config_snapshot":
+                if let cObj = raw["config"] as? [String: Any] {
+                    pushConfig = VeloPushConfig.fromJSON(cObj)
+                }
+                return
+            case "push_test_result":
+                let resObj = (raw["result"] as? [String: Any]) ?? [:]
+                let ok = (resObj["ok"] as? Bool) ?? false
+                lastActionBanner = ok
+                    ? "✅ 测试推送已送达，请查看锁屏通知"
+                    : "⚠️ \((resObj["error"] as? String) ?? "推送未送达")"
+                return
+            case "automations_snapshot":
+                if let arr = raw["automations"] as? [[String: Any]] {
+                    automations = arr.compactMap(VeloAutomationItem.fromJSON)
+                }
+                return
+            case "transcription_result":
+                if let reqId = raw["request_id"] as? String,
+                   let waiter = transcriptionWaiters.removeValue(forKey: reqId)
+                {
+                    let resObj = (raw["result"] as? [String: Any]) ?? [:]
+                    let txt = (resObj["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    waiter.resume(returning: (txt?.isEmpty == false) ? txt : nil)
+                }
+                return
+            case "events_page":
+                if let sid = raw["session_id"] as? String,
+                   let rawEvs = raw["events"] as? [[String: Any]]
+                {
+                    mergeOlderEventsPage(
+                        sessionId: sid,
+                        rawEvents: rawEvs,
+                        oldestSeq: VeloSessionItem.intValue(raw["oldest_seq"]),
+                        hasMore: (raw["has_more"] as? Bool) ?? false
+                    )
+                }
+                return
+            default:
+                break
+            }
+        }
+
         let evObj: [String: Any] = {
             if let kind = raw["kind"] as? String, kind == "event",
                let inner = raw["event"] as? [String: Any]
@@ -1701,6 +2290,16 @@ public final class VeloStore: ObservableObject {
 
             if outTps >= 0.5 {
                 liveTpsBySession[sid] = outTps
+                if let sess = sessions.first(where: { $0.id == sid }) {
+                    VeloLiveActivityManager.shared.startOrUpdate(
+                        sessionId: sid,
+                        title: sess.title,
+                        engineBadge: sess.engineCategory.shortBadge,
+                        statusLabel: "输出生成中…",
+                        tps: outTps,
+                        startedAt: turnStartedAtBySession[sid]
+                    )
+                }
             }
 
             if let idx = sessions.firstIndex(where: { $0.id == sid }) {
@@ -1932,6 +2531,7 @@ public final class VeloStore: ObservableObject {
         }
 
         updateSessionStatus(sid, .idle)
+        VeloLiveActivityManager.shared.endCurrent(sessionId: sid)
         scheduleCacheSave()
         return totalMs
     }

@@ -35,8 +35,11 @@ use velo_worktree::{WorktreeManager, default_velo_home};
 
 pub mod automations;
 pub mod pr;
+pub mod pricing;
+pub mod push;
 pub mod relay_bridge;
 pub mod service;
+pub mod storage;
 pub mod voice;
 
 pub fn canonical_workspace_path(raw: &str) -> String {
@@ -608,6 +611,10 @@ impl LiveTurnMetrics {
     }
 }
 
+fn fallback_workspace_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| velo_worktree::default_general_workspace())
+}
+
 pub struct DaemonInner {
     pub sessions: HashMap<Uuid, SessionInfo>,
     pub event_history: HashMap<Uuid, Vec<AgentEvent>>,
@@ -619,11 +626,13 @@ pub struct DaemonInner {
     pub automations: Vec<automations::AutomationRule>,
     pub repo_hooks: HashMap<String, String>,
     pub workspaces: Vec<String>,
+    pub push_config: push::PushConfig,
 }
 
 #[derive(Clone)]
 pub struct DaemonState {
     pub inner: Arc<RwLock<DaemonInner>>,
+    pub db: storage::VeloSqliteStore,
     pub agent_event_tx: broadcast::Sender<AgentEvent>,
     pub event_tx: broadcast::Sender<AgentEvent>,
     pub snapshot_tx: broadcast::Sender<Vec<SessionInfo>>,
@@ -634,6 +643,7 @@ pub struct DaemonState {
     pub automations_file: PathBuf,
     pub hooks_file: PathBuf,
     pub workspaces_file: PathBuf,
+    pub push_config_file: PathBuf,
     pub daemon_http_base: Option<String>,
 }
 
@@ -641,62 +651,26 @@ impl DaemonState {
     pub async fn new() -> Result<Self> {
         let velo_home = default_velo_home();
         tokio::fs::create_dir_all(&velo_home).await?;
+        let db_path = velo_home.join("velo.db");
         let state_file = velo_home.join("sessions.json");
         let events_dir = velo_home.join("events");
         let attachments_dir = velo_home.join("attachments");
         let automations_file = velo_home.join("automations.json");
         let hooks_file = velo_home.join("repo_hooks.json");
         let workspaces_file = velo_home.join("workspaces.json");
+        let push_config_file = velo_home.join("push_config.json");
         tokio::fs::create_dir_all(&events_dir).await?;
         tokio::fs::create_dir_all(&attachments_dir).await?;
 
-        let mut sessions = HashMap::new();
-        let mut event_history = HashMap::new();
-        if tokio::fs::try_exists(&state_file).await.unwrap_or(false) {
-            if let Ok(raw) = tokio::fs::read_to_string(&state_file).await {
-                if let Ok(saved) = serde_json::from_str::<Vec<SessionInfo>>(&raw) {
-                    for mut s in saved {
-                        s.repo_root = canonical_workspace_path(&s.repo_root);
-                        s.worktree_path = canonical_workspace_path(&s.worktree_path);
-                        if matches!(
-                            s.status,
-                            SessionStatus::Starting
-                                | SessionStatus::Running
-                                | SessionStatus::WaitingForPermission
-                        ) {
-                            s.status = SessionStatus::Stopped;
-                        }
-                        let ev_path = events_dir.join(format!("{}.json", s.id));
-                        if let Ok(ev_raw) = tokio::fs::read_to_string(&ev_path).await {
-                            if let Ok(evs) = serde_json::from_str::<Vec<AgentEvent>>(&ev_raw) {
-                                let enriched = enrich_history_turn_metrics(&evs);
-                                let mut sum_out = 0u64;
-                                let mut sum_cost = 0.0f64;
-                                for e in &enriched {
-                                    if let AgentEvent::UsageUpdated {
-                                        output_tokens,
-                                        cost_usd,
-                                        ..
-                                    } = e
-                                    {
-                                        sum_out += *output_tokens;
-                                        sum_cost += *cost_usd;
-                                    }
-                                }
-                                if sum_out > s.output_tokens {
-                                    s.output_tokens = sum_out;
-                                }
-                                if sum_cost > s.cost_usd {
-                                    s.cost_usd = sum_cost;
-                                }
-                                event_history.insert(s.id, enriched);
-                            }
-                        }
-                        sessions.insert(s.id, s);
-                    }
-                }
-            }
+        let db = storage::VeloSqliteStore::open(&db_path)?;
+        if let Ok(true) = db.migrate_from_legacy_json_if_needed(&state_file, &events_dir) {
+            info!(
+                "Migrated legacy JSON sessions & event logs into SQLite WAL database at {}",
+                db_path.display()
+            );
         }
+        let (sessions, event_history) = db.load_all()?;
+        let push_cfg = push::load_push_config(&push_config_file).await;
 
         let automations_list = if let Ok(raw) = tokio::fs::read_to_string(&automations_file).await {
             serde_json::from_str::<Vec<automations::AutomationRule>>(&raw).unwrap_or_default()
@@ -750,7 +724,9 @@ impl DaemonState {
                 automations: automations_list,
                 repo_hooks: repo_hooks_map,
                 workspaces: workspaces_list,
+                push_config: push_cfg,
             })),
+            db,
             agent_event_tx,
             event_tx,
             snapshot_tx,
@@ -761,6 +737,7 @@ impl DaemonState {
             automations_file,
             hooks_file,
             workspaces_file,
+            push_config_file,
             daemon_http_base: Some(format!(
                 "http://127.0.0.1:{}",
                 velo_protocol::DEFAULT_DAEMON_PORT
@@ -781,22 +758,32 @@ impl DaemonState {
                 let session_id = event.session_id();
                 let now = std::time::Instant::now();
                 let mut should_refresh_diff = false;
-                let mut should_persist_events = false;
                 let mut should_persist_sessions = false;
+                let mut db_usage_to_upsert: Option<AgentEvent> = None;
+                let mut db_event_to_append: Option<AgentEvent> = None;
+                let mut push_notification_job: Option<(
+                    push::PushConfig,
+                    push::PushTriggerKind,
+                    SessionInfo,
+                    Option<String>,
+                )> = None;
                 let mut outbound_events: Vec<AgentEvent> = Vec::with_capacity(2);
 
                 {
                     let mut guard = state.inner.write().await;
-                    let is_codex = guard
+                    let (sess_prov, sess_model, base_out, base_cost) = guard
                         .sessions
                         .get(&session_id)
-                        .map(|s| matches!(s.provider, AgentProvider::Codex))
-                        .unwrap_or(false);
-                    let (base_out, base_cost) = guard
-                        .sessions
-                        .get(&session_id)
-                        .map(|s| (s.output_tokens, s.cost_usd))
-                        .unwrap_or((0, 0.0));
+                        .map(|s| {
+                            (
+                                s.provider.clone(),
+                                s.model.clone(),
+                                s.output_tokens,
+                                s.cost_usd,
+                            )
+                        })
+                        .unwrap_or((AgentProvider::Claude, None, 0, 0.0));
+                    let is_codex = matches!(sess_prov, AgentProvider::Codex);
 
                     let metrics = guard
                         .live_turns
@@ -1022,11 +1009,31 @@ impl DaemonState {
                                 metrics.turn_output_tokens.max(*output_tokens);
                             if *cost_usd > 0.0 {
                                 metrics.turn_cost_usd = *cost_usd;
+                            } else {
+                                metrics.turn_cost_usd = pricing::compute_cost_usd(
+                                    &sess_prov,
+                                    sess_model.as_deref(),
+                                    metrics.turn_input_tokens,
+                                    metrics.turn_cache_read_tokens,
+                                    metrics.turn_cache_write_tokens,
+                                    metrics.turn_output_tokens,
+                                );
                             }
                             delta
                         } else {
                             metrics.turn_output_tokens += *output_tokens;
-                            metrics.turn_cost_usd += *cost_usd;
+                            if *cost_usd > 0.0 {
+                                metrics.turn_cost_usd += *cost_usd;
+                            } else {
+                                metrics.turn_cost_usd += pricing::compute_cost_usd(
+                                    &sess_prov,
+                                    sess_model.as_deref(),
+                                    *input_tokens,
+                                    *cache_read_tokens,
+                                    *cache_write_tokens,
+                                    *output_tokens,
+                                );
+                            }
                             *output_tokens
                         };
 
@@ -1110,7 +1117,7 @@ impl DaemonState {
 
                         let hist = guard.event_history.entry(session_id).or_default();
                         upsert_turn_usage_event(hist, norm_usage.clone());
-                        should_persist_events = true;
+                        db_usage_to_upsert = Some(norm_usage.clone());
 
                         if let Some(session) = guard.sessions.get_mut(&session_id) {
                             session.updated_at = Utc::now();
@@ -1152,6 +1159,14 @@ impl DaemonState {
                                 } else {
                                     metrics.last_computed_tps
                                 };
+                                let synth_cost = pricing::compute_cost_usd(
+                                    &sess_prov,
+                                    sess_model.as_deref(),
+                                    metrics.turn_input_tokens,
+                                    metrics.turn_cache_read_tokens,
+                                    metrics.turn_cache_write_tokens,
+                                    metrics.turn_est_tokens,
+                                );
                                 let synth_usage = AgentEvent::UsageUpdated {
                                     session_id,
                                     input_tokens: metrics.turn_input_tokens,
@@ -1162,21 +1177,23 @@ impl DaemonState {
                                     cache_read_tokens: metrics.turn_cache_read_tokens,
                                     cache_write_tokens: metrics.turn_cache_write_tokens,
                                     context_window: metrics.turn_context_window,
-                                    cost_usd: 0.0,
+                                    cost_usd: synth_cost,
                                     output_tps: final_tps,
                                     is_turn_total: true,
                                     timestamp: Utc::now(),
                                 };
                                 let base_out_snap = metrics.base_session_output_tokens;
+                                let base_cost_snap = metrics.base_session_cost_usd;
                                 let est_out_snap = metrics.turn_est_tokens;
                                 let hist = guard.event_history.entry(session_id).or_default();
                                 upsert_turn_usage_event(hist, synth_usage.clone());
+                                db_usage_to_upsert = Some(synth_usage.clone());
                                 if let Some(session) = guard.sessions.get_mut(&session_id) {
                                     session.output_tokens =
                                         base_out_snap.saturating_add(est_out_snap);
+                                    session.cost_usd = base_cost_snap + synth_cost;
                                 }
                                 outbound_events.push(synth_usage);
-                                should_persist_events = true;
                                 should_persist_sessions = true;
                             }
                             guard.live_turns.remove(&session_id);
@@ -1195,16 +1212,60 @@ impl DaemonState {
                                 .entry(session_id)
                                 .or_default()
                                 .push(event.clone());
-                            should_persist_events = true;
+                            db_event_to_append = Some(event.clone());
                         }
 
+                        let p_cfg = guard.push_config.clone();
                         if let Some(session) = guard.sessions.get_mut(&session_id) {
                             session.updated_at = Utc::now();
                             match &event {
-                                AgentEvent::StatusChanged { status, .. } => {
+                                AgentEvent::StatusChanged {
+                                    status, message, ..
+                                } => {
                                     session.status = *status;
                                     should_refresh_diff = true;
                                     should_persist_sessions = true;
+                                    if p_cfg.enabled {
+                                        match status {
+                                            SessionStatus::Completed => {
+                                                push_notification_job = Some((
+                                                    p_cfg,
+                                                    push::PushTriggerKind::TurnCompleted,
+                                                    session.clone(),
+                                                    message.clone(),
+                                                ));
+                                            }
+                                            SessionStatus::Failed => {
+                                                push_notification_job = Some((
+                                                    p_cfg,
+                                                    push::PushTriggerKind::TurnFailed,
+                                                    session.clone(),
+                                                    message.clone(),
+                                                ));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                AgentEvent::PermissionRequested { description, .. } => {
+                                    if p_cfg.enabled {
+                                        push_notification_job = Some((
+                                            p_cfg,
+                                            push::PushTriggerKind::PermissionRequired,
+                                            session.clone(),
+                                            Some(description.clone()),
+                                        ));
+                                    }
+                                }
+                                AgentEvent::UserQuestionRequested { question, .. } => {
+                                    if p_cfg.enabled {
+                                        push_notification_job = Some((
+                                            p_cfg,
+                                            push::PushTriggerKind::QuestionRequired,
+                                            session.clone(),
+                                            Some(question.clone()),
+                                        ));
+                                    }
                                 }
                                 AgentEvent::ProviderSessionBound {
                                     provider_session_id,
@@ -1240,6 +1301,24 @@ impl DaemonState {
                     let _ = state.event_tx.send(out_ev);
                 }
 
+                if let Some(u_ev) = db_usage_to_upsert {
+                    let _ = state.db.upsert_turn_usage_event(session_id, &u_ev);
+                }
+                if let Some(a_ev) = db_event_to_append {
+                    let _ = state.db.append_event(session_id, &a_ev);
+                }
+                if let Some((cfg, kind, sess, detail)) = push_notification_job {
+                    tokio::spawn(async move {
+                        let _ = push::send_push_notification(
+                            &cfg,
+                            kind,
+                            Some(&sess),
+                            detail.as_deref(),
+                        )
+                        .await;
+                    });
+                }
+
                 if should_refresh_diff {
                     let wt_path = {
                         let guard = state.inner.read().await;
@@ -1259,9 +1338,6 @@ impl DaemonState {
                     should_persist_sessions = true;
                 }
 
-                if should_persist_events {
-                    let _ = state.persist_session_events(session_id).await;
-                }
                 if should_persist_sessions {
                     let _ = state.persist_sessions().await;
                 }
@@ -1275,10 +1351,7 @@ impl DaemonState {
             guard.event_history.get(&session_id).cloned()
         };
         if let Some(list) = evs {
-            let _ = tokio::fs::create_dir_all(&self.events_dir).await;
-            let ev_path = self.events_dir.join(format!("{}.json", session_id));
-            let json_str = serde_json::to_string_pretty(&list)?;
-            tokio::fs::write(&ev_path, json_str).await?;
+            self.db.replace_session_events(session_id, &list)?;
         }
         Ok(())
     }
@@ -1290,8 +1363,7 @@ impl DaemonState {
             v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             v
         };
-        let json_str = serde_json::to_string_pretty(&list)?;
-        tokio::fs::write(&self.state_file, json_str).await?;
+        self.db.upsert_sessions_batch(&list)?;
         let _ = self.snapshot_tx.send(list);
         Ok(())
     }
@@ -1857,8 +1929,9 @@ impl DaemonState {
         if ws_added {
             let _ = self.persist_workspaces().await;
         }
-        let _ = self.persist_session_events(session_id).await;
+        let _ = self.db.upsert_session(&session);
         if let Some(uev) = initial_user_ev {
+            let _ = self.db.append_event(session_id, &uev);
             let _ = self.event_tx.send(uev);
         }
 
@@ -1976,6 +2049,13 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/attachments", post(upload_attachment_handler))
         .route("/api/attachments/{file}", get(get_attachment_handler))
         .route("/api/attachments-resolve", get(resolve_attachment_handler))
+        .route("/api/search", get(global_search_handler))
+        .route("/api/analytics/usage", get(usage_analytics_handler))
+        .route(
+            "/api/push/config",
+            get(get_push_config_handler).post(set_push_config_handler),
+        )
+        .route("/api/push/test", post(test_push_handler))
         .route(
             "/api/sessions",
             get(list_sessions_handler).post(create_session_handler),
@@ -2177,8 +2257,11 @@ async fn list_models_handler() -> impl IntoResponse {
 }
 
 pub(crate) async fn build_models_catalog_json() -> Value {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/daiyudai".to_string());
-    let home_path = PathBuf::from(&home);
+    let home_path = dirs::home_dir().unwrap_or_else(|| {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    });
     let mut models: Vec<Value> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -2882,6 +2965,7 @@ impl DaemonState {
 
         let ev_file = self.events_dir.join(format!("{}.json", id));
         let _ = tokio::fs::remove_file(&ev_file).await;
+        let _ = self.db.delete_session(id);
 
         let mut worktree_removed = false;
         if let Some(ref s) = removed_session {
@@ -3512,7 +3596,7 @@ async fn terminal_start_handler(
         .sessions
         .get(&id)
         .map(|s| PathBuf::from(&s.worktree_path))
-        .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"));
+        .unwrap_or_else(fallback_workspace_dir);
 
     if let Some(existing) = guard.shells.get(&id) {
         let _ = existing.resize(cols, rows);
@@ -3569,7 +3653,7 @@ async fn terminal_input_handler(
             .sessions
             .get(&id)
             .map(|s| PathBuf::from(&s.worktree_path))
-            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"));
+            .unwrap_or_else(fallback_workspace_dir);
         if let Ok(shell) =
             velo_agent::spawn_interactive_shell(id, wt_path, 96, 28, state.event_tx.clone())
         {
@@ -3625,7 +3709,7 @@ async fn terminal_restart_handler(
         .sessions
         .get(&id)
         .map(|s| PathBuf::from(&s.worktree_path))
-        .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"));
+        .unwrap_or_else(fallback_workspace_dir);
 
     match velo_agent::spawn_interactive_shell(id, wt_path.clone(), 96, 28, state.event_tx.clone()) {
         Ok(shell) => {
@@ -3645,17 +3729,79 @@ async fn terminal_restart_handler(
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct EventsQueryParams {
+    before_seq: Option<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct GlobalSearchQueryParams {
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
 async fn get_session_events_handler(
     State(state): State<DaemonState>,
     AxumPath(id): AxumPath<Uuid>,
+    Query(params): Query<EventsQueryParams>,
 ) -> impl IntoResponse {
+    if params.before_seq.is_some() || params.limit.is_some() {
+        let lim = params.limit.unwrap_or(180);
+        match state.db.query_events_page(id, params.before_seq, lim) {
+            Ok(page) => return Json(json!(page)).into_response(),
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
     let guard = state.inner.read().await;
     let events = guard
         .event_history
         .get(&id)
         .map(|evs| enrich_history_turn_metrics(evs))
         .unwrap_or_default();
-    Json(events)
+    Json(events).into_response()
+}
+
+async fn global_search_handler(
+    State(state): State<DaemonState>,
+    Query(params): Query<GlobalSearchQueryParams>,
+) -> impl IntoResponse {
+    let q = params.q.unwrap_or_default();
+    let lim = params.limit.unwrap_or(30);
+    let hits = state.db.search_global(&q, lim).unwrap_or_default();
+    Json(json!({ "ok": true, "query": q, "hits": hits }))
+}
+
+async fn usage_analytics_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    Json(state.get_usage_analytics_dto().await)
+}
+
+async fn get_push_config_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    Json(json!({ "ok": true, "config": state.get_push_config_dto().await }))
+}
+
+async fn set_push_config_handler(
+    State(state): State<DaemonState>,
+    Json(cfg): Json<push::PushConfig>,
+) -> impl IntoResponse {
+    match state.set_push_config_dto(cfg.clone()).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true, "config": cfg }))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn test_push_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    Json(state.send_test_push().await)
 }
 
 async fn get_session_diff_handler(
@@ -3702,7 +3848,7 @@ async fn list_worktree_files_handler(
         let guard = state.inner.read().await;
         match guard.sessions.get(&id) {
             Some(s) => PathBuf::from(&s.worktree_path),
-            None => PathBuf::from("/Users/daiyudai/code/velo"),
+            None => fallback_workspace_dir(),
         }
     };
 
@@ -3738,7 +3884,7 @@ async fn exec_in_worktree_handler(
         let guard = state.inner.read().await;
         match guard.sessions.get(&id) {
             Some(s) => PathBuf::from(&s.worktree_path),
-            None => PathBuf::from("/Users/daiyudai/code/velo"),
+            None => fallback_workspace_dir(),
         }
     };
 
@@ -3997,7 +4143,11 @@ impl DaemonState {
                 .or_default()
                 .push(user_ev.clone());
         }
-        let _ = self.persist_session_events(id).await;
+        if req.truncate_to_user_turn.is_some() {
+            let _ = self.persist_session_events(id).await;
+        } else {
+            let _ = self.db.append_event(id, &user_ev);
+        }
         let _ = self.event_tx.send(user_ev);
 
         let effective_prompt = if resume_session_id.is_some() {
@@ -4198,6 +4348,301 @@ async fn send_input_handler(
     }
 }
 
+impl DaemonState {
+    pub async fn get_usage_analytics_dto(&self) -> Value {
+        let guard = self.inner.read().await;
+        pricing::build_usage_analytics(&guard.sessions, &guard.event_history)
+    }
+
+    pub async fn get_push_config_dto(&self) -> push::PushConfig {
+        let guard = self.inner.read().await;
+        guard.push_config.clone()
+    }
+
+    pub async fn set_push_config_dto(&self, cfg: push::PushConfig) -> Result<()> {
+        {
+            let mut guard = self.inner.write().await;
+            guard.push_config = cfg.clone();
+        }
+        push::save_push_config(&self.push_config_file, &cfg).await
+    }
+
+    pub async fn send_test_push(&self) -> Value {
+        let cfg = self.get_push_config_dto().await;
+        push::send_push_notification(&cfg, push::PushTriggerKind::TestPing, None, None).await
+    }
+
+    pub async fn rewind_session_core(&self, id: Uuid, truncate_to_user_turn: usize) -> Value {
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(mut handle) = guard.handles.remove(&id) {
+                handle.stop();
+            }
+            if let Some(ev_list) = guard.event_history.get_mut(&id) {
+                truncate_events_at_user_turn(ev_list, truncate_to_user_turn);
+            }
+            if let Some(session) = guard.sessions.get_mut(&id) {
+                session.status = SessionStatus::Stopped;
+                session.provider_session_id = None;
+                session.updated_at = Utc::now();
+            }
+        }
+        let _ = self.persist_session_events(id).await;
+        let _ = self.persist_sessions().await;
+        json!({ "ok": true, "session_id": id, "truncated_to": truncate_to_user_turn })
+    }
+
+    pub async fn git_commit_core(&self, id: Uuid, message: &str, push_remote: bool) -> Value {
+        let wt_path = {
+            let guard = self.inner.read().await;
+            guard
+                .sessions
+                .get(&id)
+                .map(|s| PathBuf::from(&s.worktree_path))
+                .unwrap_or_else(fallback_workspace_dir)
+        };
+        let msg = if message.trim().is_empty() {
+            "chore: commit worktree changes via Velo".to_string()
+        } else {
+            message.trim().to_string()
+        };
+
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&wt_path)
+            .output()
+            .await;
+
+        let commit_out = Command::new("git")
+            .args(["commit", "-m", &msg])
+            .current_dir(&wt_path)
+            .output()
+            .await;
+
+        match commit_out {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let ok = out.status.success();
+                let mut push_out_str = String::new();
+                if ok && push_remote {
+                    if let Ok(p_out) = Command::new("git")
+                        .args(["push", "-u", "origin", "HEAD"])
+                        .current_dir(&wt_path)
+                        .output()
+                        .await
+                    {
+                        push_out_str = format!(
+                            "{}\n{}",
+                            String::from_utf8_lossy(&p_out.stdout),
+                            String::from_utf8_lossy(&p_out.stderr)
+                        )
+                        .trim()
+                        .to_string();
+                    }
+                }
+                let stats = WorktreeManager::compute_diff_stats(&wt_path)
+                    .await
+                    .unwrap_or_default();
+                {
+                    let mut guard = self.inner.write().await;
+                    if let Some(s) = guard.sessions.get_mut(&id) {
+                        s.diff_stats = stats.clone();
+                        s.updated_at = Utc::now();
+                    }
+                }
+                let _ = self.agent_event_tx.send(AgentEvent::DiffUpdated {
+                    session_id: id,
+                    stats: stats.clone(),
+                    timestamp: Utc::now(),
+                });
+                let _ = self.persist_sessions().await;
+
+                json!({
+                    "ok": ok,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "push_output": push_out_str,
+                    "stats": stats,
+                })
+            }
+            Err(err) => json!({ "ok": false, "error": err.to_string() }),
+        }
+    }
+
+    pub async fn git_discard_core(&self, id: Uuid, file_path: Option<&str>, all: bool) -> Value {
+        let wt_path = {
+            let guard = self.inner.read().await;
+            guard
+                .sessions
+                .get(&id)
+                .map(|s| PathBuf::from(&s.worktree_path))
+                .unwrap_or_else(fallback_workspace_dir)
+        };
+
+        if all {
+            let _ = Command::new("git")
+                .args(["reset", "--hard", "HEAD"])
+                .current_dir(&wt_path)
+                .output()
+                .await;
+            let _ = Command::new("git")
+                .args(["clean", "-fd"])
+                .current_dir(&wt_path)
+                .output()
+                .await;
+        } else if let Some(fp) = file_path.filter(|s| !s.trim().is_empty()) {
+            let _ = Command::new("git")
+                .args(["checkout", "HEAD", "--", fp])
+                .current_dir(&wt_path)
+                .output()
+                .await;
+            let _ = Command::new("git")
+                .args(["clean", "-fd", "--", fp])
+                .current_dir(&wt_path)
+                .output()
+                .await;
+        }
+
+        let stats = WorktreeManager::compute_diff_stats(&wt_path)
+            .await
+            .unwrap_or_default();
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(s) = guard.sessions.get_mut(&id) {
+                s.diff_stats = stats.clone();
+                s.updated_at = Utc::now();
+            }
+        }
+        let _ = self.agent_event_tx.send(AgentEvent::DiffUpdated {
+            session_id: id,
+            stats: stats.clone(),
+            timestamp: Utc::now(),
+        });
+        let _ = self.persist_sessions().await;
+
+        json!({ "ok": true, "stats": stats })
+    }
+
+    pub async fn git_merge_core(&self, id: Uuid) -> Value {
+        let session = {
+            let guard = self.inner.read().await;
+            guard.sessions.get(&id).cloned()
+        };
+        let Some(s) = session else {
+            return json!({ "ok": false, "error": "Session not found" });
+        };
+
+        let wt_path = PathBuf::from(&s.worktree_path);
+        let repo_root = PathBuf::from(&s.repo_root);
+
+        if let Ok(st) = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt_path)
+            .output()
+            .await
+        {
+            if !String::from_utf8_lossy(&st.stdout).trim().is_empty() {
+                let _ = Command::new("git")
+                    .args(["add", "-A"])
+                    .current_dir(&wt_path)
+                    .output()
+                    .await;
+                let _ = Command::new("git")
+                    .args([
+                        "commit",
+                        "-m",
+                        &format!("feat({}): worktree changes from Velo session", s.branch),
+                    ])
+                    .current_dir(&wt_path)
+                    .output()
+                    .await;
+            }
+        }
+
+        match Command::new("git")
+            .args(["merge", "--no-edit", &s.branch])
+            .current_dir(&repo_root)
+            .output()
+            .await
+        {
+            Ok(out) => json!({
+                "ok": out.status.success(),
+                "branch": s.branch,
+                "stdout": String::from_utf8_lossy(&out.stdout).to_string(),
+                "stderr": String::from_utf8_lossy(&out.stderr).to_string(),
+            }),
+            Err(err) => json!({ "ok": false, "error": err.to_string() }),
+        }
+    }
+
+    pub async fn advisor_session_core(
+        &self,
+        id: Uuid,
+        req: AdvisorSessionRequest,
+    ) -> Result<SessionInfo> {
+        let source_session = {
+            let guard = self.inner.read().await;
+            guard
+                .sessions
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Target session not found"))?
+        };
+        let wt_path = Path::new(&source_session.worktree_path);
+        let diff_stats = WorktreeManager::compute_diff_stats(wt_path)
+            .await
+            .unwrap_or_default();
+        let focus = req.focus_question.unwrap_or_else(|| {
+            "Review the current git diff for bugs, edge cases, race conditions, and architectural improvements. Do NOT modify files unless asked.".to_string()
+        });
+        let advisor_prompt = format!(
+            "[VELO ADVISOR REVIEW for session {} ({}) on branch `{}`]\n\
+             Original Task: {}\n\
+             Modified Files ({}): {}\n\
+             Advisor Focus: {}",
+            &source_session.id.to_string()[..8],
+            source_session.provider,
+            source_session.branch,
+            source_session.prompt,
+            diff_stats.files_changed,
+            diff_stats.modified_files.join(", "),
+            focus
+        );
+        let advisor_id = Uuid::new_v4();
+        let short_id = &advisor_id.to_string()[..8];
+        self.spawn_in_existing_worktree(
+            advisor_id,
+            Some(format!("advisor-{}-{}", req.advisor_provider, short_id)),
+            req.advisor_provider,
+            advisor_prompt,
+            PathBuf::from(&source_session.repo_root),
+            PathBuf::from(&source_session.worktree_path),
+            source_session.branch,
+            false,
+            Some(source_session.id),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn transcribe_audio_base64(
+        &self,
+        audio_base64: &str,
+        mime_type: &str,
+        language: Option<&str>,
+    ) -> Value {
+        let bytes = match decode_base64_payload(audio_base64) {
+            Ok(b) if !b.is_empty() => b,
+            _ => return json!({ "ok": false, "error": "Invalid or empty audio payload" }),
+        };
+        let temp_dir = self.attachments_dir.join("voice-tmp");
+        voice::transcribe_audio(&temp_dir, &bytes, mime_type, language).await
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct RewindSessionRequest {
     truncate_to_user_turn: usize,
@@ -4208,23 +4653,7 @@ async fn rewind_session_handler(
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<RewindSessionRequest>,
 ) -> impl IntoResponse {
-    {
-        let mut guard = state.inner.write().await;
-        if let Some(mut handle) = guard.handles.remove(&id) {
-            handle.stop();
-        }
-        if let Some(ev_list) = guard.event_history.get_mut(&id) {
-            truncate_events_at_user_turn(ev_list, req.truncate_to_user_turn);
-        }
-        if let Some(session) = guard.sessions.get_mut(&id) {
-            session.status = SessionStatus::Stopped;
-            session.provider_session_id = None;
-            session.updated_at = Utc::now();
-        }
-    }
-    let _ = state.persist_session_events(id).await;
-    let _ = state.persist_sessions().await;
-    Json(json!({ "ok": true, "session_id": id, "truncated_to": req.truncate_to_user_turn }))
+    Json(state.rewind_session_core(id, req.truncate_to_user_turn).await)
 }
 
 #[derive(serde::Deserialize)]
@@ -4239,88 +4668,17 @@ async fn git_commit_handler(
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<GitCommitRequest>,
 ) -> impl IntoResponse {
-    let wt_path = {
-        let guard = state.inner.read().await;
-        match guard.sessions.get(&id) {
-            Some(s) => PathBuf::from(&s.worktree_path),
-            None => PathBuf::from("/Users/daiyudai/code/velo"),
-        }
-    };
-    let msg = if req.message.trim().is_empty() {
-        "chore: commit worktree changes via Velo".to_string()
-    } else {
-        req.message.trim().to_string()
-    };
-
-    let _ = Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(&wt_path)
-        .output()
-        .await;
-
-    let commit_out = Command::new("git")
-        .args(["commit", "-m", &msg])
-        .current_dir(&wt_path)
-        .output()
-        .await;
-
-    match commit_out {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            let ok = out.status.success();
-            let mut push_out_str = String::new();
-            if ok && req.push {
-                if let Ok(p_out) = Command::new("git")
-                    .args(["push", "-u", "origin", "HEAD"])
-                    .current_dir(&wt_path)
-                    .output()
-                    .await
-                {
-                    push_out_str = format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(&p_out.stdout),
-                        String::from_utf8_lossy(&p_out.stderr)
-                    )
-                    .trim()
-                    .to_string();
-                }
-            }
-            let stats = WorktreeManager::compute_diff_stats(&wt_path)
-                .await
-                .unwrap_or_default();
-            {
-                let mut guard = state.inner.write().await;
-                if let Some(s) = guard.sessions.get_mut(&id) {
-                    s.diff_stats = stats.clone();
-                    s.updated_at = Utc::now();
-                }
-            }
-            let _ = state.event_tx.send(AgentEvent::DiffUpdated {
-                session_id: id,
-                stats: stats.clone(),
-                timestamp: Utc::now(),
-            });
-            let _ = state.persist_sessions().await;
-
-            (
-                if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST },
-                Json(json!({
-                    "ok": ok,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "push_output": push_out_str,
-                    "stats": stats,
-                })),
-            )
-                .into_response()
-        }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": err.to_string() })),
-        )
-            .into_response(),
-    }
+    let val = state.git_commit_core(id, &req.message, req.push).await;
+    let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    (
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        Json(val),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -4335,130 +4693,28 @@ async fn git_discard_handler(
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<GitDiscardRequest>,
 ) -> impl IntoResponse {
-    let wt_path = {
-        let guard = state.inner.read().await;
-        match guard.sessions.get(&id) {
-            Some(s) => PathBuf::from(&s.worktree_path),
-            None => PathBuf::from("/Users/daiyudai/code/velo"),
-        }
-    };
-
-    if req.all {
-        let _ = Command::new("git")
-            .args(["reset", "--hard", "HEAD"])
-            .current_dir(&wt_path)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["clean", "-fd"])
-            .current_dir(&wt_path)
-            .output()
-            .await;
-    } else if let Some(fp) = req.file_path.as_deref().filter(|s| !s.trim().is_empty()) {
-        let _ = Command::new("git")
-            .args(["checkout", "HEAD", "--", fp])
-            .current_dir(&wt_path)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["clean", "-fd", "--", fp])
-            .current_dir(&wt_path)
-            .output()
-            .await;
-    }
-
-    let stats = WorktreeManager::compute_diff_stats(&wt_path)
-        .await
-        .unwrap_or_default();
-    {
-        let mut guard = state.inner.write().await;
-        if let Some(s) = guard.sessions.get_mut(&id) {
-            s.diff_stats = stats.clone();
-            s.updated_at = Utc::now();
-        }
-    }
-    let _ = state.event_tx.send(AgentEvent::DiffUpdated {
-        session_id: id,
-        stats: stats.clone(),
-        timestamp: Utc::now(),
-    });
-    let _ = state.persist_sessions().await;
-
-    Json(json!({ "ok": true, "stats": stats }))
+    Json(
+        state
+            .git_discard_core(id, req.file_path.as_deref(), req.all)
+            .await,
+    )
 }
 
 async fn git_merge_handler(
     State(state): State<DaemonState>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> impl IntoResponse {
-    let session = {
-        let guard = state.inner.read().await;
-        guard.sessions.get(&id).cloned()
-    };
-    let Some(s) = session else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "ok": false, "error": "Session not found" })),
-        )
-            .into_response();
-    };
-
-    let wt_path = PathBuf::from(&s.worktree_path);
-    let repo_root = PathBuf::from(&s.repo_root);
-
-    // Auto-commit any uncommitted work in the worktree before merging if needed
-    let status_out = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&wt_path)
-        .output()
-        .await;
-    if let Ok(st) = status_out {
-        if !String::from_utf8_lossy(&st.stdout).trim().is_empty() {
-            let _ = Command::new("git")
-                .args(["add", "-A"])
-                .current_dir(&wt_path)
-                .output()
-                .await;
-            let _ = Command::new("git")
-                .args([
-                    "commit",
-                    "-m",
-                    &format!("feat({}): worktree changes from Velo session", s.branch),
-                ])
-                .current_dir(&wt_path)
-                .output()
-                .await;
-        }
-    }
-
-    let merge_out = Command::new("git")
-        .args(["merge", "--no-edit", &s.branch])
-        .current_dir(&repo_root)
-        .output()
-        .await;
-
-    match merge_out {
-        Ok(out) => {
-            let ok = out.status.success();
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            (
-                if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST },
-                Json(json!({
-                    "ok": ok,
-                    "branch": s.branch,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                })),
-            )
-                .into_response()
-        }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": err.to_string() })),
-        )
-            .into_response(),
-    }
+    let val = state.git_merge_core(id).await;
+    let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    (
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        Json(val),
+    )
+        .into_response()
 }
 
 async fn stop_session_handler(
@@ -4931,7 +5187,7 @@ async fn get_pr_handler(
             .sessions
             .get(&id)
             .map(|s| PathBuf::from(&s.worktree_path))
-            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"))
+            .unwrap_or_else(fallback_workspace_dir)
     };
     Json(pr::get_pr_status(&wt).await)
 }
@@ -4947,7 +5203,7 @@ async fn create_pr_handler(
             .sessions
             .get(&id)
             .map(|s| PathBuf::from(&s.worktree_path))
-            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"))
+            .unwrap_or_else(fallback_workspace_dir)
     };
     Json(pr::create_pull_request(&wt, req).await)
 }
@@ -4963,7 +5219,7 @@ async fn merge_pr_handler(
             .sessions
             .get(&id)
             .map(|s| PathBuf::from(&s.worktree_path))
-            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"))
+            .unwrap_or_else(fallback_workspace_dir)
     };
     Json(pr::merge_pull_request(&wt, req).await)
 }
@@ -4978,7 +5234,7 @@ async fn get_pr_checks_handler(
             .sessions
             .get(&id)
             .map(|s| PathBuf::from(&s.worktree_path))
-            .unwrap_or_else(|| PathBuf::from("/Users/daiyudai/code/velo"))
+            .unwrap_or_else(fallback_workspace_dir)
     };
     Json(pr::get_pr_checks_report(&wt).await)
 }
@@ -5892,6 +6148,7 @@ mod tests {
             .output()
             .await?;
 
+        let db = storage::VeloSqliteStore::open(&temp_base.join("velo.db"))?;
         let (agent_event_tx, _) = broadcast::channel(256);
         let (event_tx, _) = broadcast::channel(256);
         let (snapshot_tx, _) = broadcast::channel(32);
@@ -5907,7 +6164,9 @@ mod tests {
                 automations: Vec::new(),
                 repo_hooks: HashMap::new(),
                 workspaces: Vec::new(),
+                push_config: push::PushConfig::default(),
             })),
+            db,
             agent_event_tx,
             event_tx,
             snapshot_tx,
@@ -5918,6 +6177,7 @@ mod tests {
             automations_file: temp_base.join("automations.json"),
             hooks_file: temp_base.join("repo_hooks.json"),
             workspaces_file: temp_base.join("workspaces.json"),
+            push_config_file: temp_base.join("push_config.json"),
             daemon_http_base: None,
         };
         state.spawn_event_supervisor();
@@ -6245,6 +6505,80 @@ mod tests {
         assert!(desktop_usages[1].0 >= 215);
         assert!(desktop_usages[1].1 >= 30.0);
     }
+
+    #[test]
+    fn test_sqlite_wal_pagination_search_and_pricing() -> anyhow::Result<()> {
+        let tmp = std::env::temp_dir().join(format!("velo-sqlite-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp)?;
+        let db = storage::VeloSqliteStore::open(&tmp.join("velo.db"))?;
+
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+        let sess = SessionInfo {
+            id: sid,
+            name: "SQLite WAL Upgrade".to_string(),
+            provider: AgentProvider::Claude,
+            status: SessionStatus::Completed,
+            repo_root: "/tmp/velo-repo".to_string(),
+            worktree_path: "/tmp/velo-repo".to_string(),
+            branch: "main".to_string(),
+            prompt: "Migrate event storage to SQLite WAL".to_string(),
+            pid: None,
+            parent_session_id: None,
+            created_at: now,
+            updated_at: now,
+            diff_stats: Default::default(),
+            tokens_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            context_window: 200_000,
+            cost_usd: 0.0,
+            model: Some("claude-fable-5-2".to_string()),
+            effort: Some("high".to_string()),
+            provider_session_id: None,
+            approval_mode: "auto_edit".to_string(),
+            preview_url: None,
+        };
+        db.upsert_session(&sess)?;
+
+        for i in 0..25 {
+            db.append_event(
+                sid,
+                &AgentEvent::MessageDelta {
+                    session_id: sid,
+                    text: format!("Step {} unique_keyword_alpha_{}", i, i),
+                    timestamp: now + chrono::Duration::seconds(i),
+                },
+            )?;
+        }
+
+        let page1 = db.query_events_page(sid, None, 10)?;
+        assert_eq!(page1.events.len(), 10);
+        assert!(page1.has_more);
+
+        let page2 = db.query_events_page(sid, page1.oldest_seq, 10)?;
+        assert_eq!(page2.events.len(), 10);
+        assert!(page2.has_more);
+
+        let hits = db.search_global("unique_keyword_alpha_22", 10)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, sid);
+
+        // Verify Fable 5.2 pricing: 100k input (80k cached @ $0.50/M + 20k uncached @ $5.00/M = $0.14) + 10k output @ $25/M ($0.25) = $0.39
+        let cost = pricing::compute_cost_usd(
+            &AgentProvider::Claude,
+            Some("claude-fable-5-2"),
+            100_000,
+            80_000,
+            0,
+            10_000,
+        );
+        assert!((cost - 0.39).abs() < 0.0001, "expected $0.39, got {}", cost);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
+    }
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -6464,7 +6798,11 @@ pub(crate) async fn launch_provider_cli_login(provider_raw: &str) -> Result<Stri
         format!("{} {}", resolved_bin, args_str)
     };
 
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/Users/daiyudai"));
+    let home = dirs::home_dir().unwrap_or_else(|| {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    });
     let script_dir = home.join(".velo/bin");
     tokio::fs::create_dir_all(&script_dir).await?;
     let script_path = script_dir.join("velo-cli-login.command");

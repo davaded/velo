@@ -173,7 +173,7 @@ export const PaseoWorkspacePane: React.FC<PaseoWorkspacePaneProps> = ({
   };
 
   const repoDisplayName = useMemo(() => {
-    const root = session?.repo_root || "/Users/daiyudai/code/velo";
+    const root = session?.repo_root || "~/velo";
     return root.split("/").filter(Boolean).pop() || "velo";
   }, [session?.repo_root]);
 

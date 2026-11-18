@@ -90,7 +90,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
   const projectGroups = useMemo(() => {
     const map = new Map<string, SessionInfo[]>();
     for (const s of filteredSessions) {
-      const repoPath = s.repo_root || "/Users/daiyudai/code/velo";
+      const repoPath = s.repo_root || "~/velo";
       const repoName = repoPath.split("/").filter(Boolean).pop() || "workspace";
       const list = map.get(repoName) ?? [];
       list.push(s);

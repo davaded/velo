@@ -48,7 +48,11 @@ fn caffeinate_lock() -> &'static Mutex<Option<Child>> {
 }
 
 fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/Users/daiyudai"))
+    dirs::home_dir().unwrap_or_else(|| {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    })
 }
 
 pub fn velo_home_dir() -> PathBuf {
@@ -235,11 +239,22 @@ fn find_best_ui_dist_source() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let candidates = [
-        PathBuf::from("/Users/daiyudai/code/velo/Velo.app/Contents/Resources/dist"),
-        PathBuf::from("/Users/daiyudai/code/velo/apps/velo-desktop/dist"),
-        PathBuf::from("/Applications/Velo.app/Contents/Resources/dist"),
-    ];
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(macos_dir) = exe.parent() {
+            if let Some(contents_dir) = macos_dir.parent() {
+                candidates.push(contents_dir.join("Resources").join("dist"));
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("Velo.app/Contents/Resources/dist"));
+        candidates.push(cwd.join("apps/velo-desktop/dist"));
+    }
+    let h = home_dir();
+    candidates.push(h.join("code/velo/Velo.app/Contents/Resources/dist"));
+    candidates.push(h.join("code/velo/apps/velo-desktop/dist"));
+    candidates.push(PathBuf::from("/Applications/Velo.app/Contents/Resources/dist"));
     candidates.into_iter().find(|c| c.join("index.html").is_file())
 }
 

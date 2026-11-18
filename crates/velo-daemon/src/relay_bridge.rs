@@ -971,6 +971,14 @@ async fn run_supervised_e2ee_bridge(
                                                         .collect()
                                                 })
                                                 .unwrap_or_default();
+                                            let reset_thread = cmd_val
+                                                .get("reset_thread")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            let truncate_to_user_turn = cmd_val
+                                                .get("truncate_to_user_turn")
+                                                .and_then(|v| v.as_u64())
+                                                .map(|n| n as usize);
                                             if let Err(err) = state
                                                 .dispatch_session_input(
                                                     sid,
@@ -979,8 +987,8 @@ async fn run_supervised_e2ee_bridge(
                                                         model,
                                                         effort,
                                                         provider,
-                                                        reset_thread: false,
-                                                        truncate_to_user_turn: None,
+                                                        reset_thread,
+                                                        truncate_to_user_turn,
                                                         images,
                                                         approval_mode,
                                                     },
@@ -1700,6 +1708,684 @@ async fn run_supervised_e2ee_bridge(
                                         send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
                                     {
                                         let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "rewind_session" => {
+                                    if let (Some(sid_s), Some(turn_idx)) = (
+                                        cmd_val.get("session_id").and_then(|v| v.as_str()),
+                                        cmd_val.get("truncate_to_user_turn").and_then(|v| v.as_u64()),
+                                    ) {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let res = state
+                                                .rewind_session_core(sid, turn_idx as usize)
+                                                .await;
+                                            let compact_evs = {
+                                                let guard = state.inner.read().await;
+                                                guard
+                                                    .event_history
+                                                    .get(&sid)
+                                                    .map(|v| compact_history_for_relay(v))
+                                                    .unwrap_or_default()
+                                            };
+                                            for msg in [
+                                                json!({
+                                                    "type": "events_snapshot",
+                                                    "session_id": sid,
+                                                    "events": compact_evs,
+                                                }),
+                                                json!({
+                                                    "type": "rewind_result",
+                                                    "result": res,
+                                                }),
+                                            ] {
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &msg,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "get_events_page" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let before_seq = cmd_val
+                                                .get("before_seq")
+                                                .and_then(|v| v.as_i64());
+                                            let limit = cmd_val
+                                                .get("limit")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(140) as usize;
+                                            if let Ok(mut page) =
+                                                state.db.query_events_page(sid, before_seq, limit)
+                                            {
+                                                page.events = page
+                                                    .events
+                                                    .iter()
+                                                    .map(|e| compact_event_for_relay(e, 1600))
+                                                    .collect();
+                                                let resp = json!({
+                                                    "type": "events_page",
+                                                    "session_id": sid,
+                                                    "events": page.events,
+                                                    "oldest_seq": page.oldest_seq,
+                                                    "newest_seq": page.newest_seq,
+                                                    "has_more": page.has_more,
+                                                });
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &resp,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "search_sessions" => {
+                                    let q = cmd_val
+                                        .get("query")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let limit = cmd_val
+                                        .get("limit")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(30) as usize;
+                                    let hits = state.db.search_global(q, limit).unwrap_or_default();
+                                    let resp = json!({
+                                        "type": "search_results",
+                                        "query": q,
+                                        "hits": hits,
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "get_usage_analytics" => {
+                                    let analytics = state.get_usage_analytics_dto().await;
+                                    let resp = json!({
+                                        "type": "usage_analytics_snapshot",
+                                        "analytics": analytics,
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "get_push_config" => {
+                                    let cfg_dto = state.get_push_config_dto().await;
+                                    let resp = json!({
+                                        "type": "push_config_snapshot",
+                                        "config": cfg_dto,
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "set_push_config" => {
+                                    if let Some(cfg_val) = cmd_val.get("config") {
+                                        if let Ok(parsed_cfg) =
+                                            serde_json::from_value::<crate::push::PushConfig>(
+                                                cfg_val.clone(),
+                                            )
+                                        {
+                                            let ok = state
+                                                .set_push_config_dto(parsed_cfg.clone())
+                                                .await
+                                                .is_ok();
+                                            let resp = json!({
+                                                "type": "push_config_snapshot",
+                                                "ok": ok,
+                                                "config": parsed_cfg,
+                                            });
+                                            if let Some(frame_txt) = send_sealed_with_key(
+                                                &resp,
+                                                &active_key_hex,
+                                                &mut out_nonce,
+                                            ) {
+                                                let _ = writer
+                                                    .send(WsMsg::Text(frame_txt.into()))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                                "test_push" => {
+                                    let res = state.send_test_push().await;
+                                    let resp = json!({
+                                        "type": "push_test_result",
+                                        "result": res,
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "git_commit" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let msg = cmd_val
+                                                .get("message")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let push_remote = cmd_val
+                                                .get("push")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            let res =
+                                                state.git_commit_core(sid, msg, push_remote).await;
+                                            let diff = {
+                                                let guard = state.inner.read().await;
+                                                if let Some(s) = guard.sessions.get(&sid) {
+                                                    WorktreeManager::get_unified_diff(Path::new(
+                                                        &s.worktree_path,
+                                                    ))
+                                                    .await
+                                                    .unwrap_or_default()
+                                                } else {
+                                                    String::new()
+                                                }
+                                            };
+                                            for payload in [
+                                                json!({
+                                                    "type": "git_action_result",
+                                                    "action": "commit",
+                                                    "session_id": sid,
+                                                    "result": res,
+                                                }),
+                                                json!({
+                                                    "type": "diff_snapshot",
+                                                    "session_id": sid,
+                                                    "diff": diff,
+                                                }),
+                                            ] {
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &payload,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "git_discard" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let fp =
+                                                cmd_val.get("file_path").and_then(|v| v.as_str());
+                                            let all = cmd_val
+                                                .get("all")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            let res = state.git_discard_core(sid, fp, all).await;
+                                            let diff = {
+                                                let guard = state.inner.read().await;
+                                                if let Some(s) = guard.sessions.get(&sid) {
+                                                    WorktreeManager::get_unified_diff(Path::new(
+                                                        &s.worktree_path,
+                                                    ))
+                                                    .await
+                                                    .unwrap_or_default()
+                                                } else {
+                                                    String::new()
+                                                }
+                                            };
+                                            for payload in [
+                                                json!({
+                                                    "type": "git_action_result",
+                                                    "action": "discard",
+                                                    "session_id": sid,
+                                                    "result": res,
+                                                }),
+                                                json!({
+                                                    "type": "diff_snapshot",
+                                                    "session_id": sid,
+                                                    "diff": diff,
+                                                }),
+                                            ] {
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &payload,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "git_merge" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let res = state.git_merge_core(sid).await;
+                                            let payload = json!({
+                                                "type": "git_action_result",
+                                                "action": "merge",
+                                                "session_id": sid,
+                                                "result": res,
+                                            });
+                                            if let Some(frame_txt) = send_sealed_with_key(
+                                                &payload,
+                                                &active_key_hex,
+                                                &mut out_nonce,
+                                            ) {
+                                                let _ =
+                                                    writer.send(WsMsg::Text(frame_txt.into())).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                "get_pr" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let wt_opt = {
+                                                let guard = state.inner.read().await;
+                                                guard
+                                                    .sessions
+                                                    .get(&sid)
+                                                    .map(|s| PathBuf::from(&s.worktree_path))
+                                            };
+                                            if let Some(wt) = wt_opt {
+                                                let pr_val = crate::pr::get_pr_status(&wt).await;
+                                                let resp = json!({
+                                                    "type": "pr_snapshot",
+                                                    "session_id": sid,
+                                                    "data": pr_val,
+                                                });
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &resp,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "create_pr" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let wt_opt = {
+                                                let guard = state.inner.read().await;
+                                                guard
+                                                    .sessions
+                                                    .get(&sid)
+                                                    .map(|s| PathBuf::from(&s.worktree_path))
+                                            };
+                                            if let Some(wt) = wt_opt {
+                                                let req = crate::pr::CreatePrRequest {
+                                                    title: cmd_val
+                                                        .get("title")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("PR via Velo")
+                                                        .to_string(),
+                                                    body: cmd_val
+                                                        .get("body")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string(),
+                                                    base: cmd_val
+                                                        .get("base")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(str::to_string),
+                                                    draft: cmd_val
+                                                        .get("draft")
+                                                        .and_then(|v| v.as_bool())
+                                                        .unwrap_or(false),
+                                                };
+                                                let create_res =
+                                                    crate::pr::create_pull_request(&wt, req).await;
+                                                let pr_val = crate::pr::get_pr_status(&wt).await;
+                                                let resp = json!({
+                                                    "type": "pr_snapshot",
+                                                    "session_id": sid,
+                                                    "action_result": create_res,
+                                                    "data": pr_val,
+                                                });
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &resp,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "merge_pr" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let wt_opt = {
+                                                let guard = state.inner.read().await;
+                                                guard
+                                                    .sessions
+                                                    .get(&sid)
+                                                    .map(|s| PathBuf::from(&s.worktree_path))
+                                            };
+                                            if let Some(wt) = wt_opt {
+                                                let req = crate::pr::MergePrRequest {
+                                                    method: cmd_val
+                                                        .get("method")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("squash")
+                                                        .to_string(),
+                                                };
+                                                let merge_res =
+                                                    crate::pr::merge_pull_request(&wt, req).await;
+                                                let pr_val = crate::pr::get_pr_status(&wt).await;
+                                                let resp = json!({
+                                                    "type": "pr_snapshot",
+                                                    "session_id": sid,
+                                                    "action_result": merge_res,
+                                                    "data": pr_val,
+                                                });
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &resp,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer
+                                                        .send(WsMsg::Text(frame_txt.into()))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "advisor_session" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let prov_raw = cmd_val
+                                                .get("advisor_provider")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("codex");
+                                            let focus = cmd_val
+                                                .get("focus_question")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            if let Ok(new_sess) = state
+                                                .advisor_session_core(
+                                                    sid,
+                                                    velo_protocol::AdvisorSessionRequest {
+                                                        advisor_provider:
+                                                            AgentProvider::from_str_loose(prov_raw),
+                                                        focus_question: focus,
+                                                    },
+                                                )
+                                                .await
+                                            {
+                                                let sessions: Vec<SessionInfo> = {
+                                                    let guard = state.inner.read().await;
+                                                    let mut list: Vec<SessionInfo> =
+                                                        guard.sessions.values().cloned().collect();
+                                                    list.sort_by(|a, b| {
+                                                        b.created_at.cmp(&a.created_at)
+                                                    });
+                                                    list
+                                                };
+                                                for payload in [
+                                                    serde_json::to_value(
+                                                        WsServerMessage::SessionsSnapshot {
+                                                            sessions,
+                                                        },
+                                                    )
+                                                    .unwrap_or_default(),
+                                                    json!({
+                                                        "type": "handoff_completed",
+                                                        "source_session_id": sid,
+                                                        "new_session_id": new_sess.id,
+                                                    }),
+                                                ] {
+                                                    if let Some(frame_txt) = send_sealed_with_key(
+                                                        &payload,
+                                                        &active_key_hex,
+                                                        &mut out_nonce,
+                                                    ) {
+                                                        let _ = writer
+                                                            .send(WsMsg::Text(frame_txt.into()))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "transcribe_audio" => {
+                                    let req_id = cmd_val
+                                        .get("request_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let b64 = cmd_val
+                                        .get("audio_base64")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let mime = cmd_val
+                                        .get("mime_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("audio/m4a");
+                                    let lang = cmd_val.get("language").and_then(|v| v.as_str());
+                                    let res =
+                                        state.transcribe_audio_base64(b64, mime, lang).await;
+                                    let resp = json!({
+                                        "type": "transcription_result",
+                                        "request_id": req_id,
+                                        "result": res,
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "list_automations" => {
+                                    let list = {
+                                        let guard = state.inner.read().await;
+                                        guard.automations.clone()
+                                    };
+                                    let resp = json!({
+                                        "type": "automations_snapshot",
+                                        "automations": list,
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "toggle_automation" => {
+                                    if let (Some(id_s), Some(en)) = (
+                                        cmd_val.get("id").and_then(|v| v.as_str()),
+                                        cmd_val.get("enabled").and_then(|v| v.as_bool()),
+                                    ) {
+                                        if let Ok(aid) = Uuid::parse_str(id_s) {
+                                            let list = {
+                                                let mut guard = state.inner.write().await;
+                                                if let Some(r) = guard
+                                                    .automations
+                                                    .iter_mut()
+                                                    .find(|r| r.id == aid)
+                                                {
+                                                    r.enabled = en;
+                                                }
+                                                guard.automations.clone()
+                                            };
+                                            let _ = state.persist_automations().await;
+                                            let resp = json!({
+                                                "type": "automations_snapshot",
+                                                "automations": list,
+                                            });
+                                            if let Some(frame_txt) = send_sealed_with_key(
+                                                &resp,
+                                                &active_key_hex,
+                                                &mut out_nonce,
+                                            ) {
+                                                let _ =
+                                                    writer.send(WsMsg::Text(frame_txt.into())).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                "trigger_automation" => {
+                                    if let Some(id_s) = cmd_val.get("id").and_then(|v| v.as_str()) {
+                                        if let Ok(aid) = Uuid::parse_str(id_s) {
+                                            let _ = state
+                                                .trigger_automation_rule(
+                                                    aid,
+                                                    "mobile_manual_run",
+                                                    &json!({ "title": "Mobile trigger" }),
+                                                )
+                                                .await;
+                                            let list = {
+                                                let guard = state.inner.read().await;
+                                                guard.automations.clone()
+                                            };
+                                            let resp = json!({
+                                                "type": "automations_snapshot",
+                                                "automations": list,
+                                            });
+                                            if let Some(frame_txt) = send_sealed_with_key(
+                                                &resp,
+                                                &active_key_hex,
+                                                &mut out_nonce,
+                                            ) {
+                                                let _ =
+                                                    writer.send(WsMsg::Text(frame_txt.into())).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                "delete_automation" => {
+                                    if let Some(id_s) = cmd_val.get("id").and_then(|v| v.as_str()) {
+                                        if let Ok(aid) = Uuid::parse_str(id_s) {
+                                            let list = {
+                                                let mut guard = state.inner.write().await;
+                                                guard.automations.retain(|r| r.id != aid);
+                                                guard.automations.clone()
+                                            };
+                                            let _ = state.persist_automations().await;
+                                            let resp = json!({
+                                                "type": "automations_snapshot",
+                                                "automations": list,
+                                            });
+                                            if let Some(frame_txt) = send_sealed_with_key(
+                                                &resp,
+                                                &active_key_hex,
+                                                &mut out_nonce,
+                                            ) {
+                                                let _ =
+                                                    writer.send(WsMsg::Text(frame_txt.into())).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                "create_automation" => {
+                                    let name = cmd_val
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("Scheduled Task")
+                                        .trim()
+                                        .to_string();
+                                    let cron_expr = cmd_val
+                                        .get("cron_expr")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string);
+                                    let repo_path = cmd_val
+                                        .get("repo_path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let prov_s = cmd_val
+                                        .get("provider")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("claude");
+                                    let prompt_template = cmd_val
+                                        .get("prompt_template")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if !prompt_template.trim().is_empty() {
+                                        let rule = crate::automations::AutomationRule {
+                                            id: Uuid::new_v4(),
+                                            name,
+                                            enabled: true,
+                                            trigger_type: "cron".to_string(),
+                                            cron_expr,
+                                            webhook_secret: None,
+                                            github_events: Vec::new(),
+                                            repo_path: crate::canonical_workspace_path(&repo_path),
+                                            branch_prefix: "auto/hub".to_string(),
+                                            provider: AgentProvider::from_str_loose(prov_s),
+                                            model: cmd_val
+                                                .get("model")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string),
+                                            prompt_template,
+                                            created_at: Utc::now(),
+                                            last_run_at: None,
+                                            last_session_id: None,
+                                            run_count: 0,
+                                        };
+                                        let list = {
+                                            let mut guard = state.inner.write().await;
+                                            guard.automations.push(rule);
+                                            guard.automations.clone()
+                                        };
+                                        let _ = state.persist_automations().await;
+                                        let resp = json!({
+                                            "type": "automations_snapshot",
+                                            "automations": list,
+                                        });
+                                        if let Some(frame_txt) = send_sealed_with_key(
+                                            &resp,
+                                            &active_key_hex,
+                                            &mut out_nonce,
+                                        ) {
+                                            let _ =
+                                                writer.send(WsMsg::Text(frame_txt.into())).await;
+                                        }
                                     }
                                 }
                                 _ => {}

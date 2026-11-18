@@ -383,7 +383,7 @@ public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
 
         let rawRepoRoot = (dict["repo_root"] as? String)
             ?? (dict["project_path"] as? String)
-            ?? "/Users/daiyudai/code/velo"
+            ?? "~/workspace"
         let repoRoot = VeloFormatting.canonicalWorkspacePath(rawRepoRoot)
         let rawWorktree = (dict["worktree_path"] as? String) ?? repoRoot
         let worktreePath = VeloFormatting.canonicalWorkspacePath(rawWorktree)
@@ -820,14 +820,24 @@ public struct DiffFileSection: Identifiable, Equatable, Sendable {
 }
 
 public enum VeloFormatting {
+    public static func shortenHomePath(_ raw: String) -> String {
+        if raw.hasPrefix("/Users/") {
+            let parts = raw.split(separator: "/", omittingEmptySubsequences: true)
+            if parts.count >= 2 {
+                let tail = parts.dropFirst(2).joined(separator: "/")
+                return tail.isEmpty ? "~" : "~/\(tail)"
+            }
+        }
+        return raw
+    }
+
     public static func canonicalWorkspacePath(_ raw: String, macHomeHint: String? = nil) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return "/Users/daiyudai/code/velo" }
-        if s == "~" {
-            return macHomeHint ?? "/Users/daiyudai"
+        guard !s.isEmpty else { return macHomeHint ?? "~/workspace" }
+        if s == "~", let hint = macHomeHint {
+            return hint
         }
-        if s.hasPrefix("~/") {
-            let home = macHomeHint ?? "/Users/daiyudai"
+        if s.hasPrefix("~/"), let home = macHomeHint {
             s = home + String(s.dropFirst(1))
         }
         while s.count > 1 && s.hasSuffix("/") {
@@ -1248,5 +1258,223 @@ public enum VeloFormatting {
             return joined
         }
         return lines.isEmpty ? "CLI 进程异常退出，未返回有效响应。" : lines.prefix(3).joined(separator: "\n")
+    }
+}
+
+// MARK: - Analytics, Search, PR, Push & Automations DTOs
+
+public struct VeloUsageBucket: Identifiable, Equatable {
+    public var id: String { key }
+    public let key: String
+    public let label: String
+    public let sessionsCount: Int
+    public let turnsCount: Int
+    public let inputTokens: Int
+    public let cacheReadTokens: Int
+    public let outputTokens: Int
+    public let cacheHitPct: Double
+    public let avgTps: Double
+    public let costUsd: Double
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloUsageBucket {
+        VeloUsageBucket(
+            key: (d["key"] as? String) ?? UUID().uuidString,
+            label: (d["label"] as? String) ?? "—",
+            sessionsCount: VeloSessionItem.intValue(d["sessions_count"]) ?? 0,
+            turnsCount: VeloSessionItem.intValue(d["turns_count"]) ?? 0,
+            inputTokens: VeloSessionItem.intValue(d["input_tokens"]) ?? 0,
+            cacheReadTokens: VeloSessionItem.intValue(d["cache_read_tokens"]) ?? 0,
+            outputTokens: VeloSessionItem.intValue(d["output_tokens"]) ?? 0,
+            cacheHitPct: VeloSessionItem.doubleValue(d["cache_hit_pct"]) ?? 0,
+            avgTps: VeloSessionItem.doubleValue(d["avg_tps"]) ?? 0,
+            costUsd: VeloSessionItem.doubleValue(d["cost_usd"]) ?? 0
+        )
+    }
+}
+
+public struct VeloUsageAnalytics: Equatable {
+    public let sessionsCount: Int
+    public let turnsCount: Int
+    public let inputTokens: Int
+    public let cacheReadTokens: Int
+    public let outputTokens: Int
+    public let totalTokens: Int
+    public let cacheHitPct: Double
+    public let avgTps: Double
+    public let totalCostUsd: Double
+    public let todayCostUsd: Double
+    public let todayTokens: Int
+    public let byProvider: [VeloUsageBucket]
+    public let byWorkspace: [VeloUsageBucket]
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloUsageAnalytics {
+        let provArr = (d["by_provider"] as? [[String: Any]]) ?? []
+        let wsArr = (d["by_workspace"] as? [[String: Any]]) ?? []
+        return VeloUsageAnalytics(
+            sessionsCount: VeloSessionItem.intValue(d["sessions_count"]) ?? 0,
+            turnsCount: VeloSessionItem.intValue(d["turns_count"]) ?? 0,
+            inputTokens: VeloSessionItem.intValue(d["input_tokens"]) ?? 0,
+            cacheReadTokens: VeloSessionItem.intValue(d["cache_read_tokens"]) ?? 0,
+            outputTokens: VeloSessionItem.intValue(d["output_tokens"]) ?? 0,
+            totalTokens: VeloSessionItem.intValue(d["total_tokens"]) ?? 0,
+            cacheHitPct: VeloSessionItem.doubleValue(d["cache_hit_pct"]) ?? 0,
+            avgTps: VeloSessionItem.doubleValue(d["avg_tps"]) ?? 0,
+            totalCostUsd: VeloSessionItem.doubleValue(d["total_cost_usd"]) ?? 0,
+            todayCostUsd: VeloSessionItem.doubleValue(d["today_cost_usd"]) ?? 0,
+            todayTokens: VeloSessionItem.intValue(d["today_tokens"]) ?? 0,
+            byProvider: provArr.map(VeloUsageBucket.fromJSON),
+            byWorkspace: wsArr.map(VeloUsageBucket.fromJSON)
+        )
+    }
+}
+
+public struct VeloSearchHit: Identifiable, Equatable {
+    public let id: String
+    public let sessionId: String
+    public let sessionName: String
+    public let repoRoot: String
+    public let provider: String
+    public let kind: String
+    public let snippet: String
+    public let timestampMs: Int64
+
+    public static func fromJSON(_ d: [String: Any], index: Int) -> VeloSearchHit? {
+        guard let sid = d["session_id"] as? String, !sid.isEmpty else { return nil }
+        let ts = Int64(VeloSessionItem.intValue(d["timestamp_ms"]) ?? 0)
+        return VeloSearchHit(
+            id: "\(sid)-\(ts)-\(index)",
+            sessionId: sid,
+            sessionName: (d["session_name"] as? String) ?? "会话",
+            repoRoot: (d["repo_root"] as? String) ?? "",
+            provider: (d["provider"] as? String) ?? "agent",
+            kind: (d["kind"] as? String) ?? "message",
+            snippet: (d["snippet"] as? String) ?? "",
+            timestampMs: ts
+        )
+    }
+}
+
+public struct VeloPushConfig: Codable, Equatable {
+    public var enabled: Bool
+    public var barkTarget: String
+    public var webhookUrl: String
+    public var blindMode: Bool
+    public var notifyOnPermission: Bool
+    public var notifyOnComplete: Bool
+    public var notifyOnError: Bool
+
+    public init(
+        enabled: Bool = false,
+        barkTarget: String = "",
+        webhookUrl: String = "",
+        blindMode: Bool = true,
+        notifyOnPermission: Bool = true,
+        notifyOnComplete: Bool = true,
+        notifyOnError: Bool = true
+    ) {
+        self.enabled = enabled
+        self.barkTarget = barkTarget
+        self.webhookUrl = webhookUrl
+        self.blindMode = blindMode
+        self.notifyOnPermission = notifyOnPermission
+        self.notifyOnComplete = notifyOnComplete
+        self.notifyOnError = notifyOnError
+    }
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloPushConfig {
+        VeloPushConfig(
+            enabled: (d["enabled"] as? Bool) ?? false,
+            barkTarget: (d["bark_target"] as? String) ?? "",
+            webhookUrl: (d["webhook_url"] as? String) ?? "",
+            blindMode: (d["blind_mode"] as? Bool) ?? true,
+            notifyOnPermission: (d["notify_on_permission"] as? Bool) ?? true,
+            notifyOnComplete: (d["notify_on_complete"] as? Bool) ?? true,
+            notifyOnError: (d["notify_on_error"] as? Bool) ?? true
+        )
+    }
+
+    public func toJSON() -> [String: Any] {
+        [
+            "enabled": enabled,
+            "bark_target": barkTarget,
+            "webhook_url": webhookUrl,
+            "blind_mode": blindMode,
+            "notify_on_permission": notifyOnPermission,
+            "notify_on_complete": notifyOnComplete,
+            "notify_on_error": notifyOnError,
+        ]
+    }
+}
+
+public struct VeloPrCheckItem: Identifiable, Equatable {
+    public var id: String { name }
+    public let name: String
+    public let status: String
+    public let conclusion: String
+}
+
+public struct VeloPrSnapshot: Equatable {
+    public let exists: Bool
+    public let number: Int?
+    public let title: String
+    public let url: String
+    public let state: String
+    public let isDraft: Bool
+    public let mergeable: String
+    public let checks: [VeloPrCheckItem]
+    public let message: String?
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloPrSnapshot {
+        let exists = (d["exists"] as? Bool) ?? false
+        let prObj = (d["pr"] as? [String: Any]) ?? [:]
+        let rawChecks = (d["checks"] as? [[String: Any]]) ?? []
+        let checks = rawChecks.map { c in
+            VeloPrCheckItem(
+                name: (c["name"] as? String) ?? "check",
+                status: (c["status"] as? String) ?? "",
+                conclusion: (c["conclusion"] as? String) ?? ""
+            )
+        }
+        return VeloPrSnapshot(
+            exists: exists,
+            number: VeloSessionItem.intValue(prObj["number"]),
+            title: (prObj["title"] as? String) ?? "",
+            url: (prObj["url"] as? String) ?? "",
+            state: (prObj["state"] as? String) ?? "",
+            isDraft: (prObj["isDraft"] as? Bool) ?? false,
+            mergeable: (prObj["mergeable"] as? String) ?? "",
+            checks: checks,
+            message: d["message"] as? String ?? d["error"] as? String
+        )
+    }
+}
+
+public struct VeloAutomationItem: Identifiable, Equatable {
+    public let id: String
+    public let name: String
+    public var enabled: Bool
+    public let cronExpr: String
+    public let repoPath: String
+    public let provider: String
+    public let promptTemplate: String
+    public let runCount: Int
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloAutomationItem? {
+        guard let id = d["id"] as? String else { return nil }
+        let prov: String = {
+            if let p = d["provider"] as? String { return p }
+            if let obj = d["provider"] as? [String: Any], let k = obj.keys.first { return k }
+            return "claude"
+        }()
+        return VeloAutomationItem(
+            id: id,
+            name: (d["name"] as? String) ?? "定时任务",
+            enabled: (d["enabled"] as? Bool) ?? true,
+            cronExpr: (d["cron_expr"] as? String) ?? "0 9 * * *",
+            repoPath: (d["repo_path"] as? String) ?? "",
+            provider: prov,
+            promptTemplate: (d["prompt_template"] as? String) ?? "",
+            runCount: VeloSessionItem.intValue(d["run_count"]) ?? 0
+        )
     }
 }

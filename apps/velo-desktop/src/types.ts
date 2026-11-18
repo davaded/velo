@@ -57,7 +57,7 @@ export function normalizeSession(raw: Record<string, unknown>): SessionInfo {
   const repoRoot =
     (typeof raw.repo_root === "string" && raw.repo_root) ||
     (typeof raw.project_path === "string" && raw.project_path) ||
-    "/Users/daiyudai/code/velo";
+    "~/workspace";
 
   const branch =
     (typeof raw.branch === "string" && raw.branch) ||

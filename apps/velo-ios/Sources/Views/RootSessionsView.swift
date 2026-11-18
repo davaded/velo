@@ -8,6 +8,8 @@ public struct RootSessionsView: View {
 
     @State private var showPairSheet = false
     @State private var showNewThreadSheet = false
+    @State private var showAnalyticsHub = false
+    @State private var analyticsInitialTab: VeloAnalyticsHubSheet.HubTab = .analytics
     @State private var prefillRepoForNewSession: String?
     @State private var selectedEngineFilter: VeloEngineCategory?
     @State private var collapsedProjects: Set<String> = []
@@ -142,18 +144,60 @@ public struct RootSessionsView: View {
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        prefillRepoForNewSession = nil
-                        showNewThreadSheet = true
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundStyle(.primary)
-                            .frame(width: 30, height: 30)
-                            .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                    HStack(spacing: 8) {
+                        Button {
+                            analyticsInitialTab = .search
+                            showAnalyticsHub = true
+                        } label: {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 30, height: 30)
+                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
+                        .disabled(store.connectionConfig == nil)
+
+                        Button {
+                            analyticsInitialTab = .analytics
+                            showAnalyticsHub = true
+                        } label: {
+                            Image(systemName: "chart.bar.xaxis")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 30, height: 30)
+                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
+                        .disabled(store.connectionConfig == nil)
+
+                        Button {
+                            prefillRepoForNewSession = nil
+                            showNewThreadSheet = true
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 30, height: 30)
+                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
+                        .disabled(store.connectionConfig == nil)
                     }
-                    .buttonStyle(VeloPressableButtonStyle())
-                    .disabled(store.connectionConfig == nil)
+                }
+            }
+            .onChange(of: store.deepLinkTargetSessionId) { _, targetSid in
+                guard let targetSid, !targetSid.isEmpty else { return }
+                store.deepLinkTargetSessionId = nil
+                if navigationPath.last != targetSid {
+                    navigationPath = [targetSid]
+                }
+            }
+            .sheet(isPresented: $showAnalyticsHub) {
+                VeloAnalyticsHubSheet(store: store, initialTab: analyticsInitialTab) { targetSid in
+                    store.activeSessionId = targetSid
+                    Task { await store.loadEventsForSession(targetSid) }
+                    navigationPath = [targetSid]
                 }
             }
             .sheet(isPresented: $showPairSheet) {
@@ -355,7 +399,7 @@ public struct RootSessionsView: View {
         group: (repoRoot: String, projectName: String, sessions: [VeloSessionItem])
     ) -> some View {
         let isCollapsed = collapsedProjects.contains(group.repoRoot)
-        let shortPath = group.repoRoot.replacingOccurrences(of: "/Users/daiyudai", with: "~")
+        let shortPath = VeloFormatting.shortenHomePath(group.repoRoot)
 
         return VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 8) {
@@ -732,7 +776,7 @@ private struct NewSessionSheetView: View {
     @State private var selectedCategory: VeloEngineCategory = .claude
     @State private var selectedModelId: String = "claude-fable-5-2"
     @State private var effort: String = "medium"
-    @State private var repoPath: String = "/Users/daiyudai/code/velo"
+    @State private var repoPath: String = "~/workspace"
     @State private var useWorktree: Bool = false
     @State private var branch: String = ""
     @State private var customTitle: String = ""
@@ -769,7 +813,7 @@ private struct NewSessionSheetView: View {
             }
         }
         if result.isEmpty {
-            result.append("/Users/daiyudai/code/velo")
+            result.append("~/workspace")
         }
         return result
     }

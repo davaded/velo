@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Velo Contributors"]
-repository = "https://github.com/daiyudai/velo"
+repository = "https://github.com/davaded/velo"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -38,6 +38,7 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 velo-protocol = { path = "crates/velo-protocol" }
 velo-worktree = { path = "crates/velo-worktree" }

@@ -9,8 +9,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.10"
-    MARKETING_VERSION: "0.2.6"
-    CURRENT_PROJECT_VERSION: "7"
+    MARKETING_VERSION: "0.3.0"
+    CURRENT_PROJECT_VERSION: "8"
     DEVELOPMENT_TEAM: "76S2FLMS7Q"
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: YES
@@ -39,7 +39,10 @@ targets:
         CFBundleDisplayName: Velo
         NSCameraUsageDescription: "用于扫描 Mac 端 Velo 配对二维码（支持局域网、Tailscale 及端到端加密中继）"
         NSPhotoLibraryAddUsageDescription: "用于将对话中的高清图片或截图保存到系统相册"
+        NSMicrophoneUsageDescription: "用于录制语音指令并通过端到端加密通道转写为 Prompt"
+        NSSpeechRecognitionUsageDescription: "用于将你的语音实时识别为对话指令"
         NSLocalNetworkUsageDescription: "用于在同 Wi-Fi 或 Tailscale 下直连你的 Mac Velo 守护进程"
+        NSSupportsLiveActivities: true
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
           NSAllowsLocalNetworking: true

@@ -37,6 +37,7 @@ import { XtermTerminalDrawer, TerminalChunkPacket } from "./components/XtermTerm
 import { PullRequestDrawer } from "./components/PullRequestDrawer";
 import { BrowserPreviewDrawer } from "./components/BrowserPreviewDrawer";
 import { AutomationsModal } from "./components/AutomationsModal";
+import { AnalyticsAndPushModal } from "./components/AnalyticsAndPushModal";
 import { e2eeOpenFrame, e2eeSealJson } from "./utils/e2eeRelayClient";
 import {
   ArrowDown,
@@ -729,7 +730,12 @@ export function App() {
   const [repoHooks, setRepoHooks] = useState<Record<string, string>>({});
   const [hookEditCmd, setHookEditCmd] = useState<string>("");
   const [customAcpCmd, setCustomAcpCmd] = useState<string>("");
-  const [newRepoPath, setNewRepoPath] = useState<string>("/Users/daiyudai/code/velo");
+  const [newRepoPath, setNewRepoPath] = useState<string>("~/velo");
+  const [analyticsModalOpen, setAnalyticsModalOpen] = useState<boolean>(false);
+  const [analyticsInitialTab, setAnalyticsInitialTab] = useState<"analytics" | "search" | "push">(
+    "analytics"
+  );
+  const [showAllTurnsBySession, setShowAllTurnsBySession] = useState<Record<string, boolean>>({});
 
   // Full-Color xterm.js PTY Stream Packet & Turn Timing State
   const [latestTerminalChunk, setLatestTerminalChunk] = useState<TerminalChunkPacket | null>(null);
@@ -841,9 +847,9 @@ export function App() {
                 // Drop unused demo placeholder `velo-cloud` once real daemon workspaces exist
                 const cleanedPrev = prevRepos.filter(
                   (r) =>
-                    canonicalRepoPath(r.path) !== "/Users/daiyudai/code/velo-cloud" ||
-                    sessionPathSet.has("/Users/daiyudai/code/velo-cloud") ||
-                    daemonPaths.includes("/Users/daiyudai/code/velo-cloud")
+                    !canonicalRepoPath(r.path).endsWith("/code/velo-cloud") ||
+                    Array.from(sessionPathSet).some((p) => p.endsWith("/code/velo-cloud")) ||
+                    daemonPaths.some((p) => p.endsWith("/code/velo-cloud"))
                 );
                 const byPath = new Map<string, VeloRepo>();
                 for (const r of cleanedPrev) {
@@ -2389,6 +2395,18 @@ export function App() {
       }
     }
 
+    if (rawText === "/analytics" || rawText === "/billing") {
+      setAnalyticsInitialTab("analytics");
+      setAnalyticsModalOpen(true);
+      return;
+    }
+
+    if (rawText.startsWith("/search")) {
+      setAnalyticsInitialTab("search");
+      setAnalyticsModalOpen(true);
+      return;
+    }
+
     // Real Daemon /handoff endpoint
     if (rawText.startsWith("/handoff")) {
       const rest = rawText.replace("/handoff", "").trim();
@@ -2587,7 +2605,7 @@ export function App() {
           name: nextTitle,
           provider: providerName,
           prompt: priorHistory.length > 0 ? promptWithContext : text,
-          repo_path: activeRepo.path || "/Users/daiyudai/code/velo",
+          repo_path: activeRepo.path || "~/velo",
           branch: wantsIsolatedWorktree ? activeSession.branch_name : null,
           use_pty: false,
           model: activeSession.model,
@@ -3345,7 +3363,7 @@ export function App() {
   };
 
   const handleCreateRepo = () => {
-    const cleanPath = canonicalRepoPath(newRepoPath.trim() || "/Users/daiyudai/code/new-repo");
+    const cleanPath = canonicalRepoPath(newRepoPath.trim() || "~/workspace");
     const name = cleanPath.split("/").filter(Boolean).pop() || "repo";
     const code = name.slice(0, 2).toUpperCase();
     const id = repoIdFromPath(cleanPath);
@@ -3940,6 +3958,19 @@ export function App() {
           <div className="relative flex items-center gap-1.5">
             <button
               type="button"
+              onClick={() => {
+                setAnalyticsInitialTab("search");
+                setAnalyticsModalOpen(true);
+              }}
+              title="跨工作区全文搜索历史会话 · 用量账单 · 远程锁屏盲推送"
+              className="flex h-7 items-center gap-1 rounded-md px-2 text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            >
+              <CircleGauge className="h-3.5 w-3.5" />
+              <span className="hidden md:inline">账单/搜索</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setAutoCollapseSteps((v) => !v)}
               title={
                 autoCollapseSteps
@@ -4205,9 +4236,35 @@ export function App() {
                     ? "Waiting for your answer"
                     : undefined;
 
+                  const MAX_WINDOWED_TURNS = 16;
+                  const expandAll = Boolean(showAllTurnsBySession[activeSession.id]);
+                  const hiddenEarlierTurns =
+                    !expandAll && turns.length > MAX_WINDOWED_TURNS
+                      ? turns.length - MAX_WINDOWED_TURNS
+                      : 0;
+                  const visibleTurns =
+                    hiddenEarlierTurns > 0 ? turns.slice(hiddenEarlierTurns) : turns;
+
                   return (
                     <>
-                      {turns.map((turn, turnIdx) => {
+                      {hiddenEarlierTurns > 0 && (
+                        <div className="mb-3 flex justify-center">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setShowAllTurnsBySession((p) => ({
+                                ...p,
+                                [activeSession.id]: true,
+                              }))
+                            }
+                            className="rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/60 px-3.5 py-1.5 text-[11.5px] font-medium text-[var(--v-fg-secondary)] transition-colors hover:border-[var(--v-border-strong)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                          >
+                            ↑ 展开更早的 {hiddenEarlierTurns} 轮历史对话（长会话窗口渲染加速已开启）
+                          </button>
+                        </div>
+                      )}
+                      {visibleTurns.map((turn, visIdx) => {
+                        const turnIdx = hiddenEarlierTurns + visIdx;
                         const isLatestTurn = turnIdx === turns.length - 1;
                         const isTurnRunning = isLatestTurn && isSessionRunning;
                         const lastTurnItem = turn.items[turn.items.length - 1];
@@ -6560,6 +6617,16 @@ export function App() {
           </div>
         </div>
       )}
+      <AnalyticsAndPushModal
+        open={analyticsModalOpen}
+        initialTab={analyticsInitialTab}
+        daemonUrl={daemonUrl}
+        onClose={() => setAnalyticsModalOpen(false)}
+        onSelectSession={(sid) => {
+          setActiveId(sid);
+          syncSessionEventsFromDaemon(sid);
+        }}
+      />
     </div>
   );
 }

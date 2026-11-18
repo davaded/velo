@@ -39,7 +39,7 @@ export const PaseoNewWorkspaceModal: React.FC<NewWorkspaceModalProps> = ({
   const [providerKey, setProviderKey] = useState<"claude" | "codex" | "opencode" | "pty">(
     "claude"
   );
-  const [repoPath, setRepoPath] = useState("/Users/daiyudai/code/velo");
+  const [repoPath, setRepoPath] = useState("~/velo");
   const [branch, setBranch] = useState("feat/paseo-ui");
   const [prompt, setPrompt] = useState(
     "Inspect the workspace architecture and implement the requested module with unit tests."

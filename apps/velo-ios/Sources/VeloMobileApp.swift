@@ -9,7 +9,7 @@ struct VeloMobileApp: App {
         WindowGroup {
             RootSessionsView(store: store)
                 .onOpenURL { url in
-                    store.applyPairingString(url.absoluteString)
+                    store.handleIncomingURL(url)
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     if newPhase == .active {

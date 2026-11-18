@@ -434,7 +434,7 @@ export const DEMO_REPOS: VeloRepo[] = [
     id: "repo-velo",
     code: "VL",
     name: "velo",
-    path: "/Users/daiyudai/code/velo",
+    path: "~/velo",
     default_branch: "main",
   },
 ];
@@ -450,8 +450,8 @@ export const DEMO_SESSIONS: VeloSession[] = [
     effort: "medium",
     status: "idle",
     branch_name: "main",
-    worktree_path: "/Users/daiyudai/code/velo",
-    project_path: "/Users/daiyudai/code/velo",
+    worktree_path: "~/velo",
+    project_path: "~/velo",
     approval_mode: "auto_edit",
     tokens_used: 0,
     tokens_limit: 200000,
@@ -508,18 +508,28 @@ export const SLASH_SKILLS: SlashSkillItem[] = [
     label: "Workspace Browser Preview",
     desc: "打开内置浏览器预览面板并允许 Agent 检查 DOM 与运行态",
   },
+  {
+    cmd: "/analytics",
+    label: "Usage & Billing Analytics",
+    desc: "查看各引擎真实费率账单、Prompt 缓存命中率、tok/s 统计与锁屏盲推送设置",
+  },
+  {
+    cmd: "/search",
+    label: "Global Transcript Search",
+    desc: "跨全部工作区与历史会话全文检索 Prompt 与 AI 回复",
+  },
 ];
 
 export function canonicalRepoPath(rawPath: string): string {
   const trimmed = (rawPath || "").trim();
-  if (!trimmed) return "/Users/daiyudai/code/velo";
+  if (!trimmed) return "~/velo";
   return trimmed.length > 1 ? trimmed.replace(/\/+$/, "") : trimmed;
 }
 
 export function repoIdFromPath(rawPath: string): string {
   const clean = canonicalRepoPath(rawPath);
-  if (clean === "/Users/daiyudai/code/velo") return "repo-velo";
-  if (clean === "/Users/daiyudai/code/velo-cloud") return "repo-velo-cloud";
+  if (clean.endsWith("/code/velo") || clean === "~/velo") return "repo-velo";
+  if (clean.endsWith("/code/velo-cloud")) return "repo-velo-cloud";
   const slug = clean
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
@@ -585,7 +595,7 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
   const approvalMode: ApprovalMode =
     rawMode === "ask_before_edit" || rawMode === "bypass" ? rawMode : "auto_edit";
   const projectPath = canonicalRepoPath(
-    String(r.project_path ?? r.repo_root ?? "/Users/daiyudai/code/velo")
+    String(r.project_path ?? r.repo_root ?? "~/velo")
   );
   const worktreePath = canonicalRepoPath(String(r.worktree_path ?? projectPath));
   const resolvedRepoId =

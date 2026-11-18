@@ -23,6 +23,8 @@ public struct ChatThreadView: View {
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var pendingImages: [PendingComposerImage] = []
     @State private var previewImageItem: PreviewImageTarget?
+    @StateObject private var voiceRecorder = VeloVoiceRecorder()
+    @State private var isTranscribingVoice: Bool = false
     @FocusState private var composerFocused: Bool
 
     public init(
@@ -86,11 +88,27 @@ public struct ChatThreadView: View {
                         LazyVStack(alignment: .leading, spacing: 20) {
                             if turns.isEmpty {
                                 emptyThreadHero
+                            } else if store.hasMoreHistoryBySession[sessionId] != false && turns.count >= 6 {
+                                Button {
+                                    Task { await store.loadOlderEventsPage(for: sessionId) }
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: "arrow.up.circle")
+                                        Text("加载更早的 SQLite 历史消息")
+                                    }
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                                }
+                                .frame(maxWidth: .infinity)
                             }
 
                             ForEach(Array(turns.enumerated()), id: \.element.id) { idx, turn in
                                 let isLatest = idx == turns.count - 1
                                 let turnRunning = isLatest && isSessionRunning
+                                let userTurnOrdinal = turns[0...idx].filter { $0.userEvent != nil }.count - 1
 
                                 TurnBlockView(
                                     store: store,
@@ -119,7 +137,8 @@ public struct ChatThreadView: View {
                                                     text: userEv.content,
                                                     model: selectedModelId,
                                                     effort: selectedEffort,
-                                                    images: retryImages
+                                                    images: retryImages,
+                                                    truncateToUserTurn: max(0, userTurnOrdinal)
                                                 )
                                             }
                                         }
@@ -249,8 +268,22 @@ public struct ChatThreadView: View {
                     }
                     .accessibilityLabel(store.autoCollapseSteps ? "默认收起执行流" : "默认展开执行流")
 
-                    Button {
-                        showModelSheet = true
+                    Menu {
+                        Button {
+                            showModelSheet = true
+                        } label: {
+                            Label("切换模型 / 跨引擎接力", systemImage: "arrow.triangle.swap")
+                        }
+                        Button {
+                            let targetProv = (session?.agentKind == "codex") ? "claude" : "codex"
+                            Task {
+                                if let advId = await store.requestAdvisorReview(sessionId: sessionId, advisorProvider: targetProv) {
+                                    onSwitchedSession?(advId)
+                                }
+                            }
+                        } label: {
+                            Label("请求 Advisor 第二架构意见", systemImage: "person.2.wave.2")
+                        }
                     } label: {
                         Image(systemName: "arrow.triangle.swap")
                             .font(.system(size: 13.5, weight: .semibold))
@@ -258,7 +291,10 @@ public struct ChatThreadView: View {
 
                     Button {
                         showDiffSheet = true
-                        Task { await store.fetchDiff(for: sessionId) }
+                        Task {
+                            await store.fetchDiff(for: sessionId)
+                            await store.fetchPrStatus(for: sessionId)
+                        }
                     } label: {
                         Image(systemName: "arrow.left.arrow.right.square")
                             .font(.system(size: 14, weight: .semibold))
@@ -278,6 +314,8 @@ public struct ChatThreadView: View {
         }
         .sheet(isPresented: $showDiffSheet) {
             DiffViewerSheet(
+                store: store,
+                sessionId: sessionId,
                 branchName: session?.branchName ?? "main",
                 files: store.diffsBySession[sessionId] ?? []
             )
@@ -632,6 +670,45 @@ public struct ChatThreadView: View {
                     .buttonStyle(VeloPressableButtonStyle())
                     .accessibilityLabel("粘贴剪贴板图片")
                 }
+
+                // Voice-to-Prompt Microphone Dictation Button
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    if voiceRecorder.isRecording {
+                        if let audio = voiceRecorder.stopRecording() {
+                            isTranscribingVoice = true
+                            Task {
+                                if let text = await store.transcribeVoiceData(audio) {
+                                    draftPrompt = draftPrompt.isEmpty ? text : "\(draftPrompt) \(text)"
+                                }
+                                isTranscribingVoice = false
+                            }
+                        }
+                    } else {
+                        Task { _ = await voiceRecorder.startRecording() }
+                    }
+                } label: {
+                    Group {
+                        if isTranscribingVoice {
+                            ProgressView()
+                                .scaleEffect(0.75)
+                        } else {
+                            Image(systemName: voiceRecorder.isRecording ? "stop.circle.fill" : "mic.fill")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(voiceRecorder.isRecording ? VeloTheme.coral : Color.secondary)
+                        }
+                    }
+                    .frame(width: 31, height: 31)
+                    .background(
+                        voiceRecorder.isRecording
+                            ? VeloTheme.coral.opacity(0.16)
+                            : VeloTheme.elevatedSurface(colorScheme),
+                        in: Circle()
+                    )
+                }
+                .buttonStyle(VeloPressableButtonStyle())
+                .disabled(isTranscribingVoice)
+                .accessibilityLabel(voiceRecorder.isRecording ? "停止录音并转写" : "语音转写指令")
 
                 // Categorized Model & Handoff Sheet Trigger
                 Button {
@@ -2284,13 +2361,22 @@ private struct QuestionPromptCard: View {
     }
 }
 
-// MARK: - Unified Git Diff Sheet
+// MARK: - Unified Git Diff, Commit/Push & Pull Request Studio Sheet
 
 private struct DiffViewerSheet: View {
+    @ObservedObject var store: VeloStore
+    let sessionId: String
     let branchName: String
     let files: [DiffFileSection]
+
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @State private var mode: Int = 0 // 0 = Diff & Git, 1 = PR & CI
+    @State private var commitMessage: String = ""
+    @State private var pushAfterCommit: Bool = true
+    @State private var prTitle: String = ""
+    @State private var prBody: String = ""
+    @State private var isBusy: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -2298,66 +2384,261 @@ private struct DiffViewerSheet: View {
                 VeloTheme.canvas(colorScheme)
                     .ignoresSafeArea()
 
-                if files.isEmpty {
-                    ContentUnavailableView(
-                        "工作区暂无未提交变更",
-                        systemImage: "checkmark.circle",
-                        description: Text("分支 `\(branchName)` 当前与基准一致")
-                    )
-                } else {
-                    ScrollView {
-                        VStack(spacing: 12) {
-                            ForEach(files) { file in
-                                VStack(alignment: .leading, spacing: 0) {
-                                    HStack {
-                                        Text(file.path)
-                                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                            .lineLimit(1)
-                                        Spacer()
-                                        Text("+\(file.additions)")
-                                            .foregroundStyle(VeloTheme.emerald)
-                                            .font(.system(size: 11.5, weight: .bold, design: .monospaced))
-                                        Text("−\(file.deletions)")
-                                            .foregroundStyle(VeloTheme.coral)
-                                            .font(.system(size: 11.5, weight: .bold, design: .monospaced))
-                                    }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(VeloTheme.codeHeader(colorScheme))
+                VStack(spacing: 0) {
+                    Picker("模式", selection: $mode) {
+                        Text("代码变更与提交 (\(files.count))").tag(0)
+                        Text("GitHub PR 与 CI").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
 
-                                    ScrollView(.horizontal, showsIndicators: false) {
-                                        VStack(alignment: .leading, spacing: 1) {
-                                            ForEach(file.lines) { row in
-                                                Text(row.text.isEmpty ? " " : row.text)
-                                                    .font(.system(size: 11.5, design: .monospaced))
-                                                    .foregroundStyle(color(for: row.kind))
-                                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                                    .padding(.horizontal, 8)
-                                                    .padding(.vertical, 1.5)
-                                                    .background(bg(for: row.kind))
-                                            }
-                                        }
-                                        .padding(.vertical, 4)
-                                    }
-                                }
-                                .background(VeloTheme.codeSurface(colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 13, style: .continuous)
-                                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.85)
-                                )
-                            }
-                        }
-                        .padding(14)
+                    if let banner = store.lastActionBanner, !banner.isEmpty {
+                        Text(banner)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(VeloTheme.emerald)
+                            .padding(.bottom, 6)
+                    }
+
+                    if mode == 0 {
+                        gitDiffPane
+                    } else {
+                        pullRequestPane
                     }
                 }
             }
-            .navigationTitle("变更对比 (Diff)")
+            .navigationTitle("分支 `\(branchName)`")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if !files.isEmpty && mode == 0 {
+                        Menu {
+                            Button(role: .destructive) {
+                                Task { await store.gitDiscard(sessionId: sessionId, all: true) }
+                            } label: {
+                                Label("放弃全部未提交修改", systemImage: "trash")
+                            }
+                            Button {
+                                Task { await store.gitMerge(sessionId: sessionId) }
+                            } label: {
+                                Label("合并当前分支回主工作区", systemImage: "arrow.triangle.merge")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("关闭") { dismiss() }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var gitDiffPane: some View {
+        if files.isEmpty {
+            ContentUnavailableView(
+                "工作区暂无未提交变更",
+                systemImage: "checkmark.circle",
+                description: Text("分支 `\(branchName)` 当前干净无未提交修改")
+            )
+        } else {
+            VStack(spacing: 0) {
+                ScrollView {
+                    VStack(spacing: 12) {
+                        ForEach(files) { file in
+                            VStack(alignment: .leading, spacing: 0) {
+                                HStack {
+                                    Text(file.path)
+                                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text("+\(file.additions)")
+                                        .foregroundStyle(VeloTheme.emerald)
+                                        .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                                    Text("−\(file.deletions)")
+                                        .foregroundStyle(VeloTheme.coral)
+                                        .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                                    Button(role: .destructive) {
+                                        Task { await store.gitDiscard(sessionId: sessionId, filePath: file.path) }
+                                    } label: {
+                                        Image(systemName: "arrow.uturn.backward")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(VeloTheme.codeHeader(colorScheme))
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        ForEach(file.lines) { row in
+                                            Text(row.text.isEmpty ? " " : row.text)
+                                                .font(.system(size: 11.5, design: .monospaced))
+                                                .foregroundStyle(color(for: row.kind))
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 1.5)
+                                                .background(bg(for: row.kind))
+                                        }
+                                    }
+                                    .padding(.vertical, 4)
+                                }
+                            }
+                            .background(VeloTheme.codeSurface(colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                    .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.85)
+                            )
+                        }
+                    }
+                    .padding(14)
+                }
+
+                VStack(spacing: 8) {
+                    TextField("输入 Commit Message（留空自动生成）", text: $commitMessage)
+                        .font(.system(size: 13.5))
+                        .padding(10)
+                        .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                    HStack(spacing: 10) {
+                        Toggle("同步 Push 远端", isOn: $pushAfterCommit)
+                            .font(.system(size: 12.5, weight: .medium))
+
+                        Button {
+                            isBusy = true
+                            Task {
+                                await store.gitCommit(
+                                    sessionId: sessionId,
+                                    message: commitMessage,
+                                    push: pushAfterCommit
+                                )
+                                commitMessage = ""
+                                isBusy = false
+                            }
+                        } label: {
+                            Label(pushAfterCommit ? "Commit & Push" : "Commit", systemImage: "paperplane.fill")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                                .background(VeloTheme.emerald, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                        .disabled(isBusy)
+                    }
+                }
+                .padding(14)
+                .background(VeloTheme.cardSurface(colorScheme))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var pullRequestPane: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                if let pr = store.prBySession[sessionId], pr.exists {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("#\(pr.number ?? 0) \(pr.title)")
+                                .font(.system(size: 15, weight: .bold))
+                            Spacer()
+                            Text(pr.state)
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundStyle(VeloTheme.emerald)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(VeloTheme.emerald.opacity(0.14), in: Capsule())
+                        }
+                        if !pr.url.isEmpty, let u = URL(string: pr.url) {
+                            Link(pr.url, destination: u)
+                                .font(.system(size: 12, design: .monospaced))
+                                .lineLimit(1)
+                        }
+                    }
+                    .padding(14)
+                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                    if !pr.checks.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("CI Checks (\(pr.checks.count))")
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            ForEach(pr.checks) { ck in
+                                HStack {
+                                    Image(
+                                        systemName: ck.conclusion == "SUCCESS"
+                                            ? "checkmark.circle.fill"
+                                            : (ck.conclusion == "FAILURE" ? "xmark.circle.fill" : "clock.fill")
+                                    )
+                                    .foregroundStyle(
+                                        ck.conclusion == "SUCCESS"
+                                            ? VeloTheme.emerald
+                                            : (ck.conclusion == "FAILURE" ? VeloTheme.coral : VeloTheme.amber)
+                                    )
+                                    Text(ck.name)
+                                        .font(.system(size: 13, weight: .medium))
+                                    Spacer()
+                                    Text(ck.conclusion.isEmpty ? ck.status : ck.conclusion)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(10)
+                                .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                            }
+                        }
+                    }
+
+                    if pr.state == "OPEN" {
+                        Button {
+                            Task { await store.mergePullRequest(sessionId: sessionId, method: "squash") }
+                        } label: {
+                            Label("Squash & Merge PR", systemImage: "arrow.triangle.merge")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(VeloTheme.accentViolet, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("当前分支尚未关联打开的 Pull Request")
+                            .font(.system(size: 13.5, weight: .semibold))
+                        TextField("PR 标题（如 feat: mobile git & sqlite wal）", text: $prTitle)
+                            .font(.system(size: 13.5))
+                            .padding(10)
+                            .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        TextField("PR 描述说明（可选）", text: $prBody, axis: .vertical)
+                            .lineLimit(3...6)
+                            .font(.system(size: 13.5))
+                            .padding(10)
+                            .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                        Button {
+                            Task {
+                                await store.createPullRequest(
+                                    sessionId: sessionId,
+                                    title: prTitle.isEmpty ? "feat(\(branchName)): update via Velo Mobile" : prTitle,
+                                    body: prBody
+                                )
+                            }
+                        } label: {
+                            Label("推送分支并创建 GitHub PR", systemImage: "arrow.up.right.square.fill")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(VeloTheme.accentViolet, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                    }
+                    .padding(14)
+                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+            }
+            .padding(14)
         }
     }
 
