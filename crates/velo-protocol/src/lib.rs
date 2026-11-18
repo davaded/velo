@@ -184,6 +184,22 @@ pub struct SessionInfo {
     pub approval_mode: String,
     #[serde(default)]
     pub preview_url: Option<String>,
+    #[serde(default)]
+    pub queued_prompts: Vec<QueuedPromptItem>,
+}
+
+/// A follow-up user prompt queued on the server to run automatically when the active turn completes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedPromptItem {
+    pub id: String,
+    pub input: String,
+    #[serde(default)]
+    pub images: Vec<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Unified event stream emitted by `velo-agent` drivers and broadcasted to connected clients.
@@ -411,6 +427,9 @@ pub struct SessionInputRequest {
     pub images: Vec<String>,
     #[serde(default)]
     pub approval_mode: Option<String>,
+    /// Execution mode when session is busy: `"queue"` (enqueue for next turn), `"steer"` (interrupt & run immediately), or `None`.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// Client-to-daemon WebSocket command envelope.

@@ -1,0 +1,42 @@
+name: Release macOS Bundle
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos-release:
+    name: Build Velo.app & DMG (macOS arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "pnpm"
+          cache-dependency-path: apps/velo-desktop/pnpm-lock.yaml
+      - name: Install Desktop Dependencies
+        working-directory: apps/velo-desktop
+        run: pnpm install --frozen-lockfile
+      - name: Build Standalone Velo.app & DMG
+        run: |
+          chmod +x scripts/build-macos-app.sh
+          ./scripts/build-macos-app.sh
+          hdiutil create -volname "Velo" -srcfolder Velo.app -ov -format UDZO Velo-macOS-arm64.dmg
+          ditto -c -k --sequesterRsrc --keepParent Velo.app Velo-macOS-arm64.zip
+      - name: Publish GitHub Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Velo-macOS-arm64.dmg
+            Velo-macOS-arm64.zip
+            target/release/velo

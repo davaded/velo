@@ -31,6 +31,8 @@ public final class VeloStore: ObservableObject {
     @Published public var lastActionBanner: String?
     @Published public var oldestSeqBySession: [String: Int] = [:]
     @Published public var hasMoreHistoryBySession: [String: Bool] = [:]
+    @Published public var externalCliSessions: [VeloExternalCliSessionItem] = []
+    @Published public var latestImportedCliVeloId: String?
     @Published public var autoCollapseSteps: Bool = true {
         didSet {
             UserDefaults.standard.set(autoCollapseSteps, forKey: Self.autoCollapseKey)
@@ -581,11 +583,59 @@ public final class VeloStore: ObservableObject {
         effort: String,
         images: [String] = [],
         approvalMode: String = "auto_edit",
-        truncateToUserTurn: Int? = nil
+        truncateToUserTurn: Int? = nil,
+        executionMode: String? = nil
     ) async {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty || !images.isEmpty else { return }
         let effectivePrompt = clean.isEmpty ? "请查看附图" : clean
+
+        // Server-authoritative Queue Mode: enqueue follow-up without disrupting active turn UI
+        if executionMode == "queue",
+           let idx = sessions.firstIndex(where: { $0.id == sessionId }),
+           (sessions[idx].status == .running || sessions[idx].status == .waitingApproval)
+        {
+            var curQ = sessions[idx].activeQueuedPrompts
+            curQ.append(
+                VeloQueuedPromptItem(
+                    id: "q-local-\(UUID().uuidString.prefix(8))",
+                    input: effectivePrompt,
+                    images: images
+                )
+            )
+            sessions[idx].queuedPrompts = curQ
+            triggerHaptic(.light)
+
+            switch connectionConfig {
+            case .direct(let baseURL):
+                if let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/input") {
+                    var req = URLRequest(url: url)
+                    req.httpMethod = "POST"
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                        "input": effectivePrompt,
+                        "model": model,
+                        "effort": effort,
+                        "images": images,
+                        "mode": "queue",
+                    ])
+                    _ = try? await URLSession.shared.data(for: req)
+                }
+            case .e2eeRelay:
+                sendEncryptedCommand([
+                    "cmd": "send_input",
+                    "session_id": sessionId,
+                    "input": effectivePrompt,
+                    "model": model,
+                    "effort": effort,
+                    "images": images,
+                    "mode": "queue",
+                ])
+            case .none:
+                break
+            }
+            return
+        }
 
         let now = Date()
         let timeStr = Self.shortTimeString(from: now)
@@ -666,6 +716,9 @@ public final class VeloStore: ObservableObject {
                 body["truncate_to_user_turn"] = truncIdx
                 body["reset_thread"] = true
             }
+            if let executionMode {
+                body["mode"] = executionMode
+            }
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             do {
                 let (data, resp) = try await URLSession.shared.data(for: req)
@@ -695,10 +748,84 @@ public final class VeloStore: ObservableObject {
                 payload["truncate_to_user_turn"] = truncIdx
                 payload["reset_thread"] = true
             }
+            if let executionMode {
+                payload["mode"] = executionMode
+            }
             sendEncryptedCommand(payload)
         case .none:
             appendLocalErrorEvent(sessionId: sessionId, rawError: "当前未连接主机")
             finalizeSessionTurnLocally(sessionId)
+        }
+    }
+
+    public func removeQueuedPrompt(sessionId: String, queueId: String) async {
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[idx].queuedPrompts = sessions[idx].activeQueuedPrompts.filter { $0.id != queueId }
+        }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            let encoded = queueId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? queueId
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/queue/\(encoded)") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "DELETE"
+            _ = try? await URLSession.shared.data(for: req)
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "remove_queued_prompt",
+                "session_id": sessionId,
+                "queue_id": queueId,
+            ])
+        case .none:
+            break
+        }
+    }
+
+    public func fetchExternalCliSessions() async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/cli-sessions"),
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let arr = obj["sessions"] as? [[String: Any]]
+            else { return }
+            externalCliSessions = arr.compactMap(VeloExternalCliSessionItem.fromJSON)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "list_cli_sessions"])
+        case .none:
+            break
+        }
+    }
+
+    public func importExternalCliSession(provider: String, cliSessionId: String) async -> String? {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/cli-sessions/import") else { return nil }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "provider": provider,
+                "cli_session_id": cliSessionId,
+            ])
+            guard let (data, _) = try? await URLSession.shared.data(for: req),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let sessDict = obj["session"] as? [String: Any],
+                  let item = VeloSessionItem.fromJSON(sessDict)
+            else { return nil }
+            sessions.removeAll { $0.id == item.id }
+            sessions.insert(item, at: 0)
+            activeSessionId = item.id
+            await loadEventsForSession(item.id)
+            return item.id
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "import_cli_session",
+                "provider": provider,
+                "cli_session_id": cliSessionId,
+            ])
+            return nil
+        case .none:
+            return nil
         }
     }
 
@@ -2047,6 +2174,22 @@ public final class VeloStore: ObservableObject {
                         oldestSeq: VeloSessionItem.intValue(raw["oldest_seq"]),
                         hasMore: (raw["has_more"] as? Bool) ?? false
                     )
+                }
+                return
+            case "cli_sessions_snapshot":
+                if let arr = raw["sessions"] as? [[String: Any]] {
+                    externalCliSessions = arr.compactMap(VeloExternalCliSessionItem.fromJSON)
+                }
+                return
+            case "cli_session_imported":
+                if let sessDict = raw["session"] as? [String: Any],
+                   let item = VeloSessionItem.fromJSON(sessDict)
+                {
+                    sessions.removeAll { $0.id == item.id }
+                    sessions.insert(item, at: 0)
+                    activeSessionId = item.id
+                    latestImportedCliVeloId = item.id
+                    Task { await loadEventsForSession(item.id) }
                 }
                 return
             default:

@@ -196,6 +196,14 @@ enum Commands {
         #[arg(default_value = "status")]
         action: String,
     },
+
+    /// One-command wireless build, re-sign & install of VeloMobile onto paired iPhone
+    #[command(visible_alias = "ios-install")]
+    Ios {
+        /// Optional physical device UDID or name (auto-detected if omitted)
+        #[arg(long)]
+        device: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -635,6 +643,27 @@ async fn main() -> Result<()> {
                 println!("   Logs Directory:     {}", st.log_dir);
             }
         },
+        Commands::Ios { device } => {
+            let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let script = [
+                cwd.join("scripts/install-ios-device.sh"),
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../scripts/install-ios-device.sh"),
+            ]
+            .into_iter()
+            .find(|p| p.is_file())
+            .ok_or_else(|| anyhow::anyhow!("Could not find scripts/install-ios-device.sh"))?;
+
+            let mut cmd = StdCommand::new("bash");
+            cmd.arg(&script);
+            if let Some(dev) = device {
+                cmd.arg(dev);
+            }
+            let status = cmd.status().context("Failed to execute install-ios-device.sh")?;
+            if !status.success() {
+                bail!("iOS installation exited with status {}", status);
+            }
+        }
     }
 
     Ok(())

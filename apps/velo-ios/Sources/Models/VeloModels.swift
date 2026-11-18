@@ -262,6 +262,70 @@ public enum SessionRunState: String, Codable, Sendable {
     case idle
 }
 
+public struct VeloQueuedPromptItem: Identifiable, Codable, Equatable, Sendable {
+    public let id: String
+    public var input: String
+    public var images: [String]
+
+    public static func fromJSON(_ dict: [String: Any]) -> VeloQueuedPromptItem? {
+        guard let id = dict["id"] as? String, !id.isEmpty else { return nil }
+        let inp = (dict["input"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let imgs = (dict["images"] as? [String]) ?? []
+        guard !inp.isEmpty || !imgs.isEmpty else { return nil }
+        return VeloQueuedPromptItem(id: id, input: inp, images: imgs)
+    }
+}
+
+public struct VeloExternalCliSessionItem: Identifiable, Equatable, Sendable {
+    public var id: String { "\(provider)-\(cliSessionId)" }
+    public let provider: String
+    public let cliSessionId: String
+    public let title: String
+    public let cwd: String
+    public let projectName: String
+    public let updatedAtLabel: String
+    public let messageCount: Int
+    public let lastPreview: String
+    public let importedSessionId: String?
+
+    public static func fromJSON(_ dict: [String: Any]) -> VeloExternalCliSessionItem? {
+        guard let cSid = dict["cli_session_id"] as? String, !cSid.isEmpty else { return nil }
+        let prov = ((dict["provider"] as? String) ?? "claude").lowercased()
+        let title = (dict["title"] as? String) ?? cSid
+        let cwd = (dict["cwd"] as? String) ?? ""
+        let proj = (dict["project_name"] as? String) ?? "workspace"
+        let msgCount = VeloSessionItem.intValue(dict["message_count"]) ?? 0
+        let preview = (dict["last_preview"] as? String) ?? ""
+        let impSid = (dict["imported_session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+
+        let timeLabel: String = {
+            if let raw = dict["updated_at"] as? String {
+                let isoFrac = ISO8601DateFormatter()
+                isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                let isoPlain = ISO8601DateFormatter()
+                if let d = isoFrac.date(from: raw) ?? isoPlain.date(from: raw) {
+                    let f = DateFormatter()
+                    f.dateFormat = "MM-dd HH:mm"
+                    return f.string(from: d)
+                }
+            }
+            return ""
+        }()
+
+        return VeloExternalCliSessionItem(
+            provider: prov,
+            cliSessionId: cSid,
+            title: title,
+            cwd: cwd,
+            projectName: proj,
+            updatedAtLabel: timeLabel,
+            messageCount: msgCount,
+            lastPreview: preview,
+            importedSessionId: impSid
+        )
+    }
+}
+
 public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public var title: String
@@ -285,6 +349,11 @@ public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
     public var contextWindow: Int
     public var costUsd: Double
     public var updatedAtLabel: String
+    public var queuedPrompts: [VeloQueuedPromptItem]?
+
+    public var activeQueuedPrompts: [VeloQueuedPromptItem] {
+        queuedPrompts ?? []
+    }
 
     public var engineCategory: VeloEngineCategory {
         VeloEngineCategory.from(agentKind: agentKind)
@@ -402,6 +471,9 @@ public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
             return "刚刚"
         }()
 
+        let parsedQueue: [VeloQueuedPromptItem] = (dict["queued_prompts"] as? [[String: Any]])?
+            .compactMap(VeloQueuedPromptItem.fromJSON) ?? []
+
         return VeloSessionItem(
             id: id,
             title: title,
@@ -424,7 +496,8 @@ public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
             cacheReadTokens: cacheReadTokens,
             contextWindow: contextWindow,
             costUsd: costUsd,
-            updatedAtLabel: updatedLabel
+            updatedAtLabel: updatedLabel,
+            queuedPrompts: parsedQueue
         )
     }
 

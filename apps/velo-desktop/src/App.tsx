@@ -3,10 +3,7 @@ import {
   AgentEvent,
   AgentKind,
   ApprovalMode,
-  DEMO_DIFF_FILES,
-  DEMO_EVENTS,
   DEMO_REPOS,
-  DEMO_SESSIONS,
   DiffFileItem,
   EffortLevel,
   MODEL_CATALOG,
@@ -38,6 +35,8 @@ import { PullRequestDrawer } from "./components/PullRequestDrawer";
 import { BrowserPreviewDrawer } from "./components/BrowserPreviewDrawer";
 import { AutomationsModal } from "./components/AutomationsModal";
 import { AnalyticsAndPushModal } from "./components/AnalyticsAndPushModal";
+import { CliSessionsModal, ExternalCliSessionItem } from "./components/CliSessionsModal";
+import { QueuedPromptsBar } from "./components/QueuedPromptsBar";
 import { e2eeOpenFrame, e2eeSealJson } from "./utils/e2eeRelayClient";
 import {
   ArrowDown,
@@ -549,12 +548,14 @@ export function App() {
   });
   const [targetRepoIdForNewWt, setTargetRepoIdForNewWt] = useState<string>(DEMO_REPOS[0].id);
 
-  // Core Sessions & Events (Persisted across restarts; auto-migrate outdated model IDs)
+  // Core Sessions & Events (Persisted across restarts; zero fake demo threads)
   const [sessions, setSessions] = useState<VeloSession[]>(() => {
     try {
       const saved = localStorage.getItem("velo.sessions.v3");
       if (saved) {
-        const parsed = JSON.parse(saved) as VeloSession[];
+        const parsed = (JSON.parse(saved) as VeloSession[]).filter(
+          (s) => s.id !== "sess-default"
+        );
         if (Array.isArray(parsed) && parsed.length > 0) {
           return parsed.map((s) => {
             const valid = MODEL_CATALOG.find((m) => m.id === s.model);
@@ -574,10 +575,11 @@ export function App() {
     } catch {
       // ignore
     }
-    return DEMO_SESSIONS;
+    return [];
   });
   const [activeId, setActiveId] = useState<string>(() => {
-    return localStorage.getItem("velo.activeId.v3") || DEMO_SESSIONS[0].id;
+    const saved = localStorage.getItem("velo.activeId.v3");
+    return saved && saved !== "sess-default" ? saved : "";
   });
   const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(() => {
     try {
@@ -589,7 +591,7 @@ export function App() {
     } catch {
       // ignore
     }
-    return DEMO_EVENTS;
+    return {};
   });
 
   useEffect(() => {
@@ -738,6 +740,8 @@ export function App() {
   const [customAcpCmd, setCustomAcpCmd] = useState<string>("");
   const [newRepoPath, setNewRepoPath] = useState<string>("~/velo");
   const [analyticsModalOpen, setAnalyticsModalOpen] = useState<boolean>(false);
+  const [cliImportOpen, setCliImportOpen] = useState<boolean>(false);
+  const [e2eeCliSessions, setE2eeCliSessions] = useState<ExternalCliSessionItem[] | null>(null);
   const [analyticsInitialTab, setAnalyticsInitialTab] = useState<"analytics" | "search" | "push">(
     "analytics"
   );
@@ -795,10 +799,33 @@ export function App() {
     });
   }, []);
 
-  const activeSession = useMemo(
-    () => sessions.find((s) => s.id === activeId) || sessions[0] || DEMO_SESSIONS[0],
-    [sessions, activeId]
-  );
+  const activeSession = useMemo<VeloSession>(() => {
+    const found = sessions.find((s) => s.id === activeId) || sessions[0];
+    if (found) return found;
+    const defaultRepo = repos[0] || DEMO_REPOS[0];
+    return {
+      id: "draft-empty",
+      repo_id: defaultRepo.id,
+      title: "New thread",
+      agent_kind: "claude",
+      model: "claude-fable-5-2",
+      model_short: "Fable 5.2",
+      effort: "medium",
+      status: "idle",
+      branch_name: defaultRepo.default_branch || "main",
+      worktree_path: defaultRepo.path,
+      project_path: defaultRepo.path,
+      approval_mode: "auto_edit",
+      queued_prompts: [],
+      tokens_used: 0,
+      tokens_limit: 200000,
+      cost_usd: 0,
+      files_changed: 0,
+      insertions: 0,
+      deletions: 0,
+      updated_at: "ready",
+    };
+  }, [sessions, activeId, repos]);
 
   const activeRepo = useMemo(
     () => repos.find((r) => r.id === activeSession.repo_id) || repos[0],
@@ -922,7 +949,7 @@ export function App() {
                   : d
               );
             const combined = [...merged, ...remainingLocal];
-            return combined.length > 0 ? combined : DEMO_SESSIONS;
+            return combined;
           });
         }
       })
@@ -1320,6 +1347,19 @@ export function App() {
             );
           }
         }
+        return;
+      }
+
+      if (raw.type === "cli_sessions_snapshot" && Array.isArray(raw.sessions)) {
+        setE2eeCliSessions(raw.sessions as ExternalCliSessionItem[]);
+        return;
+      }
+
+      if (raw.type === "cli_session_imported" && raw.ok && raw.session) {
+        const imported = normalizeToVeloSession(raw.session, 0);
+        setSessions((prev) => [imported, ...prev.filter((s) => s.id !== imported.id)]);
+        setActiveId(imported.id);
+        syncSessionEventsFromDaemon(imported.id);
         return;
       }
 
@@ -2430,11 +2470,62 @@ export function App() {
     [daemonUrl]
   );
 
+  const handleRemoveQueuedPrompt = useCallback(
+    async (queueId: string) => {
+      const sid = activeSession.id;
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === sid
+            ? { ...s, queued_prompts: (s.queued_prompts || []).filter((q) => q.id !== queueId) }
+            : s
+        )
+      );
+      try {
+        await fetch(`${daemonUrl}/api/sessions/${sid}/queue/${encodeURIComponent(queueId)}`, {
+          method: "DELETE",
+        });
+      } catch {
+        sendE2eeCommand({
+          cmd: "remove_queued_prompt",
+          session_id: sid,
+          queue_id: queueId,
+        });
+      }
+    },
+    [activeSession.id, daemonUrl]
+  );
+
+  // Register global hooks for macOS Menu Bar Status Item (`VeloApp.swift`)
+  useEffect(() => {
+    const w = window as unknown as {
+      __veloOpenCliImport?: () => void;
+      __veloOpenPairModal?: () => void;
+      __veloSelectSession?: (sid: string) => void;
+    };
+    w.__veloOpenCliImport = () => setCliImportOpen(true);
+    w.__veloOpenPairModal = () => {
+      fetchPairTicket();
+      setActiveModal("qr");
+    };
+    w.__veloSelectSession = (sid: string) => {
+      if (sid) {
+        setActiveId(sid);
+        syncSessionEventsFromDaemon(sid);
+      }
+    };
+    return () => {
+      delete w.__veloOpenCliImport;
+      delete w.__veloOpenPairModal;
+      delete w.__veloSelectSession;
+    };
+  }, [fetchPairTicket, syncSessionEventsFromDaemon]);
+
   const handleSendPrompt = async (
     customText?: string,
     overridePriorEvents?: AgentEvent[],
     truncateToUserTurn?: number,
-    overrideImages?: string[]
+    overrideImages?: string[],
+    executionMode?: "queue" | "steer"
   ) => {
     const attachedPaths =
       overrideImages !== undefined ? overrideImages : pendingAttachments.map((a) => a.path);
@@ -2462,6 +2553,58 @@ export function App() {
     if (rawText.toLowerCase() === "/browser") {
       setDrawerTab("browser");
       setDrawerOpen(true);
+      return;
+    }
+
+    if (rawText === "/import" || rawText === "/cli") {
+      setCliImportOpen(true);
+      return;
+    }
+
+    // Server-side Queue Mode: enqueue follow-up prompt without disturbing the running turn UI
+    if (executionMode === "queue" && activeSession.status === "running") {
+      const optimisticQueueItem = {
+        id: `q-local-${Date.now()}`,
+        input: text,
+        images: attachedPaths,
+        model: activeSession.model,
+        effort: activeSession.effort || "medium",
+      };
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === activeSession.id
+            ? { ...s, queued_prompts: [...(s.queued_prompts || []), optimisticQueueItem] }
+            : s
+        )
+      );
+      try {
+        const qRes = await fetch(`${daemonUrl}/api/sessions/${activeSession.id}/input`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input: text,
+            model: activeSession.model,
+            effort: activeSession.effort || "medium",
+            images: attachedPaths,
+            mode: "queue",
+          }),
+        });
+        if (qRes.ok) {
+          refreshSessions();
+          return;
+        }
+      } catch {
+        // fallback to E2EE
+      }
+      sendE2eeCommand({
+        cmd: "send_input",
+        session_id: activeSession.id,
+        input: text,
+        model: activeSession.model,
+        effort: activeSession.effort || "medium",
+        images: attachedPaths,
+        mode: "queue",
+      });
       return;
     }
 
@@ -2720,6 +2863,7 @@ export function App() {
           truncate_to_user_turn: truncateToUserTurn,
           reset_thread: truncateToUserTurn !== undefined,
           images: attachedPaths,
+          mode: executionMode ?? null,
         }),
       });
 
@@ -3001,17 +3145,11 @@ export function App() {
   // Delete / archive a thread from sidebar, daemon state, events history & isolated Git worktree
   const handleDeleteSession = async (sessionId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const target = sessions.find((s) => s.id === sessionId);
     setSessions((prev) => {
       const remaining = prev.filter((s) => s.id !== sessionId);
       if (remaining.length === 0) {
-        const fallback: VeloSession = {
-          ...DEMO_SESSIONS[0],
-          id: `wt-${Date.now()}`,
-          repo_id: target?.repo_id || repos[0]?.id || "repo-velo",
-        };
-        setActiveId(fallback.id);
-        return [fallback];
+        setActiveId("");
+        return [];
       }
       if (activeSession.id === sessionId) {
         setActiveId(remaining[0].id);
@@ -3072,8 +3210,10 @@ export function App() {
       );
       if (remaining.length > 0 && activeSession.repo_id === repoId) {
         setActiveId(remaining[0].id);
+      } else if (remaining.length === 0) {
+        setActiveId("");
       }
-      return remaining.length > 0 ? remaining : DEMO_SESSIONS;
+      return remaining;
     });
   };
 
@@ -3900,6 +4040,13 @@ export function App() {
               <span className="font-mono text-[11px] text-[var(--v-fg-faint)]">⌘K</span>
             </button>
             <button
+              onClick={() => setCliImportOpen(true)}
+              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            >
+              <Terminal className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+              <span>接管终端会话</span>
+            </button>
+            <button
               onClick={() => setActiveModal("automations")}
               className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
@@ -4113,6 +4260,13 @@ export function App() {
               className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
               <FolderPlus className="h-4 w-4" />
+            </button>
+            <button
+              onClick={() => setCliImportOpen(true)}
+              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            >
+              <Terminal className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+              <span>接管终端会话</span>
             </button>
             <button
               onClick={() => setActiveModal("automations")}
@@ -5185,6 +5339,11 @@ export function App() {
                     </div>
                   )}
 
+                  <QueuedPromptsBar
+                    items={activeSession.queued_prompts || []}
+                    onRemove={(qid) => void handleRemoveQueuedPrompt(qid)}
+                  />
+
                   {isDictating ? (
                     <div className="flex items-center gap-2.5 py-1.5">
                       <button
@@ -5244,7 +5403,17 @@ export function App() {
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && !e.shiftKey) {
                           e.preventDefault();
-                          handleSendPrompt();
+                          if (activeSession.status === "running") {
+                            void handleSendPrompt(
+                              undefined,
+                              undefined,
+                              undefined,
+                              undefined,
+                              e.metaKey || e.altKey ? "steer" : "queue"
+                            );
+                          } else {
+                            void handleSendPrompt();
+                          }
                         }
                       }}
                       placeholder={`Ask ${
@@ -5666,13 +5835,51 @@ export function App() {
                         costUsd={activeSession.cost_usd || 0}
                       />
                       {activeSession.status === "running" ? (
-                        <button
-                          onClick={handleStopSession}
-                          title="停止当前执行 (Stop)"
-                          className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] transition-all hover:opacity-90"
-                        >
-                          <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          {(prompt.trim().length > 0 || pendingAttachments.length > 0) && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void handleSendPrompt(
+                                    undefined,
+                                    undefined,
+                                    undefined,
+                                    undefined,
+                                    "queue"
+                                  )
+                                }
+                                title="加入队列：当前轮完成后立即自动执行 (Enter)"
+                                className="flex h-7 items-center gap-1 rounded-full bg-[#a78bfa]/18 px-2.5 text-[11.5px] font-medium text-[#a78bfa] transition-colors hover:bg-[#a78bfa]/28 cursor-pointer"
+                              >
+                                <span>排队</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void handleSendPrompt(
+                                    undefined,
+                                    undefined,
+                                    undefined,
+                                    undefined,
+                                    "steer"
+                                  )
+                                }
+                                title="打断并纠偏：立即中断当前执行并带上此条指令重跑 (⌘Enter)"
+                                className="flex h-7 items-center gap-1 rounded-full bg-[#fbbf24]/18 px-2.5 text-[11.5px] font-medium text-[#fbbf24] transition-colors hover:bg-[#fbbf24]/28 cursor-pointer"
+                              >
+                                <span>纠偏</span>
+                              </button>
+                            </>
+                          )}
+                          <button
+                            onClick={handleStopSession}
+                            title="停止当前执行 (Stop)"
+                            className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] transition-all hover:opacity-90"
+                          >
+                            <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
+                          </button>
+                        </div>
                       ) : (
                         <button
                           onClick={() => handleSendPrompt()}
@@ -6956,6 +7163,26 @@ export function App() {
           setActiveId(sid);
           syncSessionEventsFromDaemon(sid);
         }}
+      />
+      <CliSessionsModal
+        open={cliImportOpen}
+        daemonUrl={daemonUrl}
+        externalSessions={e2eeCliSessions}
+        onRequestE2eeList={() => sendE2eeCommand({ cmd: "list_cli_sessions" })}
+        onImportViaE2ee={(prov, cSid) =>
+          sendE2eeCommand({
+            cmd: "import_cli_session",
+            provider: prov,
+            cli_session_id: cSid,
+          })
+        }
+        onImportedSession={(rawSess) => {
+          const imported = normalizeToVeloSession(rawSess, 0);
+          setSessions((prev) => [imported, ...prev.filter((s) => s.id !== imported.id)]);
+          setActiveId(imported.id);
+          syncSessionEventsFromDaemon(imported.id);
+        }}
+        onClose={() => setCliImportOpen(false)}
       />
     </div>
   );

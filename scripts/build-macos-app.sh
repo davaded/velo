@@ -26,9 +26,9 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key>
   <string>dev.velo.desktop</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.3.2</string>
+  <string>0.4.0</string>
   <key>CFBundleVersion</key>
-  <string>10</string>
+  <string>11</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleExecutable</key>

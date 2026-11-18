@@ -589,8 +589,52 @@ public struct ChatThreadView: View {
         let uploadedPaths = pendingImages.compactMap(\.uploadedPath)
         let isUploadingAny = pendingImages.contains(where: \.isUploading)
         let canSend = (hasText || !uploadedPaths.isEmpty) && !isUploadingAny
+        let queuedList = session?.activeQueuedPrompts ?? []
 
         return VStack(spacing: 10) {
+            if !queuedList.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "text.append")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("队列待发 (\(queuedList.count)) · 当前轮结束后自动执行")
+                            .font(.system(size: 11.5, weight: .semibold))
+                        Spacer()
+                    }
+                    .foregroundStyle(VeloTheme.accentVioletSoft)
+
+                    ForEach(Array(queuedList.enumerated()), id: \.element.id) { idx, q in
+                        HStack(spacing: 7) {
+                            Text("#\(idx + 1)")
+                                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Text(q.input)
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Spacer(minLength: 4)
+                            Button {
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                Task {
+                                    await store.removeQueuedPrompt(sessionId: sessionId, queueId: q.id)
+                                }
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(VeloTheme.accentViolet.opacity(0.09), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            }
+
             if !pendingImages.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 9) {
@@ -849,18 +893,74 @@ public struct ChatThreadView: View {
 
                 Spacer(minLength: 2)
 
-                // Tactile Send / Stop Button
-                if isSessionRunning && !canSend && pendingImages.isEmpty {
-                    Button {
-                        Task { await store.stopSession(sessionId) }
-                    } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 12.5, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 34, height: 34)
-                            .background(VeloTheme.coral, in: Circle())
+                // Tactile Send / Queue / Steer / Stop Controls
+                if isSessionRunning {
+                    HStack(spacing: 6) {
+                        if canSend {
+                            Button {
+                                let toSend = draftPrompt
+                                let attached = uploadedPaths
+                                draftPrompt = ""
+                                pendingImages.removeAll()
+                                composerFocused = false
+                                Task {
+                                    await store.sendPrompt(
+                                        sessionId: sessionId,
+                                        text: toSend,
+                                        model: selectedModelId,
+                                        effort: selectedEffort,
+                                        images: attached,
+                                        executionMode: "queue"
+                                    )
+                                }
+                            } label: {
+                                Text("排队")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 32)
+                                    .background(VeloTheme.accentViolet.opacity(0.16), in: Capsule())
+                            }
+                            .buttonStyle(VeloPressableButtonStyle())
+
+                            Button {
+                                let toSend = draftPrompt
+                                let attached = uploadedPaths
+                                draftPrompt = ""
+                                pendingImages.removeAll()
+                                composerFocused = false
+                                Task {
+                                    await store.sendPrompt(
+                                        sessionId: sessionId,
+                                        text: toSend,
+                                        model: selectedModelId,
+                                        effort: selectedEffort,
+                                        images: attached,
+                                        executionMode: "steer"
+                                    )
+                                }
+                            } label: {
+                                Text("纠偏")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundStyle(VeloTheme.amber)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 32)
+                                    .background(VeloTheme.amber.opacity(0.18), in: Capsule())
+                            }
+                            .buttonStyle(VeloPressableButtonStyle())
+                        }
+
+                        Button {
+                            Task { await store.stopSession(sessionId) }
+                        } label: {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 12.5, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 34, height: 34)
+                                .background(VeloTheme.coral, in: Circle())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
                     }
-                    .buttonStyle(VeloPressableButtonStyle())
                 } else {
                     Button {
                         let toSend = draftPrompt

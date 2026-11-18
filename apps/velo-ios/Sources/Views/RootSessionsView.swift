@@ -8,6 +8,7 @@ public struct RootSessionsView: View {
 
     @State private var showPairSheet = false
     @State private var showNewThreadSheet = false
+    @State private var showCliImportSheet = false
     @State private var showAnalyticsHub = false
     @State private var analyticsInitialTab: VeloAnalyticsHubSheet.HubTab = .analytics
     @State private var prefillRepoForNewSession: String?
@@ -146,6 +147,19 @@ public struct RootSessionsView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 8) {
                         Button {
+                            showCliImportSheet = true
+                        } label: {
+                            Image(systemName: "apple.terminal")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 30, height: 30)
+                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
+                        .disabled(store.connectionConfig == nil)
+                        .accessibilityLabel("接管 Mac 终端会话")
+
+                        Button {
                             analyticsInitialTab = .search
                             showAnalyticsHub = true
                         } label: {
@@ -191,6 +205,11 @@ public struct RootSessionsView: View {
                 store.deepLinkTargetSessionId = nil
                 if navigationPath.last != targetSid {
                     navigationPath = [targetSid]
+                }
+            }
+            .sheet(isPresented: $showCliImportSheet) {
+                VeloCliSessionsSheet(store: store) { importedSid in
+                    navigationPath = [importedSid]
                 }
             }
             .sheet(isPresented: $showAnalyticsHub) {

@@ -28,12 +28,13 @@ use uuid::Uuid;
 use velo_agent::{AgentHandle, AgentSpawner, InteractiveShellHandle};
 use velo_protocol::{
     AdvisorSessionRequest, AgentEvent, AgentProvider, CommitteeRequest, CreateSessionRequest,
-    HandoffSessionRequest, LoopSessionRequest, SessionInfo, SessionInputRequest, SessionStatus,
-    WsClientMessage, WsServerMessage, default_approval_mode,
+    HandoffSessionRequest, LoopSessionRequest, QueuedPromptItem, SessionInfo, SessionInputRequest,
+    SessionStatus, WsClientMessage, WsServerMessage, default_approval_mode,
 };
 use velo_worktree::{WorktreeManager, default_velo_home};
 
 pub mod automations;
+pub mod cli_sessions;
 pub mod pr;
 pub mod pricing;
 pub mod push;
@@ -761,6 +762,7 @@ impl DaemonState {
                 let mut should_persist_sessions = false;
                 let mut db_usage_to_upsert: Option<AgentEvent> = None;
                 let mut db_event_to_append: Option<AgentEvent> = None;
+                let mut next_queued_job: Option<QueuedPromptItem> = None;
                 let mut push_notification_job: Option<(
                     push::PushConfig,
                     push::PushTriggerKind,
@@ -1225,7 +1227,14 @@ impl DaemonState {
                                     session.status = *status;
                                     should_refresh_diff = true;
                                     should_persist_sessions = true;
-                                    if p_cfg.enabled {
+                                    if matches!(
+                                        status,
+                                        SessionStatus::Completed | SessionStatus::Failed
+                                    ) && !session.queued_prompts.is_empty()
+                                    {
+                                        next_queued_job = Some(session.queued_prompts.remove(0));
+                                    }
+                                    if p_cfg.enabled && next_queued_job.is_none() {
                                         match status {
                                             SessionStatus::Completed => {
                                                 push_notification_job = Some((
@@ -1340,6 +1349,29 @@ impl DaemonState {
 
                 if should_persist_sessions {
                     let _ = state.persist_sessions().await;
+                }
+
+                if let Some(queued_item) = next_queued_job {
+                    let st_next = state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                        let _ = st_next
+                            .dispatch_session_input(
+                                session_id,
+                                SessionInputRequest {
+                                    input: queued_item.input,
+                                    model: queued_item.model,
+                                    effort: queued_item.effort,
+                                    provider: None,
+                                    reset_thread: false,
+                                    truncate_to_user_turn: None,
+                                    images: queued_item.images,
+                                    approval_mode: None,
+                                    mode: None,
+                                },
+                            )
+                            .await;
+                    });
                 }
             }
         });
@@ -1894,6 +1926,7 @@ impl DaemonState {
             cost_usd: 0.0,
             approval_mode: approval_mode.clone(),
             preview_url: None,
+            queued_prompts: Vec::new(),
         };
 
         let initial_user_ev = if !prompt.trim().is_empty() || !images.is_empty() {
@@ -2087,6 +2120,12 @@ pub fn build_router(state: DaemonState) -> Router {
             post(terminal_restart_handler),
         )
         .route("/api/sessions/{id}/input", post(send_input_handler))
+        .route(
+            "/api/sessions/{id}/queue/{queue_id}",
+            axum::routing::delete(remove_queued_prompt_handler),
+        )
+        .route("/api/cli-sessions", get(list_cli_sessions_handler))
+        .route("/api/cli-sessions/import", post(import_cli_session_handler))
         .route("/api/sessions/{id}/rewind", post(rewind_session_handler))
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
         .route("/api/sessions/{id}/git/commit", post(git_commit_handler))
@@ -4010,10 +4049,48 @@ impl DaemonState {
         id: Uuid,
         req: SessionInputRequest,
     ) -> Result<Value> {
+        if req.mode.as_deref() == Some("queue") {
+            let mut enqueued_len: Option<usize> = None;
+            {
+                let mut guard = self.inner.write().await;
+                let Some(sess) = guard.sessions.get_mut(&id) else {
+                    anyhow::bail!("Session not found");
+                };
+                if matches!(
+                    sess.status,
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingForPermission
+                ) {
+                    sess.queued_prompts.push(QueuedPromptItem {
+                        id: format!("q-{}", Uuid::new_v4().simple()),
+                        input: req.input.clone(),
+                        images: req.images.clone(),
+                        model: req.model.clone(),
+                        effort: req.effort.clone(),
+                        created_at: Utc::now(),
+                    });
+                    sess.updated_at = Utc::now();
+                    enqueued_len = Some(sess.queued_prompts.len());
+                }
+            }
+            if let Some(qlen) = enqueued_len {
+                let _ = self.persist_sessions().await;
+                return Ok(json!({
+                    "ok": true,
+                    "queued": true,
+                    "queue_len": qlen,
+                    "session_id": id,
+                }));
+            }
+        }
+
+        let mut stopped_active_handle = false;
         let (existing_session, prior_transcript, parent_handoff_context) = {
             let mut guard = self.inner.write().await;
             if let Some(mut old_handle) = guard.handles.remove(&id) {
                 old_handle.stop();
+                stopped_active_handle = true;
             }
             if let Some(turn_idx) = req.truncate_to_user_turn {
                 if let Some(ev_list) = guard.event_history.get_mut(&id) {
@@ -4069,6 +4146,11 @@ impl DaemonState {
         let Some(session) = existing_session else {
             anyhow::bail!("Session not found");
         };
+
+        if stopped_active_handle {
+            // Allow killed child process exit event to settle before starting steered turn
+            tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+        }
 
         let is_engine_bound = req.truncate_to_user_turn.is_none()
             && !req.reset_thread
@@ -4317,6 +4399,7 @@ impl DaemonState {
                         truncate_to_user_turn: None,
                         images: Vec::new(),
                         approval_mode: Some(source_session.approval_mode),
+                        mode: None,
                     },
                 )
                 .await?;
@@ -4327,6 +4410,179 @@ impl DaemonState {
         }
 
         Ok(created)
+    }
+
+    pub async fn remove_queued_prompt_core(&self, id: Uuid, queue_id: &str) -> Value {
+        let mut removed = false;
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(s) = guard.sessions.get_mut(&id) {
+                let prev_len = s.queued_prompts.len();
+                s.queued_prompts.retain(|q| q.id != queue_id);
+                removed = s.queued_prompts.len() != prev_len;
+                if removed {
+                    s.updated_at = Utc::now();
+                }
+            }
+        }
+        if removed {
+            let _ = self.persist_sessions().await;
+        }
+        json!({ "ok": removed, "session_id": id, "queue_id": queue_id })
+    }
+
+    pub async fn list_cli_sessions_core(&self) -> Vec<cli_sessions::ExternalCliSessionDto> {
+        let existing_map: HashMap<String, Uuid> = {
+            let guard = self.inner.read().await;
+            guard
+                .sessions
+                .values()
+                .filter_map(|s| s.provider_session_id.as_ref().map(|psid| (psid.clone(), s.id)))
+                .collect()
+        };
+        tokio::task::spawn_blocking(move || {
+            cli_sessions::discover_external_cli_sessions(&existing_map, 40)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    pub async fn import_cli_session_core(
+        &self,
+        provider_str: &str,
+        cli_session_id: &str,
+    ) -> Result<SessionInfo> {
+        let existing_velo_id = {
+            let guard = self.inner.read().await;
+            guard
+                .sessions
+                .values()
+                .find(|s| s.provider_session_id.as_deref() == Some(cli_session_id.trim()))
+                .map(|s| s.id)
+        };
+        let target_id = existing_velo_id.unwrap_or_else(Uuid::new_v4);
+        let p_str = provider_str.to_string();
+        let c_sid = cli_session_id.to_string();
+
+        let parsed = tokio::task::spawn_blocking(move || {
+            cli_sessions::load_external_cli_session(&p_str, &c_sid, target_id)
+        })
+        .await??;
+
+        let canonical_cwd = canonical_workspace_path(&parsed.cwd);
+        let wt_path = PathBuf::from(&canonical_cwd);
+        let branch = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&wt_path)
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "main".to_string());
+        let diff_stats = WorktreeManager::compute_diff_stats(&wt_path)
+            .await
+            .unwrap_or_default();
+
+        let default_model = match parsed.provider {
+            AgentProvider::Codex => Some("gpt-5.4".to_string()),
+            _ => Some("claude-fable-5-2".to_string()),
+        };
+
+        let mut ws_added = false;
+        let out_session = {
+            let mut guard = self.inner.write().await;
+            if !guard.workspaces.contains(&canonical_cwd) {
+                guard.workspaces.push(canonical_cwd.clone());
+                ws_added = true;
+            }
+            if let Some(existing) = guard.sessions.get_mut(&target_id) {
+                existing.name = parsed.title.clone();
+                existing.updated_at = parsed.updated_at;
+                existing.diff_stats = diff_stats;
+                let s_clone = existing.clone();
+                guard.event_history.insert(target_id, parsed.events.clone());
+                s_clone
+            } else {
+                let s = SessionInfo {
+                    id: target_id,
+                    name: parsed.title,
+                    provider: parsed.provider,
+                    prompt: parsed.first_prompt,
+                    repo_root: canonical_cwd.clone(),
+                    worktree_path: canonical_cwd,
+                    branch,
+                    status: SessionStatus::Completed,
+                    pid: None,
+                    diff_stats,
+                    created_at: parsed.updated_at,
+                    updated_at: Utc::now(),
+                    parent_session_id: None,
+                    provider_session_id: Some(parsed.cli_session_id),
+                    model: default_model,
+                    effort: Some("high".to_string()),
+                    tokens_used: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    context_window: 0,
+                    cost_usd: 0.0,
+                    approval_mode: default_approval_mode(),
+                    preview_url: None,
+                    queued_prompts: Vec::new(),
+                };
+                guard.sessions.insert(target_id, s.clone());
+                guard.event_history.insert(target_id, parsed.events.clone());
+                s
+            }
+        };
+
+        let _ = self.db.replace_session_events(target_id, &parsed.events);
+        if ws_added {
+            let _ = self.persist_workspaces().await;
+        }
+        let _ = self.persist_sessions().await;
+        Ok(out_session)
+    }
+}
+
+async fn remove_queued_prompt_handler(
+    State(state): State<DaemonState>,
+    AxumPath((id, queue_id)): AxumPath<(Uuid, String)>,
+) -> impl IntoResponse {
+    Json(state.remove_queued_prompt_core(id, &queue_id).await)
+}
+
+async fn list_cli_sessions_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    let items = state.list_cli_sessions_core().await;
+    Json(json!({ "ok": true, "sessions": items }))
+}
+
+#[derive(serde::Deserialize)]
+struct ImportCliSessionRequest {
+    provider: String,
+    cli_session_id: String,
+}
+
+async fn import_cli_session_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<ImportCliSessionRequest>,
+) -> impl IntoResponse {
+    match state
+        .import_cli_session_core(&req.provider, &req.cli_session_id)
+        .await
+    {
+        Ok(sess) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "session": sess })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -6539,6 +6795,7 @@ mod tests {
             provider_session_id: None,
             approval_mode: "auto_edit".to_string(),
             preview_url: None,
+            queued_prompts: Vec::new(),
         };
         db.upsert_session(&sess)?;
 

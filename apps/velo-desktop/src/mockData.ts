@@ -360,6 +360,15 @@ export interface VeloRepo {
   default_branch: string;
 }
 
+export interface QueuedPromptDto {
+  id: string;
+  input: string;
+  images?: string[];
+  model?: string | null;
+  effort?: string | null;
+  created_at?: string;
+}
+
 export interface VeloSession {
   id: string;
   repo_id: string;
@@ -374,6 +383,7 @@ export interface VeloSession {
   project_path: string;
   approval_mode: ApprovalMode;
   preview_url?: string | null;
+  queued_prompts?: QueuedPromptDto[];
   tokens_used: number;
   input_tokens?: number;
   output_tokens?: number;
@@ -629,6 +639,9 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     project_path: projectPath,
     approval_mode: approvalMode,
     preview_url: typeof r.preview_url === "string" ? r.preview_url : null,
+    queued_prompts: Array.isArray(r.queued_prompts)
+      ? (r.queued_prompts as QueuedPromptDto[])
+      : [],
     tokens_used: Number(r.tokens_used ?? 0),
     input_tokens: Number(r.input_tokens ?? 0),
     output_tokens: Number(r.output_tokens ?? 0),

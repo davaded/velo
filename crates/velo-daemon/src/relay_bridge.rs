@@ -979,6 +979,10 @@ async fn run_supervised_e2ee_bridge(
                                                 .get("truncate_to_user_turn")
                                                 .and_then(|v| v.as_u64())
                                                 .map(|n| n as usize);
+                                            let mode = cmd_val
+                                                .get("mode")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string());
                                             if let Err(err) = state
                                                 .dispatch_session_input(
                                                     sid,
@@ -991,6 +995,7 @@ async fn run_supervised_e2ee_bridge(
                                                         truncate_to_user_turn,
                                                         images,
                                                         approval_mode,
+                                                        mode,
                                                     },
                                                 )
                                                 .await
@@ -1823,6 +1828,82 @@ async fn run_supervised_e2ee_bridge(
                                         send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
                                     {
                                         let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "remove_queued_prompt" => {
+                                    if let (Some(sid_s), Some(qid)) = (
+                                        cmd_val.get("session_id").and_then(|v| v.as_str()),
+                                        cmd_val.get("queue_id").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let _ = state.remove_queued_prompt_core(sid, qid).await;
+                                        }
+                                    }
+                                }
+                                "list_cli_sessions" => {
+                                    let items = state.list_cli_sessions_core().await;
+                                    let resp = json!({
+                                        "type": "cli_sessions_snapshot",
+                                        "sessions": items,
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "import_cli_session" => {
+                                    let prov = cmd_val
+                                        .get("provider")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("claude");
+                                    let c_sid = cmd_val
+                                        .get("cli_session_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !c_sid.is_empty() {
+                                        match state.import_cli_session_core(prov, c_sid).await {
+                                            Ok(sess) => {
+                                                let ws_list = state.list_workspaces().await;
+                                                let ws_snap = json!({
+                                                    "type": "workspaces_snapshot",
+                                                    "workspaces": ws_list,
+                                                });
+                                                if let Some(f) = send_sealed_with_key(
+                                                    &ws_snap,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer.send(WsMsg::Text(f.into())).await;
+                                                }
+                                                let ack = json!({
+                                                    "type": "cli_session_imported",
+                                                    "ok": true,
+                                                    "session": sess,
+                                                });
+                                                if let Some(f) = send_sealed_with_key(
+                                                    &ack,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer.send(WsMsg::Text(f.into())).await;
+                                                }
+                                            }
+                                            Err(err) => {
+                                                let ack = json!({
+                                                    "type": "cli_session_imported",
+                                                    "ok": false,
+                                                    "error": err.to_string(),
+                                                });
+                                                if let Some(f) = send_sealed_with_key(
+                                                    &ack,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer.send(WsMsg::Text(f.into())).await;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 "get_push_config" => {
