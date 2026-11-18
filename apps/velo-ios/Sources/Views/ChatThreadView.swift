@@ -633,12 +633,67 @@ public struct ChatThreadView: View {
                 }
             }
 
-            TextField("向 \(cat.shortBadge) 发送指令或附图…", text: $draftPrompt, axis: .vertical)
-                .lineLimit(1...5)
-                .focused($composerFocused)
-                .font(.system(size: 15))
+            if voiceRecorder.isRecording {
+                // Pure Visual Acoustic Soundwave Feedback (Zero Text Labels)
+                HStack(spacing: 10) {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        withAnimation(.snappy(duration: 0.2)) {
+                            voiceRecorder.cancelRecording()
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 32, height: 32)
+                            .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+
+                    VoiceRecordingWaveformBar(levels: voiceRecorder.barLevels)
+                        .frame(height: 34)
+                        .frame(maxWidth: .infinity)
+
+                    Button {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        isTranscribingVoice = true
+                        Task {
+                            let outcome = await voiceRecorder.stopAndTranscribe()
+                            var recognized = outcome.text
+                            if (recognized == nil || recognized?.isEmpty == true),
+                               let backupData = outcome.fallbackAudio
+                            {
+                                recognized = await store.transcribeVoiceData(backupData)
+                            }
+                            if let text = recognized, !text.isEmpty {
+                                draftPrompt = draftPrompt.isEmpty ? text : "\(draftPrompt) \(text)"
+                                composerFocused = true
+                            }
+                            isTranscribingVoice = false
+                        }
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(VeloTheme.coral.opacity(0.18))
+                                .frame(width: 34, height: 34)
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 13.5, weight: .bold))
+                                .foregroundStyle(VeloTheme.coral)
+                        }
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+                }
                 .padding(.horizontal, 4)
-                .padding(.top, 2)
+                .padding(.vertical, 3)
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            } else {
+                TextField("向 \(cat.shortBadge) 发送指令或附图…", text: $draftPrompt, axis: .vertical)
+                    .lineLimit(1...5)
+                    .focused($composerFocused)
+                    .font(.system(size: 15))
+                    .padding(.horizontal, 4)
+                    .padding(.top, 2)
+            }
 
             HStack(spacing: 7) {
                 // Paseo-Style Compressed Photo / Screenshot Picker
@@ -653,9 +708,9 @@ public struct ChatThreadView: View {
                         .frame(width: 31, height: 31)
                         .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
                 }
-                .disabled(pendingImages.count >= 4)
+                .disabled(pendingImages.count >= 4 || voiceRecorder.isRecording)
 
-                if UIPasteboard.general.hasImages && pendingImages.count < 4 {
+                if UIPasteboard.general.hasImages && pendingImages.count < 4 && !voiceRecorder.isRecording {
                     Button {
                         if let pasted = UIPasteboard.general.image {
                             enqueueComposerImage(pasted, filename: "clipboard-\(Int(Date().timeIntervalSince1970)).jpg")
@@ -671,44 +726,32 @@ public struct ChatThreadView: View {
                     .accessibilityLabel("粘贴剪贴板图片")
                 }
 
-                // Voice-to-Prompt Microphone Dictation Button
-                Button {
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    if voiceRecorder.isRecording {
-                        if let audio = voiceRecorder.stopRecording() {
-                            isTranscribingVoice = true
-                            Task {
-                                if let text = await store.transcribeVoiceData(audio) {
-                                    draftPrompt = draftPrompt.isEmpty ? text : "\(draftPrompt) \(text)"
-                                }
-                                isTranscribingVoice = false
+                // Voice-to-Prompt Microphone Dictation Button (Icon-only, zero text)
+                if !voiceRecorder.isRecording {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        composerFocused = false
+                        Task {
+                            _ = await voiceRecorder.startRecording()
+                        }
+                    } label: {
+                        Group {
+                            if isTranscribingVoice {
+                                ProgressView()
+                                    .scaleEffect(0.75)
+                            } else {
+                                Image(systemName: "mic.fill")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(Color.secondary)
                             }
                         }
-                    } else {
-                        Task { _ = await voiceRecorder.startRecording() }
+                        .frame(width: 31, height: 31)
+                        .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
                     }
-                } label: {
-                    Group {
-                        if isTranscribingVoice {
-                            ProgressView()
-                                .scaleEffect(0.75)
-                        } else {
-                            Image(systemName: voiceRecorder.isRecording ? "stop.circle.fill" : "mic.fill")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(voiceRecorder.isRecording ? VeloTheme.coral : Color.secondary)
-                        }
-                    }
-                    .frame(width: 31, height: 31)
-                    .background(
-                        voiceRecorder.isRecording
-                            ? VeloTheme.coral.opacity(0.16)
-                            : VeloTheme.elevatedSurface(colorScheme),
-                        in: Circle()
-                    )
+                    .buttonStyle(VeloPressableButtonStyle())
+                    .disabled(isTranscribingVoice)
+                    .accessibilityLabel("语音输入")
                 }
-                .buttonStyle(VeloPressableButtonStyle())
-                .disabled(isTranscribingVoice)
-                .accessibilityLabel(voiceRecorder.isRecording ? "停止录音并转写" : "语音转写指令")
 
                 // Categorized Model & Handoff Sheet Trigger
                 Button {
@@ -1861,7 +1904,7 @@ private struct NativeMarkdownView: View {
 
     private static func isTableRow(_ line: String) -> Bool {
         let t = line.trimmingCharacters(in: .whitespaces)
-        return t.contains("|") && t.count >= 3
+        return t.contains("|") && t.count >= 2
     }
 
     private static func isTableSeparator(_ line: String) -> Bool {
@@ -1873,15 +1916,57 @@ private struct NativeMarkdownView: View {
             let c = cell.trimmingCharacters(in: .whitespaces)
             guard !c.isEmpty else { return false }
             let core = c.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-            return core.count >= 3 && core.allSatisfy { $0 == "-" }
+            return !core.isEmpty && core.allSatisfy { $0 == "-" }
         }
     }
 
+    /// Splits a GFM table row while respecting escaped pipes (`\|`) and inline code spans (`` `a | b` ``),
+    /// and normalizes HTML `<br>` tags inside cells into line breaks.
     private static func splitTableCells(_ line: String) -> [String] {
         var t = line.trimmingCharacters(in: .whitespaces)
         if t.hasPrefix("|") { t.removeFirst() }
-        if t.hasSuffix("|") { t.removeLast() }
-        return t.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        if t.hasSuffix("|") && !t.hasSuffix("\\|") { t.removeLast() }
+
+        var cells: [String] = []
+        var current = ""
+        var inCodeSpan = false
+        var iterator = t.makeIterator()
+
+        while let ch = iterator.next() {
+            if ch == "\\" {
+                if let next = iterator.next() {
+                    if next == "|" {
+                        current.append("|")
+                    } else {
+                        current.append(ch)
+                        current.append(next)
+                    }
+                } else {
+                    current.append(ch)
+                }
+                continue
+            }
+            if ch == "`" {
+                inCodeSpan.toggle()
+                current.append(ch)
+                continue
+            }
+            if ch == "|" && !inCodeSpan {
+                cells.append(normalizeTableCellText(current))
+                current = ""
+            } else {
+                current.append(ch)
+            }
+        }
+        cells.append(normalizeTableCellText(current))
+        return cells
+    }
+
+    private static func normalizeTableCellText(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "<br/>", with: "\n", options: .caseInsensitive)
+            .replacingOccurrences(of: "<br />", with: "\n", options: .caseInsensitive)
+            .replacingOccurrences(of: "<br>", with: "\n", options: .caseInsensitive)
     }
 
     private static func parseTableAlignments(_ line: String, count: Int) -> [Alignment] {
@@ -2110,17 +2195,58 @@ private struct FencedCodeCardView: View {
     }
 }
 
+private struct VoiceRecordingWaveformBar: View {
+    let levels: [CGFloat]
+    @State private var pulseDot: Bool = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(VeloTheme.coral)
+                .frame(width: 7.5, height: 7.5)
+                .scaleEffect(pulseDot ? 1.18 : 0.78)
+                .opacity(pulseDot ? 1.0 : 0.45)
+                .animation(.easeInOut(duration: 0.65).repeatForever(autoreverses: true), value: pulseDot)
+
+            HStack(alignment: .center, spacing: 3.2) {
+                ForEach(Array(levels.enumerated()), id: \.offset) { _, lv in
+                    Capsule(style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [VeloTheme.coral, VeloTheme.accentVioletSoft],
+                                startPoint: .bottom,
+                                endPoint: .top
+                            )
+                        )
+                        .frame(width: 3.0, height: max(4, min(26, lv * 26)))
+                        .animation(.interpolatingSpring(stiffness: 260, damping: 19), value: lv)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(VeloTheme.coral.opacity(0.09), in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(VeloTheme.coral.opacity(0.24), lineWidth: 0.8)
+        )
+        .onAppear {
+            pulseDot = true
+        }
+    }
+}
+
 private struct MarkdownTableCardView: View {
     let headers: [String]
     let alignments: [Alignment]
     let rows: [[String]]
     @Environment(\.colorScheme) private var colorScheme
 
-    private static let minColumnWidth: CGFloat = 74
-    private static let maxColumnWidth: CGFloat = 260
+    private static let minColumnWidth: CGFloat = 78
+    private static let maxColumnWidth: CGFloat = 250
     private static let cellHorizontalPadding: CGFloat = 22
 
-    // A horizontal ScrollView proposes no width, so cells need an explicit width to wrap instead of overflowing into neighbors.
     private var columnWidths: [CGFloat] {
         headers.indices.map { col in
             var widest = Self.measure(headers[col], weight: .semibold)
@@ -2134,51 +2260,101 @@ private struct MarkdownTableCardView: View {
         }
     }
 
+    private var totalTableWidth: CGFloat {
+        let widths = columnWidths
+        let dividers = CGFloat(max(0, widths.count - 1)) * 0.6
+        return widths.reduce(0, +) + dividers
+    }
+
     private static func measure(_ text: String, weight: UIFont.Weight) -> CGFloat {
         let plain = text
             .replacingOccurrences(of: "`", with: "")
             .replacingOccurrences(of: "**", with: "")
-        return (plain as NSString).size(withAttributes: [.font: UIFont.systemFont(ofSize: 13, weight: weight)]).width
+            .replacingOccurrences(of: "__", with: "")
+        return plain
+            .components(separatedBy: .newlines)
+            .map { line in
+                (line as NSString).size(withAttributes: [.font: UIFont.systemFont(ofSize: 13, weight: weight)]).width
+            }
+            .max() ?? 0
+    }
+
+    private func textAlignment(for align: Alignment) -> TextAlignment {
+        if align == .center { return .center }
+        if align == .trailing { return .trailing }
+        return .leading
     }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
-                GridRow {
+        let widths = columnWidths
+        let tableWidth = totalTableWidth
+
+        ScrollView(.horizontal, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                // Header Row
+                HStack(alignment: .center, spacing: 0) {
                     ForEach(Array(headers.enumerated()), id: \.offset) { colIdx, title in
+                        let colAlign = alignments[safe: colIdx] ?? .leading
+                        let colWidth = widths[safe: colIdx] ?? Self.minColumnWidth
                         InlineMarkdownText(
-                            text: title,
+                            text: title.isEmpty ? " " : title,
                             baseSize: 13,
                             baseWeight: .semibold,
-                            lineSpacing: 2
+                            lineSpacing: 2,
+                            alignment: textAlignment(for: colAlign)
                         )
                         .padding(.horizontal, 11)
-                        .padding(.vertical, 8)
-                        .frame(width: columnWidths[safe: colIdx] ?? Self.minColumnWidth, alignment: alignments[safe: colIdx] ?? .leading)
+                        .padding(.vertical, 9)
+                        .frame(width: colWidth, alignment: colAlign)
+
+                        if colIdx < headers.count - 1 {
+                            Rectangle()
+                                .fill(VeloTheme.hairline(colorScheme))
+                                .frame(width: 0.6)
+                        }
                     }
                 }
+                .frame(width: tableWidth, alignment: .leading)
                 .background(VeloTheme.codeHeader(colorScheme))
 
+                // Data Rows
                 ForEach(Array(rows.enumerated()), id: \.offset) { rowIdx, row in
                     Rectangle()
                         .fill(VeloTheme.hairline(colorScheme))
-                        .frame(height: 0.7)
-                    GridRow {
-                        ForEach(Array(row.enumerated()), id: \.offset) { colIdx, cell in
+                        .frame(width: tableWidth, height: 0.7)
+
+                    HStack(alignment: .top, spacing: 0) {
+                        ForEach(0..<headers.count, id: \.self) { colIdx in
+                            let cell = row[safe: colIdx] ?? ""
+                            let colAlign = alignments[safe: colIdx] ?? .leading
+                            let colWidth = widths[safe: colIdx] ?? Self.minColumnWidth
                             InlineMarkdownText(
                                 text: cell.isEmpty ? " " : cell,
                                 baseSize: 13,
                                 baseWeight: .regular,
-                                lineSpacing: 2
+                                lineSpacing: 2.5,
+                                alignment: textAlignment(for: colAlign)
                             )
                             .padding(.horizontal, 11)
-                            .padding(.vertical, 7.5)
-                            .frame(width: columnWidths[safe: colIdx] ?? Self.minColumnWidth, alignment: alignments[safe: colIdx] ?? .leading)
+                            .padding(.vertical, 8.5)
+                            .frame(width: colWidth, alignment: colAlign)
+
+                            if colIdx < headers.count - 1 {
+                                Rectangle()
+                                    .fill(VeloTheme.hairline(colorScheme).opacity(0.65))
+                                    .frame(width: 0.6)
+                            }
                         }
                     }
-                    .background(rowIdx.isMultiple(of: 2) ? Color.clear : VeloTheme.elevatedSurface(colorScheme).opacity(0.35))
+                    .frame(width: tableWidth, alignment: .leading)
+                    .background(
+                        rowIdx.isMultiple(of: 2)
+                            ? Color.clear
+                            : VeloTheme.elevatedSurface(colorScheme).opacity(0.35)
+                    )
                 }
             }
+            .frame(width: tableWidth, alignment: .leading)
             .background(VeloTheme.cardSurface(colorScheme))
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(
@@ -2201,10 +2377,12 @@ private struct InlineMarkdownText: View {
     var baseWeight: Font.Weight = .regular
     var secondary: Bool = false
     var lineSpacing: CGFloat = 4.0
+    var alignment: TextAlignment = .leading
 
     var body: some View {
         Text(Self.buildAttributed(text, baseSize: baseSize, baseWeight: baseWeight, secondary: secondary))
             .lineSpacing(lineSpacing)
+            .multilineTextAlignment(alignment)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
     }
