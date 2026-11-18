@@ -1,18 +1,6 @@
 import Foundation
 #if canImport(ActivityKit)
 import ActivityKit
-
-public struct VeloSessionActivityAttributes: ActivityAttributes {
-    public struct ContentState: Codable, Hashable {
-        public var statusLabel: String
-        public var throughputTps: Double?
-        public var elapsedSeconds: Int
-    }
-
-    public var sessionId: String
-    public var sessionTitle: String
-    public var engineBadge: String
-}
 #endif
 
 @MainActor
@@ -63,28 +51,28 @@ public final class VeloLiveActivityManager {
             )
             activeSessionId = sessionId
         } catch {
-            // Silently ignore on devices/entitlements without widget extension
+            currentActivity = nil
+            activeSessionId = nil
         }
         #endif
     }
 
-    public func endCurrent(sessionId: String? = nil) {
+    public func endCurrent(sessionId: String? = nil, finalLabel: String = "已完成") {
         #if canImport(ActivityKit)
-        if let sid = sessionId, let cur = activeSessionId, cur != sid {
+        if let sessionId, let activeSessionId, sessionId != activeSessionId {
             return
         }
-        if let existing = currentActivity {
-            let finalState = VeloSessionActivityAttributes.ContentState(
-                statusLabel: "已完成",
-                throughputTps: nil,
-                elapsedSeconds: 0
+        guard let act = currentActivity else { return }
+        let endState = VeloSessionActivityAttributes.ContentState(
+            statusLabel: finalLabel,
+            throughputTps: nil,
+            elapsedSeconds: act.content.state.elapsedSeconds
+        )
+        Task {
+            await act.end(
+                ActivityContent(state: endState, staleDate: nil),
+                dismissalPolicy: .after(.now + 12)
             )
-            Task {
-                await existing.end(
-                    ActivityContent(state: finalState, staleDate: nil),
-                    dismissalPolicy: .default
-                )
-            }
         }
         currentActivity = nil
         activeSessionId = nil

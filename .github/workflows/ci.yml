@@ -39,3 +39,25 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Typecheck & Vite Production Bundle
         run: pnpm run build
+
+  ios-app:
+    name: Velo iOS App & Live Activity Build
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: apps/velo-ios
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: which xcodegen || brew install xcodegen
+      - name: Generate Xcode Project & Compile (Unsigned CI Check)
+        run: |
+          xcodegen generate
+          xcodebuild \
+            -project VeloMobile.xcodeproj \
+            -scheme VeloMobile \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build

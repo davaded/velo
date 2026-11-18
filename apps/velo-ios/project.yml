@@ -9,8 +9,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.10"
-    MARKETING_VERSION: "0.3.1"
-    CURRENT_PROJECT_VERSION: "9"
+    MARKETING_VERSION: "0.3.2"
+    CURRENT_PROJECT_VERSION: "10"
     DEVELOPMENT_TEAM: "76S2FLMS7Q"
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: YES
@@ -22,7 +22,11 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources
+      - path: Shared
       - path: Assets.xcassets
+    dependencies:
+      - target: VeloLiveActivityExtension
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.daiyudai.velo.mobile
@@ -50,3 +54,23 @@ targets:
           - CFBundleURLName: dev.velo.mobile.pair
             CFBundleURLSchemes:
               - velo
+
+  VeloLiveActivityExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: LiveActivityExtension
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.daiyudai.velo.mobile.liveactivity
+        INFOPLIST_KEY_CFBundleDisplayName: VeloLiveActivity
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+    info:
+      path: LiveActivityExtension/Info.plist
+      properties:
+        CFBundleDisplayName: VeloLiveActivity
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension

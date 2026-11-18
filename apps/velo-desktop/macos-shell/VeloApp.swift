@@ -1,10 +1,50 @@
+import AVFoundation
 import Cocoa
+import Speech
 import WebKit
+
+private final class MacSpeechRequestBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+
+    func set(_ req: SFSpeechAudioBufferRecognitionRequest?) {
+        lock.lock()
+        request = req
+        lock.unlock()
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        let req = request
+        lock.unlock()
+        req?.append(buffer)
+    }
+
+    func endAudio() {
+        lock.lock()
+        let req = request
+        lock.unlock()
+        req?.endAudio()
+    }
+}
 
 class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler {
     var window: NSWindow!
     var webView: WKWebView!
     var daemonProcess: Process?
+
+    // Native macOS Speech.framework + AVAudioEngine live dictation state
+    private var audioEngine: AVAudioEngine?
+    private var speechRecognizer: SFSpeechRecognizer?
+    private let requestBox = MacSpeechRequestBox()
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var isVoiceRecording = false
+    private var committedVoiceText = ""
+    private var currentSegmentText = ""
+    private var didReceiveVoiceFinal = false
+    private var lastWaveSentAt: TimeInterval = 0
+    private var wavePhase: Double = 0
+    private var waveLevels: [Double] = Array(repeating: 0.16, count: 24)
 
     func isDaemonPortListening() -> Bool {
         var addr = sockaddr_in()
@@ -31,15 +71,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
 
         let bundledBin = Bundle.main.bundlePath + "/Contents/MacOS/velo-daemon"
         let bundledUiDir = Bundle.main.bundlePath + "/Contents/Resources/dist"
-        let devReleaseBin = "/Users/daiyudai/code/velo/target/release/velo"
-        let devDebugBin = "/Users/daiyudai/code/velo/target/debug/velo"
+        let userHomeBin = NSHomeDirectory() + "/.velo/bin/velo-daemon"
         let daemonBin: String
         if FileManager.default.isExecutableFile(atPath: bundledBin) {
             daemonBin = bundledBin
-        } else if FileManager.default.isExecutableFile(atPath: devReleaseBin) {
-            daemonBin = devReleaseBin
-        } else if FileManager.default.isExecutableFile(atPath: devDebugBin) {
-            daemonBin = devDebugBin
+        } else if FileManager.default.isExecutableFile(atPath: userHomeBin) {
+            daemonBin = userHomeBin
         } else {
             return
         }
@@ -114,7 +151,199 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
             default:
                 window.appearance = nil
             }
+        } else if message.name == "veloVoice", let action = message.body as? String {
+            switch action {
+            case "start":
+                startNativeVoiceDictation()
+            case "stop":
+                stopNativeVoiceDictation(deliverTranscript: true)
+            case "cancel":
+                stopNativeVoiceDictation(deliverTranscript: false)
+            default:
+                break
+            }
         }
+    }
+
+    // MARK: - Native macOS Speech.framework Dictation Bridge
+
+    private func startNativeVoiceDictation() {
+        if isVoiceRecording { return }
+
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] micGranted in
+            guard let self, micGranted else {
+                DispatchQueue.main.async {
+                    self?.emitVoiceJS("window.__veloOnNativeVoiceResult && window.__veloOnNativeVoiceResult('');")
+                }
+                return
+            }
+
+            SFSpeechRecognizer.requestAuthorization { [weak self] authStatus in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard authStatus == .authorized,
+                          let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")) ?? SFSpeechRecognizer(),
+                          recognizer.isAvailable
+                    else {
+                        self.emitVoiceJS("window.__veloOnNativeVoiceFallback && window.__veloOnNativeVoiceFallback();")
+                        return
+                    }
+
+                    let engine = AVAudioEngine()
+                    let inputNode = engine.inputNode
+                    let fmt = inputNode.outputFormat(forBus: 0)
+                    guard fmt.sampleRate > 0 && fmt.channelCount > 0 else {
+                        self.emitVoiceJS("window.__veloOnNativeVoiceFallback && window.__veloOnNativeVoiceFallback();")
+                        return
+                    }
+
+                    self.committedVoiceText = ""
+                    self.currentSegmentText = ""
+                    self.didReceiveVoiceFinal = false
+                    self.wavePhase = 0
+                    self.waveLevels = Array(repeating: 0.18, count: 24)
+                    self.speechRecognizer = recognizer
+                    self.startSpeechSegment(with: recognizer)
+
+                    let box = self.requestBox
+                    inputNode.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buffer, _ in
+                        box.append(buffer)
+                        let lvl = Self.computeNormalizedLevel(from: buffer)
+                        let now = CACurrentMediaTime()
+                        DispatchQueue.main.async {
+                            guard let self, self.isVoiceRecording else { return }
+                            guard now - self.lastWaveSentAt >= 0.045 else { return }
+                            self.lastWaveSentAt = now
+                            self.wavePhase += 0.55
+                            let idle = 0.16 + 0.07 * abs(sin(self.wavePhase))
+                            let boosted = min(1.0, max(idle, pow(max(0, lvl), 0.72) * 1.15))
+                            if !self.waveLevels.isEmpty { self.waveLevels.removeFirst() }
+                            self.waveLevels.append(boosted)
+                            let csv = self.waveLevels.map { String(format: "%.3f", $0) }.joined(separator: ",")
+                            self.emitVoiceJS("window.__veloOnNativeVoiceLevels && window.__veloOnNativeVoiceLevels([\(csv)]);")
+                        }
+                    }
+
+                    do {
+                        engine.prepare()
+                        try engine.start()
+                        self.audioEngine = engine
+                        self.isVoiceRecording = true
+                    } catch {
+                        inputNode.removeTap(onBus: 0)
+                        self.requestBox.set(nil)
+                        self.recognitionTask?.cancel()
+                        self.recognitionTask = nil
+                        self.speechRecognizer = nil
+                        self.emitVoiceJS("window.__veloOnNativeVoiceFallback && window.__veloOnNativeVoiceFallback();")
+                    }
+                }
+            }
+        }
+    }
+
+    private func startSpeechSegment(with recognizer: SFSpeechRecognizer) {
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        if #available(macOS 13.0, *) {
+            req.addsPunctuation = true
+        }
+        didReceiveVoiceFinal = false
+        requestBox.set(req)
+
+        recognitionTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
+            let txt = result?.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let isFinal = result?.isFinal ?? false
+            let hasError = (error != nil)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if !txt.isEmpty {
+                    self.currentSegmentText = txt
+                }
+                if isFinal || hasError {
+                    if self.isVoiceRecording, isFinal, let activeRec = self.speechRecognizer, activeRec.isAvailable {
+                        if !self.currentSegmentText.isEmpty {
+                            self.committedVoiceText += self.currentSegmentText
+                            self.currentSegmentText = ""
+                        }
+                        self.startSpeechSegment(with: activeRec)
+                    } else {
+                        self.didReceiveVoiceFinal = true
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopNativeVoiceDictation(deliverTranscript: Bool) {
+        let wasRecording = isVoiceRecording
+        isVoiceRecording = false
+
+        if let engine = audioEngine {
+            engine.stop()
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        audioEngine = nil
+        requestBox.endAudio()
+
+        if !deliverTranscript || !wasRecording {
+            requestBox.set(nil)
+            recognitionTask?.cancel()
+            recognitionTask = nil
+            speechRecognizer = nil
+            committedVoiceText = ""
+            currentSegmentText = ""
+            return
+        }
+
+        // Poll lightly on main runloop up to ~950ms for final punctuated segment
+        var polls = 0
+        func checkReady() {
+            if self.didReceiveVoiceFinal || polls >= 19 {
+                self.recognitionTask?.finish()
+                self.recognitionTask = nil
+                self.requestBox.set(nil)
+                self.speechRecognizer = nil
+                let full = (self.committedVoiceText + self.currentSegmentText)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let jsonData = try? JSONSerialization.data(withJSONObject: [full]),
+                   let jsonArr = String(data: jsonData, encoding: .utf8)
+                {
+                    self.emitVoiceJS("window.__veloOnNativeVoiceResult && window.__veloOnNativeVoiceResult((\(jsonArr))[0]);")
+                } else {
+                    self.emitVoiceJS("window.__veloOnNativeVoiceResult && window.__veloOnNativeVoiceResult('');")
+                }
+                return
+            }
+            polls += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                checkReady()
+            }
+        }
+        checkReady()
+    }
+
+    private func emitVoiceJS(_ js: String) {
+        webView?.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    private static func computeNormalizedLevel(from buffer: AVAudioPCMBuffer) -> Double {
+        let frames = Int(buffer.frameLength)
+        guard frames > 0, let ch = buffer.floatChannelData?[0] else { return 0.16 }
+        var sum: Float = 0
+        let step = max(1, frames / 256)
+        var count = 0
+        var i = 0
+        while i < frames {
+            let s = ch[i]
+            sum += s * s
+            count += 1
+            i += step
+        }
+        let rms = sqrt(sum / Float(max(1, count)))
+        let db = 20.0 * log10(max(Double(rms), 0.000_02))
+        let clamped = max(-52.0, min(-8.0, db))
+        return (clamped + 52.0) / 44.0
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -140,8 +369,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         let contentController = WKUserContentController()
         contentController.add(self, name: "windowDrag")
         contentController.add(self, name: "windowTheme")
+        contentController.add(self, name: "veloVoice")
         let scriptSource = """
         window.__VELO_MACOS_APP__ = true;
+        window.__VELO_NATIVE_VOICE__ = true;
         window.addEventListener('mousedown', function(e) {
           if (e.button !== 0) return;
           if (e.target && e.target.closest && e.target.closest('button, input, textarea, a, select')) return;

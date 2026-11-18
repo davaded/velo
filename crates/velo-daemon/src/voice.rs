@@ -33,6 +33,8 @@ pub async fn transcribe_audio(
         "wav"
     } else if mime_type.contains("mp4") || mime_type.contains("m4a") {
         "m4a"
+    } else if mime_type.contains("caf") {
+        "caf"
     } else {
         "webm"
     };
@@ -125,11 +127,11 @@ pub async fn transcribe_audio(
                 ])
                 .output()
                 .await;
-            let _ = tokio::fs::remove_file(&raw_file).await;
             if let Ok(res) = out {
                 if res.status.success() {
                     if let Ok(val) = serde_json::from_slice::<Value>(&res.stdout) {
                         if let Some(t) = val.get("text").and_then(|v| v.as_str()) {
+                            let _ = tokio::fs::remove_file(&raw_file).await;
                             return json!(TranscribeResponse {
                                 ok: true,
                                 text: t.trim().to_string(),
@@ -143,11 +145,117 @@ pub async fn transcribe_audio(
         }
     }
 
+    // 3. macOS Native Speech.framework (`SFSpeechURLRecognitionRequest`) zero-dependency fallback
+    #[cfg(target_os = "macos")]
+    {
+        let mut speech_input = raw_file.clone();
+        let mut converted_wav: Option<std::path::PathBuf> = None;
+
+        // Convert webm/ogg to 16kHz wav if ffmpeg is available; m4a/wav/caf are read natively by Speech.framework
+        if ext == "webm" {
+            if let Some(ffmpeg) = resolve_cli_binary("ffmpeg") {
+                let wav_path = temp_dir.join(format!("voice-conv-{}.wav", Uuid::new_v4()));
+                let conv = Command::new(&ffmpeg)
+                    .args([
+                        "-y",
+                        "-i",
+                        &raw_file.to_string_lossy(),
+                        "-ar",
+                        "16000",
+                        "-ac",
+                        "1",
+                        &wav_path.to_string_lossy(),
+                    ])
+                    .env("PATH", &aug_path)
+                    .output()
+                    .await;
+                if let Ok(c) = conv {
+                    if c.status.success() && wav_path.exists() {
+                        speech_input = wav_path.clone();
+                        converted_wav = Some(wav_path);
+                    }
+                }
+            }
+        }
+
+        let locale_id = if lang.starts_with("zh") {
+            "zh-CN"
+        } else if lang.starts_with("en") {
+            "en-US"
+        } else {
+            lang
+        };
+        let swift_src = format!(
+            r#"
+import Foundation
+import Speech
+
+let url = URL(fileURLWithPath: "{}")
+guard let rec = SFSpeechRecognizer(locale: Locale(identifier: "{}")) ?? SFSpeechRecognizer(),
+      rec.isAvailable else {{
+    exit(2)
+}}
+let req = SFSpeechURLRecognitionRequest(url: url)
+if #available(macOS 13.0, *) {{
+    req.addsPunctuation = true
+}}
+var best = ""
+let sem = DispatchSemaphore(value: 0)
+let _ = rec.recognitionTask(with: req) {{ result, error in
+    if let r = result {{
+        let s = r.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.isEmpty {{ best = s }}
+        if r.isFinal {{ sem.signal() }}
+    }} else if error != nil {{
+        sem.signal()
+    }}
+}}
+_ = sem.wait(timeout: .now() + 12.0)
+if !best.isEmpty {{
+    print("VELO_STT_TEXT:\(best)")
+    exit(0)
+}}
+exit(3)
+"#,
+            speech_input.display(),
+            locale_id
+        );
+
+        let swift_out = Command::new("swift")
+            .args(["-e", &swift_src])
+            .output()
+            .await;
+
+        if let Some(wav_p) = converted_wav {
+            let _ = tokio::fs::remove_file(wav_p).await;
+        }
+
+        if let Ok(out) = swift_out {
+            if out.status.success() {
+                let raw_stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some(txt) = raw_stdout.lines().find_map(|line| {
+                    line.find("VELO_STT_TEXT:")
+                        .map(|p| line[p + "VELO_STT_TEXT:".len()..].trim().to_string())
+                }) {
+                    if !txt.is_empty() {
+                        let _ = tokio::fs::remove_file(&raw_file).await;
+                        return json!(TranscribeResponse {
+                            ok: true,
+                            text: txt,
+                            engine: "macos-speech-framework".to_string(),
+                            error: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let _ = tokio::fs::remove_file(&raw_file).await;
     json!(TranscribeResponse {
         ok: false,
         text: String::new(),
         engine: "webkit-speech".to_string(),
-        error: Some("No local whisper CLI (`mlx_whisper` / `whisper-cli`) or `OPENAI_API_KEY` found; using native WebKit SpeechRecognition.".to_string()),
+        error: Some("No local whisper CLI (`mlx_whisper` / `whisper-cli`) or `OPENAI_API_KEY` found; using native Speech.".to_string()),
     })
 }

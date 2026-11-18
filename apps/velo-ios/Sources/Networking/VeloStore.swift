@@ -514,10 +514,26 @@ public final class VeloStore: ObservableObject {
     public func loadEventsForSession(_ sessionId: String) async {
         switch connectionConfig {
         case .direct(let baseURL):
-            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/events") else { return }
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/events?limit=160") else { return }
             guard let (data, _) = try? await URLSession.shared.data(from: url),
-                  let rawList = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+                  let parsedJson = try? JSONSerialization.jsonObject(with: data)
             else { return }
+
+            let rawList: [[String: Any]]
+            if let arr = parsedJson as? [[String: Any]] {
+                rawList = arr
+            } else if let pageObj = parsedJson as? [String: Any],
+                      let evs = pageObj["events"] as? [[String: Any]]
+            {
+                rawList = evs
+                if let oSeq = VeloSessionItem.intValue(pageObj["oldest_seq"]) {
+                    oldestSeqBySession[sessionId] = oSeq
+                }
+                hasMoreHistoryBySession[sessionId] = (pageObj["has_more"] as? Bool) ?? false
+            } else {
+                return
+            }
+
             let sessionItem = sessions.first(where: { $0.id == sessionId })
             let fallbackProv = sessionItem?.agentKind ?? "agy"
             let (items, activeStart) = Self.reconstructEventsWithActiveTurn(
@@ -535,7 +551,8 @@ public final class VeloStore: ObservableObject {
                 self.turnStartedAtBySession[sessionId] = activeStart
             }
         case .e2eeRelay:
-            sendEncryptedCommand(["cmd": "get_events", "session_id": sessionId])
+            oldestSeqBySession.removeValue(forKey: sessionId)
+            sendEncryptedCommand(["cmd": "get_events_page", "session_id": sessionId, "limit": 140])
         case .none:
             break
         }
@@ -936,17 +953,37 @@ public final class VeloStore: ObservableObject {
         oldestSeq: Int?,
         hasMore: Bool
     ) {
+        let isInitialPage = (oldestSeqBySession[sessionId] == nil)
         if let oldestSeq { oldestSeqBySession[sessionId] = oldestSeq }
         hasMoreHistoryBySession[sessionId] = hasMore
-        let prov = sessions.first(where: { $0.id == sessionId })?.agentKind ?? "claude"
-        let parsed = Self.reconstructEventsFromHistory(sessionId: sessionId, rawList: rawEvents, fallbackProvider: prov)
+
+        let sessionItem = sessions.first(where: { $0.id == sessionId })
+        let prov = sessionItem?.agentKind ?? "claude"
+        let (parsed, activeStart) = Self.reconstructEventsWithActiveTurn(
+            sessionId: sessionId,
+            rawList: rawEvents,
+            fallbackProvider: prov
+        )
+        if isInitialPage {
+            if !parsed.isEmpty || eventsBySession[sessionId] == nil {
+                eventsBySession[sessionId] = parsed
+                scheduleCacheSave()
+            }
+            if sessionItem?.status == .running || sessionItem?.status == .waitingApproval,
+               let activeStart
+            {
+                turnStartedAtBySession[sessionId] = activeStart
+            }
+            return
+        }
+
         guard !parsed.isEmpty else { return }
         let existing = eventsBySession[sessionId] ?? []
         if existing.isEmpty {
             eventsBySession[sessionId] = parsed
             return
         }
-        let existingContents = Set(existing.prefix(8).map { "\($0.timestamp)|\($0.content.prefix(64))" })
+        let existingContents = Set(existing.prefix(10).map { "\($0.timestamp)|\($0.content.prefix(64))" })
         let uniqueOlder = parsed.filter { !existingContents.contains("\($0.timestamp)|\($0.content.prefix(64))") }
         if !uniqueOlder.isEmpty {
             eventsBySession[sessionId] = uniqueOlder + existing

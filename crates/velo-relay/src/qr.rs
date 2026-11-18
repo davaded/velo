@@ -587,7 +587,7 @@ req.symbologies = [.qr]
 let handler = VNImageRequestHandler(cgImage: cgImg, options: [:])
 try handler.perform([req])
 if let hit = req.results?.first?.payloadStringValue {{
-    print(hit)
+    print("VELO_QR_HIT:\(hit)")
 }} else {{
     fputs("NO_QR_DETECTED\n", stderr)
     exit(3)
@@ -600,14 +600,21 @@ if let hit = req.results?.first?.payloadStringValue {{
                 .output()
                 .expect("run swift Vision QR scanner");
             let _ = std::fs::remove_file(&tmp_path);
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let raw_stdout = String::from_utf8_lossy(&out.stdout);
+            let decoded = raw_stdout
+                .lines()
+                .find_map(|line| {
+                    line.find("VELO_QR_HIT:")
+                        .map(|pos| line[pos + "VELO_QR_HIT:".len()..].trim().to_string())
+                })
+                .unwrap_or_else(|| raw_stdout.trim().to_string());
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             assert!(
                 out.status.success(),
                 "Vision failed on case {idx} (ver size {}): stderr={stderr}",
                 qr.size
             );
-            assert_eq!(stdout, *expected, "Decoded QR payload mismatch on case {idx}");
+            assert_eq!(decoded, *expected, "Decoded QR payload mismatch on case {idx}");
         }
     }
 }

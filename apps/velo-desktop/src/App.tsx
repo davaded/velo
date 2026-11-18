@@ -71,7 +71,6 @@ import {
   Server,
   Settings,
   Smartphone,
-  Square,
   SquarePen,
   Sun,
   Terminal,
@@ -704,8 +703,15 @@ export function App() {
   const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
   const [composerDragOver, setComposerDragOver] = useState<boolean>(false);
   const [isDictating, setIsDictating] = useState<boolean>(false);
-  const speechRecRef = useRef<{ stop: () => void } | null>(null);
+  const [isTranscribingVoice, setIsTranscribingVoice] = useState<boolean>(false);
+  const [voiceLevels, setVoiceLevels] = useState<number[]>(() => Array(24).fill(0.16));
+  const speechRecRef = useRef<{ stop: () => void; abort?: () => void } | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const discardRecordingRef = useRef<boolean>(false);
+  const webAudioCleanupRef = useRef<(() => void) | null>(null);
+  const [oldestSeqBySession, setOldestSeqBySession] = useState<Record<string, number>>({});
+  const [hasMoreHistoryBySession, setHasMoreHistoryBySession] = useState<Record<string, boolean>>({});
+  const [loadingOlderBySession, setLoadingOlderBySession] = useState<Record<string, boolean>>({});
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renamingTitle, setRenamingTitle] = useState<string>("");
 
@@ -1017,22 +1023,46 @@ export function App() {
   const syncSessionEventsFromDaemon = useCallback(
     (sid: string) => {
       if (!sid || sid.startsWith("sess-") || sid.startsWith("wt-")) return;
-      fetch(`${daemonUrl}/api/sessions/${sid}/events`)
+      fetch(`${daemonUrl}/api/sessions/${sid}/events?limit=180`)
         .then((r) => (r.ok ? r.json() : Promise.reject()))
-        .then((rawList: Array<Record<string, unknown>>) => {
-          if (!Array.isArray(rawList) || rawList.length === 0) return;
-          const reconstructed = reconstructEventsFromHistory(sid, rawList);
-          if (reconstructed.length > 0) {
-            setEventsBySession((prev) => {
-              const cur = prev[sid] || [];
-              const isActivelyStreaming = cur.some((x) => x.is_streaming_chunk);
-              if (isActivelyStreaming && cur.length > reconstructed.length) {
-                return prev;
+        .then(
+          (
+            payload:
+              | Array<Record<string, unknown>>
+              | {
+                  events?: Array<Record<string, unknown>>;
+                  oldest_seq?: number | null;
+                  has_more?: boolean;
+                }
+          ) => {
+            const rawList = Array.isArray(payload)
+              ? payload
+              : Array.isArray(payload?.events)
+              ? payload.events
+              : [];
+            if (!Array.isArray(payload)) {
+              if (typeof payload?.oldest_seq === "number") {
+                setOldestSeqBySession((prev) => ({ ...prev, [sid]: payload.oldest_seq as number }));
               }
-              return { ...prev, [sid]: reconstructed };
-            });
+              setHasMoreHistoryBySession((prev) => ({
+                ...prev,
+                [sid]: Boolean(payload?.has_more),
+              }));
+            }
+            if (rawList.length === 0) return;
+            const reconstructed = reconstructEventsFromHistory(sid, rawList);
+            if (reconstructed.length > 0) {
+              setEventsBySession((prev) => {
+                const cur = prev[sid] || [];
+                const isActivelyStreaming = cur.some((x) => x.is_streaming_chunk);
+                if (isActivelyStreaming && cur.length > reconstructed.length) {
+                  return prev;
+                }
+                return { ...prev, [sid]: reconstructed };
+              });
+            }
           }
-        })
+        )
         .catch(() => {
           if (
             e2eeRelayConfig &&
@@ -1043,13 +1073,82 @@ export function App() {
               e2eeRelayConfig.sharedKeyHex,
               "mobile-web",
               e2eeNonceRef.current++,
-              { cmd: "get_events", session_id: sid }
+              { cmd: "get_events_page", session_id: sid, limit: 140 }
             );
             e2eeWsRef.current.send(sealed);
           }
         });
     },
     [daemonUrl, e2eeRelayConfig]
+  );
+
+  const loadOlderEventsForSession = useCallback(
+    async (sid: string) => {
+      if (!sid || sid === "sess-default" || loadingOlderBySession[sid]) return;
+      const beforeSeq = oldestSeqBySession[sid];
+      if (typeof beforeSeq !== "number") return;
+      setLoadingOlderBySession((prev) => ({ ...prev, [sid]: true }));
+      const scrollEl = chatScrollRef.current;
+      const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
+      const prevScrollTop = scrollEl ? scrollEl.scrollTop : 0;
+
+      try {
+        const res = await fetch(
+          `${daemonUrl}/api/sessions/${sid}/events?limit=160&before_seq=${beforeSeq}`
+        );
+        if (res.ok) {
+          const page = (await res.json()) as {
+            events?: Array<Record<string, unknown>>;
+            oldest_seq?: number | null;
+            has_more?: boolean;
+          };
+          if (typeof page.oldest_seq === "number") {
+            setOldestSeqBySession((prev) => ({ ...prev, [sid]: page.oldest_seq as number }));
+          }
+          setHasMoreHistoryBySession((prev) => ({ ...prev, [sid]: Boolean(page.has_more) }));
+          const olderRaw = Array.isArray(page.events) ? page.events : [];
+          const olderEvents = reconstructEventsFromHistory(sid, olderRaw);
+          if (olderEvents.length > 0) {
+            setEventsBySession((prev) => {
+              const cur = prev[sid] || [];
+              const headKeys = new Set(
+                cur.slice(0, 10).map((e) => `${e.timestamp}|${e.content.slice(0, 64)}`)
+              );
+              const deduped = olderEvents.filter(
+                (e) => !headKeys.has(`${e.timestamp}|${e.content.slice(0, 64)}`)
+              );
+              return deduped.length > 0 ? { ...prev, [sid]: [...deduped, ...cur] } : prev;
+            });
+            requestAnimationFrame(() => {
+              const el = chatScrollRef.current;
+              if (el && prevScrollHeight > 0) {
+                el.scrollTop = prevScrollTop + (el.scrollHeight - prevScrollHeight);
+              }
+            });
+          }
+          setLoadingOlderBySession((prev) => ({ ...prev, [sid]: false }));
+          return;
+        }
+      } catch {
+        // Fallback to E2EE relay below
+      }
+
+      if (
+        e2eeRelayConfig &&
+        e2eeWsRef.current &&
+        e2eeWsRef.current.readyState === WebSocket.OPEN
+      ) {
+        const sealed = e2eeSealJson(
+          e2eeRelayConfig.sharedKeyHex,
+          "mobile-web",
+          e2eeNonceRef.current++,
+          { cmd: "get_events_page", session_id: sid, before_seq: beforeSeq, limit: 140 }
+        );
+        e2eeWsRef.current.send(sealed);
+      }
+      setLoadingOlderBySession((prev) => ({ ...prev, [sid]: false }));
+    },
+    [daemonUrl, e2eeRelayConfig, loadingOlderBySession, oldestSeqBySession]
   );
 
   useEffect(() => {
@@ -1220,6 +1319,41 @@ export function App() {
               curId === "sess-default" || !curId ? normalized[0].id : curId
             );
           }
+        }
+        return;
+      }
+
+      if (
+        raw.type === "events_page" &&
+        typeof raw.session_id === "string" &&
+        Array.isArray(raw.events)
+      ) {
+        const pageSid = raw.session_id;
+        if (typeof raw.oldest_seq === "number") {
+          setOldestSeqBySession((prev) => ({ ...prev, [pageSid]: raw.oldest_seq as number }));
+        }
+        setHasMoreHistoryBySession((prev) => ({
+          ...prev,
+          [pageSid]: Boolean(raw.has_more),
+        }));
+        const parsedPage = reconstructEventsFromHistory(
+          pageSid,
+          raw.events as Array<Record<string, unknown>>
+        );
+        if (parsedPage.length > 0) {
+          setEventsBySession((prev) => {
+            const cur = prev[pageSid] || [];
+            if (cur.length === 0) {
+              return { ...prev, [pageSid]: parsedPage };
+            }
+            const headKeys = new Set(
+              cur.slice(0, 10).map((e) => `${e.timestamp}|${e.content.slice(0, 64)}`)
+            );
+            const deduped = parsedPage.filter(
+              (e) => !headKeys.has(`${e.timestamp}|${e.content.slice(0, 64)}`)
+            );
+            return deduped.length > 0 ? { ...prev, [pageSid]: [...deduped, ...cur] } : prev;
+          });
         }
         return;
       }
@@ -3082,15 +3216,140 @@ export function App() {
     }).catch(() => {});
   };
 
-  // Hands-Free Voice Dictation Input (Web Speech API + MediaRecorder `/api/transcribe` fallback)
+  const startBrowserAudioMeter = async (): Promise<MediaStream | null> => {
+    if (!navigator.mediaDevices?.getUserMedia) return null;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (AudioCtx) {
+        const ctx = new AudioCtx();
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 64;
+        source.connect(analyser);
+        const freq = new Uint8Array(analyser.frequencyBinCount);
+        let rafId = 0;
+        let phase = 0;
+        let lastTick = 0;
+        const tick = (ts: number) => {
+          if (ts - lastTick >= 42) {
+            lastTick = ts;
+            phase += 0.5;
+            analyser.getByteFrequencyData(freq);
+            let sum = 0;
+            for (let i = 0; i < freq.length; i++) sum += freq[i];
+            const avg = sum / Math.max(1, freq.length * 255);
+            const idle = 0.16 + 0.07 * Math.abs(Math.sin(phase));
+            const lvl = Math.min(1, Math.max(idle, Math.pow(avg, 0.7) * 1.45));
+            setVoiceLevels((prev) => [...prev.slice(1), lvl]);
+          }
+          rafId = requestAnimationFrame(tick);
+        };
+        rafId = requestAnimationFrame(tick);
+        webAudioCleanupRef.current = () => {
+          cancelAnimationFrame(rafId);
+          stream.getTracks().forEach((t) => t.stop());
+          ctx.close().catch(() => {});
+          webAudioCleanupRef.current = null;
+        };
+      }
+      return stream;
+    } catch {
+      return null;
+    }
+  };
+
+  const handleFinishVoiceDictation = () => {
+    discardRecordingRef.current = false;
+    const nw = window as unknown as {
+      __VELO_NATIVE_VOICE__?: boolean;
+      webkit?: { messageHandlers?: { veloVoice?: { postMessage: (msg: string) => void } } };
+    };
+    if (nw.__VELO_NATIVE_VOICE__ && nw.webkit?.messageHandlers?.veloVoice) {
+      setIsDictating(false);
+      setIsTranscribingVoice(true);
+      nw.webkit.messageHandlers.veloVoice.postMessage("stop");
+      return;
+    }
+    setIsDictating(false);
+    speechRecRef.current?.stop();
+    speechRecRef.current = null;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      setIsTranscribingVoice(true);
+      mediaRecorderRef.current.stop();
+    } else {
+      webAudioCleanupRef.current?.();
+      setVoiceLevels(Array(24).fill(0.16));
+    }
+  };
+
+  const handleCancelVoiceDictation = () => {
+    discardRecordingRef.current = true;
+    setIsDictating(false);
+    setIsTranscribingVoice(false);
+    const nw = window as unknown as {
+      __VELO_NATIVE_VOICE__?: boolean;
+      webkit?: { messageHandlers?: { veloVoice?: { postMessage: (msg: string) => void } } };
+    };
+    if (nw.__VELO_NATIVE_VOICE__ && nw.webkit?.messageHandlers?.veloVoice) {
+      nw.webkit.messageHandlers.veloVoice.postMessage("cancel");
+    }
+    if (speechRecRef.current) {
+      if (speechRecRef.current.abort) speechRecRef.current.abort();
+      else speechRecRef.current.stop();
+      speechRecRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+    webAudioCleanupRef.current?.();
+    setVoiceLevels(Array(24).fill(0.16));
+  };
+
+  // Hands-Free Voice Dictation Input (Native macOS Speech.framework -> Web Speech -> `/api/transcribe`)
   const handleToggleVoiceDictation = async () => {
     if (isDictating) {
-      setIsDictating(false);
-      speechRecRef.current?.stop();
-      speechRecRef.current = null;
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
-      }
+      handleFinishVoiceDictation();
+      return;
+    }
+
+    discardRecordingRef.current = false;
+    setVoiceLevels(Array(24).fill(0.18));
+
+    const nw = window as unknown as {
+      __VELO_NATIVE_VOICE__?: boolean;
+      __veloOnNativeVoiceLevels?: (levels: number[]) => void;
+      __veloOnNativeVoiceResult?: (text: string) => void;
+      __veloOnNativeVoiceFallback?: () => void;
+      webkit?: { messageHandlers?: { veloVoice?: { postMessage: (msg: string) => void } } };
+    };
+
+    if (nw.__VELO_NATIVE_VOICE__ && nw.webkit?.messageHandlers?.veloVoice) {
+      nw.__veloOnNativeVoiceLevels = (levels: number[]) => {
+        if (Array.isArray(levels) && levels.length > 0) {
+          setVoiceLevels(levels);
+        }
+      };
+      nw.__veloOnNativeVoiceResult = (text: string) => {
+        setIsDictating(false);
+        setIsTranscribingVoice(false);
+        setVoiceLevels(Array(24).fill(0.16));
+        const clean = (text || "").trim();
+        if (clean && !discardRecordingRef.current) {
+          setPrompt((prev) => (prev ? `${prev} ${clean}` : clean));
+          setTimeout(() => composerTextareaRef.current?.focus(), 20);
+        }
+      };
+      nw.__veloOnNativeVoiceFallback = () => {
+        // If macOS Speech permission is disabled, gracefully fall back to browser/daemon MediaRecorder
+        nw.__VELO_NATIVE_VOICE__ = false;
+        setIsDictating(false);
+        void handleToggleVoiceDictation();
+      };
+      setIsDictating(true);
+      nw.webkit.messageHandlers.veloVoice.postMessage("start");
       return;
     }
 
@@ -3104,6 +3363,7 @@ export function App() {
         onend: (() => void) | null;
         start: () => void;
         stop: () => void;
+        abort?: () => void;
       };
       webkitSpeechRecognition?: new () => {
         lang: string;
@@ -3114,17 +3374,20 @@ export function App() {
         onend: (() => void) | null;
         start: () => void;
         stop: () => void;
+        abort?: () => void;
       };
     };
 
     const SpeechCtor = w.SpeechRecognition || w.webkitSpeechRecognition;
     if (SpeechCtor) {
       try {
+        await startBrowserAudioMeter();
         const rec = new SpeechCtor();
         rec.lang = navigator.language || "zh-CN";
         rec.continuous = true;
         rec.interimResults = false;
         rec.onresult = (ev) => {
+          if (discardRecordingRef.current) return;
           let finalChunk = "";
           for (let i = 0; i < ev.results.length; i++) {
             const resItem = ev.results[i];
@@ -3136,54 +3399,72 @@ export function App() {
             setPrompt((prev) => (prev ? `${prev} ${finalChunk.trim()}` : finalChunk.trim()));
           }
         };
-        rec.onerror = () => setIsDictating(false);
-        rec.onend = () => setIsDictating(false);
+        rec.onerror = () => {
+          webAudioCleanupRef.current?.();
+          setIsDictating(false);
+        };
+        rec.onend = () => {
+          webAudioCleanupRef.current?.();
+          setIsDictating(false);
+        };
         speechRecRef.current = rec;
         setIsDictating(true);
         rec.start();
         return;
       } catch {
-        // fallback to MediaRecorder below
+        webAudioCleanupRef.current?.();
       }
     }
 
-    if (navigator.mediaDevices?.getUserMedia) {
+    const stream = await startBrowserAudioMeter();
+    if (stream) {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const chunks: BlobPart[] = [];
         const mr = new MediaRecorder(stream);
         mr.ondataavailable = (e) => {
           if (e.data.size > 0) chunks.push(e.data);
         };
         mr.onstop = async () => {
-          stream.getTracks().forEach((t) => t.stop());
-          const blob = new Blob(chunks, { type: mr.mimeType || "audio/webm" });
-          const b64 = await new Promise<string>((resolve) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(String(reader.result || ""));
-            reader.readAsDataURL(blob);
-          });
-          const res = await fetch(`${daemonUrl}/api/transcribe`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              audio_base64: b64,
-              mime_type: blob.type || "audio/webm",
-              language: "zh",
-            }),
-          });
-          if (res.ok) {
-            const d = (await res.json()) as { ok?: boolean; text?: string };
-            if (d.ok && d.text?.trim()) {
-              setPrompt((prev) => (prev ? `${prev} ${d.text!.trim()}` : d.text!.trim()));
-            }
+          webAudioCleanupRef.current?.();
+          setVoiceLevels(Array(24).fill(0.16));
+          if (discardRecordingRef.current) {
+            setIsDictating(false);
+            setIsTranscribingVoice(false);
+            return;
           }
-          setIsDictating(false);
+          try {
+            const blob = new Blob(chunks, { type: mr.mimeType || "audio/webm" });
+            const b64 = await new Promise<string>((resolve) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(String(reader.result || ""));
+              reader.readAsDataURL(blob);
+            });
+            const res = await fetch(`${daemonUrl}/api/transcribe`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                audio_base64: b64,
+                mime_type: blob.type || "audio/webm",
+                language: "zh",
+              }),
+            });
+            if (res.ok) {
+              const d = (await res.json()) as { ok?: boolean; text?: string };
+              if (d.ok && d.text?.trim()) {
+                setPrompt((prev) => (prev ? `${prev} ${d.text!.trim()}` : d.text!.trim()));
+                setTimeout(() => composerTextareaRef.current?.focus(), 20);
+              }
+            }
+          } finally {
+            setIsDictating(false);
+            setIsTranscribingVoice(false);
+          }
         };
         mediaRecorderRef.current = mr;
         setIsDictating(true);
         mr.start();
       } catch {
+        webAudioCleanupRef.current?.();
         setIsDictating(false);
       }
     }
@@ -4178,11 +4459,35 @@ export function App() {
                 const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
                 isPinnedToBottomRef.current = nearBottom;
                 setShowJumpToBottom(!nearBottom);
+                if (
+                  el.scrollTop < 32 &&
+                  hasMoreHistoryBySession[activeSession.id] &&
+                  !loadingOlderBySession[activeSession.id]
+                ) {
+                  void loadOlderEventsForSession(activeSession.id);
+                }
               }}
               className="w-full flex-1 overflow-y-auto px-3.5 py-4 sm:px-6 sm:py-6"
               data-testid="agent-chat-scroll"
             >
               <div className="mx-auto flex max-w-[680px] flex-col gap-1.5">
+                {hasMoreHistoryBySession[activeSession.id] && (
+                  <div className="mb-2 flex justify-center">
+                    <button
+                      type="button"
+                      onClick={() => void loadOlderEventsForSession(activeSession.id)}
+                      disabled={Boolean(loadingOlderBySession[activeSession.id])}
+                      className="inline-flex items-center gap-1.5 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3 py-1 text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:border-[var(--v-border-strong)] hover:text-[var(--v-fg-primary)] cursor-pointer disabled:opacity-50"
+                    >
+                      <span>
+                        {loadingOlderBySession[activeSession.id]
+                          ? "正在加载更早记录…"
+                          : "↑ 加载更早历史消息"}
+                      </span>
+                    </button>
+                  </div>
+                )}
+
                 {activeEvents.length === 0 && (
                   <div className="my-20 flex flex-col items-center justify-center gap-3 text-center select-none">
                     <div className="inline-flex items-center gap-2 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3 py-1 text-[12px] text-[var(--v-fg-secondary)]">
@@ -4880,38 +5185,75 @@ export function App() {
                     </div>
                   )}
 
-                  <textarea
-                    ref={composerTextareaRef}
-                    rows={2}
-                    value={prompt}
-                    onChange={(e) => handlePromptChange(e.target.value)}
-                    onPaste={(e) => {
-                      const items = e.clipboardData?.items;
-                      if (!items) return;
-                      const imgFiles: File[] = [];
-                      for (let i = 0; i < items.length; i++) {
-                        if (items[i].type.startsWith("image/")) {
-                          const file = items[i].getAsFile();
-                          if (file) imgFiles.push(file);
+                  {isDictating ? (
+                    <div className="flex items-center gap-2.5 py-1.5">
+                      <button
+                        type="button"
+                        onClick={handleCancelVoiceDictation}
+                        aria-label="Cancel voice recording"
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--v-bg-active)] text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-primary)] cursor-pointer"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+
+                      <div className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-full border border-[#f87171]/25 bg-[#f87171]/10 px-3">
+                        <span className="h-2 w-2 shrink-0 rounded-full bg-[#f87171] animate-pulse" />
+                        <div className="flex flex-1 items-center justify-center gap-[3.5px]">
+                          {voiceLevels.map((lv, idx) => (
+                            <span
+                              key={idx}
+                              style={{
+                                height: `${Math.max(4, Math.min(24, Math.round(lv * 24)))}px`,
+                              }}
+                              className="w-[3px] rounded-full bg-gradient-to-t from-[#f87171] to-[#a78bfa] transition-[height] duration-75"
+                            />
+                          ))}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleFinishVoiceDictation}
+                        aria-label="Finish voice recording"
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#f87171]/20 text-[#f87171] transition-colors hover:bg-[#f87171]/30 cursor-pointer"
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ) : (
+                    <textarea
+                      ref={composerTextareaRef}
+                      rows={2}
+                      value={prompt}
+                      onChange={(e) => handlePromptChange(e.target.value)}
+                      onPaste={(e) => {
+                        const items = e.clipboardData?.items;
+                        if (!items) return;
+                        const imgFiles: File[] = [];
+                        for (let i = 0; i < items.length; i++) {
+                          if (items[i].type.startsWith("image/")) {
+                            const file = items[i].getAsFile();
+                            if (file) imgFiles.push(file);
+                          }
                         }
-                      }
-                      if (imgFiles.length > 0) {
-                        e.preventDefault();
-                        handleUploadImageFiles(imgFiles);
-                      }
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        handleSendPrompt();
-                      }
-                    }}
-                    placeholder={`Ask ${
-                      modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-                      activeSession.model_short
-                    } anything... (/ for commands, ⌘V paste screenshot, or click mic to dictate)`}
-                    className="w-full resize-none bg-transparent text-[13.5px] max-md:text-[16px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
-                  />
+                        if (imgFiles.length > 0) {
+                          e.preventDefault();
+                          handleUploadImageFiles(imgFiles);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSendPrompt();
+                        }
+                      }}
+                      placeholder={`Ask ${
+                        modelCatalog.find((m) => m.id === activeSession.model)?.label ||
+                        activeSession.model_short
+                      } anything... (/ for commands, ⌘V paste screenshot, or click mic to dictate)`}
+                      className="w-full resize-none bg-transparent text-[13.5px] max-md:text-[16px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
+                    />
+                  )}
 
                   {/* Composer Bottom Toolbar: Concrete Model Picker (Claude / Codex / ACP) + Effort + Permission Mode + Voice */}
                   <div className="relative mt-1.5 flex flex-wrap items-center justify-between gap-2">
@@ -5302,30 +5644,18 @@ export function App() {
                         <ImagePlus className="h-3.5 w-3.5" />
                       </button>
 
-                      {/* Pill 5: Hands-Free Voice Dictation Input (WebKit SpeechRecognition + Whisper STT Fallback) */}
-                      <button
-                        type="button"
-                        onClick={handleToggleVoiceDictation}
-                        title={
-                          isDictating
-                            ? "Stop voice dictation"
-                            : "Hands-free voice dictation (Web Speech / Whisper STT)"
-                        }
-                        className={`flex h-6 items-center gap-1 rounded-full px-1.5 transition-colors cursor-pointer ${
-                          isDictating
-                            ? "bg-[#f87171]/20 text-[#f87171] animate-pulse"
-                            : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
-                        }`}
-                      >
-                        {isDictating ? (
-                          <>
-                            <Square className="h-3 w-3 fill-current" />
-                            <span className="font-mono text-[10px]">Listening…</span>
-                          </>
-                        ) : (
-                          <Mic className="h-3.5 w-3.5" />
-                        )}
-                      </button>
+                      {/* Pill 5: Voice Dictation Input (Icon-only, zero text while recording) */}
+                      {!isDictating && (
+                        <button
+                          type="button"
+                          onClick={() => void handleToggleVoiceDictation()}
+                          disabled={isTranscribingVoice}
+                          title="Voice dictation"
+                          className="flex h-6 w-6 items-center justify-center rounded-full text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer disabled:opacity-50"
+                        >
+                          <Mic className={`h-3.5 w-3.5 ${isTranscribingVoice ? "animate-pulse text-[#f87171]" : ""}`} />
+                        </button>
+                      )}
                     </div>
 
                     {/* Right Controls: BeautifulContextMeter (Real Token & USD Telemetry) + Submit / Stop Disc */}

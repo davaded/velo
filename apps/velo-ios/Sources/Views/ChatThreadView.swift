@@ -25,6 +25,9 @@ public struct ChatThreadView: View {
     @State private var previewImageItem: PreviewImageTarget?
     @StateObject private var voiceRecorder = VeloVoiceRecorder()
     @State private var isTranscribingVoice: Bool = false
+    @State private var isLoadingOlderHistory: Bool = false
+    @State private var didInitialBottomScroll: Bool = false
+    @State private var lastTailEventId: String? = nil
     @FocusState private var composerFocused: Bool
 
     public init(
@@ -88,13 +91,24 @@ public struct ChatThreadView: View {
                         LazyVStack(alignment: .leading, spacing: 20) {
                             if turns.isEmpty {
                                 emptyThreadHero
-                            } else if store.hasMoreHistoryBySession[sessionId] != false && turns.count >= 6 {
+                            } else if store.hasMoreHistoryBySession[sessionId] == true {
                                 Button {
-                                    Task { await store.loadOlderEventsPage(for: sessionId) }
+                                    guard !isLoadingOlderHistory else { return }
+                                    isLoadingOlderHistory = true
+                                    Task {
+                                        await store.loadOlderEventsPage(for: sessionId)
+                                        try? await Task.sleep(nanoseconds: 250_000_000)
+                                        isLoadingOlderHistory = false
+                                    }
                                 } label: {
                                     HStack(spacing: 5) {
-                                        Image(systemName: "arrow.up.circle")
-                                        Text("加载更早的 SQLite 历史消息")
+                                        if isLoadingOlderHistory {
+                                            ProgressView()
+                                                .scaleEffect(0.72)
+                                        } else {
+                                            Image(systemName: "arrow.up.circle")
+                                        }
+                                        Text(isLoadingOlderHistory ? "正在加载更早记录…" : "加载更早历史消息")
                                     }
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundStyle(.secondary)
@@ -103,6 +117,15 @@ public struct ChatThreadView: View {
                                     .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                                 }
                                 .frame(maxWidth: .infinity)
+                                .onAppear {
+                                    guard didInitialBottomScroll, !isLoadingOlderHistory, !turns.isEmpty else { return }
+                                    isLoadingOlderHistory = true
+                                    Task {
+                                        await store.loadOlderEventsPage(for: sessionId)
+                                        try? await Task.sleep(nanoseconds: 350_000_000)
+                                        isLoadingOlderHistory = false
+                                    }
+                                }
                             }
 
                             ForEach(Array(turns.enumerated()), id: \.element.id) { idx, turn in
@@ -179,7 +202,9 @@ public struct ChatThreadView: View {
                         .padding(.bottom, 12)
                     }
                     .scrollDismissesKeyboard(.interactively)
-                    .onChange(of: store.eventsBySession[sessionId]?.count ?? 0) { _, _ in
+                    .onChange(of: store.eventsBySession[sessionId]?.last?.id) { _, newTailId in
+                        guard let newTailId, newTailId != lastTailEventId else { return }
+                        lastTailEventId = newTailId
                         guard let lastEv = store.eventsBySession[sessionId]?.last else { return }
                         let shouldScroll: Bool = {
                             if !store.autoCollapseSteps { return true }
@@ -202,6 +227,7 @@ public struct ChatThreadView: View {
                         }
                     }
                     .onChange(of: sessionId) { _, newSid in
+                        didInitialBottomScroll = false
                         if let s = store.sessions.first(where: { $0.id == newSid }) {
                             selectedModelId = s.model
                             selectedEffort = s.effort
@@ -209,9 +235,12 @@ public struct ChatThreadView: View {
                         Task {
                             await store.loadEventsForSession(newSid)
                             proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                            try? await Task.sleep(nanoseconds: 350_000_000)
+                            didInitialBottomScroll = true
                         }
                     }
                     .onAppear {
+                        didInitialBottomScroll = false
                         if let s = session {
                             selectedModelId = s.model
                             selectedEffort = s.effort
@@ -219,6 +248,8 @@ public struct ChatThreadView: View {
                         Task {
                             await store.loadEventsForSession(sessionId)
                             proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                            try? await Task.sleep(nanoseconds: 350_000_000)
+                            didInitialBottomScroll = true
                         }
                     }
                 }

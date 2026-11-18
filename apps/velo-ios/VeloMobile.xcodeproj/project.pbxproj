@@ -13,36 +13,69 @@
 		43C9F9C5CA2C460BEB9DF8A0 /* VeloModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B23793B28F46BDB8C60A104 /* VeloModels.swift */; };
 		50FFA3CFDF1E34DD3EA7133E /* ShimmerAndStatusViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = E13A632532CFAE5CC49E17CB /* ShimmerAndStatusViews.swift */; };
 		66FFAD59E86DAA8A5D79E025 /* ChatThreadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D828B8E5BF84F0E2643BE12B /* ChatThreadView.swift */; };
+		8B43636C1DD169FBE665CA6C /* VeloLiveActivityExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FEF16B141B3999FF30C8FA64 /* VeloLiveActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		97D055905EB279BECD30AE6E /* RootSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */; };
 		AC50B5D5C5084CDF2BD2D4B2 /* VeloVoiceRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25AC32F5DCF4E51E8FFD3B07 /* VeloVoiceRecorder.swift */; };
+		B6D84F598B9090DF91FEE791 /* VeloSessionActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3F6064556E00520D2601592 /* VeloSessionActivityAttributes.swift */; };
+		B87DE1091DB0CCCA2E33F72E /* VeloLiveActivityBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DE87A57ED7EFAC041356DA9 /* VeloLiveActivityBundle.swift */; };
 		B9E4D72382735CFC1DFE9F31 /* VeloLiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C851CC5E307FD7AEA5B93E5B /* VeloLiveActivityManager.swift */; };
 		C2256A61C8C4F603B293EDF5 /* QRScannerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D65ECD2C5F1E76064D249E2D /* QRScannerSheet.swift */; };
 		C4B831DBDF9BB144D624EEE3 /* VeloMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79284B976E54269E8F2EB68C /* VeloMobileApp.swift */; };
 		C8B327742DD8C80D4FFDDCCB /* VeloAttachmentCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */; };
 		E97A462096D560AACC4C4D15 /* E2EERelayCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = EACCFB84DE2C81BDE5B763D5 /* E2EERelayCrypto.swift */; };
+		FC835AEE2686E35F6B33C1CC /* VeloSessionActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3F6064556E00520D2601592 /* VeloSessionActivityAttributes.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		0F89F206850AAF1655ABFCB0 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 279B808EB872311CFD08F8C4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 5AE4303F7C160133CB8E786E;
+			remoteInfo = VeloLiveActivityExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		6199D749DA2C96A01C9657CB /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				8B43636C1DD169FBE665CA6C /* VeloLiveActivityExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootSessionsView.swift; sourceTree = "<group>"; };
 		25AC32F5DCF4E51E8FFD3B07 /* VeloVoiceRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloVoiceRecorder.swift; sourceTree = "<group>"; };
 		462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloAttachmentCache.swift; sourceTree = "<group>"; };
 		4B23793B28F46BDB8C60A104 /* VeloModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloModels.swift; sourceTree = "<group>"; };
+		5DE87A57ED7EFAC041356DA9 /* VeloLiveActivityBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloLiveActivityBundle.swift; sourceTree = "<group>"; };
 		6171078B0E084192FA3073FE /* VeloAnalyticsHubSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloAnalyticsHubSheet.swift; sourceTree = "<group>"; };
 		79284B976E54269E8F2EB68C /* VeloMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloMobileApp.swift; sourceTree = "<group>"; };
 		C851CC5E307FD7AEA5B93E5B /* VeloLiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloLiveActivityManager.swift; sourceTree = "<group>"; };
 		CC020058B3917BAE9C4C26A5 /* VeloStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloStore.swift; sourceTree = "<group>"; };
 		D65ECD2C5F1E76064D249E2D /* QRScannerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerSheet.swift; sourceTree = "<group>"; };
 		D828B8E5BF84F0E2643BE12B /* ChatThreadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatThreadView.swift; sourceTree = "<group>"; };
+		D8BBA9339B26E7A8B2CEB4F1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E13A632532CFAE5CC49E17CB /* ShimmerAndStatusViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShimmerAndStatusViews.swift; sourceTree = "<group>"; };
+		E3F6064556E00520D2601592 /* VeloSessionActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloSessionActivityAttributes.swift; sourceTree = "<group>"; };
 		E7494E1C76CB80854A3CFA09 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EACCFB84DE2C81BDE5B763D5 /* E2EERelayCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = E2EERelayCrypto.swift; sourceTree = "<group>"; };
 		F54844DBA9A803062867CFC0 /* VeloMobile.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VeloMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		FEF16B141B3999FF30C8FA64 /* VeloLiveActivityExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = VeloLiveActivityExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
 		0652BC15800B61DFD7B7BB34 /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				FEF16B141B3999FF30C8FA64 /* VeloLiveActivityExtension.appex */,
 				F54844DBA9A803062867CFC0 /* VeloMobile.app */,
 			);
 			name = Products;
@@ -60,6 +93,14 @@
 			path = Views;
 			sourceTree = "<group>";
 		};
+		932A3D1D75F7B7203E0554D5 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				E3F6064556E00520D2601592 /* VeloSessionActivityAttributes.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
 		967F79521E40624C830B8153 /* Models */ = {
 			isa = PBXGroup;
 			children = (
@@ -72,6 +113,8 @@
 			isa = PBXGroup;
 			children = (
 				E7494E1C76CB80854A3CFA09 /* Assets.xcassets */,
+				F3DBCFF48AD5CA1E30AF40F3 /* LiveActivityExtension */,
+				932A3D1D75F7B7203E0554D5 /* Shared */,
 				C2A88D1CEB50F914729DD9E3 /* Sources */,
 				0652BC15800B61DFD7B7BB34 /* Products */,
 			);
@@ -108,6 +151,15 @@
 			path = Crypto;
 			sourceTree = "<group>";
 		};
+		F3DBCFF48AD5CA1E30AF40F3 /* LiveActivityExtension */ = {
+			isa = PBXGroup;
+			children = (
+				D8BBA9339B26E7A8B2CEB4F1 /* Info.plist */,
+				5DE87A57ED7EFAC041356DA9 /* VeloLiveActivityBundle.swift */,
+			);
+			path = LiveActivityExtension;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -117,10 +169,12 @@
 			buildPhases = (
 				56AB15BD38DB91D8B5ECB28E /* Sources */,
 				649C3AD76D5C744ECCDD42F5 /* Resources */,
+				6199D749DA2C96A01C9657CB /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				EC12D5964CE027459CF1253E /* PBXTargetDependency */,
 			);
 			name = VeloMobile;
 			packageProductDependencies = (
@@ -128,6 +182,23 @@
 			productName = VeloMobile;
 			productReference = F54844DBA9A803062867CFC0 /* VeloMobile.app */;
 			productType = "com.apple.product-type.application";
+		};
+		5AE4303F7C160133CB8E786E /* VeloLiveActivityExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 488529F24A2E2AE49CC29672 /* Build configuration list for PBXNativeTarget "VeloLiveActivityExtension" */;
+			buildPhases = (
+				2D2EC2F969F526B5E045BFFC /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = VeloLiveActivityExtension;
+			packageProductDependencies = (
+			);
+			productName = VeloLiveActivityExtension;
+			productReference = FEF16B141B3999FF30C8FA64 /* VeloLiveActivityExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -139,6 +210,10 @@
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
 					37829F5DBB82079F6A39FB35 = {
+						DevelopmentTeam = 76S2FLMS7Q;
+						ProvisioningStyle = Automatic;
+					};
+					5AE4303F7C160133CB8E786E = {
 						DevelopmentTeam = 76S2FLMS7Q;
 						ProvisioningStyle = Automatic;
 					};
@@ -158,6 +233,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
+				5AE4303F7C160133CB8E786E /* VeloLiveActivityExtension */,
 				37829F5DBB82079F6A39FB35 /* VeloMobile */,
 			);
 		};
@@ -175,6 +251,15 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		2D2EC2F969F526B5E045BFFC /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B87DE1091DB0CCCA2E33F72E /* VeloLiveActivityBundle.swift in Sources */,
+				FC835AEE2686E35F6B33C1CC /* VeloSessionActivityAttributes.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		56AB15BD38DB91D8B5ECB28E /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -189,12 +274,21 @@
 				B9E4D72382735CFC1DFE9F31 /* VeloLiveActivityManager.swift in Sources */,
 				C4B831DBDF9BB144D624EEE3 /* VeloMobileApp.swift in Sources */,
 				43C9F9C5CA2C460BEB9DF8A0 /* VeloModels.swift in Sources */,
+				B6D84F598B9090DF91FEE791 /* VeloSessionActivityAttributes.swift in Sources */,
 				00EF0E4CAD7E2FEBB6F1E847 /* VeloStore.swift in Sources */,
 				AC50B5D5C5084CDF2BD2D4B2 /* VeloVoiceRecorder.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		EC12D5964CE027459CF1253E /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 5AE4303F7C160133CB8E786E /* VeloLiveActivityExtension */;
+			targetProxy = 0F89F206850AAF1655ABFCB0 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		17229218FBF737F48C427A9A /* Debug */ = {
@@ -217,6 +311,25 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.daiyudai.velo.mobile;
 				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		209B91970C01DE1DBB4D615A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LiveActivityExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = VeloLiveActivity;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.daiyudai.velo.mobile.liveactivity;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;
@@ -256,7 +369,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = 76S2FLMS7Q;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -277,7 +390,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.3.1;
+				MARKETING_VERSION = 0.3.2;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -288,6 +401,25 @@
 				SWIFT_VERSION = 5.10;
 			};
 			name = Debug;
+		};
+		5C80B3C18551FCB4D4EC8F20 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LiveActivityExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = VeloLiveActivity;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.daiyudai.velo.mobile.liveactivity;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
 		};
 		BA093B2854510A96BE88D754 /* Release */ = {
 			isa = XCBuildConfiguration;
@@ -324,7 +456,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = 76S2FLMS7Q;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -339,7 +471,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.3.1;
+				MARKETING_VERSION = 0.3.2;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -382,6 +514,15 @@
 			buildConfigurations = (
 				17229218FBF737F48C427A9A /* Debug */,
 				E1CDEEAE7F6DDF4AA6AF3E61 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		488529F24A2E2AE49CC29672 /* Build configuration list for PBXNativeTarget "VeloLiveActivityExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				209B91970C01DE1DBB4D615A /* Debug */,
+				5C80B3C18551FCB4D4EC8F20 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
