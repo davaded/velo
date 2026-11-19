@@ -1994,6 +1994,72 @@ async fn run_supervised_e2ee_bridge(
                                         }
                                     }
                                 }
+                                "get_extensions" => {
+                                    let ext = state.get_extensions_dto().await;
+                                    let resp = json!({
+                                        "type": "extensions_snapshot",
+                                        "mcp_servers": ext.get("mcp_servers").cloned().unwrap_or(json!([])),
+                                        "skills": ext.get("skills").cloned().unwrap_or(json!([])),
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "get_checkpoints" => {
+                                    if let Some(sid_str) = cmd_val.get("session_id").and_then(|v| v.as_str()) {
+                                        if let Ok(sid) = Uuid::parse_str(sid_str) {
+                                            let items = state.list_checkpoints_core(sid).await;
+                                            let resp = json!({
+                                                "type": "checkpoints_snapshot",
+                                                "session_id": sid,
+                                                "checkpoints": items,
+                                            });
+                                            if let Some(frame_txt) = send_sealed_with_key(
+                                                &resp,
+                                                &active_key_hex,
+                                                &mut out_nonce,
+                                            ) {
+                                                let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                "rewind_checkpoint" => {
+                                    if let (Some(sid_str), Some(cp_id)) = (
+                                        cmd_val.get("session_id").and_then(|v| v.as_str()),
+                                        cmd_val.get("checkpoint_id").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(sid) = Uuid::parse_str(sid_str) {
+                                            let resp = match state
+                                                .rewind_checkpoint_core(sid, cp_id.to_string())
+                                                .await
+                                            {
+                                                Ok((restored, items)) => json!({
+                                                    "type": "checkpoint_rewound",
+                                                    "ok": true,
+                                                    "session_id": sid,
+                                                    "restored": restored,
+                                                    "checkpoints": items,
+                                                }),
+                                                Err(err) => json!({
+                                                    "type": "checkpoint_rewound",
+                                                    "ok": false,
+                                                    "session_id": sid,
+                                                    "error": err.to_string(),
+                                                }),
+                                            };
+                                            if let Some(frame_txt) = send_sealed_with_key(
+                                                &resp,
+                                                &active_key_hex,
+                                                &mut out_nonce,
+                                            ) {
+                                                let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                            }
+                                        }
+                                    }
+                                }
                                 "list_cli_sessions" => {
                                     let snap = state.list_cli_sessions_core().await;
                                     let resp = json!({

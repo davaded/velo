@@ -40,12 +40,14 @@ import { QueuedPromptsBar } from "./components/QueuedPromptsBar";
 import { ChatOutlineRail, OutlineTurnSummary } from "./components/ChatOutlineRail";
 import { SidebarQuotaBar } from "./components/SidebarQuotaBar";
 import { RemoteHostsModal } from "./components/RemoteHostsModal";
+import { ExtensionsAndCheckpointsModal } from "./components/ExtensionsAndCheckpointsModal";
 import { e2eeOpenFrame, e2eeSealJson } from "./utils/e2eeRelayClient";
 import {
   Archive,
   ArchiveRestore,
   ArrowDown,
   ArrowUp,
+  Blocks,
   CalendarClock,
   Check,
   ChevronDown,
@@ -61,8 +63,10 @@ import {
   GitMerge,
   GitPullRequest,
   Globe,
+  History,
   ImagePlus,
   Layers,
+  Play,
   Lock,
   MessageSquarePlus,
   Mic,
@@ -748,6 +752,8 @@ export function App() {
   const [analyticsModalOpen, setAnalyticsModalOpen] = useState<boolean>(false);
   const [cliImportOpen, setCliImportOpen] = useState<boolean>(false);
   const [hostsModalOpen, setHostsModalOpen] = useState<boolean>(false);
+  const [extCpModalOpen, setExtCpModalOpen] = useState<boolean>(false);
+  const [extCpInitialTab, setExtCpInitialTab] = useState<"checkpoints" | "extensions">("checkpoints");
   const [relocateTarget, setRelocateTarget] = useState<{
     mode: "workspace" | "session";
     oldPath: string;
@@ -4957,15 +4963,39 @@ export function App() {
               <Search className="h-3.5 w-3.5" />
             </button>
             {activeEvents.length > 0 && (
-              <button
-                type="button"
-                onClick={() => void handleForkSession()}
-                title="从当前会话一键分叉探索新思路 (Fork)"
-                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
-              >
-                <GitFork className="h-3.5 w-3.5" />
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setExtCpInitialTab("checkpoints");
+                    setExtCpModalOpen(true);
+                  }}
+                  title="每轮自动检查点 · 一键回滚代码 (Rewind)"
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                >
+                  <History className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleForkSession()}
+                  title="从当前会话一键分叉探索新思路 (Fork)"
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                >
+                  <GitFork className="h-3.5 w-3.5" />
+                </button>
+              </>
             )}
+            <button
+              type="button"
+              onClick={() => {
+                setExtCpInitialTab("extensions");
+                setExtCpModalOpen(true);
+              }}
+              title="查看本机 MCP 服务器与 Skills"
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            >
+              <Blocks className="h-3.5 w-3.5" />
+            </button>
             {!mobileMode && (
               <button
                 onClick={() => setActiveModal("qr")}
@@ -5584,6 +5614,44 @@ export function App() {
                             {/* 3. Vercel AI Elements + Prompt-Kit Per-Turn Status Footer:
                                - Running: Orbital / Sparkle Status + TextShimmer (`Thinking for Xs…` / `Working · <tool>…` / `Working…` / `Writing…`)
                                - Completed: Copy + Retry + "Worked for Xs" (swaps to timestamp on hover) */}
+                            {/* Structured Plan Mode Quick Execute Card */}
+                            {(() => {
+                              if (!isLatestTurn || isTurnRunning || isSessionRunning) return null;
+                              const assistantTxt = turn.items
+                                .filter((it) => it.kind === "assistant")
+                                .map((it) => it.content)
+                                .join("\n");
+                              const looksLikePlan =
+                                /(?:^|\n)#{1,3}\s*(?:Implementation Plan|实施计划|实现计划|行动计划|Plan\b)/i.test(
+                                  assistantTxt
+                                ) || assistantTxt.includes("<plan>");
+                              if (!looksLikePlan) return null;
+                              return (
+                                <div className="mb-2 mt-1 flex items-center justify-between gap-3 rounded-xl border border-[#34d399]/30 bg-[#34d399]/8 px-3.5 py-2.5">
+                                  <div className="min-w-0">
+                                    <div className="text-[12px] font-semibold text-[#34d399]">
+                                      检测到结构化实施计划
+                                    </div>
+                                    <div className="text-[11px] text-[var(--v-fg-muted)]">
+                                      确认方案无误后，可一键授权 Agent 开始按计划落地修改
+                                    </div>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      void handleSendPrompt(
+                                        "计划确认无误，请按上述实施方案开始逐步落地代码修改并完成验证。"
+                                      )
+                                    }
+                                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[#34d399] px-3 py-1.5 text-[12px] font-semibold text-black hover:opacity-90 cursor-pointer"
+                                  >
+                                    <Play className="h-3 w-3 fill-current" />
+                                    <span>批准并执行计划</span>
+                                  </button>
+                                </div>
+                              );
+                            })()}
+
                             <PaseoTurnFooter
                               isRunning={isTurnRunning}
                               phase={turnPhase}
@@ -5686,23 +5754,84 @@ export function App() {
                   />
                 )}
 
-                {/* Slash Command Popover */}
+                {/* Slash Command Popover (Built-in Velo Workflow Actions + Prompt Skills) */}
                 {slashFilter !== null && (
-                  <div className="mb-2 overflow-hidden rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
-                    {SLASH_SKILLS.filter((s) =>
-                      s.cmd.toLowerCase().includes(slashFilter)
-                    ).map((skill) => (
-                      <button
-                        key={skill.cmd}
-                        onClick={() => handleSendPrompt(`${skill.cmd} `)}
-                        className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left text-[12.5px] hover:bg-[var(--v-bg-active)]"
-                      >
-                        <span className="font-mono font-medium text-[var(--v-fg-primary)]">
-                          {skill.cmd}
-                        </span>
-                        <span className="text-[12px] text-[var(--v-fg-muted)]">{skill.desc}</span>
-                      </button>
-                    ))}
+                  <div className="mb-2 max-h-[260px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
+                    {[
+                      {
+                        cmd: "/rewind",
+                        desc: "打开每轮 Git 检查点并一键回滚代码",
+                        run: () => {
+                          setPrompt("");
+                          setSlashFilter(null);
+                          setExtCpInitialTab("checkpoints");
+                          setExtCpModalOpen(true);
+                        },
+                      },
+                      {
+                        cmd: "/mcp",
+                        desc: "查看本机 MCP 服务器与 Skills 目录",
+                        run: () => {
+                          setPrompt("");
+                          setSlashFilter(null);
+                          setExtCpInitialTab("extensions");
+                          setExtCpModalOpen(true);
+                        },
+                      },
+                      {
+                        cmd: "/fork",
+                        desc: "从当前会话一键分叉探索新分支思路",
+                        run: () => {
+                          setPrompt("");
+                          setSlashFilter(null);
+                          void handleForkSession();
+                        },
+                      },
+                      {
+                        cmd: "/cli",
+                        desc: "接管与清理本机终端历史会话",
+                        run: () => {
+                          setPrompt("");
+                          setSlashFilter(null);
+                          setCliImportOpen(true);
+                        },
+                      },
+                      {
+                        cmd: "/hosts",
+                        desc: "管理多机与 SSH 远程服务器派发",
+                        run: () => {
+                          setPrompt("");
+                          setSlashFilter(null);
+                          setHostsModalOpen(true);
+                        },
+                      },
+                      ...SLASH_SKILLS.map((s) => ({
+                        cmd: s.cmd,
+                        desc: s.desc,
+                        run: () => {
+                          setSlashFilter(null);
+                          void handleSendPrompt(`${s.cmd} `);
+                        },
+                      })),
+                    ]
+                      .filter(
+                        (item) =>
+                          item.cmd.toLowerCase().includes(slashFilter) ||
+                          item.desc.toLowerCase().includes(slashFilter)
+                      )
+                      .map((item) => (
+                        <button
+                          key={item.cmd}
+                          type="button"
+                          onClick={item.run}
+                          className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left text-[12.5px] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                        >
+                          <span className="font-mono font-medium text-[var(--v-fg-primary)]">
+                            {item.cmd}
+                          </span>
+                          <span className="text-[12px] text-[var(--v-fg-muted)]">{item.desc}</span>
+                        </button>
+                      ))}
                   </div>
                 )}
 
@@ -7638,6 +7767,23 @@ export function App() {
           syncSessionEventsFromDaemon(created.id);
         }}
         onClose={() => setHostsModalOpen(false)}
+      />
+      <ExtensionsAndCheckpointsModal
+        open={extCpModalOpen}
+        initialTab={extCpInitialTab}
+        daemonUrl={daemonUrl}
+        sessionId={activeSession?.id ?? null}
+        sessionTitle={activeSession?.title ?? "当前会话"}
+        onUseSkillPrompt={(txt) => {
+          setPrompt(txt);
+          setTimeout(() => composerTextareaRef.current?.focus(), 60);
+        }}
+        onRewound={() => {
+          if (activeSession?.id) {
+            syncSessionEventsFromDaemon(activeSession.id);
+          }
+        }}
+        onClose={() => setExtCpModalOpen(false)}
       />
 
       {/* Relocate Folder / Rebind Session Workspace Path Modal */}

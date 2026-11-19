@@ -34,7 +34,9 @@ export const RemoteHostsModal: React.FC<RemoteHostsModalProps> = ({
   const [newCwd, setNewCwd] = useState("~/code");
 
   const [dispatchHostId, setDispatchHostId] = useState<string | null>(null);
-  const [dispatchProvider, setDispatchProvider] = useState<"claude" | "codex">("codex");
+  const [dispatchProvider, setDispatchProvider] = useState<
+    "claude" | "codex" | "antigravity" | "cursor"
+  >("codex");
   const [dispatchPrompt, setDispatchPrompt] = useState("");
   const [dispatching, setDispatching] = useState(false);
 
@@ -261,11 +263,17 @@ export const RemoteHostsModal: React.FC<RemoteHostsModalProps> = ({
                       <div className="flex items-center gap-2">
                         <select
                           value={dispatchProvider}
-                          onChange={(e) => setDispatchProvider(e.target.value as "claude" | "codex")}
+                          onChange={(e) =>
+                            setDispatchProvider(
+                              e.target.value as "claude" | "codex" | "antigravity" | "cursor"
+                            )
+                          }
                           className="rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)] px-2 py-1 text-[11.5px] text-[var(--v-fg-primary)]"
                         >
                           <option value="codex">远端 Codex CLI</option>
                           <option value="claude">远端 Claude Code</option>
+                          <option value="antigravity">远端 Antigravity (agy)</option>
+                          <option value="cursor">远端 Cursor Agent</option>
                         </select>
                         <input
                           type="text"

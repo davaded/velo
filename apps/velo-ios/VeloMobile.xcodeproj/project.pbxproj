@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		00EF0E4CAD7E2FEBB6F1E847 /* VeloStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC020058B3917BAE9C4C26A5 /* VeloStore.swift */; };
 		1614DE9B4C27CEA23D4D58F8 /* VeloAnalyticsHubSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6171078B0E084192FA3073FE /* VeloAnalyticsHubSheet.swift */; };
+		1AA085EC7F1192220BCBBD17 /* VeloExtensionsAndCheckpointsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B395313F2BB29A1BBB02080 /* VeloExtensionsAndCheckpointsSheet.swift */; };
 		3C2C377806E4507B74A17A15 /* VeloRemoteHostsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65545A09614BDAE26A8F7653 /* VeloRemoteHostsSheet.swift */; };
 		3D1D5B782183B9D7E501EA24 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = E7494E1C76CB80854A3CFA09 /* Assets.xcassets */; };
 		43C9F9C5CA2C460BEB9DF8A0 /* VeloModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B23793B28F46BDB8C60A104 /* VeloModels.swift */; };
@@ -59,6 +60,7 @@
 		2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloImageAnnotatorSheet.swift; sourceTree = "<group>"; };
 		462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloAttachmentCache.swift; sourceTree = "<group>"; };
 		4B23793B28F46BDB8C60A104 /* VeloModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloModels.swift; sourceTree = "<group>"; };
+		5B395313F2BB29A1BBB02080 /* VeloExtensionsAndCheckpointsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloExtensionsAndCheckpointsSheet.swift; sourceTree = "<group>"; };
 		5DE87A57ED7EFAC041356DA9 /* VeloLiveActivityBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloLiveActivityBundle.swift; sourceTree = "<group>"; };
 		6171078B0E084192FA3073FE /* VeloAnalyticsHubSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloAnalyticsHubSheet.swift; sourceTree = "<group>"; };
 		65545A09614BDAE26A8F7653 /* VeloRemoteHostsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloRemoteHostsSheet.swift; sourceTree = "<group>"; };
@@ -96,6 +98,7 @@
 				E13A632532CFAE5CC49E17CB /* ShimmerAndStatusViews.swift */,
 				6171078B0E084192FA3073FE /* VeloAnalyticsHubSheet.swift */,
 				71E30A64F2D5609BA9178BD4 /* VeloCliSessionsSheet.swift */,
+				5B395313F2BB29A1BBB02080 /* VeloExtensionsAndCheckpointsSheet.swift */,
 				2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */,
 				65545A09614BDAE26A8F7653 /* VeloRemoteHostsSheet.swift */,
 			);
@@ -281,6 +284,7 @@
 				1614DE9B4C27CEA23D4D58F8 /* VeloAnalyticsHubSheet.swift in Sources */,
 				C8B327742DD8C80D4FFDDCCB /* VeloAttachmentCache.swift in Sources */,
 				767F27888C59D51418FB6A3E /* VeloCliSessionsSheet.swift in Sources */,
+				1AA085EC7F1192220BCBBD17 /* VeloExtensionsAndCheckpointsSheet.swift in Sources */,
 				B77B9C130A452EF84106382D /* VeloImageAnnotatorSheet.swift in Sources */,
 				B9E4D72382735CFC1DFE9F31 /* VeloLiveActivityManager.swift in Sources */,
 				C4B831DBDF9BB144D624EEE3 /* VeloMobileApp.swift in Sources */,
@@ -381,7 +385,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 12;
+				CURRENT_PROJECT_VERSION = 13;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = 76S2FLMS7Q;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -402,7 +406,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.5.0;
+				MARKETING_VERSION = 0.6.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -468,7 +472,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 12;
+				CURRENT_PROJECT_VERSION = 13;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = 76S2FLMS7Q;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -483,7 +487,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.5.0;
+				MARKETING_VERSION = 0.6.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";

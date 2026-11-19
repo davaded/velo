@@ -1777,3 +1777,119 @@ public struct VeloSavedHostProfile: Identifiable, Codable, Equatable, Sendable {
         self.updatedAt = updatedAt
     }
 }
+
+// MARK: - 6. Turn Checkpoints, Local Extensions (MCP/Skills) & Offline Outbox (v0.6.0)
+
+public struct VeloTurnCheckpointItem: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let turnIndex: Int
+    public let promptPreview: String
+    public let gitRef: String
+    public let headShort: String
+    public let hadDirtyChanges: Bool
+    public let createdAtLabel: String
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloTurnCheckpointItem? {
+        guard let id = d["id"] as? String, !id.isEmpty else { return nil }
+        let turnIdx = VeloSessionItem.intValue(d["turn_index"]) ?? 1
+        let preview = (d["prompt_preview"] as? String) ?? "执行前快照"
+        let gitRef = (d["git_ref"] as? String) ?? ""
+        let headShort = (d["head_short"] as? String) ?? String(gitRef.prefix(7))
+        let dirty = (d["had_dirty_changes"] as? Bool) ?? false
+
+        let createdLabel: String = {
+            if let raw = d["created_at"] as? String {
+                let isoFrac = ISO8601DateFormatter()
+                isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                let isoPlain = ISO8601DateFormatter()
+                if let dt = isoFrac.date(from: raw) ?? isoPlain.date(from: raw) {
+                    let f = DateFormatter()
+                    f.dateFormat = "MM-dd HH:mm:ss"
+                    return f.string(from: dt)
+                }
+            }
+            return ""
+        }()
+
+        return VeloTurnCheckpointItem(
+            id: id,
+            turnIndex: turnIdx,
+            promptPreview: preview,
+            gitRef: gitRef,
+            headShort: headShort,
+            hadDirtyChanges: dirty,
+            createdAtLabel: createdLabel
+        )
+    }
+}
+
+public struct VeloMcpServerItem: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let engine: String
+    public let transport: String
+    public let target: String
+    public let enabled: Bool
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloMcpServerItem? {
+        guard let id = d["id"] as? String, !id.isEmpty else { return nil }
+        return VeloMcpServerItem(
+            id: id,
+            name: (d["name"] as? String) ?? id,
+            engine: (d["engine"] as? String) ?? "local",
+            transport: (d["transport"] as? String) ?? "stdio",
+            target: (d["target"] as? String) ?? "",
+            enabled: (d["enabled"] as? Bool) ?? true
+        )
+    }
+}
+
+public struct VeloSkillItem: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let engine: String
+    public let description: String
+    public let path: String
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloSkillItem? {
+        guard let id = d["id"] as? String, !id.isEmpty else { return nil }
+        return VeloSkillItem(
+            id: id,
+            name: (d["name"] as? String) ?? id,
+            engine: (d["engine"] as? String) ?? "local",
+            description: (d["description"] as? String) ?? "",
+            path: (d["path"] as? String) ?? ""
+        )
+    }
+}
+
+public struct VeloOfflineQueuedPrompt: Identifiable, Codable, Equatable, Sendable {
+    public let id: String
+    public let sessionId: String
+    public let text: String
+    public let model: String
+    public let effort: String
+    public let images: [String]
+    public let approvalMode: String
+    public let createdAt: Date
+
+    public init(
+        id: String = "off-\(UUID().uuidString.prefix(8))",
+        sessionId: String,
+        text: String,
+        model: String,
+        effort: String,
+        images: [String] = [],
+        approvalMode: String = "auto_edit",
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.sessionId = sessionId
+        self.text = text
+        self.model = model
+        self.effort = effort
+        self.images = images
+        self.approvalMode = approvalMode
+        self.createdAt = createdAt
+    }
+}

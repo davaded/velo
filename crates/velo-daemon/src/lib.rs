@@ -34,7 +34,9 @@ use velo_protocol::{
 use velo_worktree::{WorktreeManager, default_velo_home};
 
 pub mod automations;
+pub mod checkpoints;
 pub mod cli_sessions;
+pub mod extensions;
 pub mod hosts;
 pub mod pr;
 pub mod pricing;
@@ -2106,6 +2108,15 @@ impl DaemonState {
             return Ok(session);
         }
 
+        {
+            let cp_wt = worktree_path.clone();
+            let cp_prompt = prompt.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                checkpoints::capture_turn_checkpoint(session_id, &cp_wt, &cp_prompt)
+            })
+            .await;
+        }
+
         let handle = match AgentSpawner::spawn_agent_turn_configured(
             session_id,
             provider,
@@ -2263,6 +2274,12 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/cli-sessions", get(list_cli_sessions_handler))
         .route("/api/cli-sessions/import", post(import_cli_session_handler))
         .route("/api/cli-sessions/manage", post(manage_cli_sessions_handler))
+        .route("/api/sessions/{id}/checkpoints", get(list_checkpoints_handler))
+        .route(
+            "/api/sessions/{id}/checkpoints/rewind",
+            post(rewind_checkpoint_handler),
+        )
+        .route("/api/extensions", get(list_extensions_handler))
         .route("/api/sessions/{id}/rewind", post(rewind_session_handler))
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
         .route("/api/sessions/{id}/git/commit", post(git_commit_handler))
@@ -4450,7 +4467,17 @@ impl DaemonState {
 
         let effective_effort = req.effort.clone().or_else(|| session.effort.clone());
 
-        // Attempt 0ms hot turn dispatch via warm persistent process pool (Claude stream-json / Codex app-server)
+        // Capture lightweight non-invasive Git checkpoint before agent mutates files
+        {
+            let cp_wt = wt_path.clone();
+            let cp_prompt = req.input.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                checkpoints::capture_turn_checkpoint(id, &cp_wt, &cp_prompt)
+            })
+            .await;
+        }
+
+        // Attempt 0ms hot turn dispatch via warm persistent process pool (Claude / Antigravity / Codex)
         if !stopped_active_handle && req.truncate_to_user_turn.is_none() && !req.reset_thread {
             let mut warm_candidate = {
                 let mut guard = self.inner.write().await;
@@ -4668,6 +4695,75 @@ impl DaemonState {
             let _ = self.persist_sessions().await;
         }
         json!({ "ok": removed, "session_id": id, "queue_id": queue_id })
+    }
+
+    pub async fn list_checkpoints_core(&self, session_id: Uuid) -> Vec<checkpoints::TurnCheckpointDto> {
+        tokio::task::spawn_blocking(move || checkpoints::list_checkpoints(session_id))
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn rewind_checkpoint_core(
+        &self,
+        session_id: Uuid,
+        checkpoint_id: String,
+    ) -> Result<(checkpoints::TurnCheckpointDto, Vec<checkpoints::TurnCheckpointDto>)> {
+        let wt_path = {
+            let guard = self.inner.read().await;
+            let Some(s) = guard.sessions.get(&session_id) else {
+                anyhow::bail!("Session not found");
+            };
+            PathBuf::from(&s.worktree_path)
+        };
+        let cp_id = checkpoint_id.clone();
+        let wt_clone = wt_path.clone();
+        let restored = tokio::task::spawn_blocking(move || {
+            checkpoints::rewind_to_checkpoint(session_id, &cp_id, &wt_clone)
+        })
+        .await??;
+
+        let fresh_diff = WorktreeManager::compute_diff_stats(&wt_path).await.unwrap_or_default();
+        let note_ev = AgentEvent::MessageDelta {
+            session_id,
+            text: format!(
+                "↩️ **已回滚工作区代码至第 {} 轮检查点**（`{}` · `{}`）。",
+                restored.turn_index, restored.head_short, restored.prompt_preview
+            ),
+            timestamp: Utc::now(),
+        };
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(s) = guard.sessions.get_mut(&session_id) {
+                s.diff_stats = fresh_diff.clone();
+                s.updated_at = Utc::now();
+            }
+            guard.event_history.entry(session_id).or_default().push(note_ev.clone());
+        }
+        let _ = self.db.append_event(session_id, &note_ev);
+        let _ = self.event_tx.send(note_ev);
+        let _ = self.event_tx.send(AgentEvent::DiffUpdated {
+            session_id,
+            stats: fresh_diff,
+            timestamp: Utc::now(),
+        });
+        let _ = self.persist_sessions().await;
+
+        let updated_list = self.list_checkpoints_core(session_id).await;
+        Ok((restored, updated_list))
+    }
+
+    pub async fn get_extensions_dto(&self) -> Value {
+        let snap = tokio::task::spawn_blocking(extensions::scan_local_extensions)
+            .await
+            .unwrap_or(extensions::LocalExtensionsSnapshotDto {
+                mcp_servers: Vec::new(),
+                skills: Vec::new(),
+            });
+        json!({
+            "ok": true,
+            "mcp_servers": snap.mcp_servers,
+            "skills": snap.skills,
+        })
     }
 
     pub async fn list_cli_sessions_core(&self) -> cli_sessions::ExternalCliSessionsSnapshot {
@@ -5104,6 +5200,14 @@ impl DaemonState {
                 "cd {} 2>/dev/null || true; if command -v claude >/dev/null 2>&1; then claude -p --permission-mode acceptEdits {}; else echo 'Claude CLI not installed on remote host'; exit 1; fi",
                 cwd, quoted_prompt
             ),
+            AgentProvider::Antigravity => format!(
+                "cd {} 2>/dev/null || true; if command -v agy >/dev/null 2>&1; then agy -p {} --dangerously-skip-permissions; else echo 'Antigravity CLI (agy) not installed on remote host'; exit 1; fi",
+                cwd, quoted_prompt
+            ),
+            AgentProvider::Cursor => format!(
+                "cd {} 2>/dev/null || true; if command -v cursor-agent >/dev/null 2>&1; then cursor-agent -p --force {}; else echo 'Cursor Agent CLI not installed on remote host'; exit 1; fi",
+                cwd, quoted_prompt
+            ),
             _ => format!("cd {} 2>/dev/null || true; {}", cwd, prompt),
         };
 
@@ -5316,6 +5420,42 @@ async fn remove_queued_prompt_handler(
     AxumPath((id, queue_id)): AxumPath<(Uuid, String)>,
 ) -> impl IntoResponse {
     Json(state.remove_queued_prompt_core(id, &queue_id).await)
+}
+
+async fn list_checkpoints_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> impl IntoResponse {
+    let items = state.list_checkpoints_core(id).await;
+    Json(json!({ "ok": true, "session_id": id, "checkpoints": items }))
+}
+
+#[derive(serde::Deserialize)]
+struct RewindCheckpointRequest {
+    checkpoint_id: String,
+}
+
+async fn rewind_checkpoint_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<RewindCheckpointRequest>,
+) -> impl IntoResponse {
+    match state.rewind_checkpoint_core(id, req.checkpoint_id).await {
+        Ok((restored, list)) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "restored": restored, "checkpoints": list })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_extensions_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    Json(state.get_extensions_dto().await)
 }
 
 async fn list_cli_sessions_handler(State(state): State<DaemonState>) -> impl IntoResponse {

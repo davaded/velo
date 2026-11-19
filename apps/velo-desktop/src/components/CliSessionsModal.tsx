@@ -67,7 +67,9 @@ export const CliSessionsModal: React.FC<CliSessionsModalProps> = ({
   const [confirmCleanEphemeral, setConfirmCleanEphemeral] = useState<boolean>(false);
   const [confirmBatchDelete, setConfirmBatchDelete] = useState<boolean>(false);
   const [query, setQuery] = useState<string>("");
-  const [providerFilter, setProviderFilter] = useState<"all" | "claude" | "codex">("all");
+  const [providerFilter, setProviderFilter] = useState<
+    "all" | "claude" | "codex" | "cursor" | "antigravity"
+  >("all");
   const [showEphemeral, setShowEphemeral] = useState<boolean>(false);
   const [selectMode, setSelectMode] = useState<boolean>(false);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
@@ -303,18 +305,26 @@ export const CliSessionsModal: React.FC<CliSessionsModalProps> = ({
           </div>
 
           <div className="flex items-center rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)] p-0.5 text-[11.5px]">
-            {(["all", "claude", "codex"] as const).map((tab) => (
+            {(["all", "claude", "codex", "cursor", "antigravity"] as const).map((tab) => (
               <button
                 key={tab}
                 type="button"
                 onClick={() => setProviderFilter(tab)}
-                className={`rounded-md px-2.5 py-1 capitalize transition-colors cursor-pointer ${
+                className={`rounded-md px-2 py-1 transition-colors cursor-pointer ${
                   providerFilter === tab
                     ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
                     : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-body)]"
                 }`}
               >
-                {tab === "all" ? "全部" : tab === "claude" ? "Claude Code" : "Codex"}
+                {tab === "all"
+                  ? "全部"
+                  : tab === "claude"
+                  ? "Claude"
+                  : tab === "codex"
+                  ? "Codex"
+                  : tab === "cursor"
+                  ? "Cursor"
+                  : "AGY"}
               </button>
             ))}
           </div>
@@ -496,7 +506,6 @@ export const CliSessionsModal: React.FC<CliSessionsModalProps> = ({
           ) : (
             <div className="flex flex-col gap-2">
               {filtered.map((item) => {
-                const isClaude = item.provider === "claude";
                 const k = itemKey(item);
                 const isBusy = importingId === item.cli_session_id;
                 const isSelected = selectedKeys.has(k);
@@ -539,12 +548,22 @@ export const CliSessionsModal: React.FC<CliSessionsModalProps> = ({
                       <div className="flex items-center gap-2">
                         <span
                           className={`shrink-0 rounded-full px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
-                            isClaude
+                            item.provider === "claude"
                               ? "bg-[#fb923c]/15 text-[#fb923c]"
+                              : item.provider === "cursor"
+                              ? "bg-[#a78bfa]/15 text-[#a78bfa]"
+                              : item.provider === "antigravity"
+                              ? "bg-[#60a5fa]/15 text-[#60a5fa]"
                               : "bg-[#34d399]/15 text-[#34d399]"
                           }`}
                         >
-                          {isClaude ? "Claude" : "Codex"}
+                          {item.provider === "claude"
+                            ? "Claude"
+                            : item.provider === "cursor"
+                            ? "Cursor"
+                            : item.provider === "antigravity"
+                            ? "AGY"
+                            : "Codex"}
                         </span>
                         {item.is_ephemeral && (
                           <span className="shrink-0 rounded-full bg-[#fbbf24]/15 px-1.5 py-0.5 text-[10px] font-medium text-[#fbbf24]">

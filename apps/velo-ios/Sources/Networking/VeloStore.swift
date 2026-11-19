@@ -38,6 +38,10 @@ public final class VeloStore: ObservableObject {
     @Published public var quotaCards: [VeloProviderQuotaCard] = []
     @Published public var remoteHosts: [VeloRemoteHostItem] = []
     @Published public var savedHostProfiles: [VeloSavedHostProfile] = []
+    @Published public var checkpointsBySession: [String: [VeloTurnCheckpointItem]] = [:]
+    @Published public var mcpServers: [VeloMcpServerItem] = []
+    @Published public var installedSkills: [VeloSkillItem] = []
+    @Published public var offlineOutbox: [VeloOfflineQueuedPrompt] = []
     @Published public var autoCollapseSteps: Bool = true {
         didSet {
             UserDefaults.standard.set(autoCollapseSteps, forKey: Self.autoCollapseKey)
@@ -67,11 +71,13 @@ public final class VeloStore: ObservableObject {
     private var maxDaemonNonce: UInt64?
     private var pendingSelectNewestSession: Bool = false
     private var pendingEncryptedPayloads: [[String: Any]] = []
+    private var isFlushingOfflineOutbox: Bool = false
 
     private static let savedConfigKey = "velo.ios.connectionConfig.v1"
     private static let savedHostsKey = "velo.ios.savedHosts.v1"
     private static let unreadIdsKey = "velo.ios.unreadIds.v1"
     private static let autoCollapseKey = "velo.ios.autoCollapseSteps"
+    private static let offlineOutboxKey = "velo.ios.offlineOutbox.v1"
 
     public init() {
         if let storedCollapse = UserDefaults.standard.object(forKey: Self.autoCollapseKey) as? Bool {
@@ -84,6 +90,11 @@ public final class VeloStore: ObservableObject {
            let decodedHosts = try? JSONDecoder().decode([VeloSavedHostProfile].self, from: hostsData)
         {
             self.savedHostProfiles = decodedHosts
+        }
+        if let outboxData = UserDefaults.standard.data(forKey: Self.offlineOutboxKey),
+           let decodedOutbox = try? JSONDecoder().decode([VeloOfflineQueuedPrompt].self, from: outboxData)
+        {
+            self.offlineOutbox = decodedOutbox
         }
 
         // Frame-0 local disk cache hydration so sessions, folders, and message contents
@@ -503,6 +514,7 @@ public final class VeloStore: ObservableObject {
                     if let sid = self.activeSessionId {
                         await loadEventsForSession(sid)
                     }
+                    await self.flushOfflineOutboxIfConnected()
                 }
             } catch {
                 self.connectionError = error.localizedDescription
@@ -700,6 +712,34 @@ public final class VeloStore: ObservableObject {
         guard !clean.isEmpty || !images.isEmpty else { return }
         let effectivePrompt = clean.isEmpty ? "请查看附图" : clean
 
+        // Offline Prompt Outbox: when disconnected (e.g., subway / plane / Mac sleeping),
+        // persist locally and flush automatically once the daemon reconnects.
+        let isTransportReady: Bool = {
+            switch connectionConfig {
+            case .direct:
+                return isConnected
+            case .e2eeRelay:
+                return isConnected && isForwardSecretRatcheted
+            case .none:
+                return false
+            }
+        }()
+        if !isTransportReady && truncateToUserTurn == nil {
+            let queued = VeloOfflineQueuedPrompt(
+                sessionId: sessionId,
+                text: effectivePrompt,
+                model: model,
+                effort: effort,
+                images: images,
+                approvalMode: approvalMode
+            )
+            offlineOutbox.append(queued)
+            persistOfflineOutbox()
+            lastActionBanner = "离线暂存已保存 · 重连后自动发送"
+            triggerHaptic(.light)
+            return
+        }
+
         // Server-authoritative Queue Mode: enqueue follow-up without disrupting active turn UI
         if executionMode == "queue",
            let idx = sessions.firstIndex(where: { $0.id == sessionId }),
@@ -886,6 +926,130 @@ public final class VeloStore: ObservableObject {
                 "session_id": sessionId,
                 "queue_id": queueId,
             ])
+        case .none:
+            break
+        }
+    }
+
+    // MARK: - Offline Outbox, Turn Checkpoints & Local MCP/Skills Extensions (v0.6.0)
+
+    private func persistOfflineOutbox() {
+        if let data = try? JSONEncoder().encode(offlineOutbox) {
+            UserDefaults.standard.set(data, forKey: Self.offlineOutboxKey)
+        }
+    }
+
+    public func removeOfflinePrompt(id: String) {
+        offlineOutbox.removeAll { $0.id == id }
+        persistOfflineOutbox()
+    }
+
+    public func flushOfflineOutboxIfConnected() async {
+        guard !offlineOutbox.isEmpty, !isFlushingOfflineOutbox, isConnected else { return }
+        if case .e2eeRelay = connectionConfig, !isForwardSecretRatcheted {
+            return
+        }
+        isFlushingOfflineOutbox = true
+        defer { isFlushingOfflineOutbox = false }
+
+        let snapshot = offlineOutbox
+        var flushedAny = false
+        for item in snapshot {
+            guard isConnected else { break }
+            guard let sess = sessions.first(where: { $0.id == item.sessionId }) else {
+                // Drop orphaned outbox entry if session was deleted on Mac
+                offlineOutbox.removeAll { $0.id == item.id }
+                persistOfflineOutbox()
+                continue
+            }
+            offlineOutbox.removeAll { $0.id == item.id }
+            persistOfflineOutbox()
+            flushedAny = true
+
+            let mode: String? = (sess.status == .running || sess.status == .waitingApproval) ? "queue" : nil
+            await sendPrompt(
+                sessionId: item.sessionId,
+                text: item.text,
+                model: item.model,
+                effort: item.effort,
+                images: item.images,
+                approvalMode: item.approvalMode,
+                executionMode: mode
+            )
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        if flushedAny {
+            lastActionBanner = "✅ 离线暂存指令已自动重发"
+        }
+    }
+
+    public func fetchCheckpoints(for sessionId: String) async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/checkpoints"),
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let arr = obj["checkpoints"] as? [[String: Any]]
+            else { return }
+            checkpointsBySession[sessionId] = arr.compactMap(VeloTurnCheckpointItem.fromJSON)
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "get_checkpoints", "session_id": sessionId])
+        case .none:
+            break
+        }
+    }
+
+    @discardableResult
+    public func rewindCheckpoint(sessionId: String, checkpointId: String) async -> Bool {
+        triggerHaptic(.medium)
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/checkpoints/rewind") else { return false }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["checkpoint_id": checkpointId])
+            guard let (data, _) = try? await URLSession.shared.data(for: req),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return false }
+            let ok = (obj["ok"] as? Bool) ?? false
+            if let arr = obj["checkpoints"] as? [[String: Any]] {
+                checkpointsBySession[sessionId] = arr.compactMap(VeloTurnCheckpointItem.fromJSON)
+            }
+            if ok {
+                lastActionBanner = "✅ 已回滚至目标轮次快照（并自动留存回滚前备份）"
+                await fetchDiff(for: sessionId)
+            } else {
+                lastActionBanner = "⚠️ \((obj["error"] as? String) ?? "检查点回滚失败")"
+            }
+            return ok
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "rewind_checkpoint",
+                "session_id": sessionId,
+                "checkpoint_id": checkpointId,
+            ])
+            return true
+        case .none:
+            return false
+        }
+    }
+
+    public func fetchExtensions() async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/extensions"),
+                  let (data, _) = try? await URLSession.shared.data(from: url),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return }
+            if let arr = obj["mcp_servers"] as? [[String: Any]] {
+                mcpServers = arr.compactMap(VeloMcpServerItem.fromJSON)
+            }
+            if let arr = obj["skills"] as? [[String: Any]] {
+                installedSkills = arr.compactMap(VeloSkillItem.fromJSON)
+            }
+        case .e2eeRelay:
+            sendEncryptedCommand(["cmd": "get_extensions"])
         case .none:
             break
         }
@@ -2566,6 +2730,9 @@ public final class VeloStore: ObservableObject {
                 Task { await loadEventsForSession(sid) }
             }
             scheduleCacheSave()
+            if !offlineOutbox.isEmpty {
+                Task { await self.flushOfflineOutboxIfConnected() }
+            }
             return
         }
 
@@ -2703,6 +2870,35 @@ public final class VeloStore: ObservableObject {
             case "hosts_snapshot":
                 if let arr = raw["hosts"] as? [[String: Any]] {
                     remoteHosts = arr.compactMap(VeloRemoteHostItem.fromJSON)
+                }
+                return
+            case "checkpoints_snapshot":
+                if let sid = raw["session_id"] as? String,
+                   let arr = raw["checkpoints"] as? [[String: Any]]
+                {
+                    checkpointsBySession[sid] = arr.compactMap(VeloTurnCheckpointItem.fromJSON)
+                }
+                return
+            case "checkpoint_rewound":
+                let ok = (raw["ok"] as? Bool) ?? false
+                if let sid = raw["session_id"] as? String {
+                    if let arr = raw["checkpoints"] as? [[String: Any]] {
+                        checkpointsBySession[sid] = arr.compactMap(VeloTurnCheckpointItem.fromJSON)
+                    }
+                    if ok {
+                        Task { await fetchDiff(for: sid) }
+                    }
+                }
+                lastActionBanner = ok
+                    ? "✅ 已回滚至目标轮次快照（并自动留存备份）"
+                    : "⚠️ \((raw["error"] as? String) ?? "检查点回滚失败")"
+                return
+            case "extensions_snapshot":
+                if let arr = raw["mcp_servers"] as? [[String: Any]] {
+                    mcpServers = arr.compactMap(VeloMcpServerItem.fromJSON)
+                }
+                if let arr = raw["skills"] as? [[String: Any]] {
+                    installedSkills = arr.compactMap(VeloSkillItem.fromJSON)
                 }
                 return
             default:

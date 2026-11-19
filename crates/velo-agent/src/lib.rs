@@ -609,6 +609,8 @@ impl AgentSpawner {
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
         let is_warm_claude = matches!(provider, AgentProvider::Claude);
+        let is_warm_agy = matches!(provider, AgentProvider::Antigravity);
+        let is_warm_stream = is_warm_claude || is_warm_agy;
         let mut cmd = Self::build_tokio_command(
             session_id,
             &provider,
@@ -622,7 +624,7 @@ impl AgentSpawner {
             daemon_http_base.as_deref(),
         );
         cmd.current_dir(&worktree_path)
-            .stdin(if is_warm_claude {
+            .stdin(if is_warm_stream {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -679,29 +681,42 @@ impl AgentSpawner {
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
         let turn_idle_warm = Arc::new(AtomicBool::new(false));
 
-        if is_warm_claude {
+        if is_warm_stream {
             if let Some(mut sin) = child_stdin.take() {
+                let img_hint_tool = if is_warm_agy { "view_file" } else { "Read tool" };
                 let first_text = if images.is_empty() {
                     prompt.clone()
                 } else {
                     format!(
-                        "{}\n\n[Attached local image(s) — inspect directly with Read tool: {}]",
+                        "{}\n\n[Attached local image(s) — inspect directly with {}: {}]",
                         prompt,
+                        img_hint_tool,
                         images.join(", ")
                     )
                 };
-                let first_frame = json!({
-                    "type": "user",
-                    "message": {
-                        "role": "user",
-                        "content": first_text,
-                    }
-                });
+                let first_frame = if is_warm_agy {
+                    json!({
+                        "event": "user",
+                        "message": {
+                            "role": "user",
+                            "content": first_text,
+                        }
+                    })
+                } else {
+                    json!({
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": first_text,
+                        }
+                    })
+                };
                 let _ = sin.write_all(format!("{}\n", first_frame).as_bytes()).await;
                 let _ = sin.flush().await;
 
                 let tx_warm = event_tx.clone();
                 let warm_flag = Arc::clone(&turn_idle_warm);
+                let warm_prov_name = if is_warm_agy { "agy" } else { "claude" };
                 tokio::spawn(async move {
                     while let Some(raw_in) = input_rx.recv().await {
                         if let Ok(warm_cmd) = serde_json::from_str::<Value>(raw_in.trim()) {
@@ -716,8 +731,9 @@ impl AgentSpawner {
                                     w_prompt.to_string()
                                 } else {
                                     format!(
-                                        "{}\n\n[Attached local image(s) — inspect directly with Read tool: {}]",
+                                        "{}\n\n[Attached local image(s) — inspect directly with {}: {}]",
                                         w_prompt,
+                                        img_hint_tool,
                                         w_imgs.join(", ")
                                     )
                                 };
@@ -725,16 +741,26 @@ impl AgentSpawner {
                                 let _ = tx_warm.send(AgentEvent::StatusChanged {
                                     session_id,
                                     status: SessionStatus::Running,
-                                    message: Some("Agent `claude` hot turn resumed (0ms)".to_string()),
+                                    message: Some(format!("Agent `{}` hot turn resumed (0ms)", warm_prov_name)),
                                     timestamp: Utc::now(),
                                 });
-                                let user_frame = json!({
-                                    "type": "user",
-                                    "message": {
-                                        "role": "user",
-                                        "content": full_txt,
-                                    }
-                                });
+                                let user_frame = if is_warm_agy {
+                                    json!({
+                                        "event": "user",
+                                        "message": {
+                                            "role": "user",
+                                            "content": full_txt,
+                                        }
+                                    })
+                                } else {
+                                    json!({
+                                        "type": "user",
+                                        "message": {
+                                            "role": "user",
+                                            "content": full_txt,
+                                        }
+                                    })
+                                };
                                 if sin.write_all(format!("{}\n", user_frame).as_bytes()).await.is_err() {
                                     break;
                                 }
@@ -800,13 +826,24 @@ impl AgentSpawner {
                     }
                     let _ = tx_out.send(ev.clone());
                 }
-                // Warm Claude stream-json emits `{"type":"result"}` at end of each turn while staying alive for next stdin line
-                if is_warm_claude {
+                // Warm Claude (`"type":"result"`) and Warm Antigravity (`"event":"result"`) stay alive between turns
+                if is_warm_stream {
                     let t = line.trim();
-                    if t.starts_with('{') && t.contains("\"type\":\"result\"") {
+                    if t.starts_with('{') && t.contains("\"result\"") {
                         if let Ok(rj) = serde_json::from_str::<Value>(t) {
-                            if rj.get("type").and_then(|v| v.as_str()) == Some("result") {
-                                let is_err = rj.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let is_claude_res = is_warm_claude
+                                && rj.get("type").and_then(|v| v.as_str()) == Some("result");
+                            let is_agy_res = is_warm_agy
+                                && rj.get("event").and_then(|v| v.as_str()) == Some("result");
+                            if is_claude_res || is_agy_res {
+                                let is_err = if is_agy_res {
+                                    rj.pointer("/result/status")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.eq_ignore_ascii_case("ERROR") || s.eq_ignore_ascii_case("FAILED"))
+                                        .unwrap_or(false)
+                                } else {
+                                    rj.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                                };
                                 stdout_warm_flag.store(true, Ordering::SeqCst);
                                 let _ = tx_out.send(AgentEvent::StatusChanged {
                                     session_id,
@@ -974,7 +1011,7 @@ impl AgentSpawner {
                             }
                         }
                     }
-                }, if is_warm_claude => {
+                }, if is_warm_stream => {
                     stdout_task.abort();
                     stderr_task.abort();
                     #[cfg(unix)]
@@ -1483,16 +1520,13 @@ impl AgentSpawner {
                 if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
                     c.args(["--conversation", rid]);
                 }
-                let effective_prompt = if images.is_empty() {
-                    prompt.to_string()
-                } else {
-                    format!(
-                        "{}\n\n[Attached local image(s) — inspect directly with view_file: {}]",
-                        prompt,
-                        images.join(", ")
-                    )
-                };
-                c.args(["-p", &effective_prompt, "--output-format", "stream-json"]);
+                c.args([
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                    "-p=",
+                ]);
                 if let Some(m) = model.filter(|s| {
                     let t = s.trim();
                     !t.is_empty() && t != "agy" && t != "agy-default" && t != "acp-gemini-cli"
@@ -1503,6 +1537,8 @@ impl AgentSpawner {
                     let mapped_eff = match eff.trim() {
                         "low" => "low",
                         "medium" => "medium",
+                        "xhigh" => "xhigh",
+                        "max" => "max",
                         _ => "high",
                     };
                     c.args(["--effort", mapped_eff]);

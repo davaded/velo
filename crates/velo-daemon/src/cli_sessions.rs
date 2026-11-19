@@ -1,4 +1,5 @@
 use chrono::{DateTime, TimeZone, Utc};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -114,6 +115,7 @@ pub fn classify_ephemeral_session(
             "你好",
             "测试",
             "在吗",
+            "casual greeting",
             "reply ok",
             "say ok",
             "say pong",
@@ -129,6 +131,8 @@ pub fn classify_ephemeral_session(
             "respond with just",
             "reply only with",
             "say just ",
+            "只回复两个字母",
+            "只回复",
             "health check",
             "connectivity check",
             "smoke test",
@@ -330,6 +334,23 @@ pub fn discover_external_cli_sessions_with_stats(
                 results.push((dt, dto));
             }
         }
+    }
+
+    // 3. Scan Cursor Agent CLI (`~/.cursor/chats/<hash>/<uuid>/meta.json`)
+    for (dt, dto) in scan_cursor_chats(&home, &velo_wt_prefix, existing_by_provider_sid) {
+        if dismissed.contains(&cli_dismiss_key(&dto.provider, &dto.cli_session_id)) {
+            continue;
+        }
+        results.push((dt, dto));
+    }
+
+    // 4. Scan Antigravity CLI (`~/.gemini/antigravity-cli/conversation_summaries.db`, read-only)
+    for (dt, dto) in scan_antigravity_cli_sessions(&home, &velo_wt_prefix, existing_by_provider_sid)
+    {
+        if dismissed.contains(&cli_dismiss_key(&dto.provider, &dto.cli_session_id)) {
+            continue;
+        }
+        results.push((dt, dto));
     }
 
     results.sort_by(|a, b| b.0.cmp(&a.0));
@@ -640,7 +661,461 @@ pub fn load_external_cli_session(
         return parse_full_codex_session(&path, mtime, cli_session_id, velo_session_id);
     }
 
+    if prov_lower.starts_with("cursor") {
+        return load_cursor_cli_session(&home, cli_session_id, velo_session_id);
+    }
+
+    if prov_lower.starts_with("antigravity") || prov_lower == "agy" {
+        return load_antigravity_cli_session(&home, cli_session_id, velo_session_id);
+    }
+
     anyhow::bail!("Unsupported external CLI session provider: {}", provider_str)
+}
+
+fn decode_hex_string(hex: &str) -> Option<String> {
+    let clean = hex.trim();
+    if clean.len() % 2 != 0 || clean.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(clean.len() / 2);
+    for chunk in clean.as_bytes().chunks(2) {
+        let s = std::str::from_utf8(chunk).ok()?;
+        let b = u8::from_str_radix(s, 16).ok()?;
+        bytes.push(b);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn read_cursor_store_meta(chat_dir: &Path) -> (Option<String>, usize) {
+    let db_path = chat_dir.join("store.db");
+    if !db_path.is_file() {
+        return (None, 0);
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return (None, 0);
+    };
+    let mut name: Option<String> = None;
+    if let Ok(raw_hex) = conn.query_row("SELECT value FROM meta WHERE key = '0' LIMIT 1", [], |r| {
+        r.get::<_, String>(0)
+    }) {
+        if let Some(decoded) = decode_hex_string(&raw_hex) {
+            if let Ok(v) = serde_json::from_str::<Value>(&decoded) {
+                if let Some(n) = v.get("name").and_then(|x| x.as_str()) {
+                    let clean = n.trim();
+                    if !clean.is_empty() && !clean.eq_ignore_ascii_case("New Agent") {
+                        name = Some(clean.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let blob_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+        .unwrap_or(0);
+    let approx_msgs = ((blob_count as usize) / 4).max(if blob_count > 0 { 2 } else { 0 });
+    (name, approx_msgs)
+}
+
+fn scan_cursor_chats(
+    home: &Path,
+    velo_wt_prefix: &str,
+    existing_by_provider_sid: &HashMap<String, Uuid>,
+) -> Vec<(DateTime<Utc>, ExternalCliSessionDto)> {
+    let root = home.join(".cursor/chats");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut by_sid: HashMap<String, (DateTime<Utc>, ExternalCliSessionDto)> = HashMap::new();
+    let Ok(ws_dirs) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    for ws_entry in ws_dirs.flatten() {
+        let ws_path = ws_entry.path();
+        if !ws_path.is_dir() {
+            continue;
+        }
+        let Ok(chat_dirs) = fs::read_dir(&ws_path) else {
+            continue;
+        };
+        for chat_entry in chat_dirs.flatten() {
+            let chat_dir = chat_entry.path();
+            if !chat_dir.is_dir() {
+                continue;
+            }
+            let sid = chat_entry.file_name().to_string_lossy().trim().to_string();
+            if sid.is_empty() || sid.starts_with('.') {
+                continue;
+            }
+            let meta_path = chat_dir.join("meta.json");
+            let Ok(raw_meta) = fs::read_to_string(&meta_path) else {
+                continue;
+            };
+            let Ok(meta_val) = serde_json::from_str::<Value>(&raw_meta) else {
+                continue;
+            };
+            if meta_val.get("hasConversation").and_then(|v| v.as_bool()) == Some(false) {
+                continue;
+            }
+            let cwd = meta_val
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if cwd.is_empty() || !Path::new(&cwd).is_dir() {
+                continue;
+            }
+            let updated_ms = meta_val
+                .get("updatedAtMs")
+                .or_else(|| meta_val.get("createdAtMs"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let dt = if updated_ms > 1_000_000_000_000 {
+                Utc.timestamp_millis_opt(updated_ms)
+                    .single()
+                    .unwrap_or_else(Utc::now)
+            } else {
+                let mtime = fs::metadata(&meta_path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                system_time_to_utc(mtime)
+            };
+
+            let imported_id = existing_by_provider_sid.get(&sid).copied();
+            if cwd.starts_with(velo_wt_prefix) && imported_id.is_some() {
+                continue;
+            }
+            let (stored_name, approx_msgs) = read_cursor_store_meta(&chat_dir);
+            if approx_msgs == 0 {
+                continue;
+            }
+            let project_name = Path::new(&cwd)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workspace")
+                .to_string();
+            let has_custom = stored_name.is_some();
+            let title = stored_name.unwrap_or_else(|| format!("Cursor · {}", project_name));
+            let ephemeral_reason = classify_ephemeral_session(
+                &cwd,
+                &title,
+                has_custom,
+                approx_msgs,
+                velo_wt_prefix,
+                imported_id.is_some(),
+            );
+
+            let dto = ExternalCliSessionDto {
+                provider: "cursor".to_string(),
+                cli_session_id: sid.clone(),
+                title,
+                cwd: cwd.clone(),
+                project_name,
+                updated_at: dt.to_rfc3339(),
+                message_count: approx_msgs,
+                last_preview: format!("Cursor 本地对话 · {}", cwd),
+                imported_session_id: imported_id,
+                is_ephemeral: ephemeral_reason.is_some(),
+                ephemeral_reason,
+            };
+
+            let replace = by_sid
+                .get(&sid)
+                .map(|(old_dt, _)| dt > *old_dt)
+                .unwrap_or(true);
+            if replace {
+                by_sid.insert(sid, (dt, dto));
+            }
+        }
+    }
+    by_sid.into_values().collect()
+}
+
+fn load_cursor_cli_session(
+    home: &Path,
+    cli_session_id: &str,
+    velo_sid: Uuid,
+) -> anyhow::Result<ParsedExternalSession> {
+    let sid = validate_safe_session_id(cli_session_id)?;
+    let root = home.join(".cursor/chats");
+    let mut best: Option<(DateTime<Utc>, PathBuf, String)> = None;
+
+    if let Ok(ws_dirs) = fs::read_dir(&root) {
+        for ws_entry in ws_dirs.flatten() {
+            let chat_dir = ws_entry.path().join(sid);
+            let meta_path = chat_dir.join("meta.json");
+            if !meta_path.is_file() {
+                continue;
+            }
+            if let Ok(raw) = fs::read_to_string(&meta_path) {
+                if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                    let cwd = val
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let updated_ms = val
+                        .get("updatedAtMs")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let dt = Utc
+                        .timestamp_millis_opt(updated_ms)
+                        .single()
+                        .unwrap_or_else(Utc::now);
+                    if !cwd.is_empty()
+                        && best.as_ref().map(|b| dt > b.0).unwrap_or(true)
+                    {
+                        best = Some((dt, chat_dir, cwd));
+                    }
+                }
+            }
+        }
+    }
+
+    let (dt, chat_dir, cwd) =
+        best.ok_or_else(|| anyhow::anyhow!("Cursor chat session `{}` not found", sid))?;
+    let (stored_name, _) = read_cursor_store_meta(&chat_dir);
+    let proj = Path::new(&cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+    let title = stored_name.unwrap_or_else(|| format!("Cursor · {}", proj));
+    let events = vec![AgentEvent::MessageDelta {
+        session_id: velo_sid,
+        text: format!(
+            "已无缝接管本机 Cursor Agent 会话（`{}` · 目录 `{}`）。\n直接输入下一条消息将通过 `cursor-agent --resume` 原地续接上下文。",
+            sid, cwd
+        ),
+        timestamp: dt,
+    }];
+
+    Ok(ParsedExternalSession {
+        provider: AgentProvider::Cursor,
+        cli_session_id: sid.to_string(),
+        title: title.clone(),
+        cwd,
+        updated_at: dt,
+        first_prompt: title,
+        events,
+    })
+}
+
+fn parse_first_workspace_uri(raw_json: &str) -> Option<String> {
+    let arr = serde_json::from_str::<Value>(raw_json).ok()?.as_array()?.clone();
+    for item in arr {
+        if let Some(uri) = item.as_str() {
+            let p = uri.trim().strip_prefix("file://").unwrap_or(uri.trim());
+            let decoded = p.replace("%20", " ");
+            if !decoded.is_empty() && Path::new(&decoded).is_dir() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+fn parse_agy_sqlite_datetime(raw: &str) -> DateTime<Utc> {
+    let trimmed = raw.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return dt.with_timezone(&Utc);
+    }
+    let iso_like = trimmed.replacen(' ', "T", 1);
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&iso_like) {
+        return dt.with_timezone(&Utc);
+    }
+    Utc::now()
+}
+
+fn scan_antigravity_cli_sessions(
+    home: &Path,
+    velo_wt_prefix: &str,
+    existing_by_provider_sid: &HashMap<String, Uuid>,
+) -> Vec<(DateTime<Utc>, ExternalCliSessionDto)> {
+    let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris \
+         FROM conversation_summaries \
+         WHERE nesting_depth = 0 AND killed = 0 \
+         ORDER BY last_modified_time DESC LIMIT 40",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1).unwrap_or_default(),
+            r.get::<_, String>(2).unwrap_or_default(),
+            r.get::<_, i64>(3).unwrap_or(0),
+            r.get::<_, String>(4).unwrap_or_default(),
+            r.get::<_, String>(5).unwrap_or_default(),
+        ))
+    }) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        let (cid, raw_title, raw_preview, step_count, modified_str, ws_uris) = row;
+        if cid.trim().is_empty() || step_count <= 0 {
+            continue;
+        }
+        let Some(cwd) = parse_first_workspace_uri(&ws_uris) else {
+            continue;
+        };
+        let imported_id = existing_by_provider_sid.get(&cid).copied();
+        if cwd.starts_with(velo_wt_prefix) && imported_id.is_some() {
+            continue;
+        }
+        let clean_title = clean_title_snippet(&raw_title);
+        let clean_prev = clean_title_snippet(&raw_preview);
+        if clean_prev.starts_with("<conversation_history>") && clean_title.is_empty() {
+            continue;
+        }
+        let project_name = Path::new(&cwd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        let has_custom = !clean_title.is_empty();
+        let title = if !clean_title.is_empty() {
+            clean_title
+        } else if !clean_prev.is_empty() {
+            clean_prev.clone()
+        } else {
+            format!("Antigravity · {}", project_name)
+        };
+        let msg_est = (step_count as usize).max(2);
+        let ephemeral_reason = classify_ephemeral_session(
+            &cwd,
+            &title,
+            false,
+            msg_est,
+            velo_wt_prefix,
+            imported_id.is_some(),
+        );
+        // Also flag tiny 2-step "Casual Greeting" even when agy auto-titled it
+        let final_ephemeral = ephemeral_reason.or_else(|| {
+            if !has_custom && msg_est <= 2 {
+                Some("极短临时会话".to_string())
+            } else {
+                None
+            }
+        });
+
+        let dt = parse_agy_sqlite_datetime(&modified_str);
+        out.push((
+            dt,
+            ExternalCliSessionDto {
+                provider: "antigravity".to_string(),
+                cli_session_id: cid,
+                title,
+                cwd,
+                project_name,
+                updated_at: dt.to_rfc3339(),
+                message_count: msg_est,
+                last_preview: clean_prev,
+                imported_session_id: imported_id,
+                is_ephemeral: final_ephemeral.is_some(),
+                ephemeral_reason: final_ephemeral,
+            },
+        ));
+    }
+    out
+}
+
+fn load_antigravity_cli_session(
+    home: &Path,
+    cli_session_id: &str,
+    velo_sid: Uuid,
+) -> anyhow::Result<ParsedExternalSession> {
+    let sid = validate_safe_session_id(cli_session_id)?;
+    let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let (raw_title, raw_preview, modified_str, ws_uris): (String, String, String, String) = conn
+        .query_row(
+            "SELECT title, preview, last_modified_time, workspace_uris \
+             FROM conversation_summaries WHERE conversation_id = ?1 LIMIT 1",
+            [sid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+
+    let cwd = parse_first_workspace_uri(&ws_uris)
+        .unwrap_or_else(|| home.to_string_lossy().to_string());
+    let dt = parse_agy_sqlite_datetime(&modified_str);
+    let title = {
+        let t = clean_title_snippet(&raw_title);
+        if !t.is_empty() {
+            t
+        } else {
+            let p = clean_title_snippet(&raw_preview);
+            if !p.is_empty() { p } else { format!("Antigravity · {}", &sid[..8.min(sid.len())]) }
+        }
+    };
+
+    let mut events = Vec::new();
+    // Reconstruct recent preview turns from conversations_fts if available (read-only)
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT user_body, agent_body FROM conversations_fts WHERE conversation_id = ?1 LIMIT 6",
+    ) {
+        if let Ok(rows) = stmt.query_map([sid], |r| {
+            Ok((r.get::<_, String>(0).unwrap_or_default(), r.get::<_, String>(1).unwrap_or_default()))
+        }) {
+            for (u_txt, a_txt) in rows.flatten() {
+                if !u_txt.trim().is_empty() {
+                    events.push(AgentEvent::UserMessage {
+                        session_id: velo_sid,
+                        text: u_txt.chars().take(1800).collect(),
+                        images: Vec::new(),
+                        timestamp: dt,
+                    });
+                }
+                if !a_txt.trim().is_empty() {
+                    events.push(AgentEvent::MessageDelta {
+                        session_id: velo_sid,
+                        text: a_txt.chars().take(2400).collect(),
+                        timestamp: dt,
+                    });
+                }
+            }
+        }
+    }
+
+    if events.is_empty() {
+        events.push(AgentEvent::MessageDelta {
+            session_id: velo_sid,
+            text: format!(
+                "已接管本机 Antigravity CLI 会话（`{}` · 目录 `{}`）。\n直接输入下一条消息将通过 `agy --conversation` 原地续接上下文。",
+                sid, cwd
+            ),
+            timestamp: dt,
+        });
+    }
+
+    Ok(ParsedExternalSession {
+        provider: AgentProvider::Antigravity,
+        cli_session_id: sid.to_string(),
+        title: title.clone(),
+        cwd,
+        updated_at: dt,
+        first_prompt: title,
+        events,
+    })
 }
 
 fn parse_full_claude_session(
@@ -1036,6 +1511,37 @@ pub fn delete_external_cli_session_file(
         return Ok(false);
     }
 
+    if prov.starts_with("cursor") {
+        let root = home.join(".cursor/chats");
+        if !root.is_dir() {
+            return Ok(false);
+        }
+        let canonical_root = fs::canonicalize(&root)?;
+        let mut deleted = false;
+        if let Ok(ws_dirs) = fs::read_dir(&root) {
+            for ws_entry in ws_dirs.flatten() {
+                let candidate = ws_entry.path().join(sid);
+                if candidate.is_dir() {
+                    if let Ok(canon_dir) = fs::canonicalize(&candidate) {
+                        if canon_dir.starts_with(&canonical_root) && canon_dir != canonical_root {
+                            fs::remove_dir_all(&canon_dir)?;
+                            deleted = true;
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(deleted);
+    }
+
+    if prov.starts_with("antigravity") || prov == "agy" {
+        // Safely dismiss Antigravity CLI sessions via Velo's hide list without mutating agy's SQLite DB
+        let mut dismissed = load_dismissed_cli_sessions();
+        let inserted = dismissed.insert(cli_dismiss_key("antigravity", sid));
+        save_dismissed_cli_sessions(&dismissed)?;
+        return Ok(inserted);
+    }
+
     anyhow::bail!("Unsupported external CLI session provider: {}", provider_str)
 }
 
@@ -1068,6 +1574,16 @@ pub fn manage_external_cli_sessions(
             let mut deleted = 0usize;
             let mut dismissed_changed = false;
             for (prov, sid) in items {
+                let p_low = prov.trim().to_lowercase();
+                if p_low.starts_with("antigravity") || p_low == "agy" {
+                    if validate_safe_session_id(sid).is_ok()
+                        && dismissed.insert(cli_dismiss_key("antigravity", sid))
+                    {
+                        deleted += 1;
+                        dismissed_changed = true;
+                    }
+                    continue;
+                }
                 if delete_external_cli_session_file(prov, sid).unwrap_or(false) {
                     deleted += 1;
                 }

@@ -129,6 +129,8 @@ public struct VeloRemoteHostsSheet: View {
                                     Picker("引擎", selection: $dispatchProvider) {
                                         Text("Codex").tag("codex")
                                         Text("Claude").tag("claude")
+                                        Text("AGY").tag("antigravity")
+                                        Text("Cursor").tag("cursor")
                                     }
                                     .pickerStyle(.segmented)
 

@@ -18,6 +18,8 @@ public struct ChatThreadView: View {
     @State private var selectedEffort: String = "medium"
     @State private var showDiffSheet: Bool = false
     @State private var showModelSheet: Bool = false
+    @State private var showExtensionsCheckpointsSheet: Bool = false
+    @State private var extensionsCheckpointsTab: Int = 0
     @State private var showRenameAlert: Bool = false
     @State private var renameDraftTitle: String = ""
     @State private var pickerItems: [PhotosPickerItem] = []
@@ -134,6 +136,19 @@ public struct ChatThreadView: View {
                 files: store.diffsBySession[sessionId] ?? []
             )
         }
+        .sheet(isPresented: $showExtensionsCheckpointsSheet) {
+            VeloExtensionsAndCheckpointsSheet(
+                store: store,
+                sessionId: sessionId,
+                initialTab: extensionsCheckpointsTab,
+                onInjectSkillPrompt: { injected in
+                    draftPrompt = draftPrompt.isEmpty ? injected : "\(draftPrompt)\n\(injected)"
+                    composerFocused = true
+                }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
         .sheet(isPresented: $showModelSheet) {
             ModelAndHandoffSheet(
                 store: store,
@@ -221,6 +236,20 @@ public struct ChatThreadView: View {
                     showModelSheet = true
                 } label: {
                     Label("切换模型 / 跨引擎接力", systemImage: "arrow.triangle.swap")
+                }
+                Button {
+                    extensionsCheckpointsTab = 0
+                    showExtensionsCheckpointsSheet = true
+                    Task { await store.fetchCheckpoints(for: sessionId) }
+                } label: {
+                    Label("每轮 Git 检查点与回滚", systemImage: "clock.arrow.circlepath")
+                }
+                Button {
+                    extensionsCheckpointsTab = 1
+                    showExtensionsCheckpointsSheet = true
+                    Task { await store.fetchExtensions() }
+                } label: {
+                    Label("MCP 与 Skills 检查器", systemImage: "puzzlepiece.extension")
                 }
                 if !turns.isEmpty && !isSessionRunning {
                     Button {
@@ -318,6 +347,8 @@ public struct ChatThreadView: View {
                     ForEach(Array(turns.enumerated()), id: \.element.id) { idx, turn in
                         turnRowView(idx: idx, turn: turn)
                     }
+
+                    planReviewExecuteCard
 
                     if let approval = store.pendingApprovals[sessionId] {
                         ApprovalPromptCard(
@@ -687,6 +718,225 @@ public struct ChatThreadView: View {
         .padding(.top, 56)
     }
 
+    private var latestTurnLooksLikePlan: Bool {
+        guard !isSessionRunning, let lastTurn = turns.last else { return false }
+        let assistantText = lastTurn.items.compactMap { item -> String? in
+            if case .assistant = item.kind { return item.content }
+            return nil
+        }.joined(separator: "\n")
+        guard !assistantText.isEmpty else { return false }
+        if assistantText.contains("<plan>") { return true }
+        let pattern = #"(?im)(?:^|\n)#{1,3}\s*(?:Implementation Plan|实施计划|实现计划|行动计划|执行计划|Plan\b)"#
+        return assistantText.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    @ViewBuilder
+    private var planReviewExecuteCard: some View {
+        if latestTurnLooksLikePlan {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2.5) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "checklist.checked")
+                            .font(.system(size: 11.5, weight: .bold))
+                        Text("检测到结构化实施计划")
+                            .font(.system(size: 12.5, weight: .bold))
+                    }
+                    .foregroundStyle(VeloTheme.emerald)
+                    Text("确认方案后可一键下发执行指令")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 6)
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    Task {
+                        await store.sendPrompt(
+                            sessionId: sessionId,
+                            text: "计划确认无误，请按上述实施方案开始逐步落地代码修改并完成验证。",
+                            model: selectedModelId,
+                            effort: selectedEffort
+                        )
+                    }
+                } label: {
+                    HStack(spacing: 4.5) {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 10))
+                        Text("批准并执行计划")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(VeloTheme.emerald, in: Capsule())
+                }
+                .buttonStyle(VeloPressableButtonStyle())
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 10)
+            .background(
+                VeloTheme.emerald.opacity(0.09),
+                in: RoundedRectangle(cornerRadius: 15, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 15, style: .continuous)
+                    .stroke(VeloTheme.emerald.opacity(0.32), lineWidth: 0.9)
+            )
+        }
+    }
+
+    private var offlinePromptsForSession: [VeloOfflineQueuedPrompt] {
+        store.offlineOutbox.filter { $0.sessionId == sessionId }
+    }
+
+    @ViewBuilder
+    private var offlineOutboxBanner: some View {
+        let items = offlinePromptsForSession
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 5) {
+                    Image(systemName: "wifi.slash")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("离线暂存 (\(items.count)) · 重连 Mac 后自动发送")
+                        .font(.system(size: 11.5, weight: .semibold))
+                    Spacer()
+                }
+                .foregroundStyle(VeloTheme.amber)
+
+                ForEach(items) { item in
+                    HStack(spacing: 7) {
+                        Text(item.text)
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Button {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            store.removeOfflinePrompt(id: item.id)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(
+                        VeloTheme.elevatedSurface(colorScheme),
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    )
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                VeloTheme.amber.opacity(0.11),
+                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+            )
+        }
+    }
+
+    private struct SlashQuickAction: Identifiable {
+        let id: String
+        let cmd: String
+        let title: String
+        let icon: String
+    }
+
+    private var matchingSlashActions: [SlashQuickAction] {
+        let trimmed = draftPrompt.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("/") else { return [] }
+        let query = trimmed.lowercased()
+        let catalog: [SlashQuickAction] = [
+            SlashQuickAction(id: "rewind", cmd: "/rewind", title: "回滚检查点", icon: "clock.arrow.circlepath"),
+            SlashQuickAction(id: "mcp", cmd: "/mcp", title: "MCP & Skills", icon: "puzzlepiece.extension"),
+            SlashQuickAction(id: "fork", cmd: "/fork", title: "分叉上下文", icon: "arrow.branch"),
+            SlashQuickAction(id: "plan", cmd: "/plan", title: "先写实施方案", icon: "checklist"),
+            SlashQuickAction(id: "review", cmd: "/review", title: "代码审查", icon: "magnifyingglass.circle"),
+            SlashQuickAction(id: "compact", cmd: "/compact", title: "压缩总结上下文", icon: "arrow.down.right.and.arrow.up.left"),
+        ]
+        if query == "/" { return catalog }
+        return catalog.filter { $0.cmd.hasPrefix(query) || $0.title.lowercased().contains(query.dropFirst()) }
+    }
+
+    @ViewBuilder
+    private var slashCommandStrip: some View {
+        let items = matchingSlashActions
+        if !items.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(items) { act in
+                        Button {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            executeSlashQuickAction(act.cmd)
+                        } label: {
+                            HStack(spacing: 4.5) {
+                                Image(systemName: act.icon)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                                Text(act.cmd)
+                                    .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(.primary)
+                                Text(act.title)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5.5)
+                            .background(
+                                VeloTheme.elevatedSurface(colorScheme),
+                                in: Capsule()
+                            )
+                            .overlay(
+                                Capsule()
+                                    .stroke(VeloTheme.accentViolet.opacity(0.28), lineWidth: 0.75)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 2)
+            }
+        }
+    }
+
+    private func executeSlashQuickAction(_ cmd: String) {
+        switch cmd {
+        case "/rewind":
+            draftPrompt = ""
+            composerFocused = false
+            extensionsCheckpointsTab = 0
+            showExtensionsCheckpointsSheet = true
+            Task { await store.fetchCheckpoints(for: sessionId) }
+        case "/mcp":
+            draftPrompt = ""
+            composerFocused = false
+            extensionsCheckpointsTab = 1
+            showExtensionsCheckpointsSheet = true
+            Task { await store.fetchExtensions() }
+        case "/fork":
+            draftPrompt = ""
+            composerFocused = false
+            Task {
+                if let forkedId = await store.forkSession(sessionId, upToUserTurn: nil) {
+                    onSwitchedSession?(forkedId)
+                }
+            }
+        case "/plan":
+            draftPrompt = "先不要修改文件，请先给出包含具体改动文件的 `## 实施计划`（Implementation Plan），等我确认后再动手："
+            composerFocused = true
+        case "/review":
+            draftPrompt = "请结合当前分支改动做一次严格的代码审查，列出潜在 Bug、边界情况和性能风险。"
+            composerFocused = true
+        case "/compact":
+            draftPrompt = "/compact "
+            composerFocused = true
+        default:
+            draftPrompt = "\(cmd) "
+            composerFocused = true
+        }
+    }
+
     private var floatingComposerDock: some View {
         let cat = activeModelOption.category
         let supportedEfforts = cat.supportedEfforts
@@ -697,6 +947,9 @@ public struct ChatThreadView: View {
         let queuedList = session?.activeQueuedPrompts ?? []
 
         return VStack(spacing: 10) {
+            offlineOutboxBanner
+            slashCommandStrip
+
             if !queuedList.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 5) {
@@ -1079,6 +1332,11 @@ public struct ChatThreadView: View {
                 } else {
                     Button {
                         let toSend = draftPrompt
+                        let trimmedCmd = toSend.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        if trimmedCmd == "/rewind" || trimmedCmd == "/mcp" || trimmedCmd == "/fork" {
+                            executeSlashQuickAction(trimmedCmd)
+                            return
+                        }
                         let attached = uploadedPaths
                         draftPrompt = ""
                         pendingImages.removeAll()

@@ -84,7 +84,7 @@ pub fn build_ssh_command(host: &RemoteHostNode, remote_shell_cmd: &str) -> Comma
 
 /// Probes an SSH host for reachability, OS/CPU summary, and installed coding agent CLIs.
 pub async fn probe_ssh_host(mut host: RemoteHostNode) -> RemoteHostNode {
-    let probe_script = "uname -srm; for b in claude codex git docker; do command -v $b >/dev/null 2>&1 && echo \"AGENT:$b\"; done";
+    let probe_script = "uname -srm; for b in claude codex agy cursor-agent git docker; do command -v $b >/dev/null 2>&1 && echo \"AGENT:$b\"; done";
     let mut cmd = build_ssh_command(&host, probe_script);
     let res = tokio::time::timeout(std::time::Duration::from_secs(8), cmd.output()).await;
     host.last_checked_at = Some(Utc::now());

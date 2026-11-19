@@ -44,8 +44,10 @@ public struct VeloCliSessionsSheet: View {
                 VStack(spacing: 10) {
                     Picker("引擎过滤", selection: $providerFilter) {
                         Text("全部").tag("all")
-                        Text("Claude Code").tag("claude")
+                        Text("Claude").tag("claude")
                         Text("Codex").tag("codex")
+                        Text("Cursor").tag("cursor")
+                        Text("AGY").tag("antigravity")
                     }
                     .pickerStyle(.segmented)
                     .padding(.horizontal, 16)
@@ -74,7 +76,7 @@ public struct VeloCliSessionsSheet: View {
                             Text("未发现可接管的原生终端会话")
                                 .font(.system(size: 14, weight: .medium))
                                 .foregroundStyle(.secondary)
-                            Text("在 Mac 终端执行过的 claude / codex 对话会自动出现在这里")
+                            Text("在 Mac 终端或 IDE 执行过的 claude / codex / cursor / agy 对话会自动出现在这里")
                                 .font(.system(size: 12))
                                 .foregroundStyle(.tertiary)
                                 .multilineTextAlignment(.center)
@@ -147,22 +149,34 @@ public struct VeloCliSessionsSheet: View {
                 titleVisibility: .visible
             ) {
                 if let target = pendingDeleteTarget {
-                    Button("永久删除 Mac 上的 .jsonl 文件", role: .destructive) {
-                        pendingDeleteTarget = nil
-                        Task {
-                            await store.manageExternalCliSessions(
-                                action: "delete",
-                                items: [(target.provider, target.cliSessionId)]
-                            )
+                    if target.provider == "antigravity" {
+                        Button("从 Velo 列表永久隐藏（不改 AGY 库）", role: .destructive) {
+                            pendingDeleteTarget = nil
+                            Task {
+                                await store.manageExternalCliSessions(
+                                    action: "hide",
+                                    items: [(target.provider, target.cliSessionId)]
+                                )
+                            }
                         }
-                    }
-                    Button("仅从 Velo 列表隐藏") {
-                        pendingDeleteTarget = nil
-                        Task {
-                            await store.manageExternalCliSessions(
-                                action: "hide",
-                                items: [(target.provider, target.cliSessionId)]
-                            )
+                    } else {
+                        Button("永久删除 Mac 上的本地历史文件", role: .destructive) {
+                            pendingDeleteTarget = nil
+                            Task {
+                                await store.manageExternalCliSessions(
+                                    action: "delete",
+                                    items: [(target.provider, target.cliSessionId)]
+                                )
+                            }
+                        }
+                        Button("仅从 Velo 列表隐藏") {
+                            pendingDeleteTarget = nil
+                            Task {
+                                await store.manageExternalCliSessions(
+                                    action: "hide",
+                                    items: [(target.provider, target.cliSessionId)]
+                                )
+                            }
                         }
                     }
                 }
@@ -257,13 +271,24 @@ public struct VeloCliSessionsSheet: View {
     }
 
     private func cliSessionCard(_ item: VeloExternalCliSessionItem) -> some View {
-        let isClaude = item.provider == "claude"
-        let badgeColor = isClaude ? Color.orange : VeloTheme.emerald
+        let badgeMeta: (label: String, color: Color) = {
+            switch item.provider {
+            case "claude":
+                return ("CLAUDE", Color.orange)
+            case "cursor":
+                return ("CURSOR", VeloTheme.accentViolet)
+            case "antigravity":
+                return ("AGY", VeloEngineCategory.agy.accentColor)
+            default:
+                return ("CODEX", VeloTheme.emerald)
+            }
+        }()
+        let badgeColor = badgeMeta.color
         let isBusy = importingCliId == item.cliSessionId
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
-                Text(isClaude ? "CLAUDE" : "CODEX")
+                Text(badgeMeta.label)
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundStyle(badgeColor)
                     .padding(.horizontal, 7)
