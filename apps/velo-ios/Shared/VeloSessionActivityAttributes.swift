@@ -8,6 +8,7 @@ public struct VeloSessionActivityAttributes: ActivityAttributes {
         case tool
         case writing
         case waitingApproval
+        case pausedSync
         case completed
         case failed
     }

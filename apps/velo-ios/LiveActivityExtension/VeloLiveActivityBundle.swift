@@ -17,6 +17,7 @@ struct VeloSessionLiveActivity: Widget {
     private let cyan = Color(red: 0.22, green: 0.74, blue: 0.97)
     private let amber = Color(red: 0.98, green: 0.75, blue: 0.14)
     private let coral = Color(red: 0.97, green: 0.44, blue: 0.44)
+    private let slate = Color(red: 0.62, green: 0.66, blue: 0.75)
 
     private func engineAccent(_ badge: String) -> Color {
         let lower = badge.lowercased()
@@ -42,6 +43,16 @@ struct VeloSessionLiveActivity: Widget {
         return "cpu"
     }
 
+    private func resolvedPhase(
+        for context: ActivityViewContext<VeloSessionActivityAttributes>
+    ) -> VeloSessionActivityAttributes.PhaseKind {
+        let raw = context.state.phase
+        if context.isStale && raw != .completed && raw != .failed && raw != .waitingApproval {
+            return .pausedSync
+        }
+        return raw
+    }
+
     private func phaseColor(
         _ phase: VeloSessionActivityAttributes.PhaseKind,
         badge: String
@@ -50,6 +61,7 @@ struct VeloSessionLiveActivity: Widget {
         case .waitingApproval: return amber
         case .completed: return emerald
         case .failed: return coral
+        case .pausedSync: return slate
         case .thinking, .tool, .writing: return engineAccent(badge)
         }
     }
@@ -62,6 +74,7 @@ struct VeloSessionLiveActivity: Widget {
         case .waitingApproval: return "exclamationmark.shield.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "xmark.octagon.fill"
+        case .pausedSync: return "arrow.clockwise.circle.fill"
         case .thinking: return engineIcon(badge)
         case .tool: return "hammer.fill"
         case .writing: return "waveform"
@@ -74,9 +87,30 @@ struct VeloSessionLiveActivity: Widget {
         case .tool: return "工具执行"
         case .writing: return "输出回复"
         case .waitingApproval: return "等待审批"
+        case .pausedSync: return "待同步"
         case .completed: return "已完成"
         case .failed: return "执行异常"
         }
+    }
+
+    private func resolvedHeadline(
+        for context: ActivityViewContext<VeloSessionActivityAttributes>,
+        phase: VeloSessionActivityAttributes.PhaseKind
+    ) -> String {
+        if phase == .pausedSync {
+            return "后台连接已休眠 · 轻点查看最新状态"
+        }
+        return context.state.stepHeadline
+    }
+
+    private func resolvedTarget(
+        for context: ActivityViewContext<VeloSessionActivityAttributes>,
+        phase: VeloSessionActivityAttributes.PhaseKind
+    ) -> String? {
+        if phase == .pausedSync {
+            return nil
+        }
+        return context.state.stepTarget
     }
 
     /// Uses a bounded 59:59 timer interval (instead of `Date.distantFuture`) so SwiftUI WidgetKit
@@ -84,10 +118,16 @@ struct VeloSessionLiveActivity: Widget {
     @ViewBuilder
     private func liveClockView(
         state: VeloSessionActivityAttributes.ContentState,
+        phase: VeloSessionActivityAttributes.PhaseKind,
         fontSize: CGFloat,
         fixedWidth: CGFloat
     ) -> some View {
-        if let doneSec = state.finishedElapsedSeconds {
+        if phase == .pausedSync {
+            Text("轻点刷新")
+                .font(.system(size: max(10, fontSize - 2), weight: .semibold))
+                .lineLimit(1)
+                .frame(width: fixedWidth + 10, alignment: .trailing)
+        } else if let doneSec = state.finishedElapsedSeconds {
             Text(formatDuration(doneSec))
                 .font(.system(size: fontSize, weight: .semibold, design: .monospaced))
                 .monospacedDigit()
@@ -117,6 +157,7 @@ struct VeloSessionLiveActivity: Widget {
             switch phase {
             case .completed, .failed: return 1.0
             case .waitingApproval: return 0.72
+            case .pausedSync: return 0.50
             case .writing: return 0.85
             case .tool: return min(0.78, 0.28 + CGFloat(stepCount) * 0.1)
             case .thinking: return 0.22
@@ -143,8 +184,11 @@ struct VeloSessionLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: VeloSessionActivityAttributes.self) { context in
             // MARK: - Lock Screen & StandBy Banner
-            let accent = phaseColor(context.state.phase, badge: context.attributes.engineBadge)
+            let phase = resolvedPhase(for: context)
+            let accent = phaseColor(phase, badge: context.attributes.engineBadge)
             let brandColor = engineAccent(context.attributes.engineBadge)
+            let headline = resolvedHeadline(for: context, phase: phase)
+            let target = resolvedTarget(for: context, phase: phase)
 
             VStack(alignment: .leading, spacing: 9) {
                 // Header: Engine Pill + Project/Branch + Clean Right-Aligned Timer
@@ -167,8 +211,8 @@ struct VeloSessionLiveActivity: Widget {
 
                     Spacer(minLength: 6)
 
-                    liveClockView(state: context.state, fontSize: 13, fixedWidth: 46)
-                        .foregroundStyle(.white.opacity(0.88))
+                    liveClockView(state: context.state, phase: phase, fontSize: 13, fixedWidth: 46)
+                        .foregroundStyle(phase == .pausedSync ? slate : .white.opacity(0.88))
                 }
 
                 // Title
@@ -179,19 +223,21 @@ struct VeloSessionLiveActivity: Widget {
 
                 // Recessed Live Step & Telemetry Strip
                 HStack(spacing: 7) {
-                    Image(systemName: phaseIcon(context.state.phase, badge: context.attributes.engineBadge))
+                    Image(systemName: phaseIcon(phase, badge: context.attributes.engineBadge))
                         .font(.system(size: 11.5, weight: .semibold))
                         .foregroundStyle(accent)
 
                     VStack(alignment: .leading, spacing: 1.5) {
-                        Text(context.state.stepHeadline)
+                        Text(headline)
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(
-                                context.state.phase == .waitingApproval ? amber : .white.opacity(0.92)
+                                phase == .waitingApproval
+                                    ? amber
+                                    : (phase == .pausedSync ? .white.opacity(0.76) : .white.opacity(0.92))
                             )
                             .lineLimit(1)
 
-                        if let target = context.state.stepTarget, !target.isEmpty {
+                        if let target, !target.isEmpty {
                             Text(target)
                                 .font(.system(size: 10.5, design: .monospaced))
                                 .foregroundStyle(.white.opacity(0.52))
@@ -202,14 +248,21 @@ struct VeloSessionLiveActivity: Widget {
 
                     Spacer(minLength: 6)
 
-                    if context.state.phase == .waitingApproval {
+                    if phase == .waitingApproval {
                         Text("点此审批")
                             .font(.system(size: 10.5, weight: .bold))
                             .foregroundStyle(.black)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3.5)
                             .background(amber, in: Capsule())
-                    } else if let tps = context.state.throughputTps, tps >= 0.5, context.state.phase == .writing {
+                    } else if phase == .pausedSync {
+                        Text("打开查看")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.82))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.white.opacity(0.14), in: Capsule())
+                    } else if let tps = context.state.throughputTps, tps >= 0.5, phase == .writing {
                         Text("⚡ \(shortTps(tps))")
                             .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                             .foregroundStyle(emerald)
@@ -233,7 +286,7 @@ struct VeloSessionLiveActivity: Widget {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7.5)
                 .background(
-                    context.state.phase == .waitingApproval
+                    phase == .waitingApproval
                         ? amber.opacity(0.12)
                         : Color.white.opacity(0.07),
                     in: RoundedRectangle(cornerRadius: 11, style: .continuous)
@@ -241,7 +294,7 @@ struct VeloSessionLiveActivity: Widget {
                 .overlay(
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
                         .stroke(
-                            context.state.phase == .waitingApproval
+                            phase == .waitingApproval
                                 ? amber.opacity(0.35)
                                 : Color.white.opacity(0.08),
                             lineWidth: 0.7
@@ -249,7 +302,7 @@ struct VeloSessionLiveActivity: Widget {
                 )
 
                 phaseProgressBar(
-                    phase: context.state.phase,
+                    phase: phase,
                     accent: accent,
                     stepCount: context.state.stepCount
                 )
@@ -261,8 +314,11 @@ struct VeloSessionLiveActivity: Widget {
             .widgetURL(URL(string: "velo://session/\(context.attributes.sessionId)"))
 
         } dynamicIsland: { context in
-            let accent = phaseColor(context.state.phase, badge: context.attributes.engineBadge)
+            let phase = resolvedPhase(for: context)
+            let accent = phaseColor(phase, badge: context.attributes.engineBadge)
             let brandColor = engineAccent(context.attributes.engineBadge)
+            let headline = resolvedHeadline(for: context, phase: phase)
+            let target = resolvedTarget(for: context, phase: phase)
 
             return DynamicIsland {
                 // MARK: - Expanded Dynamic Island (Cutout-Safe Leading / Trailing + Full-Width Bottom)
@@ -281,7 +337,7 @@ struct VeloSessionLiveActivity: Widget {
                                 .font(.system(size: 12.5, weight: .bold))
                                 .foregroundStyle(.white)
                                 .lineLimit(1)
-                            Text(phaseShortLabel(context.state.phase))
+                            Text(phaseShortLabel(phase))
                                 .font(.system(size: 10.5, weight: .semibold))
                                 .foregroundStyle(accent)
                                 .lineLimit(1)
@@ -293,15 +349,15 @@ struct VeloSessionLiveActivity: Widget {
 
                 DynamicIslandExpandedRegion(.trailing) {
                     VStack(alignment: .trailing, spacing: 2) {
-                        liveClockView(state: context.state, fontSize: 14, fixedWidth: 46)
-                            .foregroundStyle(.white)
+                        liveClockView(state: context.state, phase: phase, fontSize: 14, fixedWidth: 46)
+                            .foregroundStyle(phase == .pausedSync ? slate : .white)
 
-                        if let tps = context.state.throughputTps, tps >= 0.5, context.state.phase == .writing {
+                        if let tps = context.state.throughputTps, tps >= 0.5, phase == .writing {
                             Text("⚡ \(shortTps(tps))")
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundStyle(emerald)
                                 .lineLimit(1)
-                        } else if context.state.stepCount > 0 {
+                        } else if phase != .pausedSync && context.state.stepCount > 0 {
                             Text("第 \(context.state.stepCount) 步")
                                 .font(.system(size: 10, weight: .medium, design: .monospaced))
                                 .foregroundStyle(.white.opacity(0.55))
@@ -349,18 +405,18 @@ struct VeloSessionLiveActivity: Widget {
 
                         // Row 2: Active Step Capsule
                         HStack(spacing: 7) {
-                            Image(systemName: phaseIcon(context.state.phase, badge: context.attributes.engineBadge))
+                            Image(systemName: phaseIcon(phase, badge: context.attributes.engineBadge))
                                 .font(.system(size: 11.5, weight: .semibold))
                                 .foregroundStyle(accent)
 
-                            Text(context.state.stepHeadline)
+                            Text(headline)
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(
-                                    context.state.phase == .waitingApproval ? amber : .white.opacity(0.88)
+                                    phase == .waitingApproval ? amber : .white.opacity(0.88)
                                 )
                                 .lineLimit(1)
 
-                            if let target = context.state.stepTarget, !target.isEmpty {
+                            if let target, !target.isEmpty {
                                 Text(target)
                                     .font(.system(size: 10.5, design: .monospaced))
                                     .foregroundStyle(.white.opacity(0.48))
@@ -373,14 +429,14 @@ struct VeloSessionLiveActivity: Widget {
                         .padding(.horizontal, 10)
                         .padding(.vertical, 7)
                         .background(
-                            context.state.phase == .waitingApproval
+                            phase == .waitingApproval
                                 ? amber.opacity(0.14)
                                 : Color.white.opacity(0.08),
                             in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                         )
 
                         phaseProgressBar(
-                            phase: context.state.phase,
+                            phase: phase,
                             accent: accent,
                             stepCount: context.state.stepCount
                         )
@@ -389,21 +445,24 @@ struct VeloSessionLiveActivity: Widget {
                     .padding(.top, 3)
                 }
             } compactLeading: {
-                // Pure iconic engine/phase emblem — zero clipped text, crisp pill symmetry!
                 ZStack {
                     Circle()
                         .fill(accent.opacity(0.24))
                         .frame(width: 21, height: 21)
-                    Image(systemName: phaseIcon(context.state.phase, badge: context.attributes.engineBadge))
+                    Image(systemName: phaseIcon(phase, badge: context.attributes.engineBadge))
                         .font(.system(size: 10.5, weight: .bold))
                         .foregroundStyle(accent)
                 }
             } compactTrailing: {
-                switch context.state.phase {
+                switch phase {
                 case .waitingApproval:
                     Text("审批")
                         .font(.system(size: 11.5, weight: .bold))
                         .foregroundStyle(amber)
+                case .pausedSync:
+                    Text("查看")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(slate)
                 case .completed:
                     HStack(spacing: 2) {
                         Image(systemName: "checkmark")
@@ -417,14 +476,14 @@ struct VeloSessionLiveActivity: Widget {
                         .font(.system(size: 11.5, weight: .bold))
                         .foregroundStyle(coral)
                 case .thinking, .tool, .writing:
-                    liveClockView(state: context.state, fontSize: 12, fixedWidth: 36)
+                    liveClockView(state: context.state, phase: phase, fontSize: 12, fixedWidth: 36)
                         .foregroundStyle(accent)
                 }
             } minimal: {
                 ZStack {
                     Circle()
                         .fill(accent.opacity(0.24))
-                    Image(systemName: phaseIcon(context.state.phase, badge: context.attributes.engineBadge))
+                    Image(systemName: phaseIcon(phase, badge: context.attributes.engineBadge))
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(accent)
                 }

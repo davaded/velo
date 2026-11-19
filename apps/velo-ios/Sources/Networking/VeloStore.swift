@@ -325,9 +325,45 @@ public final class VeloStore: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.savedConfigKey)
     }
 
+    private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
+    private var lastBackgroundedAt: Date?
+
+    public func handleAppDidEnterBackground() {
+        lastBackgroundedAt = Date()
+        let hasLiveWork = sessions.contains(where: { $0.status == .running || $0.status == .waitingApproval })
+            || VeloLiveActivityManager.shared.hasActiveLiveActivity
+        guard hasLiveWork else {
+            endBackgroundTaskIfNeeded()
+            return
+        }
+        guard backgroundTaskId == .invalid else { return }
+        backgroundTaskId = UIApplication.shared.beginBackgroundTask(withName: "VeloLiveActivitySync") { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // iOS is about to suspend our socket — immediately switch the Lock Screen Live Activity
+                // out of "正在生成回复…" into a truthful "后台连接已休眠 · 轻点查看最新状态"!
+                VeloLiveActivityManager.shared.markBackgroundSuspended()
+                self.endBackgroundTaskIfNeeded()
+            }
+        }
+    }
+
+    private func endBackgroundTaskIfNeeded() {
+        guard backgroundTaskId != .invalid else { return }
+        let idToEnd = backgroundTaskId
+        backgroundTaskId = .invalid
+        UIApplication.shared.endBackgroundTask(idToEnd)
+    }
+
     public func ensureConnectedOnForeground() {
+        endBackgroundTaskIfNeeded()
+        let bgElapsed = lastBackgroundedAt.map { Date().timeIntervalSince($0) } ?? 0
+        lastBackgroundedAt = nil
         guard connectionConfig != nil else { return }
-        if !isConnected || wsTask == nil || wsTask?.state != .running {
+        // After sleeping >8s, iOS may leave a half-open dead TCP socket reporting `.running`;
+        // force a clean reconnect so we immediately receive an authoritative `sessions_snapshot`
+        // and reconcile any Live Activity that finished while locked!
+        if bgElapsed >= 8 || !isConnected || wsTask == nil || wsTask?.state != .running {
             connect()
         } else if case .e2eeRelay = connectionConfig, !isForwardSecretRatcheted {
             sendEncryptedSync()
@@ -756,6 +792,7 @@ public final class VeloStore: ObservableObject {
                 sessions[idx].agentKind = ak
             }
             sessions[idx].effort = effort
+            VeloLiveActivityManager.shared.markTurnStarted(sessionId: sessionId)
             VeloLiveActivityManager.shared.syncSessionActivity(
                 session: sessions[idx],
                 sessionId: sessionId,
@@ -2165,7 +2202,7 @@ public final class VeloStore: ObservableObject {
 
     public func stopSession(_ sessionId: String) async {
         triggerHaptic(.rigid)
-        finalizeSessionTurnLocally(sessionId)
+        finalizeSessionTurnLocally(sessionId, finalLabel: "任务已停止")
         switch connectionConfig {
         case .direct(let baseURL):
             guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/stop") else { return }
@@ -2183,6 +2220,15 @@ public final class VeloStore: ObservableObject {
     public func resolveApproval(sessionId: String, requestId: String, approve: Bool) async {
         let decision = approve ? "approve" : "deny"
         pendingApprovals.removeValue(forKey: sessionId)
+        updateSessionStatus(sessionId, .running)
+        VeloLiveActivityManager.shared.syncSessionActivity(
+            session: sessions.first(where: { $0.id == sessionId }),
+            sessionId: sessionId,
+            phase: "thinking",
+            headline: approve ? "已批准，继续执行…" : "已拒绝，等待回应…",
+            startedAt: turnStartedAtBySession[sessionId],
+            forceImmediate: true
+        )
         triggerHaptic(.medium)
 
         switch connectionConfig {
@@ -2794,6 +2840,7 @@ public final class VeloStore: ObservableObject {
                     stepStartedAtBySession[sid] = turnStartedAtBySession[sid]
                 }
                 updateSessionStatus(sid, .running)
+                VeloLiveActivityManager.shared.markTurnStarted(sessionId: sid)
                 VeloLiveActivityManager.shared.syncSessionActivity(
                     session: sessions.first(where: { $0.id == sid }),
                     sessionId: sid,
@@ -2802,13 +2849,17 @@ public final class VeloStore: ObservableObject {
                     startedAt: turnStartedAtBySession[sid],
                     forceImmediate: true
                 )
-            } else if st == "completed" || st == "failed" || st == "stopped" {
+            } else if st == "completed" || st == "failed" || st == "stopped"
+                || st == "idle" || st == "done" || st == "finished"
+                || st == "cancelled" || st == "canceled"
+            {
                 let isFailed = (st == "failed")
+                let isStopped = (st == "stopped" || st == "cancelled" || st == "canceled")
                 let totalMs = finalizeSessionTurnLocally(
                     sid,
                     now: serverDate,
                     failed: isFailed,
-                    finalLabel: isFailed ? "执行遇到异常" : (st == "stopped" ? "任务已停止" : "任务已完成")
+                    finalLabel: isFailed ? "执行遇到异常" : (isStopped ? "任务已停止" : "任务已完成")
                 )
                 if st == "completed" || st == "failed" {
                     markSessionUnreadIfBackground(sid)
@@ -3184,6 +3235,15 @@ public final class VeloStore: ObservableObject {
                 )
             }
             eventsBySession[sid] = list
+            updateSessionStatus(sid, .idle)
+            VeloLiveActivityManager.shared.endCurrent(
+                sessionId: sid,
+                finalLabel: parsed.isAuthRequired ? "需要重新登录" : "执行遇到异常",
+                failed: true
+            )
+            if !sessions.contains(where: { $0.status == .running || $0.status == .waitingApproval }) {
+                endBackgroundTaskIfNeeded()
+            }
             scheduleCacheSave()
 
         default:
@@ -3247,6 +3307,9 @@ public final class VeloStore: ObservableObject {
             finalLabel: finalLabel,
             failed: failed
         )
+        if !sessions.contains(where: { $0.status == .running || $0.status == .waitingApproval }) {
+            endBackgroundTaskIfNeeded()
+        }
         scheduleCacheSave()
         return totalMs
     }

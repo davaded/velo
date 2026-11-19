@@ -12,8 +12,13 @@ struct VeloMobileApp: App {
                     store.handleIncomingURL(url)
                 }
                 .onChange(of: scenePhase) { _, newPhase in
-                    if newPhase == .active {
+                    switch newPhase {
+                    case .active:
                         store.ensureConnectedOnForeground()
+                    case .background:
+                        store.handleAppDidEnterBackground()
+                    default:
+                        break
                     }
                 }
         }
