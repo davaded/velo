@@ -29,6 +29,10 @@ echo "🔨 [2/3] Building & Signing VeloMobile.app for iPhone (${DEVICE_ID})..."
 
 APP_PATH="${DERIVED}/Build/Products/Debug-iphoneos/VeloMobile.app"
 echo "📲 [3/3] Wirelessly Installing & Launching Velo onto iPhone (${DEVICE_ID})..."
+if ! xcrun devicectl list devices 2>/dev/null | grep -q "${DEVICE_ID}.*available"; then
+  killall CoreDeviceService 2>/dev/null || true
+  sleep 2
+fi
 xcrun devicectl device install app --device "${DEVICE_ID}" "${APP_PATH}"
 xcrun devicectl device process launch --device "${DEVICE_ID}" com.daiyudai.velo.mobile || true
 echo "✅ VeloMobile is freshly signed, installed, and running on your iPhone!"
