@@ -261,9 +261,12 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                             </span>
                           </div>
                           <div className="space-y-2">
-                            {card.mode === "unauthenticated" ? (
+                            {card.mode !== "subscription" || card.windows.length === 0 ? (
                               <div className="text-[11.5px] text-[var(--v-fg-muted)]">
-                                {card.summary_text || "当前未登录该 CLI 账号"}
+                                {card.summary_text ||
+                                  (card.mode === "api_key"
+                                    ? "API Key 按量模式 · 无 5h/7d 速率窗口"
+                                    : "当前未登录该 CLI 账号")}
                               </div>
                             ) : (
                               card.windows.map((w) => {
@@ -274,12 +277,9 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                                       ? `${Math.floor(w.reset_in_seconds / 86400)}d ${Math.floor((w.reset_in_seconds % 86400) / 3600)}h 后重置`
                                       : `${Math.floor(w.reset_in_seconds / 3600)}h ${Math.floor((w.reset_in_seconds % 3600) / 60)}m 后重置`
                                     : "";
-                                const rightLabel =
-                                  card.mode === "wallet" && w.detail_text
-                                    ? w.detail_text
-                                    : `${
-                                        w.detail_text ? `${w.detail_text} · ` : ""
-                                      }剩余 ${Math.round(rem)}%${resetHrs ? ` · ${resetHrs}` : ""}`;
+                                const rightLabel = `${
+                                  w.detail_text ? `${w.detail_text} · ` : ""
+                                }剩余 ${Math.round(rem)}%${resetHrs ? ` · ${resetHrs}` : ""}`;
                                 return (
                                   <div key={w.id} className="space-y-1">
                                     <div className="flex items-center justify-between text-[11px]">

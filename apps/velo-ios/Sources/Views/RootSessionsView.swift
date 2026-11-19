@@ -88,8 +88,8 @@ public struct RootSessionsView: View {
                             // 1. Live Specular Connection Status Card
                             connectionStatusCard
 
-                            // 1b. Compact 5h / 7d Subscription Quota Balance Strip
-                            if !store.quotaCards.isEmpty {
+                            // 1b. Compact 5h / 7d Subscription Quota Balance Strip (only when real subscription windows exist)
+                            if store.quotaCards.contains(where: { $0.mode == "subscription" && !$0.windows.isEmpty }) {
                                 compactQuotaStrip
                             }
 
@@ -344,8 +344,7 @@ public struct RootSessionsView: View {
     // MARK: - Subviews
 
     private var compactQuotaStrip: some View {
-        let activeCards = store.quotaCards.filter { $0.mode != "unauthenticated" && !$0.windows.isEmpty }
-        let unauthCards = store.quotaCards.filter { $0.mode == "unauthenticated" }
+        let activeCards = store.quotaCards.filter { $0.mode == "subscription" && !$0.windows.isEmpty }
 
         return Button {
             analyticsInitialTab = .analytics
@@ -363,9 +362,6 @@ public struct RootSessionsView: View {
                                 : VeloTheme.emerald
                         }()
                         let rightSummary: String = {
-                            if card.mode == "wallet" {
-                                return card.summaryText ?? wPrimary.detailText ?? ""
-                            }
                             let w7d = card.windows.first(where: { $0.id == "7d" })
                             var s = "余 \(Int(rem.rounded()))%"
                             if let w7d {
@@ -405,17 +401,6 @@ public struct RootSessionsView: View {
                             }
                             .frame(height: 5)
                         }
-                    }
-                }
-
-                if !unauthCards.isEmpty {
-                    HStack {
-                        ForEach(unauthCards) { c in
-                            Text("\(c.provider == "claude" ? "Claude" : "Codex"): 未登录")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(.tertiary)
-                        }
-                        Spacer()
                     }
                 }
             }

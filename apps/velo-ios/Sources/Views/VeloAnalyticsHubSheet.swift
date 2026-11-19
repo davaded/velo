@@ -107,7 +107,7 @@ public struct VeloAnalyticsHubSheet: View {
     private var analyticsSection: some View {
         if !store.quotaCards.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                Text("实时配额与账户余额")
+                Text("配额窗口与接入模式")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.secondary)
 
@@ -125,10 +125,15 @@ public struct VeloAnalyticsHubSheet: View {
                                 .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                         }
 
-                        if card.mode == "unauthenticated" {
-                            Text(card.summaryText ?? "当前未登录该 CLI 账号")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.secondary)
+                        if card.mode != "subscription" || card.windows.isEmpty {
+                            Text(
+                                card.summaryText
+                                    ?? (card.mode == "api_key"
+                                        ? "API Key 按量模式 · 无 5h/7d 速率窗口"
+                                        : "当前未登录该 CLI 账号")
+                            )
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
                         } else {
                             ForEach(card.windows) { w in
                                 let rem = max(0, min(100, w.remainingPercent))
@@ -140,9 +145,6 @@ public struct VeloAnalyticsHubSheet: View {
                                         : VeloTheme.emerald
                                 }()
                                 let rightTxt: String = {
-                                    if card.mode == "wallet", let dt = w.detailText {
-                                        return dt
-                                    }
                                     var parts: [String] = []
                                     if let dt = w.detailText, !dt.isEmpty { parts.append(dt) }
                                     parts.append("剩余 \(Int(rem.rounded()))%")

@@ -15,7 +15,7 @@ pub struct ProviderQuotaCardDto {
     pub provider: String,
     pub label: String,
     pub plan_badge: String,
-    /// `"subscription"` | `"wallet"` | `"unauthenticated"`
+    /// `"subscription"` | `"api_key"` | `"unauthenticated"`
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_text: Option<String>,
@@ -57,14 +57,18 @@ fn status_for_used_pct(used: f64) -> String {
     }
 }
 
-fn format_compact_usd(v: f64) -> String {
-    if v >= 1_000_000.0 {
-        format!("${:.2}M", v / 1_000_000.0)
-    } else if v >= 1_000.0 {
-        format!("${:.1}k", v / 1_000.0)
-    } else {
-        format!("${:.2}", v)
-    }
+fn extract_url_host(raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .trim()
+        .to_string()
 }
 
 fn parse_any_timestamp(val: &Value) -> Option<DateTime<Utc>> {
@@ -123,11 +127,10 @@ fn curl_json_get(url: &str, headers: &[(&str, String)]) -> Option<Value> {
     serde_json::from_slice::<Value>(&out.stdout).ok()
 }
 
-/// Parses `sub2api` / compatible gateway `/v1/usage` responses across all 3 real modes:
-/// 1. Key-level `rate_limits` (`window: "5h" | "1d" | "7d"`)
-/// 2. Group `subscription` (`daily_limit_usd` / `weekly_limit_usd` / `monthly_limit_usd`)
-/// 3. Unrestricted Wallet Balance (`planName: "钱包余额"`, `balance`, `usage.today`, `daily_usage`)
-fn parse_gateway_usage_card(
+/// Parses gateway `/v1/usage` ONLY for real rate-limit / subscription windows (`5h` / `1d` / `7d` / `30d`).
+/// Unrestricted / pay-as-you-go / wallet keys return `None` here so they are classified as `mode: "api_key"`
+/// with zero fabricated progress bars.
+fn parse_gateway_subscription_windows(
     provider: &str,
     label: &str,
     val: &Value,
@@ -136,10 +139,11 @@ fn parse_gateway_usage_card(
     let plan_name = val
         .get("planName")
         .and_then(|v| v.as_str())
-        .unwrap_or("API 配额")
+        .filter(|s| !s.is_empty() && *s != "钱包余额")
+        .unwrap_or("网关限额")
         .to_string();
 
-    // Mode A: Key-level 5h / 1d / 7d rate_limits array
+    // 1. Key-level `rate_limits` array (`window: "5h" | "1d" | "7d"` with `limit > 0`)
     if let Some(rl_arr) = val.get("rate_limits").and_then(|v| v.as_array()) {
         let mut wins = Vec::new();
         for entry in rl_arr {
@@ -185,7 +189,7 @@ fn parse_gateway_usage_card(
         }
     }
 
-    // Mode B: Group Subscription (`daily_limit_usd`, `weekly_limit_usd`, `monthly_limit_usd`)
+    // 2. Group `subscription` (`daily_limit_usd` / `weekly_limit_usd` / `monthly_limit_usd` > 0)
     if let Some(sub) = val.get("subscription").and_then(|v| v.as_object()) {
         let mut wins = Vec::new();
         for (u_key, l_key, id, win_label) in [
@@ -223,100 +227,30 @@ fn parse_gateway_usage_card(
         }
     }
 
-    // Mode C: Wallet Balance (`balance` / `remaining` + `usage.today` + `daily_usage`)
-    let balance = val
-        .get("balance")
-        .or_else(|| val.get("remaining"))
-        .and_then(|v| v.as_f64())?;
-    let today_obj = val.pointer("/usage/today");
-    let today_cost = today_obj
-        .and_then(|t| t.get("actual_cost").or_else(|| t.get("cost")))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let today_reqs = today_obj
-        .and_then(|t| t.get("requests"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    None
+}
 
-    let mut week_cost = 0.0;
-    let mut week_reqs = 0u64;
-    if let Some(daily) = val.get("daily_usage").and_then(|v| v.as_array()) {
-        for item in daily.iter().rev().take(7) {
-            week_cost += item
-                .get("actual_cost")
-                .or_else(|| item.get("cost"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            week_reqs += item
-                .get("requests")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        }
-    }
-
-    let total_cost = val
-        .pointer("/usage/total/actual_cost")
-        .or_else(|| val.pointer("/usage/total/cost"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(week_cost);
-    let denom = (balance + total_cost).max(1.0);
-    let used_pct = ((total_cost / denom) * 100.0).clamp(0.0, 100.0);
-    let rem_pct = (100.0 - used_pct).clamp(0.0, 100.0);
-
-    let summary = format!(
-        "今日 ${:.2} · 7d ${:.2} · 余 {}",
-        today_cost,
-        week_cost,
-        format_compact_usd(balance)
-    );
-
-    let windows = vec![
-        RateLimitWindowDto {
-            id: "today".to_string(),
-            label: "今日消耗".to_string(),
-            used_percent: (used_pct * 10.0).round() / 10.0,
-            remaining_percent: (rem_pct * 10.0).round() / 10.0,
-            resets_at: None,
-            reset_in_seconds: None,
-            detail_text: Some(format!("${:.2} · {} 次请求", today_cost, today_reqs)),
-            status: if balance <= 1.0 {
-                "warning".to_string()
-            } else {
-                "healthy".to_string()
-            },
-            source: "wallet".to_string(),
-        },
-        RateLimitWindowDto {
-            id: "7d".to_string(),
-            label: "近 7d 消耗".to_string(),
-            used_percent: (used_pct * 10.0).round() / 10.0,
-            remaining_percent: (rem_pct * 10.0).round() / 10.0,
-            resets_at: None,
-            reset_in_seconds: None,
-            detail_text: Some(format!(
-                "${:.2} · {} 次请求 · 余额 {}",
-                week_cost,
-                week_reqs,
-                format_compact_usd(balance)
-            )),
-            status: if balance <= 1.0 {
-                "warning".to_string()
-            } else {
-                "healthy".to_string()
-            },
-            source: "wallet".to_string(),
-        },
-    ];
-
-    Some(ProviderQuotaCardDto {
+fn build_custom_gateway_api_key_card(
+    provider: &str,
+    label: &str,
+    base_url: &str,
+    now: DateTime<Utc>,
+) -> ProviderQuotaCardDto {
+    let host = extract_url_host(base_url);
+    let summary = if host.is_empty() {
+        "自定义网关 API Key · 无 5h/7d 速率窗口".to_string()
+    } else {
+        format!("自定义网关 ({host}) · 无 5h/7d 速率窗口")
+    };
+    ProviderQuotaCardDto {
         provider: provider.to_string(),
         label: label.to_string(),
-        plan_badge: plan_name,
-        mode: "wallet".to_string(),
+        plan_badge: "自定义网关 · API Key".to_string(),
+        mode: "api_key".to_string(),
         summary_text: Some(summary),
-        windows,
+        windows: Vec::new(),
         updated_at: now,
-    })
+    }
 }
 
 fn probe_claude_card(
@@ -324,39 +258,63 @@ fn probe_claude_card(
     cache: &PersistedQuotaCache,
     now: DateTime<Utc>,
 ) -> ProviderQuotaCardDto {
-    // 1. Check `~/.claude/settings.json` for custom gateway (`ANTHROPIC_BASE_URL` + token)
+    // 1. Check `~/.claude/settings.json` for custom gateway or direct Anthropic API key
     if let Ok(raw_settings) = fs::read_to_string(home.join(".claude/settings.json")) {
         if let Ok(settings_val) = serde_json::from_str::<Value>(&raw_settings) {
             let base_url = settings_val
                 .pointer("/env/ANTHROPIC_BASE_URL")
                 .and_then(|v| v.as_str())
-                .map(|s| s.trim_end_matches('/'));
+                .map(|s| s.trim_end_matches('/'))
+                .filter(|s| !s.is_empty());
             let token = settings_val
                 .pointer("/env/ANTHROPIC_AUTH_TOKEN")
                 .or_else(|| settings_val.pointer("/env/ANTHROPIC_API_KEY"))
-                .and_then(|v| v.as_str());
-            if let (Some(base), Some(tok)) = (base_url, token) {
-                if !tok.is_empty() {
-                    let usage_url = if base.ends_with("/v1") {
-                        format!("{base}/usage")
-                    } else {
-                        format!("{base}/v1/usage")
-                    };
-                    if let Some(u_val) =
-                        curl_json_get(&usage_url, &[("Authorization", format!("Bearer {tok}"))])
-                    {
-                        if let Some(card) =
-                            parse_gateway_usage_card("claude", "Claude Code", &u_val, now)
-                        {
-                            return card;
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+
+            if let Some(base) = base_url {
+                let host = extract_url_host(base);
+                if !host.eq_ignore_ascii_case("api.anthropic.com") {
+                    if let Some(tok) = token {
+                        let usage_url = if base.ends_with("/v1") {
+                            format!("{base}/usage")
+                        } else {
+                            format!("{base}/v1/usage")
+                        };
+                        if let Some(u_val) = curl_json_get(
+                            &usage_url,
+                            &[("Authorization", format!("Bearer {tok}"))],
+                        ) {
+                            if let Some(sub_card) = parse_gateway_subscription_windows(
+                                "claude",
+                                "Claude Code",
+                                &u_val,
+                                now,
+                            ) {
+                                return sub_card;
+                            }
                         }
                     }
+                    return build_custom_gateway_api_key_card("claude", "Claude Code", base, now);
                 }
+            }
+
+            if token.is_some() {
+                return ProviderQuotaCardDto {
+                    provider: "claude".to_string(),
+                    label: "Claude Code".to_string(),
+                    plan_badge: "Anthropic API Key".to_string(),
+                    mode: "api_key".to_string(),
+                    summary_text: Some("Anthropic API Key 按量计费 · 无 5h/7d 订阅窗口".to_string()),
+                    windows: Vec::new(),
+                    updated_at: now,
+                };
             }
         }
     }
 
     // 2. Check Official Claude Code OAuth Keychain (`Claude Code-credentials` -> `claudeAiOauth.accessToken`)
+    let mut has_claude_oauth = false;
     if let Ok(kc_out) = Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
         .output()
@@ -368,6 +326,7 @@ fn probe_claude_card(
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                 {
+                    has_claude_oauth = true;
                     let sub_type = cred_val
                         .pointer("/claudeAiOauth/subscriptionType")
                         .and_then(|v| v.as_str())
@@ -433,28 +392,30 @@ fn probe_claude_card(
         }
     }
 
-    // 3. Check live cached `rate_limit_event` frames from an active session
-    let cached_wins: Vec<RateLimitWindowDto> = cache
-        .by_provider
-        .get("claude")
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|w| refresh_window_countdown(w, now))
-        .collect();
-    if !cached_wins.is_empty() {
-        return ProviderQuotaCardDto {
-            provider: "claude".to_string(),
-            label: "Claude Code".to_string(),
-            plan_badge: "实时订阅配额".to_string(),
-            mode: "subscription".to_string(),
-            summary_text: None,
-            windows: cached_wins,
-            updated_at: now,
-        };
+    // 3. Fallback to live cached `rate_limit_event` frames ONLY if Claude OAuth is signed in
+    if has_claude_oauth {
+        let cached_wins: Vec<RateLimitWindowDto> = cache
+            .by_provider
+            .get("claude")
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|w| refresh_window_countdown(w, now))
+            .collect();
+        if !cached_wins.is_empty() {
+            return ProviderQuotaCardDto {
+                provider: "claude".to_string(),
+                label: "Claude Code".to_string(),
+                plan_badge: "实时订阅配额".to_string(),
+                mode: "subscription".to_string(),
+                summary_text: None,
+                windows: cached_wins,
+                updated_at: now,
+            };
+        }
     }
 
-    // 4. Unauthenticated — never show a fake 100% bar!
+    // 4. Unauthenticated — never show a fake bar
     ProviderQuotaCardDto {
         provider: "claude".to_string(),
         label: "Claude Code".to_string(),
@@ -466,22 +427,106 @@ fn probe_claude_card(
     }
 }
 
-fn extract_toml_string_val(raw_toml: &str, key_name: &str) -> Option<String> {
+#[derive(Debug, Default)]
+struct CodexTomlConfig {
+    base_url: Option<String>,
+    requires_openai_auth: Option<bool>,
+    experimental_bearer_token: Option<String>,
+}
+
+fn parse_codex_toml_config(raw_toml: &str) -> CodexTomlConfig {
+    let mut active_provider_name = "openai".to_string();
+    let mut top_openai_base_url: Option<String> = None;
+    let mut current_section = String::new();
+
+    #[derive(Default)]
+    struct ProviderSection {
+        base_url: Option<String>,
+        requires_openai_auth: Option<bool>,
+        experimental_bearer_token: Option<String>,
+    }
+    let mut provider_sections: HashMap<String, ProviderSection> = HashMap::new();
+
     for line in raw_toml.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('#') {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some((lhs, rhs)) = trimmed.split_once('=') {
-            if lhs.trim() == key_name {
-                let val = rhs.trim().trim_matches('"').trim_matches('\'').trim();
-                if !val.is_empty() {
-                    return Some(val.to_string());
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = trimmed[1..trimmed.len() - 1].trim().to_string();
+            continue;
+        }
+        let Some((raw_k, raw_v)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = raw_k.trim();
+        let val_clean = raw_v
+            .split('#')
+            .next()
+            .unwrap_or(raw_v)
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+
+        if current_section.is_empty() {
+            if key == "model_provider" && !val_clean.is_empty() {
+                active_provider_name = val_clean.to_string();
+            } else if key == "openai_base_url" && !val_clean.is_empty() {
+                top_openai_base_url = Some(val_clean.to_string());
+            }
+        } else if let Some(prov_key) = current_section.strip_prefix("model_providers.") {
+            let norm_prov = prov_key.trim().trim_matches('"').trim_matches('\'').to_lowercase();
+            let entry = provider_sections.entry(norm_prov).or_default();
+            match key {
+                "base_url" if !val_clean.is_empty() => {
+                    entry.base_url = Some(val_clean.to_string());
                 }
+                "requires_openai_auth" => {
+                    if val_clean.eq_ignore_ascii_case("false") {
+                        entry.requires_openai_auth = Some(false);
+                    } else if val_clean.eq_ignore_ascii_case("true") {
+                        entry.requires_openai_auth = Some(true);
+                    }
+                }
+                "experimental_bearer_token" if !val_clean.is_empty() => {
+                    entry.experimental_bearer_token = Some(val_clean.to_string());
+                }
+                _ => {}
             }
         }
     }
-    None
+
+    let sec = provider_sections.remove(&active_provider_name.to_lowercase());
+    CodexTomlConfig {
+        base_url: sec.as_ref().and_then(|s| s.base_url.clone()).or(top_openai_base_url),
+        requires_openai_auth: sec.as_ref().and_then(|s| s.requires_openai_auth),
+        experimental_bearer_token: sec.and_then(|s| s.experimental_bearer_token),
+    }
+}
+
+fn classify_codex_window_slot(w_obj: &Value, fallback_id: &str) -> (&'static str, &'static str) {
+    if let Some(secs) = w_obj
+        .get("limit_window_seconds")
+        .or_else(|| w_obj.get("window_seconds"))
+        .and_then(|v| v.as_i64())
+    {
+        if secs >= 86_400 * 3 {
+            return ("7d", "7d 周配额");
+        }
+        return ("5h", "5h 窗口");
+    }
+    if let Some(mins) = w_obj.get("window_minutes").and_then(|v| v.as_i64()) {
+        if mins >= 1440 * 3 {
+            return ("7d", "7d 周配额");
+        }
+        return ("5h", "5h 窗口");
+    }
+    if fallback_id == "7d" {
+        ("7d", "7d 周配额")
+    } else {
+        ("5h", "5h 窗口")
+    }
 }
 
 fn probe_codex_card(
@@ -490,27 +535,45 @@ fn probe_codex_card(
     now: DateTime<Utc>,
 ) -> ProviderQuotaCardDto {
     let raw_toml = fs::read_to_string(home.join(".codex/config.toml")).unwrap_or_default();
-    let base_url = extract_toml_string_val(&raw_toml, "base_url");
-    let exp_bearer = extract_toml_string_val(&raw_toml, "experimental_bearer_token");
+    let cfg = parse_codex_toml_config(&raw_toml);
 
     let auth_val: Value = fs::read_to_string(home.join(".codex/auth.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(Value::Null);
-    let api_key = auth_val
-        .get("OPENAI_API_KEY")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or(exp_bearer);
+    let api_key = cfg
+        .experimental_bearer_token
+        .clone()
+        .or_else(|| {
+            auth_val
+                .get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
     let oauth_token = auth_val
         .pointer("/tokens/access_token")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    let chatgpt_account_id = auth_val
+        .pointer("/tokens/account_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
 
-    // 1. Custom Gateway / `sub2api` (`base_url` + `OPENAI_API_KEY`)
-    if let (Some(base), Some(key)) = (base_url.as_deref(), api_key.as_deref()) {
-        if !base.contains("api.openai.com") {
+    let is_custom_gateway = cfg
+        .base_url
+        .as_deref()
+        .map(|u| {
+            let host = extract_url_host(u);
+            !host.is_empty()
+                && !host.eq_ignore_ascii_case("api.openai.com")
+                && !host.eq_ignore_ascii_case("chatgpt.com")
+        })
+        .unwrap_or(false);
+
+    // 1. Custom Gateway (`base_url` points to non-OpenAI gateway, or `requires_openai_auth = false`)
+    if is_custom_gateway || cfg.requires_openai_auth == Some(false) {
+        if let (Some(base), Some(key)) = (cfg.base_url.as_deref(), api_key.as_deref()) {
             let trimmed_base = base.trim_end_matches('/');
             let usage_url = if trimmed_base.ends_with("/v1") {
                 format!("{trimmed_base}/usage")
@@ -520,37 +583,52 @@ fn probe_codex_card(
             if let Some(u_val) =
                 curl_json_get(&usage_url, &[("Authorization", format!("Bearer {key}"))])
             {
-                if let Some(card) = parse_gateway_usage_card("codex", "OpenAI Codex", &u_val, now) {
-                    return card;
+                if let Some(sub_card) =
+                    parse_gateway_subscription_windows("codex", "OpenAI Codex", &u_val, now)
+                {
+                    return sub_card;
                 }
             }
+            return build_custom_gateway_api_key_card("codex", "OpenAI Codex", base, now);
         }
+        return build_custom_gateway_api_key_card(
+            "codex",
+            "OpenAI Codex",
+            cfg.base_url.as_deref().unwrap_or(""),
+            now,
+        );
     }
 
-    // 2. Official ChatGPT Plus / Pro OAuth (`chatgpt.com/backend-api/wham/usage`)
+    // 2. Official ChatGPT Plus / Pro / Team OAuth (`chatgpt.com/backend-api/wham/usage`)
     if let Some(tok) = oauth_token {
-        if let Some(wham) = curl_json_get(
-            "https://chatgpt.com/backend-api/wham/usage",
-            &[
-                ("Authorization", format!("Bearer {tok}")),
-                ("User-Agent", "codex-cli".to_string()),
-            ],
-        ) {
+        let mut headers = vec![
+            ("Authorization", format!("Bearer {tok}")),
+            ("User-Agent", "codex-cli".to_string()),
+        ];
+        if let Some(acc_id) = chatgpt_account_id {
+            headers.push(("ChatGPT-Account-Id", acc_id.to_string()));
+        }
+        if let Some(wham) = curl_json_get("https://chatgpt.com/backend-api/wham/usage", &headers) {
             let plan_type = wham
                 .get("plan_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("ChatGPT");
             let mut wins = Vec::new();
-            for (ptr, id, win_label) in [
-                ("/rate_limit/primary_window", "5h", "5h 窗口"),
-                ("/rate_limit/secondary_window", "7d", "7d 周配额"),
+            for (ptr, fallback_id) in [
+                ("/rate_limit/primary_window", "5h"),
+                ("/rate_limit/secondary_window", "7d"),
             ] {
                 if let Some(w_obj) = wham.pointer(ptr) {
                     if let Some(used_pct) = w_obj.get("used_percent").and_then(|v| v.as_f64()) {
-                        let resets_at = w_obj.get("reset_at").and_then(parse_any_timestamp);
+                        let (id, win_label) = classify_codex_window_slot(w_obj, fallback_id);
+                        let resets_at = w_obj
+                            .get("reset_at")
+                            .or_else(|| w_obj.get("resets_at"))
+                            .and_then(parse_any_timestamp);
                         let reset_in_seconds = resets_at
                             .map(|r| (r - now).num_seconds())
                             .filter(|&s| s > 0);
+                        wins.retain(|x: &RateLimitWindowDto| x.id != id);
                         wins.push(RateLimitWindowDto {
                             id: id.to_string(),
                             label: win_label.to_string(),
@@ -567,6 +645,7 @@ fn probe_codex_card(
                     }
                 }
             }
+            wins.sort_by_key(|w| if w.id == "5h" { 0 } else { 1 });
             if !wins.is_empty() {
                 return ProviderQuotaCardDto {
                     provider: "codex".to_string(),
@@ -579,38 +658,52 @@ fn probe_codex_card(
                 };
             }
         }
+
+        // Fallback to cached or recent session JSONL rate_limits ONLY when signed into official ChatGPT OAuth
+        let mut cached_wins: Vec<RateLimitWindowDto> = cache
+            .by_provider
+            .get("codex")
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|w| refresh_window_countdown(w, now))
+            .collect();
+        if cached_wins.is_empty() {
+            scan_tail_codex_rate_limits(&home.join(".codex/sessions"), &mut cached_wins, now);
+        }
+        if !cached_wins.is_empty() {
+            return ProviderQuotaCardDto {
+                provider: "codex".to_string(),
+                label: "OpenAI Codex".to_string(),
+                plan_badge: "Codex 订阅配额".to_string(),
+                mode: "subscription".to_string(),
+                summary_text: None,
+                windows: cached_wins,
+                updated_at: now,
+            };
+        }
     }
 
-    // 3. Check cached or tail-of-JSONL non-null `rate_limits`
-    let mut cached_wins: Vec<RateLimitWindowDto> = cache
-        .by_provider
-        .get("codex")
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|w| refresh_window_countdown(w, now))
-        .collect();
-    if cached_wins.is_empty() {
-        scan_tail_codex_rate_limits(&home.join(".codex/sessions"), &mut cached_wins, now);
-    }
-    if !cached_wins.is_empty() {
+    // 3. Direct OpenAI Platform API Key (`sk-...` against `api.openai.com`, no ChatGPT OAuth)
+    if api_key.is_some() {
         return ProviderQuotaCardDto {
             provider: "codex".to_string(),
             label: "OpenAI Codex".to_string(),
-            plan_badge: "实时订阅配额".to_string(),
-            mode: "subscription".to_string(),
-            summary_text: None,
-            windows: cached_wins,
+            plan_badge: "OpenAI API Key".to_string(),
+            mode: "api_key".to_string(),
+            summary_text: Some("OpenAI API Key 按量计费 · 无 5h/7d 订阅窗口".to_string()),
+            windows: Vec::new(),
             updated_at: now,
         };
     }
 
+    // 4. Unauthenticated
     ProviderQuotaCardDto {
         provider: "codex".to_string(),
         label: "OpenAI Codex".to_string(),
-        plan_badge: "未配置配额源".to_string(),
+        plan_badge: "未登录".to_string(),
         mode: "unauthenticated".to_string(),
-        summary_text: Some("未检测到可用配额或未登录".to_string()),
+        summary_text: Some("未登录 · 请运行 codex login".to_string()),
         windows: Vec::new(),
         updated_at: now,
     }
@@ -657,10 +750,14 @@ fn scan_tail_codex_rate_limits(
                 continue;
             };
             if let Some(rl) = val.pointer("/payload/rate_limits") {
-                for (slot, id, label) in [("primary", "5h", "5h 窗口"), ("secondary", "7d", "7d 周配额")] {
+                for (slot, fallback_id) in [("primary", "5h"), ("secondary", "7d")] {
                     if let Some(w_obj) = rl.get(slot) {
                         if let Some(used_pct) = w_obj.get("used_percent").and_then(|v| v.as_f64()) {
-                            let resets_at = w_obj.get("resets_at").and_then(parse_any_timestamp);
+                            let (id, label) = classify_codex_window_slot(w_obj, fallback_id);
+                            let resets_at = w_obj
+                                .get("resets_at")
+                                .or_else(|| w_obj.get("reset_at"))
+                                .and_then(parse_any_timestamp);
                             if let Some(dto) = refresh_window_countdown(
                                 RateLimitWindowDto {
                                     id: id.to_string(),
@@ -682,6 +779,7 @@ fn scan_tail_codex_rate_limits(
                     }
                 }
                 if !live_windows.is_empty() {
+                    live_windows.sort_by_key(|w| if w.id == "5h" { 0 } else { 1 });
                     return;
                 }
             }
@@ -787,22 +885,51 @@ mod tests {
         assert!((win.used_percent - 42.0).abs() < 0.1);
         assert!((win.remaining_percent - 58.0).abs() < 0.1);
 
+        // Unrestricted wallet payload MUST NOT produce fake subscription windows
         let wallet_raw = serde_json::json!({
+            "mode": "unrestricted",
             "planName": "钱包余额",
-            "balance": 100.0,
+            "balance": 980144.0,
             "usage": {
                 "today": { "actual_cost": 4.5, "requests": 12 },
                 "total": { "actual_cost": 25.0 }
-            },
-            "daily_usage": [
-                { "date": "2026-11-18", "actual_cost": 10.0, "requests": 30 },
-                { "date": "2026-11-19", "actual_cost": 4.5, "requests": 12 }
+            }
+        });
+        assert!(
+            parse_gateway_subscription_windows("codex", "OpenAI Codex", &wallet_raw, now).is_none(),
+            "unrestricted wallet key must not be treated as a 5h/7d subscription"
+        );
+
+        // Real 5h/7d gateway rate_limits MUST produce subscription windows
+        let limited_raw = serde_json::json!({
+            "mode": "quota_limited",
+            "planName": "Pro 5h/7d",
+            "rate_limits": [
+                { "window": "5h", "limit": 20.0, "used": 5.0 },
+                { "window": "7d", "limit": 100.0, "used": 40.0 }
             ]
         });
-        let card = parse_gateway_usage_card("codex", "OpenAI Codex", &wallet_raw, now)
-            .expect("should parse sub2api wallet card");
-        assert_eq!(card.mode, "wallet");
-        assert_eq!(card.windows.len(), 2);
-        assert!(card.summary_text.unwrap_or_default().contains("今日 $4.50"));
+        let sub_card =
+            parse_gateway_subscription_windows("codex", "OpenAI Codex", &limited_raw, now)
+                .expect("rate_limits should produce subscription card");
+        assert_eq!(sub_card.mode, "subscription");
+        assert_eq!(sub_card.windows.len(), 2);
+        assert!((sub_card.windows[0].remaining_percent - 75.0).abs() < 0.1);
+
+        // Active TOML section parsing must respect model_provider
+        let sample_toml = r#"
+model_provider = "OpenAI"
+[model_providers.Other]
+base_url = "https://unused.example.com/v1"
+[model_providers.OpenAI]
+base_url = "https://api.daidaiyu.me/v1"
+requires_openai_auth = false
+"#;
+        let parsed = parse_codex_toml_config(sample_toml);
+        assert_eq!(
+            parsed.base_url.as_deref(),
+            Some("https://api.daidaiyu.me/v1")
+        );
+        assert_eq!(parsed.requires_openai_auth, Some(false));
     }
 }

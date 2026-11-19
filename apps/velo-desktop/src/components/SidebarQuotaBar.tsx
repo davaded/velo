@@ -15,7 +15,7 @@ export interface ProviderQuotaCard {
   provider: string;
   label: string;
   plan_badge: string;
-  mode?: "subscription" | "wallet" | "unauthenticated" | string;
+  mode?: "subscription" | "api_key" | "unauthenticated" | string;
   summary_text?: string | null;
   windows: QuotaWindowItem[];
 }
@@ -63,11 +63,12 @@ export const SidebarQuotaBar: React.FC<{
     return () => clearInterval(id);
   }, [daemonUrl]);
 
-  // Only show configured/authenticated providers prominently; keep unauthenticated subtle
-  const activeCards = cards.filter((c) => c.mode !== "unauthenticated");
-  const unauthCards = cards.filter((c) => c.mode === "unauthenticated");
+  // Strictly show 5h/7d quota bars ONLY when official OAuth or gateway returns real rate-limit windows
+  const subscriptionCards = cards.filter(
+    (c) => c.mode === "subscription" && c.windows.length > 0
+  );
 
-  if (cards.length === 0) return null;
+  if (subscriptionCards.length === 0) return null;
 
   return (
     <div className="mx-2 mb-1.5 rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)]/75 px-2.5 py-2">
@@ -77,7 +78,7 @@ export const SidebarQuotaBar: React.FC<{
           onClick={onOpenAnalytics}
           className="text-[10.5px] font-medium text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)] cursor-pointer"
         >
-          实时配额与余额监控
+          5h / 7d 订阅配额监控
         </button>
         <button
           type="button"
@@ -90,9 +91,8 @@ export const SidebarQuotaBar: React.FC<{
       </div>
 
       <div className="space-y-1.5">
-        {activeCards.map((card) => {
+        {subscriptionCards.map((card) => {
           const shortName = card.provider === "claude" ? "Claude" : "Codex";
-          const isWallet = card.mode === "wallet";
           const wPrimary = card.windows.find((w) => w.id === "5h") || card.windows[0];
           const w7d = card.windows.find((w) => w.id === "7d");
           if (!wPrimary) return null;
@@ -108,11 +108,9 @@ export const SidebarQuotaBar: React.FC<{
               ? "bg-[#fb923c]"
               : "bg-[#34d399]";
 
-          const rightSummary = isWallet
-            ? card.summary_text || wPrimary.detail_text || ""
-            : `余 ${Math.round(remPct)}%${
-                w7d ? ` · 7d ${Math.round(w7d.remaining_percent)}%` : ""
-              }${resetTxt ? ` · ${resetTxt}` : ""}`;
+          const rightSummary = `余 ${Math.round(remPct)}%${
+            w7d ? ` · 7d ${Math.round(w7d.remaining_percent)}%` : ""
+          }${resetTxt ? ` · ${resetTxt}` : ""}`;
 
           return (
             <div key={card.provider} className="space-y-0.5">
@@ -136,16 +134,6 @@ export const SidebarQuotaBar: React.FC<{
             </div>
           );
         })}
-
-        {unauthCards.length > 0 && (
-          <div className="flex items-center justify-between pt-0.5 text-[10px] text-[var(--v-fg-faint)]">
-            {unauthCards.map((c) => (
-              <span key={c.provider}>
-                {c.provider === "claude" ? "Claude" : "Codex"}: 未登录
-              </span>
-            ))}
-          </div>
-        )}
       </div>
     </div>
   );
