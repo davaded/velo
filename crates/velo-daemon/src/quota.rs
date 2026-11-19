@@ -1,11 +1,13 @@
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 use velo_protocol::{AgentEvent, RateLimitWindowDto, SessionInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +15,10 @@ pub struct ProviderQuotaCardDto {
     pub provider: String,
     pub label: String,
     pub plan_badge: String,
+    /// `"subscription"` | `"wallet"` | `"unauthenticated"`
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_text: Option<String>,
     pub windows: Vec<RateLimitWindowDto>,
     pub updated_at: DateTime<Utc>,
 }
@@ -21,6 +27,9 @@ pub struct ProviderQuotaCardDto {
 pub struct PersistedQuotaCache {
     pub by_provider: HashMap<String, Vec<RateLimitWindowDto>>,
 }
+
+static LIVE_PROBE_CACHE: OnceLock<Mutex<Option<(Instant, Vec<ProviderQuotaCardDto>)>>> =
+    OnceLock::new();
 
 pub fn load_quota_cache(path: &Path) -> PersistedQuotaCache {
     fs::read_to_string(path)
@@ -48,11 +57,49 @@ fn status_for_used_pct(used: f64) -> String {
     }
 }
 
-fn refresh_window_countdown(mut w: RateLimitWindowDto, now: DateTime<Utc>) -> Option<RateLimitWindowDto> {
+fn format_compact_usd(v: f64) -> String {
+    if v >= 1_000_000.0 {
+        format!("${:.2}M", v / 1_000_000.0)
+    } else if v >= 1_000.0 {
+        format!("${:.1}k", v / 1_000.0)
+    } else {
+        format!("${:.2}", v)
+    }
+}
+
+fn parse_any_timestamp(val: &Value) -> Option<DateTime<Utc>> {
+    if let Some(s) = val.as_str() {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    if let Some(sec) = val.as_i64() {
+        let s = if sec > 1_000_000_000_000 {
+            sec / 1000
+        } else {
+            sec
+        };
+        return Utc.timestamp_opt(s, 0).single();
+    }
+    if let Some(f) = val.as_f64() {
+        let s = if f > 1_000_000_000_000.0 {
+            (f / 1000.0) as i64
+        } else {
+            f as i64
+        };
+        return Utc.timestamp_opt(s, 0).single();
+    }
+    None
+}
+
+fn refresh_window_countdown(
+    mut w: RateLimitWindowDto,
+    now: DateTime<Utc>,
+) -> Option<RateLimitWindowDto> {
     if let Some(resets) = w.resets_at {
         let diff = (resets - now).num_seconds();
         if diff <= 0 {
-            return None; // Window already reset!
+            return None;
         }
         w.reset_in_seconds = Some(diff);
     }
@@ -62,19 +109,332 @@ fn refresh_window_countdown(mut w: RateLimitWindowDto, now: DateTime<Utc>) -> Op
     Some(w)
 }
 
-/// Scans recent `~/.claude/projects` and `~/.codex/sessions` JSONL files for either:
-/// 1. Official rate-limit frames (`rate_limit_event` / `token_count.rate_limits`)
-/// 2. Actual 5-hour & 7-day rolling subscription activity windows + exact reset countdown!
-pub fn build_subscription_quotas_snapshot(
-    cache: &PersistedQuotaCache,
-    sessions: &HashMap<uuid::Uuid, SessionInfo>,
-    event_history: &HashMap<uuid::Uuid, Vec<AgentEvent>>,
-) -> Vec<ProviderQuotaCardDto> {
-    let now = Utc::now();
-    let cutoff_5h = now - Duration::hours(5);
-    let cutoff_7d = now - Duration::days(7);
+fn curl_json_get(url: &str, headers: &[(&str, String)]) -> Option<Value> {
+    let mut cmd = Command::new("/usr/bin/curl");
+    cmd.args(["-sS", "--max-time", "5", "-H", "Accept: application/json"]);
+    for (k, v) in headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    cmd.arg(url);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&out.stdout).ok()
+}
 
-    let mut claude_live_windows: Vec<RateLimitWindowDto> = cache
+/// Parses `sub2api` / compatible gateway `/v1/usage` responses across all 3 real modes:
+/// 1. Key-level `rate_limits` (`window: "5h" | "1d" | "7d"`)
+/// 2. Group `subscription` (`daily_limit_usd` / `weekly_limit_usd` / `monthly_limit_usd`)
+/// 3. Unrestricted Wallet Balance (`planName: "钱包余额"`, `balance`, `usage.today`, `daily_usage`)
+fn parse_gateway_usage_card(
+    provider: &str,
+    label: &str,
+    val: &Value,
+    now: DateTime<Utc>,
+) -> Option<ProviderQuotaCardDto> {
+    let plan_name = val
+        .get("planName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("API 配额")
+        .to_string();
+
+    // Mode A: Key-level 5h / 1d / 7d rate_limits array
+    if let Some(rl_arr) = val.get("rate_limits").and_then(|v| v.as_array()) {
+        let mut wins = Vec::new();
+        for entry in rl_arr {
+            let win_id = entry.get("window").and_then(|v| v.as_str()).unwrap_or("5h");
+            let limit = entry.get("limit").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let used = entry.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if limit <= 0.0 {
+                continue;
+            }
+            let used_pct = ((used / limit) * 100.0).clamp(0.0, 100.0);
+            let resets_at = entry.get("reset_at").and_then(parse_any_timestamp);
+            let reset_in_seconds = resets_at
+                .map(|r| (r - now).num_seconds())
+                .filter(|&s| s > 0);
+            let win_label = match win_id {
+                "5h" => "5h 窗口",
+                "1d" => "今日限额",
+                "7d" => "7d 周限额",
+                _ => win_id,
+            };
+            wins.push(RateLimitWindowDto {
+                id: win_id.to_string(),
+                label: win_label.to_string(),
+                used_percent: (used_pct * 10.0).round() / 10.0,
+                remaining_percent: (((100.0 - used_pct).clamp(0.0, 100.0)) * 10.0).round() / 10.0,
+                resets_at,
+                reset_in_seconds,
+                detail_text: Some(format!("${:.2} / ${:.2}", used, limit)),
+                status: status_for_used_pct(used_pct),
+                source: "provider_api".to_string(),
+            });
+        }
+        if !wins.is_empty() {
+            return Some(ProviderQuotaCardDto {
+                provider: provider.to_string(),
+                label: label.to_string(),
+                plan_badge: plan_name,
+                mode: "subscription".to_string(),
+                summary_text: None,
+                windows: wins,
+                updated_at: now,
+            });
+        }
+    }
+
+    // Mode B: Group Subscription (`daily_limit_usd`, `weekly_limit_usd`, `monthly_limit_usd`)
+    if let Some(sub) = val.get("subscription").and_then(|v| v.as_object()) {
+        let mut wins = Vec::new();
+        for (u_key, l_key, id, win_label) in [
+            ("daily_usage_usd", "daily_limit_usd", "1d", "今日额度"),
+            ("weekly_usage_usd", "weekly_limit_usd", "7d", "7d 周额度"),
+            ("monthly_usage_usd", "monthly_limit_usd", "30d", "月度额度"),
+        ] {
+            if let Some(limit) = sub.get(l_key).and_then(|v| v.as_f64()).filter(|&l| l > 0.0) {
+                let used = sub.get(u_key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let used_pct = ((used / limit) * 100.0).clamp(0.0, 100.0);
+                wins.push(RateLimitWindowDto {
+                    id: id.to_string(),
+                    label: win_label.to_string(),
+                    used_percent: (used_pct * 10.0).round() / 10.0,
+                    remaining_percent: (((100.0 - used_pct).clamp(0.0, 100.0)) * 10.0).round()
+                        / 10.0,
+                    resets_at: None,
+                    reset_in_seconds: None,
+                    detail_text: Some(format!("${:.2} / ${:.2}", used, limit)),
+                    status: status_for_used_pct(used_pct),
+                    source: "provider_api".to_string(),
+                });
+            }
+        }
+        if !wins.is_empty() {
+            return Some(ProviderQuotaCardDto {
+                provider: provider.to_string(),
+                label: label.to_string(),
+                plan_badge: plan_name,
+                mode: "subscription".to_string(),
+                summary_text: None,
+                windows: wins,
+                updated_at: now,
+            });
+        }
+    }
+
+    // Mode C: Wallet Balance (`balance` / `remaining` + `usage.today` + `daily_usage`)
+    let balance = val
+        .get("balance")
+        .or_else(|| val.get("remaining"))
+        .and_then(|v| v.as_f64())?;
+    let today_obj = val.pointer("/usage/today");
+    let today_cost = today_obj
+        .and_then(|t| t.get("actual_cost").or_else(|| t.get("cost")))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let today_reqs = today_obj
+        .and_then(|t| t.get("requests"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut week_cost = 0.0;
+    let mut week_reqs = 0u64;
+    if let Some(daily) = val.get("daily_usage").and_then(|v| v.as_array()) {
+        for item in daily.iter().rev().take(7) {
+            week_cost += item
+                .get("actual_cost")
+                .or_else(|| item.get("cost"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            week_reqs += item
+                .get("requests")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+        }
+    }
+
+    let total_cost = val
+        .pointer("/usage/total/actual_cost")
+        .or_else(|| val.pointer("/usage/total/cost"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(week_cost);
+    let denom = (balance + total_cost).max(1.0);
+    let used_pct = ((total_cost / denom) * 100.0).clamp(0.0, 100.0);
+    let rem_pct = (100.0 - used_pct).clamp(0.0, 100.0);
+
+    let summary = format!(
+        "今日 ${:.2} · 7d ${:.2} · 余 {}",
+        today_cost,
+        week_cost,
+        format_compact_usd(balance)
+    );
+
+    let windows = vec![
+        RateLimitWindowDto {
+            id: "today".to_string(),
+            label: "今日消耗".to_string(),
+            used_percent: (used_pct * 10.0).round() / 10.0,
+            remaining_percent: (rem_pct * 10.0).round() / 10.0,
+            resets_at: None,
+            reset_in_seconds: None,
+            detail_text: Some(format!("${:.2} · {} 次请求", today_cost, today_reqs)),
+            status: if balance <= 1.0 {
+                "warning".to_string()
+            } else {
+                "healthy".to_string()
+            },
+            source: "wallet".to_string(),
+        },
+        RateLimitWindowDto {
+            id: "7d".to_string(),
+            label: "近 7d 消耗".to_string(),
+            used_percent: (used_pct * 10.0).round() / 10.0,
+            remaining_percent: (rem_pct * 10.0).round() / 10.0,
+            resets_at: None,
+            reset_in_seconds: None,
+            detail_text: Some(format!(
+                "${:.2} · {} 次请求 · 余额 {}",
+                week_cost,
+                week_reqs,
+                format_compact_usd(balance)
+            )),
+            status: if balance <= 1.0 {
+                "warning".to_string()
+            } else {
+                "healthy".to_string()
+            },
+            source: "wallet".to_string(),
+        },
+    ];
+
+    Some(ProviderQuotaCardDto {
+        provider: provider.to_string(),
+        label: label.to_string(),
+        plan_badge: plan_name,
+        mode: "wallet".to_string(),
+        summary_text: Some(summary),
+        windows,
+        updated_at: now,
+    })
+}
+
+fn probe_claude_card(
+    home: &Path,
+    cache: &PersistedQuotaCache,
+    now: DateTime<Utc>,
+) -> ProviderQuotaCardDto {
+    // 1. Check `~/.claude/settings.json` for custom gateway (`ANTHROPIC_BASE_URL` + token)
+    if let Ok(raw_settings) = fs::read_to_string(home.join(".claude/settings.json")) {
+        if let Ok(settings_val) = serde_json::from_str::<Value>(&raw_settings) {
+            let base_url = settings_val
+                .pointer("/env/ANTHROPIC_BASE_URL")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim_end_matches('/'));
+            let token = settings_val
+                .pointer("/env/ANTHROPIC_AUTH_TOKEN")
+                .or_else(|| settings_val.pointer("/env/ANTHROPIC_API_KEY"))
+                .and_then(|v| v.as_str());
+            if let (Some(base), Some(tok)) = (base_url, token) {
+                if !tok.is_empty() {
+                    let usage_url = if base.ends_with("/v1") {
+                        format!("{base}/usage")
+                    } else {
+                        format!("{base}/v1/usage")
+                    };
+                    if let Some(u_val) =
+                        curl_json_get(&usage_url, &[("Authorization", format!("Bearer {tok}"))])
+                    {
+                        if let Some(card) =
+                            parse_gateway_usage_card("claude", "Claude Code", &u_val, now)
+                        {
+                            return card;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check Official Claude Code OAuth Keychain (`Claude Code-credentials` -> `claudeAiOauth.accessToken`)
+    if let Ok(kc_out) = Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+    {
+        if kc_out.status.success() {
+            if let Ok(cred_val) = serde_json::from_slice::<Value>(&kc_out.stdout) {
+                if let Some(tok) = cred_val
+                    .pointer("/claudeAiOauth/accessToken")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    let sub_type = cred_val
+                        .pointer("/claudeAiOauth/subscriptionType")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Pro / Max");
+                    if let Some(usage_val) = curl_json_get(
+                        "https://api.anthropic.com/api/oauth/usage",
+                        &[
+                            ("Authorization", format!("Bearer {tok}")),
+                            ("anthropic-beta", "oauth-2025-04-20".to_string()),
+                            ("User-Agent", "claude-code/2.1.0".to_string()),
+                        ],
+                    ) {
+                        let mut wins = Vec::new();
+                        for (field, id, win_label) in [
+                            ("five_hour", "5h", "5h 窗口"),
+                            ("seven_day", "7d", "7d 周配额"),
+                        ] {
+                            if let Some(w_obj) = usage_val.get(field) {
+                                if let Some(raw_u) =
+                                    w_obj.get("utilization").and_then(|v| v.as_f64())
+                                {
+                                    let used_pct = if raw_u <= 1.0 && raw_u > 0.0 {
+                                        raw_u * 100.0
+                                    } else {
+                                        raw_u
+                                    };
+                                    let resets_at =
+                                        w_obj.get("resets_at").and_then(parse_any_timestamp);
+                                    let reset_in_seconds = resets_at
+                                        .map(|r| (r - now).num_seconds())
+                                        .filter(|&s| s > 0);
+                                    wins.push(RateLimitWindowDto {
+                                        id: id.to_string(),
+                                        label: win_label.to_string(),
+                                        used_percent: (used_pct * 10.0).round() / 10.0,
+                                        remaining_percent: (((100.0 - used_pct).clamp(0.0, 100.0))
+                                            * 10.0)
+                                            .round()
+                                            / 10.0,
+                                        resets_at,
+                                        reset_in_seconds,
+                                        detail_text: None,
+                                        status: status_for_used_pct(used_pct),
+                                        source: "provider_api".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        if !wins.is_empty() {
+                            return ProviderQuotaCardDto {
+                                provider: "claude".to_string(),
+                                label: "Claude Code".to_string(),
+                                plan_badge: format!("Claude {sub_type}"),
+                                mode: "subscription".to_string(),
+                                summary_text: None,
+                                windows: wins,
+                                updated_at: now,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Check live cached `rate_limit_event` frames from an active session
+    let cached_wins: Vec<RateLimitWindowDto> = cache
         .by_provider
         .get("claude")
         .cloned()
@@ -82,8 +442,147 @@ pub fn build_subscription_quotas_snapshot(
         .into_iter()
         .filter_map(|w| refresh_window_countdown(w, now))
         .collect();
+    if !cached_wins.is_empty() {
+        return ProviderQuotaCardDto {
+            provider: "claude".to_string(),
+            label: "Claude Code".to_string(),
+            plan_badge: "实时订阅配额".to_string(),
+            mode: "subscription".to_string(),
+            summary_text: None,
+            windows: cached_wins,
+            updated_at: now,
+        };
+    }
 
-    let mut codex_live_windows: Vec<RateLimitWindowDto> = cache
+    // 4. Unauthenticated — never show a fake 100% bar!
+    ProviderQuotaCardDto {
+        provider: "claude".to_string(),
+        label: "Claude Code".to_string(),
+        plan_badge: "未登录".to_string(),
+        mode: "unauthenticated".to_string(),
+        summary_text: Some("未登录 · 请运行 claude /login".to_string()),
+        windows: Vec::new(),
+        updated_at: now,
+    }
+}
+
+fn extract_toml_string_val(raw_toml: &str, key_name: &str) -> Option<String> {
+    for line in raw_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((lhs, rhs)) = trimmed.split_once('=') {
+            if lhs.trim() == key_name {
+                let val = rhs.trim().trim_matches('"').trim_matches('\'').trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn probe_codex_card(
+    home: &Path,
+    cache: &PersistedQuotaCache,
+    now: DateTime<Utc>,
+) -> ProviderQuotaCardDto {
+    let raw_toml = fs::read_to_string(home.join(".codex/config.toml")).unwrap_or_default();
+    let base_url = extract_toml_string_val(&raw_toml, "base_url");
+    let exp_bearer = extract_toml_string_val(&raw_toml, "experimental_bearer_token");
+
+    let auth_val: Value = fs::read_to_string(home.join(".codex/auth.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null);
+    let api_key = auth_val
+        .get("OPENAI_API_KEY")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(exp_bearer);
+    let oauth_token = auth_val
+        .pointer("/tokens/access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    // 1. Custom Gateway / `sub2api` (`base_url` + `OPENAI_API_KEY`)
+    if let (Some(base), Some(key)) = (base_url.as_deref(), api_key.as_deref()) {
+        if !base.contains("api.openai.com") {
+            let trimmed_base = base.trim_end_matches('/');
+            let usage_url = if trimmed_base.ends_with("/v1") {
+                format!("{trimmed_base}/usage")
+            } else {
+                format!("{trimmed_base}/v1/usage")
+            };
+            if let Some(u_val) =
+                curl_json_get(&usage_url, &[("Authorization", format!("Bearer {key}"))])
+            {
+                if let Some(card) = parse_gateway_usage_card("codex", "OpenAI Codex", &u_val, now) {
+                    return card;
+                }
+            }
+        }
+    }
+
+    // 2. Official ChatGPT Plus / Pro OAuth (`chatgpt.com/backend-api/wham/usage`)
+    if let Some(tok) = oauth_token {
+        if let Some(wham) = curl_json_get(
+            "https://chatgpt.com/backend-api/wham/usage",
+            &[
+                ("Authorization", format!("Bearer {tok}")),
+                ("User-Agent", "codex-cli".to_string()),
+            ],
+        ) {
+            let plan_type = wham
+                .get("plan_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ChatGPT");
+            let mut wins = Vec::new();
+            for (ptr, id, win_label) in [
+                ("/rate_limit/primary_window", "5h", "5h 窗口"),
+                ("/rate_limit/secondary_window", "7d", "7d 周配额"),
+            ] {
+                if let Some(w_obj) = wham.pointer(ptr) {
+                    if let Some(used_pct) = w_obj.get("used_percent").and_then(|v| v.as_f64()) {
+                        let resets_at = w_obj.get("reset_at").and_then(parse_any_timestamp);
+                        let reset_in_seconds = resets_at
+                            .map(|r| (r - now).num_seconds())
+                            .filter(|&s| s > 0);
+                        wins.push(RateLimitWindowDto {
+                            id: id.to_string(),
+                            label: win_label.to_string(),
+                            used_percent: (used_pct * 10.0).round() / 10.0,
+                            remaining_percent: (((100.0 - used_pct).clamp(0.0, 100.0)) * 10.0)
+                                .round()
+                                / 10.0,
+                            resets_at,
+                            reset_in_seconds,
+                            detail_text: None,
+                            status: status_for_used_pct(used_pct),
+                            source: "provider_api".to_string(),
+                        });
+                    }
+                }
+            }
+            if !wins.is_empty() {
+                return ProviderQuotaCardDto {
+                    provider: "codex".to_string(),
+                    label: "OpenAI Codex".to_string(),
+                    plan_badge: format!("Codex ({plan_type})"),
+                    mode: "subscription".to_string(),
+                    summary_text: None,
+                    windows: wins,
+                    updated_at: now,
+                };
+            }
+        }
+    }
+
+    // 3. Check cached or tail-of-JSONL non-null `rate_limits`
+    let mut cached_wins: Vec<RateLimitWindowDto> = cache
         .by_provider
         .get("codex")
         .cloned()
@@ -91,272 +590,43 @@ pub fn build_subscription_quotas_snapshot(
         .into_iter()
         .filter_map(|w| refresh_window_countdown(w, now))
         .collect();
-
-    // Tally rolling 5h and 7d turn/token activity from Velo SQLite + native CLI JSONLs
-    let mut claude_5h_weighted: f64 = 0.0;
-    let mut claude_5h_oldest: Option<DateTime<Utc>> = None;
-    let mut claude_7d_weighted: f64 = 0.0;
-    let mut claude_7d_oldest: Option<DateTime<Utc>> = None;
-
-    let mut codex_5h_weighted: f64 = 0.0;
-    let mut codex_5h_oldest: Option<DateTime<Utc>> = None;
-    let mut codex_7d_weighted: f64 = 0.0;
-    let mut codex_7d_oldest: Option<DateTime<Utc>> = None;
-
-    for (sid, evs) in event_history {
-        let prov = sessions
-            .get(sid)
-            .map(|s| s.provider.to_string())
-            .unwrap_or_default();
-        for ev in evs {
-            if let AgentEvent::UsageUpdated {
-                output_tokens,
-                input_tokens,
-                cache_read_tokens,
-                timestamp,
-                ..
-            } = ev
-            {
-                let uncached_in = input_tokens.saturating_sub(*cache_read_tokens);
-                // Weighted subscription units: output tokens count 5x uncached input, cached 0.1x
-                let units = (*output_tokens as f64)
-                    + (uncached_in as f64 * 0.2)
-                    + (*cache_read_tokens as f64 * 0.02);
-                if prov == "claude" {
-                    if *timestamp >= cutoff_5h {
-                        claude_5h_weighted += units;
-                        claude_5h_oldest = Some(
-                            claude_5h_oldest
-                                .map(|o| o.min(*timestamp))
-                                .unwrap_or(*timestamp),
-                        );
-                    }
-                    if *timestamp >= cutoff_7d {
-                        claude_7d_weighted += units;
-                        claude_7d_oldest = Some(
-                            claude_7d_oldest
-                                .map(|o| o.min(*timestamp))
-                                .unwrap_or(*timestamp),
-                        );
-                    }
-                } else if prov == "codex" {
-                    if *timestamp >= cutoff_5h {
-                        codex_5h_weighted += units;
-                        codex_5h_oldest = Some(
-                            codex_5h_oldest
-                                .map(|o| o.min(*timestamp))
-                                .unwrap_or(*timestamp),
-                        );
-                    }
-                    if *timestamp >= cutoff_7d {
-                        codex_7d_weighted += units;
-                        codex_7d_oldest = Some(
-                            codex_7d_oldest
-                                .map(|o| o.min(*timestamp))
-                                .unwrap_or(*timestamp),
-                        );
-                    }
-                }
-            }
-        }
+    if cached_wins.is_empty() {
+        scan_tail_codex_rate_limits(&home.join(".codex/sessions"), &mut cached_wins, now);
     }
-
-    // Also scan recent native CLI JSONL files modified in the last 7 days so external terminal usage is counted too!
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        scan_external_claude_activity(
-            &home.join(".claude/projects"),
-            cutoff_5h,
-            cutoff_7d,
-            &mut claude_5h_weighted,
-            &mut claude_5h_oldest,
-            &mut claude_7d_weighted,
-            &mut claude_7d_oldest,
-            &mut claude_live_windows,
-            now,
-        );
-        scan_external_codex_activity(
-            &home.join(".codex/sessions"),
-            cutoff_5h,
-            cutoff_7d,
-            &mut codex_5h_weighted,
-            &mut codex_5h_oldest,
-            &mut codex_7d_weighted,
-            &mut codex_7d_oldest,
-            &mut codex_live_windows,
-            now,
-        );
-    }
-
-    if claude_live_windows.is_empty() {
-        // Standard Claude Pro/Max 5h rolling window (~450k weighted units) & 7d rolling window (~4.5M weighted units)
-        let pct_5h = ((claude_5h_weighted / 450_000.0) * 100.0).clamp(0.0, 99.0);
-        let reset_5h = claude_5h_oldest.map(|t| t + Duration::hours(5));
-        let pct_7d = ((claude_7d_weighted / 4_500_000.0) * 100.0).clamp(0.0, 99.0);
-        let reset_7d = claude_7d_oldest.map(|t| t + Duration::days(7));
-
-        claude_live_windows.push(RateLimitWindowDto {
-            id: "5h".to_string(),
-            label: "5h 窗口".to_string(),
-            used_percent: (pct_5h * 10.0).round() / 10.0,
-            remaining_percent: ((100.0 - pct_5h) * 10.0).round() / 10.0,
-            resets_at: reset_5h,
-            reset_in_seconds: reset_5h.map(|r| (r - now).num_seconds().max(0)),
-            status: status_for_used_pct(pct_5h),
-            source: "local_window".to_string(),
-        });
-        claude_live_windows.push(RateLimitWindowDto {
-            id: "7d".to_string(),
-            label: "7d 周配额".to_string(),
-            used_percent: (pct_7d * 10.0).round() / 10.0,
-            remaining_percent: ((100.0 - pct_7d) * 10.0).round() / 10.0,
-            resets_at: reset_7d,
-            reset_in_seconds: reset_7d.map(|r| (r - now).num_seconds().max(0)),
-            status: status_for_used_pct(pct_7d),
-            source: "local_window".to_string(),
-        });
-    }
-
-    if codex_live_windows.is_empty() {
-        let pct_5h = ((codex_5h_weighted / 550_000.0) * 100.0).clamp(0.0, 99.0);
-        let reset_5h = codex_5h_oldest.map(|t| t + Duration::hours(5));
-        let pct_7d = ((codex_7d_weighted / 5_500_000.0) * 100.0).clamp(0.0, 99.0);
-        let reset_7d = codex_7d_oldest.map(|t| t + Duration::days(7));
-
-        codex_live_windows.push(RateLimitWindowDto {
-            id: "5h".to_string(),
-            label: "5h 窗口".to_string(),
-            used_percent: (pct_5h * 10.0).round() / 10.0,
-            remaining_percent: ((100.0 - pct_5h) * 10.0).round() / 10.0,
-            resets_at: reset_5h,
-            reset_in_seconds: reset_5h.map(|r| (r - now).num_seconds().max(0)),
-            status: status_for_used_pct(pct_5h),
-            source: "local_window".to_string(),
-        });
-        codex_live_windows.push(RateLimitWindowDto {
-            id: "7d".to_string(),
-            label: "7d 周配额".to_string(),
-            used_percent: (pct_7d * 10.0).round() / 10.0,
-            remaining_percent: ((100.0 - pct_7d) * 10.0).round() / 10.0,
-            resets_at: reset_7d,
-            reset_in_seconds: reset_7d.map(|r| (r - now).num_seconds().max(0)),
-            status: status_for_used_pct(pct_7d),
-            source: "local_window".to_string(),
-        });
-    }
-
-    vec![
-        ProviderQuotaCardDto {
-            provider: "claude".to_string(),
-            label: "Claude Code".to_string(),
-            plan_badge: if claude_live_windows.iter().any(|w| w.source == "provider_header") {
-                "实时订阅配额".to_string()
-            } else {
-                "5h / 7d 窗口活跃度".to_string()
-            },
-            windows: claude_live_windows,
-            updated_at: now,
-        },
-        ProviderQuotaCardDto {
+    if !cached_wins.is_empty() {
+        return ProviderQuotaCardDto {
             provider: "codex".to_string(),
             label: "OpenAI Codex".to_string(),
-            plan_badge: if codex_live_windows.iter().any(|w| w.source == "provider_header") {
-                "实时订阅配额".to_string()
-            } else {
-                "5h / 7d 窗口活跃度".to_string()
-            },
-            windows: codex_live_windows,
+            plan_badge: "实时订阅配额".to_string(),
+            mode: "subscription".to_string(),
+            summary_text: None,
+            windows: cached_wins,
             updated_at: now,
-        },
-    ]
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_external_claude_activity(
-    root: &Path,
-    cutoff_5h: DateTime<Utc>,
-    cutoff_7d: DateTime<Utc>,
-    w_5h: &mut f64,
-    oldest_5h: &mut Option<DateTime<Utc>>,
-    w_7d: &mut f64,
-    oldest_7d: &mut Option<DateTime<Utc>>,
-    live_windows: &mut Vec<RateLimitWindowDto>,
-    now: DateTime<Utc>,
-) {
-    let Ok(rd) = fs::read_dir(root) else { return };
-    let min_sys = SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(7 * 86400))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    for proj_entry in rd.flatten() {
-        let Ok(sub_rd) = fs::read_dir(proj_entry.path()) else {
-            continue;
         };
-        for f_entry in sub_rd.flatten().take(12) {
-            let p = f_entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Ok(meta) = f_entry.metadata() else { continue };
-            if meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) < min_sys {
-                continue;
-            }
-            let Ok(file) = fs::File::open(&p) else { continue };
-            for line in BufReader::new(file).lines().take(250).flatten() {
-                if !line.contains("\"usage\"") && !line.contains("rate_limit") {
-                    continue;
-                }
-                let Ok(val) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if val.get("type").and_then(|v| v.as_str()) == Some("rate_limit_event") {
-                    if let Some(w) = parse_claude_rate_limit_json(&val, now) {
-                        live_windows.retain(|x| x.id != w.id);
-                        live_windows.push(w);
-                    }
-                }
-                if let Some(usage) = val.pointer("/message/usage") {
-                    let ts = val
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                        .map(|d| d.with_timezone(&Utc));
-                    if let Some(ts) = ts {
-                        let out = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let units = (out as f64) + (inp as f64 * 0.2);
-                        if ts >= cutoff_5h {
-                            *w_5h += units;
-                            *oldest_5h = Some(oldest_5h.map(|o| o.min(ts)).unwrap_or(ts));
-                        }
-                        if ts >= cutoff_7d {
-                            *w_7d += units;
-                            *oldest_7d = Some(oldest_7d.map(|o| o.min(ts)).unwrap_or(ts));
-                        }
-                    }
-                }
-            }
-        }
+    }
+
+    ProviderQuotaCardDto {
+        provider: "codex".to_string(),
+        label: "OpenAI Codex".to_string(),
+        plan_badge: "未配置配额源".to_string(),
+        mode: "unauthenticated".to_string(),
+        summary_text: Some("未检测到可用配额或未登录".to_string()),
+        windows: Vec::new(),
+        updated_at: now,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_external_codex_activity(
+fn scan_tail_codex_rate_limits(
     root: &Path,
-    cutoff_5h: DateTime<Utc>,
-    cutoff_7d: DateTime<Utc>,
-    w_5h: &mut f64,
-    oldest_5h: &mut Option<DateTime<Utc>>,
-    w_7d: &mut f64,
-    oldest_7d: &mut Option<DateTime<Utc>>,
     live_windows: &mut Vec<RateLimitWindowDto>,
     now: DateTime<Utc>,
 ) {
     let min_sys = SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(7 * 86400))
+        .checked_sub(StdDuration::from_secs(7 * 86400))
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    let mut files = Vec::new();
-    fn walk(dir: &Path, depth: usize, min_sys: SystemTime, out: &mut Vec<PathBuf>) {
-        if depth > 4 || out.len() >= 25 {
+    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
+    fn walk(dir: &Path, depth: usize, min_sys: SystemTime, out: &mut Vec<(SystemTime, PathBuf)>) {
+        if depth > 4 || out.len() >= 30 {
             return;
         }
         let Ok(rd) = fs::read_dir(dir) else { return };
@@ -365,37 +635,32 @@ fn scan_external_codex_activity(
             let Ok(m) = e.metadata() else { continue };
             if m.is_dir() {
                 walk(&p, depth + 1, min_sys, out);
-            } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl")
-                && m.modified().unwrap_or(SystemTime::UNIX_EPOCH) >= min_sys
-            {
-                out.push(p);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                let mtime = m.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                if mtime >= min_sys {
+                    out.push((mtime, p));
+                }
             }
         }
     }
     walk(root, 0, min_sys, &mut files);
+    files.sort_by(|a, b| b.0.cmp(&a.0));
 
-    for p in files {
+    for (_, p) in files.into_iter().take(4) {
         let Ok(file) = fs::File::open(&p) else { continue };
-        for line in BufReader::new(file).lines().take(300).flatten() {
-            if !line.contains("token_count") && !line.contains("output_text") {
+        let lines: Vec<String> = BufReader::new(file).lines().flatten().collect();
+        for line in lines.iter().rev().take(150) {
+            if !line.contains("\"used_percent\"") {
                 continue;
             }
-            let Ok(val) = serde_json::from_str::<Value>(&line) else {
+            let Ok(val) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            let ts = val
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&Utc));
             if let Some(rl) = val.pointer("/payload/rate_limits") {
                 for (slot, id, label) in [("primary", "5h", "5h 窗口"), ("secondary", "7d", "7d 周配额")] {
                     if let Some(w_obj) = rl.get(slot) {
                         if let Some(used_pct) = w_obj.get("used_percent").and_then(|v| v.as_f64()) {
-                            let resets_at = w_obj
-                                .get("resets_at")
-                                .and_then(|v| v.as_i64())
-                                .and_then(|sec| Utc.timestamp_opt(sec, 0).single());
+                            let resets_at = w_obj.get("resets_at").and_then(parse_any_timestamp);
                             if let Some(dto) = refresh_window_countdown(
                                 RateLimitWindowDto {
                                     id: id.to_string(),
@@ -404,6 +669,7 @@ fn scan_external_codex_activity(
                                     remaining_percent: (100.0 - used_pct).clamp(0.0, 100.0),
                                     resets_at,
                                     reset_in_seconds: None,
+                                    detail_text: None,
                                     status: status_for_used_pct(used_pct),
                                     source: "provider_header".to_string(),
                                 },
@@ -415,40 +681,65 @@ fn scan_external_codex_activity(
                         }
                     }
                 }
-            }
-            if let Some(ts) = ts {
-                if line.contains("output_text") {
-                    let est_units = (line.len() as f64) * 0.35;
-                    if ts >= cutoff_5h {
-                        *w_5h += est_units;
-                        *oldest_5h = Some(oldest_5h.map(|o| o.min(ts)).unwrap_or(ts));
-                    }
-                    if ts >= cutoff_7d {
-                        *w_7d += est_units;
-                        *oldest_7d = Some(oldest_7d.map(|o| o.min(ts)).unwrap_or(ts));
-                    }
+                if !live_windows.is_empty() {
+                    return;
                 }
             }
         }
     }
 }
 
+pub fn build_subscription_quotas_snapshot(
+    cache: &PersistedQuotaCache,
+    _sessions: &HashMap<uuid::Uuid, SessionInfo>,
+    _event_history: &HashMap<uuid::Uuid, Vec<AgentEvent>>,
+) -> Vec<ProviderQuotaCardDto> {
+    build_subscription_quotas_snapshot_opts(cache, false)
+}
+
+pub fn build_subscription_quotas_snapshot_opts(
+    cache: &PersistedQuotaCache,
+    force_refresh: bool,
+) -> Vec<ProviderQuotaCardDto> {
+    let lock = LIVE_PROBE_CACHE.get_or_init(|| Mutex::new(None));
+    if !force_refresh {
+        if let Ok(guard) = lock.lock() {
+            if let Some((ts, ref cached_cards)) = *guard {
+                if ts.elapsed() < StdDuration::from_secs(30) {
+                    return cached_cards.clone();
+                }
+            }
+        }
+    }
+
+    let now = Utc::now();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+    let cards = vec![
+        probe_claude_card(&home, cache, now),
+        probe_codex_card(&home, cache, now),
+    ];
+
+    if let Ok(mut guard) = lock.lock() {
+        *guard = Some((Instant::now(), cards.clone()));
+    }
+    cards
+}
+
 pub fn parse_claude_rate_limit_json(val: &Value, now: DateTime<Utc>) -> Option<RateLimitWindowDto> {
     let info = val.get("rate_limit_info").unwrap_or(val);
     let raw_u = info.get("utilization").and_then(|v| v.as_f64())?;
-    let used_pct = if raw_u <= 1.0 { raw_u * 100.0 } else { raw_u };
-    let resets_sec = info
+    let used_pct = if raw_u <= 1.0 && raw_u > 0.0 {
+        raw_u * 100.0
+    } else {
+        raw_u
+    };
+    let resets_at = info
         .get("resetsAt")
         .or_else(|| info.get("resets_at"))
-        .and_then(|v| v.as_i64());
-    let resets_at = resets_sec.and_then(|sec| {
-        let s = if sec > 1_000_000_000_000 {
-            sec / 1000
-        } else {
-            sec
-        };
-        Utc.timestamp_opt(s, 0).single()
-    });
+        .and_then(parse_any_timestamp);
     let rtype = info
         .get("rateLimitType")
         .and_then(|v| v.as_str())
@@ -466,6 +757,7 @@ pub fn parse_claude_rate_limit_json(val: &Value, now: DateTime<Utc>) -> Option<R
             remaining_percent: (100.0 - used_pct).clamp(0.0, 100.0),
             resets_at,
             reset_in_seconds: None,
+            detail_text: None,
             status: status_for_used_pct(used_pct),
             source: "provider_header".to_string(),
         },
@@ -476,9 +768,10 @@ pub fn parse_claude_rate_limit_json(val: &Value, now: DateTime<Utc>) -> Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     #[test]
-    fn test_parse_claude_rate_limit_and_snapshot() {
+    fn test_parse_claude_rate_limit_and_gateway_modes() {
         let now = Utc::now();
         let future_ts = (now + Duration::hours(2)).timestamp();
         let raw = serde_json::json!({
@@ -493,15 +786,23 @@ mod tests {
         assert_eq!(win.id, "5h");
         assert!((win.used_percent - 42.0).abs() < 0.1);
         assert!((win.remaining_percent - 58.0).abs() < 0.1);
-        assert!(win.reset_in_seconds.unwrap_or(0) >= 7190);
 
-        let cards = build_subscription_quotas_snapshot(
-            &PersistedQuotaCache::default(),
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-        assert_eq!(cards.len(), 2);
-        assert_eq!(cards[0].provider, "claude");
-        assert_eq!(cards[1].provider, "codex");
+        let wallet_raw = serde_json::json!({
+            "planName": "钱包余额",
+            "balance": 100.0,
+            "usage": {
+                "today": { "actual_cost": 4.5, "requests": 12 },
+                "total": { "actual_cost": 25.0 }
+            },
+            "daily_usage": [
+                { "date": "2026-11-18", "actual_cost": 10.0, "requests": 30 },
+                { "date": "2026-11-19", "actual_cost": 4.5, "requests": 12 }
+            ]
+        });
+        let card = parse_gateway_usage_card("codex", "OpenAI Codex", &wallet_raw, now)
+            .expect("should parse sub2api wallet card");
+        assert_eq!(card.mode, "wallet");
+        assert_eq!(card.windows.len(), 2);
+        assert!(card.summary_text.unwrap_or_default().contains("今日 $4.50"));
     }
 }

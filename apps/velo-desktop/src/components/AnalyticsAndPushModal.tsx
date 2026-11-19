@@ -261,40 +261,51 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                             </span>
                           </div>
                           <div className="space-y-2">
-                            {card.windows.map((w) => {
-                              const rem = Math.max(0, Math.min(100, w.remaining_percent));
-                              const resetHrs =
-                                typeof w.reset_in_seconds === "number" && w.reset_in_seconds > 0
-                                  ? w.reset_in_seconds >= 86400
-                                    ? `${Math.floor(w.reset_in_seconds / 86400)}d ${Math.floor((w.reset_in_seconds % 86400) / 3600)}h 后重置`
-                                    : `${Math.floor(w.reset_in_seconds / 3600)}h ${Math.floor((w.reset_in_seconds % 3600) / 60)}m 后重置`
-                                  : "";
-                              return (
-                                <div key={w.id} className="space-y-1">
-                                  <div className="flex items-center justify-between text-[11px]">
-                                    <span className="text-[var(--v-fg-secondary)]">{w.label}</span>
-                                    <span className="font-mono text-[10.5px] text-[var(--v-fg-muted)] tabular-nums">
-                                      剩余 {Math.round(rem)}% (已用 {Math.round(w.used_percent)}%)
-                                      {resetHrs ? ` · ${resetHrs}` : ""}
-                                    </span>
+                            {card.mode === "unauthenticated" ? (
+                              <div className="text-[11.5px] text-[var(--v-fg-muted)]">
+                                {card.summary_text || "当前未登录该 CLI 账号"}
+                              </div>
+                            ) : (
+                              card.windows.map((w) => {
+                                const rem = Math.max(0, Math.min(100, w.remaining_percent));
+                                const resetHrs =
+                                  typeof w.reset_in_seconds === "number" && w.reset_in_seconds > 0
+                                    ? w.reset_in_seconds >= 86400
+                                      ? `${Math.floor(w.reset_in_seconds / 86400)}d ${Math.floor((w.reset_in_seconds % 86400) / 3600)}h 后重置`
+                                      : `${Math.floor(w.reset_in_seconds / 3600)}h ${Math.floor((w.reset_in_seconds % 3600) / 60)}m 后重置`
+                                    : "";
+                                const rightLabel =
+                                  card.mode === "wallet" && w.detail_text
+                                    ? w.detail_text
+                                    : `${
+                                        w.detail_text ? `${w.detail_text} · ` : ""
+                                      }剩余 ${Math.round(rem)}%${resetHrs ? ` · ${resetHrs}` : ""}`;
+                                return (
+                                  <div key={w.id} className="space-y-1">
+                                    <div className="flex items-center justify-between text-[11px]">
+                                      <span className="text-[var(--v-fg-secondary)]">{w.label}</span>
+                                      <span className="font-mono text-[10.5px] text-[var(--v-fg-muted)] tabular-nums">
+                                        {rightLabel}
+                                      </span>
+                                    </div>
+                                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
+                                      <div
+                                        style={{ width: `${Math.max(4, rem)}%` }}
+                                        className={`h-full rounded-full ${
+                                          w.status === "exhausted"
+                                            ? "bg-[#f87171]"
+                                            : w.status === "warning"
+                                            ? "bg-[#fbbf24]"
+                                            : card.provider === "claude"
+                                            ? "bg-[#fb923c]"
+                                            : "bg-[#34d399]"
+                                        }`}
+                                      />
+                                    </div>
                                   </div>
-                                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
-                                    <div
-                                      style={{ width: `${Math.max(3, rem)}%` }}
-                                      className={`h-full rounded-full ${
-                                        w.status === "exhausted"
-                                          ? "bg-[#f87171]"
-                                          : w.status === "warning"
-                                          ? "bg-[#fbbf24]"
-                                          : card.provider === "claude"
-                                          ? "bg-[#fb923c]"
-                                          : "bg-[#34d399]"
-                                      }`}
-                                    />
-                                  </div>
-                                </div>
-                              );
-                            })}
+                                );
+                              })
+                            )}
                           </div>
                         </div>
                       ))}

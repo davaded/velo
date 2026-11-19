@@ -201,8 +201,10 @@ pub struct RateLimitWindowDto {
     pub resets_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_in_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_text: Option<String>,
     pub status: String, // "healthy" | "warning" | "exhausted"
-    pub source: String, // "provider_header" | "local_window"
+    pub source: String, // "provider_api" | "provider_header" | "wallet"
 }
 
 /// A follow-up user prompt queued on the server to run automatically when the active turn completes.

@@ -344,29 +344,53 @@ public struct RootSessionsView: View {
     // MARK: - Subviews
 
     private var compactQuotaStrip: some View {
-        Button {
+        let activeCards = store.quotaCards.filter { $0.mode != "unauthenticated" && !$0.windows.isEmpty }
+        let unauthCards = store.quotaCards.filter { $0.mode == "unauthenticated" }
+
+        return Button {
             analyticsInitialTab = .analytics
             showAnalyticsHub = true
         } label: {
-            HStack(spacing: 12) {
-                ForEach(store.quotaCards) { card in
-                    if let w5h = card.windows.first(where: { $0.id == "5h" }) ?? card.windows.first {
-                        let rem = max(0, min(100, w5h.remainingPercent))
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(activeCards) { card in
+                    if let wPrimary = card.windows.first(where: { $0.id == "5h" }) ?? card.windows.first {
+                        let rem = max(0, min(100, wPrimary.remainingPercent))
                         let barColor: Color = {
-                            if w5h.status == "exhausted" { return VeloTheme.coral }
-                            if w5h.status == "warning" { return VeloTheme.amber }
+                            if wPrimary.status == "exhausted" { return VeloTheme.coral }
+                            if wPrimary.status == "warning" { return VeloTheme.amber }
                             return card.provider == "claude"
                                 ? Color(red: 0.98, green: 0.57, blue: 0.24)
                                 : VeloTheme.emerald
                         }()
+                        let rightSummary: String = {
+                            if card.mode == "wallet" {
+                                return card.summaryText ?? wPrimary.detailText ?? ""
+                            }
+                            let w7d = card.windows.first(where: { $0.id == "7d" })
+                            var s = "余 \(Int(rem.rounded()))%"
+                            if let w7d {
+                                s += " · 7d \(Int(w7d.remainingPercent.rounded()))%"
+                            }
+                            if !wPrimary.resetCountdownLabel.isEmpty {
+                                s += " · \(wPrimary.resetCountdownLabel)"
+                            }
+                            return s
+                        }()
+
                         VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(card.provider == "claude" ? "Claude 5h" : "Codex 5h")
-                                    .font(.system(size: 11, weight: .semibold))
+                            HStack(spacing: 6) {
+                                Text(card.provider == "claude" ? "Claude" : "Codex")
+                                    .font(.system(size: 11.5, weight: .semibold))
                                     .foregroundStyle(.primary)
-                                Spacer()
-                                Text("余 \(Int(rem.rounded()))%\(w5h.resetCountdownLabel.isEmpty ? "" : " · \(w5h.resetCountdownLabel)")")
-                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                Text(card.planBadge)
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                                Spacer(minLength: 4)
+                                Text(rightSummary)
+                                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                             }
@@ -381,7 +405,17 @@ public struct RootSessionsView: View {
                             }
                             .frame(height: 5)
                         }
-                        .frame(maxWidth: .infinity)
+                    }
+                }
+
+                if !unauthCards.isEmpty {
+                    HStack {
+                        ForEach(unauthCards) { c in
+                            Text("\(c.provider == "claude" ? "Claude" : "Codex"): 未登录")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
                     }
                 }
             }

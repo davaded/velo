@@ -107,7 +107,7 @@ public struct VeloAnalyticsHubSheet: View {
     private var analyticsSection: some View {
         if !store.quotaCards.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                Text("5h / 7d 订阅窗口实时余量")
+                Text("实时配额与账户余额")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.secondary)
 
@@ -125,36 +125,52 @@ public struct VeloAnalyticsHubSheet: View {
                                 .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                         }
 
-                        ForEach(card.windows) { w in
-                            let rem = max(0, min(100, w.remainingPercent))
-                            let barColor: Color = {
-                                if w.status == "exhausted" { return VeloTheme.coral }
-                                if w.status == "warning" { return VeloTheme.amber }
-                                return card.provider == "claude"
-                                    ? Color(red: 0.98, green: 0.57, blue: 0.24)
-                                    : VeloTheme.emerald
-                            }()
-
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
-                                    Text(w.label)
-                                        .font(.system(size: 12))
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    Text("剩余 \(Int(rem.rounded()))% · 已用 \(Int(w.usedPercent.rounded()))%\(w.resetCountdownLabel.isEmpty ? "" : " · \(w.resetCountdownLabel)")")
-                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                }
-                                GeometryReader { geo in
-                                    ZStack(alignment: .leading) {
-                                        Capsule()
-                                            .fill(VeloTheme.elevatedSurface(colorScheme))
-                                        Capsule()
-                                            .fill(barColor)
-                                            .frame(width: max(6, geo.size.width * CGFloat(rem / 100.0)))
+                        if card.mode == "unauthenticated" {
+                            Text(card.summaryText ?? "当前未登录该 CLI 账号")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(card.windows) { w in
+                                let rem = max(0, min(100, w.remainingPercent))
+                                let barColor: Color = {
+                                    if w.status == "exhausted" { return VeloTheme.coral }
+                                    if w.status == "warning" { return VeloTheme.amber }
+                                    return card.provider == "claude"
+                                        ? Color(red: 0.98, green: 0.57, blue: 0.24)
+                                        : VeloTheme.emerald
+                                }()
+                                let rightTxt: String = {
+                                    if card.mode == "wallet", let dt = w.detailText {
+                                        return dt
                                     }
+                                    var parts: [String] = []
+                                    if let dt = w.detailText, !dt.isEmpty { parts.append(dt) }
+                                    parts.append("剩余 \(Int(rem.rounded()))%")
+                                    if !w.resetCountdownLabel.isEmpty { parts.append(w.resetCountdownLabel) }
+                                    return parts.joined(separator: " · ")
+                                }()
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text(w.label)
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        Text(rightTxt)
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    GeometryReader { geo in
+                                        ZStack(alignment: .leading) {
+                                            Capsule()
+                                                .fill(VeloTheme.elevatedSurface(colorScheme))
+                                            Capsule()
+                                                .fill(barColor)
+                                                .frame(width: max(6, geo.size.width * CGFloat(rem / 100.0)))
+                                        }
+                                    }
+                                    .frame(height: 6)
                                 }
-                                .frame(height: 6)
                             }
                         }
                     }

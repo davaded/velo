@@ -1670,6 +1670,7 @@ public struct VeloQuotaWindowItem: Identifiable, Equatable, Sendable {
     public let usedPercent: Double
     public let remainingPercent: Double
     public let resetInSeconds: Int64?
+    public let detailText: String?
     public let status: String
 
     public var resetCountdownLabel: String {
@@ -1691,6 +1692,7 @@ public struct VeloQuotaWindowItem: Identifiable, Equatable, Sendable {
         let used = VeloSessionItem.doubleValue(d["used_percent"]) ?? 0
         let rem = VeloSessionItem.doubleValue(d["remaining_percent"]) ?? max(0, 100 - used)
         let resetSec = VeloSessionItem.intValue(d["reset_in_seconds"]).map { Int64($0) }
+        let detail = d["detail_text"] as? String
         let st = (d["status"] as? String) ?? "healthy"
         return VeloQuotaWindowItem(
             id: id,
@@ -1698,6 +1700,7 @@ public struct VeloQuotaWindowItem: Identifiable, Equatable, Sendable {
             usedPercent: used,
             remainingPercent: rem,
             resetInSeconds: resetSec,
+            detailText: detail,
             status: st
         )
     }
@@ -1708,18 +1711,23 @@ public struct VeloProviderQuotaCard: Identifiable, Equatable, Sendable {
     public let provider: String
     public let label: String
     public let planBadge: String
+    public let mode: String
+    public let summaryText: String?
     public let windows: [VeloQuotaWindowItem]
 
     public static func fromJSON(_ d: [String: Any]) -> VeloProviderQuotaCard? {
         guard let provider = d["provider"] as? String, !provider.isEmpty else { return nil }
         let label = (d["label"] as? String) ?? provider.capitalized
         let badge = (d["plan_badge"] as? String) ?? "Subscription"
+        let mode = (d["mode"] as? String) ?? "subscription"
+        let summary = d["summary_text"] as? String
         let wins = ((d["windows"] as? [[String: Any]]) ?? []).compactMap(VeloQuotaWindowItem.fromJSON)
-        guard !wins.isEmpty else { return nil }
         return VeloProviderQuotaCard(
             provider: provider,
             label: label,
             planBadge: badge,
+            mode: mode,
+            summaryText: summary,
             windows: wins
         )
     }
