@@ -459,6 +459,7 @@ public final class VeloStore: ObservableObject {
                     self.connectionError = nil
                     let parsed = arr.compactMap(VeloSessionItem.fromJSON)
                     self.sessions = parsed
+                    VeloLiveActivityManager.shared.reconcile(with: parsed)
                     if self.activeSessionId == nil, let first = parsed.first {
                         self.activeSessionId = first.id
                     }
@@ -2504,6 +2505,7 @@ public final class VeloStore: ObservableObject {
         {
             let parsed = rawArr.compactMap(VeloSessionItem.fromJSON)
             self.sessions = parsed
+            VeloLiveActivityManager.shared.reconcile(with: parsed)
             if pendingSelectNewestSession, let newest = parsed.first {
                 pendingSelectNewestSession = false
                 self.activeSessionId = newest.id
@@ -2801,14 +2803,13 @@ public final class VeloStore: ObservableObject {
                     forceImmediate: true
                 )
             } else if st == "completed" || st == "failed" || st == "stopped" {
-                let totalMs = finalizeSessionTurnLocally(sid, now: serverDate)
-                if st == "failed" {
-                    VeloLiveActivityManager.shared.endCurrent(
-                        sessionId: sid,
-                        finalLabel: "执行遇到异常",
-                        failed: true
-                    )
-                }
+                let isFailed = (st == "failed")
+                let totalMs = finalizeSessionTurnLocally(
+                    sid,
+                    now: serverDate,
+                    failed: isFailed,
+                    finalLabel: isFailed ? "执行遇到异常" : (st == "stopped" ? "任务已停止" : "任务已完成")
+                )
                 if st == "completed" || st == "failed" {
                     markSessionUnreadIfBackground(sid)
                 }
@@ -2993,7 +2994,9 @@ public final class VeloStore: ObservableObject {
 
             if outTps >= 0.5 {
                 liveTpsBySession[sid] = outTps
-                if let sess = sessions.first(where: { $0.id == sid }) {
+                if let sess = sessions.first(where: { $0.id == sid }),
+                   sess.status == .running
+                {
                     VeloLiveActivityManager.shared.syncSessionActivity(
                         session: sess,
                         sessionId: sid,
@@ -3189,7 +3192,12 @@ public final class VeloStore: ObservableObject {
     }
 
     @discardableResult
-    private func finalizeSessionTurnLocally(_ sid: String, now: Date = Date()) -> Int {
+    private func finalizeSessionTurnLocally(
+        _ sid: String,
+        now: Date = Date(),
+        failed: Bool = false,
+        finalLabel: String = "任务已完成"
+    ) -> Int {
         let startOrigin = turnStartedAtBySession[sid] ?? now.addingTimeInterval(-1)
         let stepOrigin = stepStartedAtBySession[sid] ?? startOrigin
         let totalMs = max(500, Int(now.timeIntervalSince(startOrigin) * 1000))
@@ -3234,7 +3242,11 @@ public final class VeloStore: ObservableObject {
         }
 
         updateSessionStatus(sid, .idle)
-        VeloLiveActivityManager.shared.endCurrent(sessionId: sid)
+        VeloLiveActivityManager.shared.endCurrent(
+            sessionId: sid,
+            finalLabel: finalLabel,
+            failed: failed
+        )
         scheduleCacheSave()
         return totalMs
     }

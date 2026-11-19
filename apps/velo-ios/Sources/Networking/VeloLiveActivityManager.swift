@@ -26,6 +26,52 @@ public final class VeloLiveActivityManager {
         #endif
     }
 
+    /// Reconciles any active or adopted Live Activity with the daemon's authoritative session list.
+    /// Immediately dismisses stale/zombie Dynamic Island pills for sessions that finished while backgrounded.
+    public func reconcile(with sessions: [VeloSessionItem]) {
+        #if canImport(ActivityKit)
+        let runningIds = Set(
+            sessions
+                .filter { $0.status == .running || $0.status == .waitingApproval }
+                .map(\.id)
+        )
+
+        for act in Activity<VeloSessionActivityAttributes>.activities {
+            let sid = act.attributes.sessionId
+            let phase = act.content.state.phase
+            if phase == .completed || phase == .failed {
+                continue
+            }
+            if !runningIds.contains(sid) {
+                stepCounterBySession.removeValue(forKey: sid)
+                let prev = act.content.state
+                let elapsedSec = max(1, Int(Date().timeIntervalSince(prev.startedAt)))
+                let endState = VeloSessionActivityAttributes.ContentState(
+                    phase: .completed,
+                    stepHeadline: "任务已完成",
+                    stepTarget: nil,
+                    startedAt: prev.startedAt,
+                    finishedElapsedSeconds: elapsedSec,
+                    stepCount: prev.stepCount,
+                    throughputTps: nil,
+                    insertions: prev.insertions,
+                    deletions: prev.deletions
+                )
+                Task {
+                    await act.end(
+                        ActivityContent(state: endState, staleDate: nil),
+                        dismissalPolicy: .immediate
+                    )
+                }
+                if activeSessionId == sid {
+                    currentActivity = nil
+                    activeSessionId = nil
+                }
+            }
+        }
+        #endif
+    }
+
     public func syncSessionActivity(
         session: VeloSessionItem?,
         sessionId: String,
@@ -40,11 +86,6 @@ public final class VeloLiveActivityManager {
         #if canImport(ActivityKit)
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
 
-        if incrementStep {
-            stepCounterBySession[sessionId, default: 0] += 1
-        }
-        let steps = stepCounterBySession[sessionId] ?? 0
-
         let mappedPhase: VeloSessionActivityAttributes.PhaseKind = {
             switch phase {
             case "waiting": return .waitingApproval
@@ -55,6 +96,20 @@ public final class VeloLiveActivityManager {
             default: return .thinking
             }
         }()
+
+        // Never start/resurrect an active pill for a session that is already idle
+        if let session,
+           session.status == .idle,
+           mappedPhase != .completed,
+           mappedPhase != .failed
+        {
+            return
+        }
+
+        if incrementStep {
+            stepCounterBySession[sessionId, default: 0] += 1
+        }
+        let steps = stepCounterBySession[sessionId] ?? 0
 
         let now = Date()
         if !forceImmediate,
@@ -69,7 +124,24 @@ public final class VeloLiveActivityManager {
         }
         lastUpdateAt = now
 
-        let originDate = startedAt ?? currentActivity?.content.state.startedAt ?? now
+        let originDate: Date = {
+            if let explicit = startedAt {
+                return explicit
+            }
+            if activeSessionId == sessionId, let prev = currentActivity?.content.state.startedAt {
+                return prev
+            }
+            return now
+        }()
+
+        // Clear stale throughput when starting a new turn or running non-writing steps
+        let resolvedTps: Double? = {
+            if mappedPhase == .writing {
+                return tps ?? currentActivity?.content.state.throughputTps
+            }
+            return nil
+        }()
+
         let state = VeloSessionActivityAttributes.ContentState(
             phase: mappedPhase,
             stepHeadline: headline,
@@ -77,20 +149,26 @@ public final class VeloLiveActivityManager {
             startedAt: originDate,
             finishedElapsedSeconds: nil,
             stepCount: steps,
-            throughputTps: tps ?? currentActivity?.content.state.throughputTps,
+            throughputTps: resolvedTps,
             insertions: session?.insertions ?? currentActivity?.content.state.insertions ?? 0,
             deletions: session?.deletions ?? currentActivity?.content.state.deletions ?? 0
         )
 
-        if let existing = currentActivity, activeSessionId == sessionId {
+        if let existing = currentActivity,
+           activeSessionId == sessionId,
+           existing.activityState == .active
+        {
             Task {
-                await existing.update(ActivityContent(state: state, staleDate: now.addingTimeInterval(900)))
+                await existing.update(
+                    ActivityContent(state: state, staleDate: now.addingTimeInterval(900))
+                )
             }
             return
         }
 
-        // Clean up any prior activity before requesting a new one
-        for old in Activity<VeloSessionActivityAttributes>.activities {
+        // Clean up any OTHER session activities before requesting a new one (avoid race-killing our own new activity)
+        let staleActivities = Activity<VeloSessionActivityAttributes>.activities
+        for old in staleActivities {
             Task { await old.end(nil, dismissalPolicy: .immediate) }
         }
 
@@ -156,7 +234,16 @@ public final class VeloLiveActivityManager {
         if let sessionId {
             stepCounterBySession.removeValue(forKey: sessionId)
         }
-        guard let act = currentActivity else { return }
+        let targetAct: Activity<VeloSessionActivityAttributes>? = {
+            if let currentActivity { return currentActivity }
+            if let sessionId {
+                return Activity<VeloSessionActivityAttributes>.activities.first(where: {
+                    $0.attributes.sessionId == sessionId
+                })
+            }
+            return Activity<VeloSessionActivityAttributes>.activities.first
+        }()
+        guard let act = targetAct else { return }
         let prev = act.content.state
         let elapsedSec = max(1, Int(Date().timeIntervalSince(prev.startedAt)))
         let endState = VeloSessionActivityAttributes.ContentState(
@@ -173,7 +260,7 @@ public final class VeloLiveActivityManager {
         Task {
             await act.end(
                 ActivityContent(state: endState, staleDate: nil),
-                dismissalPolicy: .after(.now + 8)
+                dismissalPolicy: .after(.now + 12)
             )
         }
         currentActivity = nil
