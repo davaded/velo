@@ -287,6 +287,8 @@ public struct VeloExternalCliSessionItem: Identifiable, Equatable, Sendable {
     public let messageCount: Int
     public let lastPreview: String
     public let importedSessionId: String?
+    public let isEphemeral: Bool
+    public let ephemeralReason: String?
 
     public static func fromJSON(_ dict: [String: Any]) -> VeloExternalCliSessionItem? {
         guard let cSid = dict["cli_session_id"] as? String, !cSid.isEmpty else { return nil }
@@ -297,6 +299,8 @@ public struct VeloExternalCliSessionItem: Identifiable, Equatable, Sendable {
         let msgCount = VeloSessionItem.intValue(dict["message_count"]) ?? 0
         let preview = (dict["last_preview"] as? String) ?? ""
         let impSid = (dict["imported_session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let isEph = (dict["is_ephemeral"] as? Bool) ?? false
+        let ephReason = (dict["ephemeral_reason"] as? String).flatMap { $0.isEmpty ? nil : $0 }
 
         let timeLabel: String = {
             if let raw = dict["updated_at"] as? String {
@@ -321,7 +325,9 @@ public struct VeloExternalCliSessionItem: Identifiable, Equatable, Sendable {
             updatedAtLabel: timeLabel,
             messageCount: msgCount,
             lastPreview: preview,
-            importedSessionId: impSid
+            importedSessionId: impSid,
+            isEphemeral: isEph,
+            ephemeralReason: ephReason
         )
     }
 }

@@ -32,6 +32,7 @@ public final class VeloStore: ObservableObject {
     @Published public var oldestSeqBySession: [String: Int] = [:]
     @Published public var hasMoreHistoryBySession: [String: Bool] = [:]
     @Published public var externalCliSessions: [VeloExternalCliSessionItem] = []
+    @Published public var hiddenCliSessionsCount: Int = 0
     @Published public var latestImportedCliVeloId: String?
     @Published public var unreadSessionIds: Set<String> = []
     @Published public var quotaCards: [VeloProviderQuotaCard] = []
@@ -862,8 +863,54 @@ public final class VeloStore: ObservableObject {
                   let arr = obj["sessions"] as? [[String: Any]]
             else { return }
             externalCliSessions = arr.compactMap(VeloExternalCliSessionItem.fromJSON)
+            if let hc = VeloSessionItem.intValue(obj["hidden_count"]) {
+                hiddenCliSessionsCount = hc
+            }
         case .e2eeRelay:
             sendEncryptedCommand(["cmd": "list_cli_sessions"])
+        case .none:
+            break
+        }
+    }
+
+    public func manageExternalCliSessions(
+        action: String,
+        items: [(provider: String, cliSessionId: String)]
+    ) async {
+        let payloadItems: [[String: String]] = items.map {
+            ["provider": $0.provider, "cli_session_id": $0.cliSessionId]
+        }
+        if action == "delete" || action == "hide" {
+            let removeKeys = Set(items.map { "\($0.provider.lowercased())-\($0.cliSessionId)" })
+            externalCliSessions.removeAll { removeKeys.contains($0.id) }
+        }
+        triggerHaptic(.light)
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/cli-sessions/manage") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "action": action,
+                "items": payloadItems,
+            ])
+            guard let (data, _) = try? await URLSession.shared.data(for: req),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return }
+            if let arr = obj["sessions"] as? [[String: Any]] {
+                externalCliSessions = arr.compactMap(VeloExternalCliSessionItem.fromJSON)
+            }
+            if let hc = VeloSessionItem.intValue(obj["hidden_count"]) {
+                hiddenCliSessionsCount = hc
+            }
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "manage_cli_sessions",
+                "action": action,
+                "items": payloadItems,
+            ])
         case .none:
             break
         }
@@ -2573,6 +2620,9 @@ public final class VeloStore: ObservableObject {
             case "cli_sessions_snapshot":
                 if let arr = raw["sessions"] as? [[String: Any]] {
                     externalCliSessions = arr.compactMap(VeloExternalCliSessionItem.fromJSON)
+                }
+                if let hc = VeloSessionItem.intValue(raw["hidden_count"]) {
+                    hiddenCliSessionsCount = hc
                 }
                 return
             case "cli_session_imported":

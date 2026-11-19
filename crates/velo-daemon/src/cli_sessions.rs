@@ -1,7 +1,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,128 @@ pub struct ExternalCliSessionDto {
     pub last_preview: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub is_ephemeral: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalCliSessionsSnapshot {
+    pub sessions: Vec<ExternalCliSessionDto>,
+    pub ephemeral_count: usize,
+    pub hidden_count: usize,
+}
+
+fn dismissed_store_path() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".velo/dismissed_cli_sessions.json"))
+}
+
+pub fn load_dismissed_cli_sessions() -> HashSet<String> {
+    let Some(path) = dismissed_store_path() else {
+        return HashSet::new();
+    };
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+pub fn save_dismissed_cli_sessions(set: &HashSet<String>) -> anyhow::Result<()> {
+    let Some(path) = dismissed_store_path() else {
+        anyhow::bail!("HOME directory not found");
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut sorted: Vec<String> = set.iter().cloned().collect();
+    sorted.sort();
+    fs::write(path, serde_json::to_string_pretty(&sorted)?)?;
+    Ok(())
+}
+
+fn cli_dismiss_key(provider: &str, cli_session_id: &str) -> String {
+    format!("{}:{}", provider.trim().to_lowercase(), cli_session_id.trim())
+}
+
+pub fn classify_ephemeral_session(
+    cwd: &str,
+    title: &str,
+    has_custom_title: bool,
+    msg_count: usize,
+    velo_wt_prefix: &str,
+    imported: bool,
+) -> Option<String> {
+    if imported {
+        return None;
+    }
+    let clean_cwd = cwd.trim();
+    if clean_cwd == "/" {
+        return Some("根目录临时会话".to_string());
+    }
+    if clean_cwd.starts_with("/tmp")
+        || clean_cwd.starts_with("/private/tmp")
+        || clean_cwd.starts_with("/var/folders")
+        || clean_cwd.contains("/.cache/")
+        || clean_cwd.contains("/scratchpad")
+        || (!velo_wt_prefix.is_empty() && clean_cwd.starts_with(velo_wt_prefix))
+    {
+        return Some("临时目录会话".to_string());
+    }
+
+    if !has_custom_title && msg_count <= 2 {
+        let norm = title
+            .trim()
+            .to_lowercase()
+            .trim_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | '。' | '！' | '？' | '"' | '\'' | '`'))
+            .trim()
+            .to_string();
+
+        const EXACT_PINGS: &[&str] = &[
+            "ok",
+            "okay",
+            "hi",
+            "hello",
+            "hey",
+            "ping",
+            "pong",
+            "test",
+            "testing",
+            "1",
+            "123",
+            "你好",
+            "测试",
+            "在吗",
+            "reply ok",
+            "say ok",
+            "say pong",
+            "just ok",
+            "just pong",
+        ];
+        if EXACT_PINGS.contains(&norm.as_str()) {
+            return Some("单轮探测/测试".to_string());
+        }
+
+        const PROBE_SUBSTRS: &[&str] = &[
+            "reply with just",
+            "respond with just",
+            "reply only with",
+            "say just ",
+            "health check",
+            "connectivity check",
+            "smoke test",
+        ];
+        if PROBE_SUBSTRS.iter().any(|p| norm.contains(p)) {
+            return Some("连通性测试".to_string());
+        }
+
+        if msg_count <= 1 && norm.chars().count() <= 4 {
+            return Some("极短临时会话".to_string());
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -153,10 +275,23 @@ pub fn discover_external_cli_sessions(
     existing_by_provider_sid: &HashMap<String, Uuid>,
     limit: usize,
 ) -> Vec<ExternalCliSessionDto> {
+    discover_external_cli_sessions_with_stats(existing_by_provider_sid, limit).sessions
+}
+
+pub fn discover_external_cli_sessions_with_stats(
+    existing_by_provider_sid: &HashMap<String, Uuid>,
+    limit: usize,
+) -> ExternalCliSessionsSnapshot {
     let Some(home) = home_dir() else {
-        return Vec::new();
+        return ExternalCliSessionsSnapshot {
+            sessions: Vec::new(),
+            ephemeral_count: 0,
+            hidden_count: 0,
+        };
     };
     let velo_wt_prefix = home.join(".velo/worktrees").to_string_lossy().to_string();
+    let dismissed = load_dismissed_cli_sessions();
+    let hidden_count = dismissed.len();
     let mut results: Vec<(DateTime<Utc>, ExternalCliSessionDto)> = Vec::new();
 
     // 1. Scan Claude Code (`~/.claude/projects/*/*.jsonl`)
@@ -164,9 +299,14 @@ pub fn discover_external_cli_sessions(
     if claude_root.is_dir() {
         for (path, mtime) in collect_recent_jsonl_files(&claude_root, 2)
             .into_iter()
-            .take(35)
+            .take(80)
         {
-            if let Some(dto) = summarize_claude_jsonl(&path, mtime, &velo_wt_prefix, existing_by_provider_sid) {
+            if let Some(dto) =
+                summarize_claude_jsonl(&path, mtime, &velo_wt_prefix, existing_by_provider_sid)
+            {
+                if dismissed.contains(&cli_dismiss_key(&dto.provider, &dto.cli_session_id)) {
+                    continue;
+                }
                 let dt = parse_timestamp_or(Some(&dto.updated_at), system_time_to_utc(mtime));
                 results.push((dt, dto));
             }
@@ -178,9 +318,14 @@ pub fn discover_external_cli_sessions(
     if codex_root.is_dir() {
         for (path, mtime) in collect_recent_jsonl_files(&codex_root, 4)
             .into_iter()
-            .take(35)
+            .take(80)
         {
-            if let Some(dto) = summarize_codex_jsonl(&path, mtime, &velo_wt_prefix, existing_by_provider_sid) {
+            if let Some(dto) =
+                summarize_codex_jsonl(&path, mtime, &velo_wt_prefix, existing_by_provider_sid)
+            {
+                if dismissed.contains(&cli_dismiss_key(&dto.provider, &dto.cli_session_id)) {
+                    continue;
+                }
                 let dt = parse_timestamp_or(Some(&dto.updated_at), system_time_to_utc(mtime));
                 results.push((dt, dto));
             }
@@ -188,8 +333,30 @@ pub fn discover_external_cli_sessions(
     }
 
     results.sort_by(|a, b| b.0.cmp(&a.0));
-    results.truncate(limit.clamp(5, 80));
-    results.into_iter().map(|(_, d)| d).collect()
+
+    // Reserve `limit` slots for real non-ephemeral sessions so temporary probes never crowd them out
+    let max_real = limit.clamp(5, 80);
+    let mut kept_real = Vec::new();
+    let mut kept_ephemeral = Vec::new();
+    for item in results {
+        if item.1.is_ephemeral {
+            if kept_ephemeral.len() < 40 {
+                kept_ephemeral.push(item);
+            }
+        } else if kept_real.len() < max_real {
+            kept_real.push(item);
+        }
+    }
+    let ephemeral_count = kept_ephemeral.len();
+    let mut combined = kept_real;
+    combined.extend(kept_ephemeral);
+    combined.sort_by(|a, b| b.0.cmp(&a.0));
+
+    ExternalCliSessionsSnapshot {
+        sessions: combined.into_iter().map(|(_, d)| d).collect(),
+        ephemeral_count,
+        hidden_count,
+    }
 }
 
 fn summarize_claude_jsonl(
@@ -289,9 +456,18 @@ fn summarize_claude_jsonl(
         .and_then(|n| n.to_str())
         .unwrap_or("workspace")
         .to_string();
+    let has_custom_title = custom_title.is_some();
     let title = custom_title
         .or(first_user_title)
         .unwrap_or_else(|| format!("Claude · {}", project_name));
+    let ephemeral_reason = classify_ephemeral_session(
+        &cwd,
+        &title,
+        has_custom_title,
+        msg_count,
+        velo_wt_prefix,
+        imported_id.is_some(),
+    );
 
     Some(ExternalCliSessionDto {
         provider: "claude".to_string(),
@@ -303,6 +479,8 @@ fn summarize_claude_jsonl(
         message_count: msg_count,
         last_preview,
         imported_session_id: imported_id,
+        is_ephemeral: ephemeral_reason.is_some(),
+        ephemeral_reason,
     })
 }
 
@@ -382,6 +560,14 @@ fn summarize_codex_jsonl(
         .unwrap_or("workspace")
         .to_string();
     let title = first_user_title.unwrap_or_else(|| format!("Codex · {}", project_name));
+    let ephemeral_reason = classify_ephemeral_session(
+        &cwd,
+        &title,
+        false,
+        msg_count,
+        velo_wt_prefix,
+        imported_id.is_some(),
+    );
 
     Some(ExternalCliSessionDto {
         provider: "codex".to_string(),
@@ -393,6 +579,8 @@ fn summarize_codex_jsonl(
         message_count: msg_count,
         last_preview,
         imported_session_id: imported_id,
+        is_ephemeral: ephemeral_reason.is_some(),
+        ephemeral_reason,
     })
 }
 
@@ -732,4 +920,206 @@ fn parse_full_codex_session(
         first_prompt,
         events,
     })
+}
+
+fn validate_safe_session_id(raw: &str) -> anyhow::Result<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.len() > 200
+    {
+        anyhow::bail!("Invalid external CLI session id");
+    }
+    Ok(trimmed)
+}
+
+/// Safely deletes a native Claude (`~/.claude/projects/.../<sid>.jsonl`) or Codex (`~/.codex/sessions/.../*.jsonl`)
+/// session file on disk after canonical root boundary verification.
+pub fn delete_external_cli_session_file(
+    provider_str: &str,
+    cli_session_id: &str,
+) -> anyhow::Result<bool> {
+    let sid = validate_safe_session_id(cli_session_id)?;
+    let home = home_dir().ok_or_else(|| anyhow::anyhow!("HOME directory not found"))?;
+    let prov = provider_str.trim().to_lowercase();
+
+    if prov.starts_with("claude") {
+        let root = home.join(".claude/projects");
+        if !root.is_dir() {
+            return Ok(false);
+        }
+        let canonical_root = fs::canonicalize(&root)?;
+        let target_name = format!("{sid}.jsonl");
+        let mut deleted = false;
+        for (p, _) in collect_recent_jsonl_files(&root, 2) {
+            if p.file_name().and_then(|n| n.to_str()) == Some(target_name.as_str()) {
+                let canon_file = fs::canonicalize(&p)?;
+                if canon_file.starts_with(&canonical_root)
+                    && canon_file.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                {
+                    fs::remove_file(&canon_file)?;
+                    deleted = true;
+                    // Also remove companion `<sid>/` subagent directory if inside the same project folder
+                    if let Some(parent) = canon_file.parent() {
+                        let companion = parent.join(sid);
+                        if companion.is_dir() {
+                            if let Ok(canon_comp) = fs::canonicalize(&companion) {
+                                if canon_comp.starts_with(&canonical_root) {
+                                    let _ = fs::remove_dir_all(&canon_comp);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        return Ok(deleted);
+    }
+
+    if prov.starts_with("codex") {
+        let root = home.join(".codex/sessions");
+        if !root.is_dir() {
+            return Ok(false);
+        }
+        let canonical_root = fs::canonicalize(&root)?;
+        let files = collect_recent_jsonl_files(&root, 4);
+        let mut target: Option<PathBuf> = None;
+        for (p, _) in &files {
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains(sid))
+                .unwrap_or(false)
+            {
+                target = Some(p.clone());
+                break;
+            }
+        }
+        if target.is_none() {
+            for (p, _) in files.iter().take(80) {
+                if let Ok(f) = fs::File::open(p) {
+                    if let Some(Ok(first_line)) = BufReader::new(f).lines().next() {
+                        if first_line.contains(sid) {
+                            target = Some(p.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(found) = target {
+            let canon_file = fs::canonicalize(&found)?;
+            if canon_file.starts_with(&canonical_root)
+                && canon_file.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            {
+                fs::remove_file(&canon_file)?;
+                // Best-effort remove matching entry from `~/.codex/session_index.jsonl`
+                let idx_path = home.join(".codex/session_index.jsonl");
+                if let Ok(raw_idx) = fs::read_to_string(&idx_path) {
+                    let filtered: Vec<&str> = raw_idx
+                        .lines()
+                        .filter(|line| !line.contains(sid))
+                        .collect();
+                    if filtered.len() < raw_idx.lines().count() {
+                        let mut out = filtered.join("\n");
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        let _ = fs::write(&idx_path, out);
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    anyhow::bail!("Unsupported external CLI session provider: {}", provider_str)
+}
+
+/// Executes batch management (`"delete"` | `"hide"` | `"unhide_all"`) over discovered external CLI sessions.
+pub fn manage_external_cli_sessions(
+    action: &str,
+    items: &[(String, String)],
+) -> anyhow::Result<usize> {
+    let mut dismissed = load_dismissed_cli_sessions();
+    match action.trim().to_lowercase().as_str() {
+        "unhide_all" => {
+            let count = dismissed.len();
+            dismissed.clear();
+            save_dismissed_cli_sessions(&dismissed)?;
+            Ok(count)
+        }
+        "hide" => {
+            let mut added = 0usize;
+            for (prov, sid) in items {
+                if validate_safe_session_id(sid).is_ok() {
+                    if dismissed.insert(cli_dismiss_key(prov, sid)) {
+                        added += 1;
+                    }
+                }
+            }
+            save_dismissed_cli_sessions(&dismissed)?;
+            Ok(added)
+        }
+        "delete" => {
+            let mut deleted = 0usize;
+            let mut dismissed_changed = false;
+            for (prov, sid) in items {
+                if delete_external_cli_session_file(prov, sid).unwrap_or(false) {
+                    deleted += 1;
+                }
+                if dismissed.remove(&cli_dismiss_key(prov, sid)) {
+                    dismissed_changed = true;
+                }
+            }
+            if dismissed_changed {
+                let _ = save_dismissed_cli_sessions(&dismissed);
+            }
+            Ok(deleted)
+        }
+        other => anyhow::bail!("Unsupported manage action: {}", other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_ephemeral_sessions() {
+        assert!(classify_ephemeral_session("/", "ok", false, 2, "/wt", false).is_some());
+        assert!(
+            classify_ephemeral_session("/Users/me/code/velo", "Reply with just OK", false, 2, "/wt", false)
+                .is_some()
+        );
+        assert!(
+            classify_ephemeral_session("/Users/me/code/velo", "hi", false, 2, "/wt", false)
+                .is_some()
+        );
+        assert!(
+            classify_ephemeral_session("/", "reply with just the word PONG", false, 2, "/wt", false)
+                .is_some()
+        );
+        assert!(
+            classify_ephemeral_session("/tmp/scratch", "debug something", false, 10, "/wt", false)
+                .is_some()
+        );
+        // Real coding sessions MUST NOT be flagged ephemeral
+        assert!(
+            classify_ephemeral_session(
+                "/Users/me/code/velo",
+                "帮我重构一下灵动岛的展示逻辑",
+                false,
+                14,
+                "/wt",
+                false
+            )
+            .is_none()
+        );
+        // Already imported sessions are never auto-hidden
+        assert!(classify_ephemeral_session("/", "ok", false, 2, "/wt", true).is_none());
+    }
 }

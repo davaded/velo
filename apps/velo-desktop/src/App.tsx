@@ -773,6 +773,7 @@ export function App() {
     }
   }, [unreadSessionIds]);
   const [e2eeCliSessions, setE2eeCliSessions] = useState<ExternalCliSessionItem[] | null>(null);
+  const [e2eeCliHiddenCount, setE2eeCliHiddenCount] = useState<number>(0);
   const [analyticsInitialTab, setAnalyticsInitialTab] = useState<"analytics" | "search" | "push">(
     "analytics"
   );
@@ -1400,6 +1401,9 @@ export function App() {
 
       if (raw.type === "cli_sessions_snapshot" && Array.isArray(raw.sessions)) {
         setE2eeCliSessions(raw.sessions as ExternalCliSessionItem[]);
+        if (typeof raw.hidden_count === "number") {
+          setE2eeCliHiddenCount(raw.hidden_count);
+        }
         return;
       }
 
@@ -7600,12 +7604,20 @@ export function App() {
         open={cliImportOpen}
         daemonUrl={daemonUrl}
         externalSessions={e2eeCliSessions}
+        externalHiddenCount={e2eeCliHiddenCount}
         onRequestE2eeList={() => sendE2eeCommand({ cmd: "list_cli_sessions" })}
         onImportViaE2ee={(prov, cSid) =>
           sendE2eeCommand({
             cmd: "import_cli_session",
             provider: prov,
             cli_session_id: cSid,
+          })
+        }
+        onManageViaE2ee={(action, items) =>
+          sendE2eeCommand({
+            cmd: "manage_cli_sessions",
+            action,
+            items,
           })
         }
         onImportedSession={(rawSess) => {

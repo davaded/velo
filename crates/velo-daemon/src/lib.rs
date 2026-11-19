@@ -2262,6 +2262,7 @@ pub fn build_router(state: DaemonState) -> Router {
         )
         .route("/api/cli-sessions", get(list_cli_sessions_handler))
         .route("/api/cli-sessions/import", post(import_cli_session_handler))
+        .route("/api/cli-sessions/manage", post(manage_cli_sessions_handler))
         .route("/api/sessions/{id}/rewind", post(rewind_session_handler))
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
         .route("/api/sessions/{id}/git/commit", post(git_commit_handler))
@@ -4669,7 +4670,7 @@ impl DaemonState {
         json!({ "ok": removed, "session_id": id, "queue_id": queue_id })
     }
 
-    pub async fn list_cli_sessions_core(&self) -> Vec<cli_sessions::ExternalCliSessionDto> {
+    pub async fn list_cli_sessions_core(&self) -> cli_sessions::ExternalCliSessionsSnapshot {
         let existing_map: HashMap<String, Uuid> = {
             let guard = self.inner.read().await;
             guard
@@ -4679,10 +4680,27 @@ impl DaemonState {
                 .collect()
         };
         tokio::task::spawn_blocking(move || {
-            cli_sessions::discover_external_cli_sessions(&existing_map, 40)
+            cli_sessions::discover_external_cli_sessions_with_stats(&existing_map, 50)
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or(cli_sessions::ExternalCliSessionsSnapshot {
+            sessions: Vec::new(),
+            ephemeral_count: 0,
+            hidden_count: 0,
+        })
+    }
+
+    pub async fn manage_cli_sessions_core(
+        &self,
+        action: String,
+        items: Vec<(String, String)>,
+    ) -> Result<(usize, cli_sessions::ExternalCliSessionsSnapshot)> {
+        let affected = tokio::task::spawn_blocking(move || {
+            cli_sessions::manage_external_cli_sessions(&action, &items)
+        })
+        .await??;
+        let snap = self.list_cli_sessions_core().await;
+        Ok((affected, snap))
     }
 
     pub async fn import_cli_session_core(
@@ -5301,8 +5319,55 @@ async fn remove_queued_prompt_handler(
 }
 
 async fn list_cli_sessions_handler(State(state): State<DaemonState>) -> impl IntoResponse {
-    let items = state.list_cli_sessions_core().await;
-    Json(json!({ "ok": true, "sessions": items }))
+    let snap = state.list_cli_sessions_core().await;
+    Json(json!({
+        "ok": true,
+        "sessions": snap.sessions,
+        "ephemeral_count": snap.ephemeral_count,
+        "hidden_count": snap.hidden_count,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct ManageCliSessionRef {
+    provider: String,
+    cli_session_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ManageCliSessionsRequest {
+    action: String,
+    #[serde(default)]
+    items: Vec<ManageCliSessionRef>,
+}
+
+async fn manage_cli_sessions_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<ManageCliSessionsRequest>,
+) -> impl IntoResponse {
+    let pairs: Vec<(String, String)> = req
+        .items
+        .into_iter()
+        .map(|it| (it.provider, it.cli_session_id))
+        .collect();
+    match state.manage_cli_sessions_core(req.action, pairs).await {
+        Ok((affected, snap)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "affected": affected,
+                "sessions": snap.sessions,
+                "ephemeral_count": snap.ephemeral_count,
+                "hidden_count": snap.hidden_count,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]

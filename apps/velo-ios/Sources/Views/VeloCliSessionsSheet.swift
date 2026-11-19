@@ -8,12 +8,22 @@ public struct VeloCliSessionsSheet: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var searchText: String = ""
     @State private var providerFilter: String = "all"
+    @State private var showEphemeral: Bool = false
     @State private var isRefreshing: Bool = false
     @State private var importingCliId: String?
+    @State private var pendingDeleteTarget: VeloExternalCliSessionItem?
+    @State private var showCleanEphemeralConfirm: Bool = false
+
+    private var ephemeralItems: [VeloExternalCliSessionItem] {
+        store.externalCliSessions.filter { $0.isEphemeral }
+    }
 
     private var filteredItems: [VeloExternalCliSessionItem] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return store.externalCliSessions.filter { item in
+            if !showEphemeral && item.isEphemeral {
+                return false
+            }
             if providerFilter != "all" && item.provider != providerFilter {
                 return false
             }
@@ -31,7 +41,7 @@ public struct VeloCliSessionsSheet: View {
                 VeloTheme.canvas(colorScheme)
                     .ignoresSafeArea()
 
-                VStack(spacing: 12) {
+                VStack(spacing: 10) {
                     Picker("引擎过滤", selection: $providerFilter) {
                         Text("全部").tag("all")
                         Text("Claude Code").tag("claude")
@@ -40,6 +50,11 @@ public struct VeloCliSessionsSheet: View {
                     .pickerStyle(.segmented)
                     .padding(.horizontal, 16)
                     .padding(.top, 6)
+
+                    if !ephemeralItems.isEmpty {
+                        ephemeralBanner
+                            .padding(.horizontal, 16)
+                    }
 
                     if isRefreshing && store.externalCliSessions.isEmpty {
                         Spacer()
@@ -86,7 +101,26 @@ public struct VeloCliSessionsSheet: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("关闭") { dismiss() }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if store.hiddenCliSessionsCount > 0 {
+                        Menu {
+                            Button {
+                                Task {
+                                    await store.manageExternalCliSessions(
+                                        action: "unhide_all",
+                                        items: []
+                                    )
+                                }
+                            } label: {
+                                Label(
+                                    "恢复 \(store.hiddenCliSessionsCount) 条已隐藏会话",
+                                    systemImage: "arrow.uturn.backward"
+                                )
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                    }
                     Button {
                         refresh()
                     } label: {
@@ -104,7 +138,113 @@ public struct VeloCliSessionsSheet: View {
                 dismiss()
                 onOpenedSession(newSid)
             }
+            .confirmationDialog(
+                "删除本机终端会话文件？",
+                isPresented: Binding(
+                    get: { pendingDeleteTarget != nil },
+                    set: { if !$0 { pendingDeleteTarget = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                if let target = pendingDeleteTarget {
+                    Button("永久删除 Mac 上的 .jsonl 文件", role: .destructive) {
+                        pendingDeleteTarget = nil
+                        Task {
+                            await store.manageExternalCliSessions(
+                                action: "delete",
+                                items: [(target.provider, target.cliSessionId)]
+                            )
+                        }
+                    }
+                    Button("仅从 Velo 列表隐藏") {
+                        pendingDeleteTarget = nil
+                        Task {
+                            await store.manageExternalCliSessions(
+                                action: "hide",
+                                items: [(target.provider, target.cliSessionId)]
+                            )
+                        }
+                    }
+                }
+                Button("取消", role: .cancel) {
+                    pendingDeleteTarget = nil
+                }
+            } message: {
+                if let target = pendingDeleteTarget {
+                    Text("「\(target.title)」— 彻底删除会从 Mac 磁盘移除该 CLI 历史文件，仅隐藏则只不在 Velo 显示。")
+                }
+            }
+            .confirmationDialog(
+                "清理 \(ephemeralItems.count) 条临时/测试会话",
+                isPresented: $showCleanEphemeralConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("永久删除这 \(ephemeralItems.count) 个本地文件", role: .destructive) {
+                    let targets = ephemeralItems.map { ($0.provider, $0.cliSessionId) }
+                    Task {
+                        await store.manageExternalCliSessions(action: "delete", items: targets)
+                    }
+                }
+                Button("仅从接管列表永久隐藏") {
+                    let targets = ephemeralItems.map { ($0.provider, $0.cliSessionId) }
+                    Task {
+                        await store.manageExternalCliSessions(action: "hide", items: targets)
+                    }
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("包括根目录测试、单轮 ok/hi/PONG 探测及临时目录会话。")
+            }
         }
+    }
+
+    private var ephemeralBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(VeloTheme.amber)
+            Text(
+                showEphemeral
+                    ? "含 \(ephemeralItems.count) 条临时会话"
+                    : "已过滤 \(ephemeralItems.count) 条临时会话"
+            )
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+            Spacer()
+            Button {
+                showEphemeral.toggle()
+            } label: {
+                Text(showEphemeral ? "隐藏" : "查看")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                showCleanEphemeralConfirm = true
+            } label: {
+                Text("一键清理")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(VeloTheme.coral)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(VeloTheme.coral.opacity(0.14), in: Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            VeloTheme.cardSurface(colorScheme),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(VeloTheme.amber.opacity(0.28), lineWidth: 0.8)
+        )
     }
 
     private func refresh() {
@@ -122,7 +262,7 @@ public struct VeloCliSessionsSheet: View {
         let isBusy = importingCliId == item.cliSessionId
 
         return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
                 Text(isClaude ? "CLAUDE" : "CODEX")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundStyle(badgeColor)
@@ -130,12 +270,44 @@ public struct VeloCliSessionsSheet: View {
                     .padding(.vertical, 2.5)
                     .background(badgeColor.opacity(0.14), in: Capsule())
 
+                if item.isEphemeral {
+                    Text("临时")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(VeloTheme.amber)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(VeloTheme.amber.opacity(0.15), in: Capsule())
+                }
+
                 Text(item.title)
                     .font(.system(size: 14.5, weight: .semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
 
                 Spacer()
+
+                Menu {
+                    Button {
+                        Task {
+                            await store.manageExternalCliSessions(
+                                action: "hide",
+                                items: [(item.provider, item.cliSessionId)]
+                            )
+                        }
+                    } label: {
+                        Label("仅从列表隐藏", systemImage: "eye.slash")
+                    }
+                    Button(role: .destructive) {
+                        pendingDeleteTarget = item
+                    } label: {
+                        Label("删除本地会话文件", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 24)
+                }
             }
 
             HStack(spacing: 6) {
@@ -163,6 +335,11 @@ public struct VeloCliSessionsSheet: View {
             }
 
             HStack {
+                if let reason = item.ephemeralReason, item.isEphemeral {
+                    Text(reason)
+                        .font(.system(size: 11))
+                        .foregroundStyle(VeloTheme.amber)
+                }
                 Spacer()
                 Button {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -210,7 +387,29 @@ public struct VeloCliSessionsSheet: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.85)
+                .stroke(
+                    item.isEphemeral
+                        ? AnyShapeStyle(VeloTheme.amber.opacity(0.32))
+                        : AnyShapeStyle(VeloTheme.specularRim(colorScheme)),
+                    lineWidth: 0.85
+                )
         )
+        .contextMenu {
+            Button {
+                Task {
+                    await store.manageExternalCliSessions(
+                        action: "hide",
+                        items: [(item.provider, item.cliSessionId)]
+                    )
+                }
+            } label: {
+                Label("仅从列表隐藏", systemImage: "eye.slash")
+            }
+            Button(role: .destructive) {
+                pendingDeleteTarget = item
+            } label: {
+                Label("删除本地会话文件", systemImage: "trash")
+            }
+        }
     }
 }

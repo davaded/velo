@@ -1995,10 +1995,47 @@ async fn run_supervised_e2ee_bridge(
                                     }
                                 }
                                 "list_cli_sessions" => {
-                                    let items = state.list_cli_sessions_core().await;
+                                    let snap = state.list_cli_sessions_core().await;
                                     let resp = json!({
                                         "type": "cli_sessions_snapshot",
-                                        "sessions": items,
+                                        "sessions": snap.sessions,
+                                        "ephemeral_count": snap.ephemeral_count,
+                                        "hidden_count": snap.hidden_count,
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "manage_cli_sessions" => {
+                                    let action = cmd_val
+                                        .get("action")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let pairs: Vec<(String, String)> = cmd_val
+                                        .get("items")
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|it| {
+                                                    let p = it.get("provider")?.as_str()?;
+                                                    let s = it.get("cli_session_id")?.as_str()?;
+                                                    Some((p.to_string(), s.to_string()))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let snap = match state.manage_cli_sessions_core(action, pairs).await {
+                                        Ok((_, s)) => s,
+                                        Err(_) => state.list_cli_sessions_core().await,
+                                    };
+                                    let resp = json!({
+                                        "type": "cli_sessions_snapshot",
+                                        "sessions": snap.sessions,
+                                        "ephemeral_count": snap.ephemeral_count,
+                                        "hidden_count": snap.hidden_count,
                                     });
                                     if let Some(frame_txt) =
                                         send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
