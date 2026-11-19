@@ -193,13 +193,19 @@ pub async fn spawn_codex_app_server(
         let mut accumulated_message = String::new();
         let mut emitted_final_message = false;
 
-        let build_turn_start = |thread_id: &str| -> Value {
+        let build_turn_start = |rpc_id: i64,
+                                thread_id: &str,
+                                turn_prompt: &str,
+                                turn_imgs: &[String],
+                                turn_model: Option<&str>,
+                                turn_eff: &str|
+         -> Value {
             let mut input_items = vec![json!({
                 "type": "text",
-                "text": prompt,
+                "text": turn_prompt,
                 "text_elements": []
             })];
-            for img in &images {
+            for img in turn_imgs {
                 let trimmed = img.trim();
                 if !trimmed.is_empty() {
                     input_items.push(json!({
@@ -213,15 +219,15 @@ pub async fn spawn_codex_app_server(
                 "input": input_items,
                 "cwd": cwd_str,
                 "approvalPolicy": approval_policy,
-                "effort": normalized_effort,
+                "effort": turn_eff,
                 "summary": "detailed"
             });
-            if let Some(ref m) = clean_model {
+            if let Some(m) = turn_model.filter(|s| !s.trim().is_empty()) {
                 params["model"] = json!(m);
             }
             json!({
                 "jsonrpc": "2.0",
-                "id": 4,
+                "id": rpc_id,
                 "method": "turn/start",
                 "params": params
             })
@@ -245,9 +251,18 @@ pub async fn spawn_codex_app_server(
         };
 
         let mut saw_turn_activity = false;
+        let mut bound_thread_id: Option<String> = None;
+        let mut turn_rpc_seq: i64 = 4;
+        let mut is_idle_warm = false;
 
         loop {
             tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(900)), if is_idle_warm => {
+                    debug!("Reaping idle warm codex app-server session {}", session_id);
+                    stderr_task.abort();
+                    terminate_process_group(pid, &mut child).await;
+                    return;
+                }
                 _ = &mut kill_rx => {
                     info!("Stopping codex app-server session {} (pid={:?})", session_id, pid);
                     stderr_task.abort();
@@ -261,6 +276,49 @@ pub async fn spawn_codex_app_server(
                     return;
                 }
                 Some(extra_in) = input_rx.recv() => {
+                    if let Ok(warm_cmd) = serde_json::from_str::<Value>(extra_in.trim()) {
+                        if warm_cmd.get("__velo_warm_turn").and_then(|v| v.as_bool()) == Some(true) {
+                            if let Some(ref tid) = bound_thread_id {
+                                let w_prompt = warm_cmd.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                                let w_imgs: Vec<String> = warm_cmd
+                                    .get("images")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                                    .unwrap_or_default();
+                                let w_model = warm_cmd
+                                    .get("model")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .or(clean_model.as_deref());
+                                let w_eff = warm_cmd
+                                    .get("effort")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(&normalized_effort);
+                                is_idle_warm = false;
+                                accumulated_reasoning.clear();
+                                accumulated_message.clear();
+                                emitted_final_message = false;
+                                turn_rpc_seq += 1;
+                                let _ = event_tx.send(AgentEvent::StatusChanged {
+                                    session_id,
+                                    status: SessionStatus::Running,
+                                    message: Some("Agent `codex` hot turn resumed (0ms)".to_string()),
+                                    timestamp: Utc::now(),
+                                });
+                                let req_val = build_turn_start(
+                                    turn_rpc_seq,
+                                    tid,
+                                    w_prompt,
+                                    &w_imgs,
+                                    w_model,
+                                    w_eff,
+                                );
+                                let _ = send_rpc(&mut stdin, &req_val).await;
+                            }
+                            continue;
+                        }
+                    }
                     let _ = stdin.write_all(extra_in.as_bytes()).await;
                     let _ = stdin.flush().await;
                 }
@@ -321,12 +379,24 @@ pub async fn spawn_codex_app_server(
                                         .pointer("/result/thread/id")
                                         .and_then(|v| v.as_str())
                                     {
+                                        bound_thread_id = Some(tid.to_string());
                                         let _ = event_tx.send(AgentEvent::ProviderSessionBound {
                                             session_id,
                                             provider_session_id: tid.to_string(),
                                             timestamp: Utc::now(),
                                         });
-                                        let _ = send_rpc(&mut stdin, &build_turn_start(tid)).await;
+                                        let _ = send_rpc(
+                                            &mut stdin,
+                                            &build_turn_start(
+                                                turn_rpc_seq,
+                                                tid,
+                                                &prompt,
+                                                &images,
+                                                clean_model.as_deref(),
+                                                &normalized_effort,
+                                            ),
+                                        )
+                                        .await;
                                     }
                                 }
                                 3 => {
@@ -354,15 +424,27 @@ pub async fn spawn_codex_app_server(
                                         .pointer("/result/thread/id")
                                         .and_then(|v| v.as_str())
                                     {
+                                        bound_thread_id = Some(tid.to_string());
                                         let _ = event_tx.send(AgentEvent::ProviderSessionBound {
                                             session_id,
                                             provider_session_id: tid.to_string(),
                                             timestamp: Utc::now(),
                                         });
-                                        let _ = send_rpc(&mut stdin, &build_turn_start(tid)).await;
+                                        let _ = send_rpc(
+                                            &mut stdin,
+                                            &build_turn_start(
+                                                turn_rpc_seq,
+                                                tid,
+                                                &prompt,
+                                                &images,
+                                                clean_model.as_deref(),
+                                                &normalized_effort,
+                                            ),
+                                        )
+                                        .await;
                                     }
                                 }
-                                4 => {
+                                id_n if id_n >= 4 => {
                                     // `turn/start` response error check
                                     if let Some(err_msg) = msg
                                         .pointer("/error/message")
@@ -816,9 +898,11 @@ pub async fn spawn_codex_app_server(
                                     timestamp: Utc::now(),
                                 });
                             }
-                            stderr_task.abort();
-                            terminate_process_group(pid, &mut child).await;
-                            return;
+                            // Keep codex app-server warm in background for instant 0ms follow-up turns!
+                            accumulated_reasoning.clear();
+                            accumulated_message.clear();
+                            emitted_final_message = false;
+                            is_idle_warm = true;
                         }
                         _ => {}
                     }

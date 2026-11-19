@@ -350,6 +350,11 @@ public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
     public var costUsd: Double
     public var updatedAtLabel: String
     public var queuedPrompts: [VeloQueuedPromptItem]?
+    public var archived: Bool?
+
+    public var isArchived: Bool {
+        archived ?? false
+    }
 
     public var activeQueuedPrompts: [VeloQueuedPromptItem] {
         queuedPrompts ?? []
@@ -473,6 +478,7 @@ public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
 
         let parsedQueue: [VeloQueuedPromptItem] = (dict["queued_prompts"] as? [[String: Any]])?
             .compactMap(VeloQueuedPromptItem.fromJSON) ?? []
+        let isArchived = (dict["archived"] as? Bool) ?? false
 
         return VeloSessionItem(
             id: id,
@@ -497,7 +503,8 @@ public struct VeloSessionItem: Identifiable, Codable, Equatable, Sendable {
             contextWindow: contextWindow,
             costUsd: costUsd,
             updatedAtLabel: updatedLabel,
-            queuedPrompts: parsedQueue
+            queuedPrompts: parsedQueue,
+            archived: isArchived
         )
     }
 
@@ -762,6 +769,109 @@ public struct TimelineEventItem: Identifiable, Codable, Equatable, Sendable {
     public var durationMs: Int?
     public var completedAt: String?
     public var telemetry: TurnUsageTelemetry? = nil
+    public var inlineDiffOld: String? = nil
+    public var inlineDiffNew: String? = nil
+    public var subagentRole: String? = nil
+    public var subagentPrompt: String? = nil
+}
+
+public enum VeloInlineDiffExtractor {
+    public static func extract(
+        toolName: String,
+        inputObj: Any?
+    ) -> (oldText: String?, newText: String?, subagentRole: String?, subagentPrompt: String?) {
+        let lower = toolName.lowercased()
+        let dict: [String: Any]? = {
+            if let d = inputObj as? [String: Any] { return d }
+            if let str = inputObj as? String,
+               str.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
+               let data = str.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            {
+                return obj
+            }
+            return nil
+        }()
+
+        guard let dict else { return (nil, nil, nil, nil) }
+
+        // 1. Subagent delegation (`Task`, `invoke_subagent`, `Agent`)
+        if lower == "task" || lower == "agent" || lower.contains("subagent") {
+            let role = (dict["subagent_type"] as? String)
+                ?? (dict["Role"] as? String)
+                ?? (dict["role"] as? String)
+                ?? (dict["description"] as? String)
+                ?? "Subagent"
+            let prompt = (dict["prompt"] as? String)
+                ?? (dict["Prompt"] as? String)
+                ?? (dict["description"] as? String)
+                ?? ""
+            return (nil, nil, String(role.prefix(64)), String(prompt.prefix(400)))
+        }
+
+        // 2. Edit / Replace (`old_string` / `new_string` or `Target` / `Replacement`)
+        let oldStr = (dict["old_string"] as? String)
+            ?? (dict["old_str"] as? String)
+            ?? (dict["Target"] as? String)
+        let newStr = (dict["new_string"] as? String)
+            ?? (dict["new_str"] as? String)
+            ?? (dict["Replacement"] as? String)
+        if oldStr != nil || newStr != nil {
+            let o = oldStr.map { String($0.prefix(1200)) }
+            let n = newStr.map { String($0.prefix(1200)) }
+            return (o, n, nil, nil)
+        }
+
+        // 3. MultiEdit (`edits: [{ old_string, new_string }]`)
+        if let edits = dict["edits"] as? [[String: Any]], !edits.isEmpty {
+            var oldParts: [String] = []
+            var newParts: [String] = []
+            for e in edits.prefix(4) {
+                if let eo = e["old_string"] as? String, !eo.isEmpty { oldParts.append(eo) }
+                if let en = e["new_string"] as? String, !en.isEmpty { newParts.append(en) }
+            }
+            if !oldParts.isEmpty || !newParts.isEmpty {
+                return (
+                    String(oldParts.joined(separator: "\n").prefix(1200)),
+                    String(newParts.joined(separator: "\n").prefix(1200)),
+                    nil,
+                    nil
+                )
+            }
+        }
+
+        // 4. Unified patch (`apply_patch` / `patch`)
+        if let patch = (dict["patch"] as? String) ?? (dict["diff"] as? String) {
+            var dels: [String] = []
+            var adds: [String] = []
+            for line in patch.components(separatedBy: .newlines).prefix(60) {
+                if line.hasPrefix("-") && !line.hasPrefix("---") {
+                    dels.append(String(line.dropFirst()))
+                } else if line.hasPrefix("+") && !line.hasPrefix("+++") {
+                    adds.append(String(line.dropFirst()))
+                }
+            }
+            if !dels.isEmpty || !adds.isEmpty {
+                return (
+                    dels.isEmpty ? nil : String(dels.joined(separator: "\n").prefix(1000)),
+                    adds.isEmpty ? nil : String(adds.joined(separator: "\n").prefix(1000)),
+                    nil,
+                    nil
+                )
+            }
+        }
+
+        // 5. Write file (`content`)
+        if lower == "write" || lower == "write_file",
+           let content = (dict["content"] as? String) ?? (dict["Content"] as? String),
+           !content.isEmpty
+        {
+            let firstLines = content.components(separatedBy: .newlines).prefix(18).joined(separator: "\n")
+            return (nil, String(firstLines.prefix(900)), nil, nil)
+        }
+
+        return (nil, nil, nil, nil)
+    }
 }
 
 public struct VeloLocalCacheSnapshot: Codable, Sendable {
@@ -1549,5 +1659,107 @@ public struct VeloAutomationItem: Identifiable, Equatable {
             promptTemplate: (d["prompt_template"] as? String) ?? "",
             runCount: VeloSessionItem.intValue(d["run_count"]) ?? 0
         )
+    }
+}
+
+// MARK: - 5. Subscription Rate-Limit Quotas & Multi-Host / SSH Nodes (v0.5.0)
+
+public struct VeloQuotaWindowItem: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let label: String
+    public let usedPercent: Double
+    public let remainingPercent: Double
+    public let resetInSeconds: Int64?
+    public let status: String
+
+    public var resetCountdownLabel: String {
+        guard let sec = resetInSeconds, sec > 0 else { return "" }
+        let hrs = sec / 3600
+        let mins = (sec % 3600) / 60
+        if hrs >= 24 {
+            return "\(hrs / 24)d \(hrs % 24)h 后重置"
+        }
+        if hrs > 0 {
+            return "\(hrs)h \(mins)m 后重置"
+        }
+        return "\(max(1, mins))m 后重置"
+    }
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloQuotaWindowItem? {
+        guard let id = d["id"] as? String, !id.isEmpty else { return nil }
+        let label = (d["label"] as? String) ?? id
+        let used = VeloSessionItem.doubleValue(d["used_percent"]) ?? 0
+        let rem = VeloSessionItem.doubleValue(d["remaining_percent"]) ?? max(0, 100 - used)
+        let resetSec = VeloSessionItem.intValue(d["reset_in_seconds"]).map { Int64($0) }
+        let st = (d["status"] as? String) ?? "healthy"
+        return VeloQuotaWindowItem(
+            id: id,
+            label: label,
+            usedPercent: used,
+            remainingPercent: rem,
+            resetInSeconds: resetSec,
+            status: st
+        )
+    }
+}
+
+public struct VeloProviderQuotaCard: Identifiable, Equatable, Sendable {
+    public var id: String { provider }
+    public let provider: String
+    public let label: String
+    public let planBadge: String
+    public let windows: [VeloQuotaWindowItem]
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloProviderQuotaCard? {
+        guard let provider = d["provider"] as? String, !provider.isEmpty else { return nil }
+        let label = (d["label"] as? String) ?? provider.capitalized
+        let badge = (d["plan_badge"] as? String) ?? "Subscription"
+        let wins = ((d["windows"] as? [[String: Any]]) ?? []).compactMap(VeloQuotaWindowItem.fromJSON)
+        guard !wins.isEmpty else { return nil }
+        return VeloProviderQuotaCard(
+            provider: provider,
+            label: label,
+            planBadge: badge,
+            windows: wins
+        )
+    }
+}
+
+public struct VeloRemoteHostItem: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let label: String
+    public let sshTarget: String
+    public let defaultCwd: String
+    public let isLocal: Bool
+    public let status: String
+    public let osInfo: String?
+    public let detectedAgents: [String]
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloRemoteHostItem? {
+        guard let id = d["id"] as? String, !id.isEmpty else { return nil }
+        return VeloRemoteHostItem(
+            id: id,
+            label: (d["label"] as? String) ?? id,
+            sshTarget: (d["ssh_target"] as? String) ?? "localhost",
+            defaultCwd: (d["default_cwd"] as? String) ?? "~",
+            isLocal: (d["is_local"] as? Bool) ?? (id == "local"),
+            status: (d["status"] as? String) ?? "unknown",
+            osInfo: d["os_info"] as? String,
+            detectedAgents: (d["detected_agents"] as? [String]) ?? []
+        )
+    }
+}
+
+public struct VeloSavedHostProfile: Identifiable, Codable, Equatable, Sendable {
+    public var id: String
+    public var name: String
+    public var config: ConnectionModeConfig
+    public var updatedAt: Date
+
+    public init(id: String = UUID().uuidString, name: String, config: ConnectionModeConfig, updatedAt: Date = Date()) {
+        self.id = id
+        self.name = name
+        self.config = config
+        self.updatedAt = updatedAt
     }
 }

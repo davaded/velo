@@ -22,7 +22,9 @@ public struct ChatThreadView: View {
     @State private var renameDraftTitle: String = ""
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var pendingImages: [PendingComposerImage] = []
+    @State private var annotatingImageId: UUID? = nil
     @State private var previewImageItem: PreviewImageTarget?
+    @State private var jumpTargetTurnId: String? = nil
     @StateObject private var voiceRecorder = VeloVoiceRecorder()
     @State private var isTranscribingVoice: Bool = false
     @State private var isLoadingOlderHistory: Bool = false
@@ -80,181 +82,10 @@ public struct ChatThreadView: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                // 1. Subtle Specular Context Strip (Bound Engine + Project/Branch + Handoff Origin)
                 if let s = session {
                     threadContextBar(s)
                 }
-
-                // 2. Chronological Turn Stream
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 20) {
-                            if turns.isEmpty {
-                                emptyThreadHero
-                            } else if store.hasMoreHistoryBySession[sessionId] == true {
-                                Button {
-                                    guard !isLoadingOlderHistory else { return }
-                                    isLoadingOlderHistory = true
-                                    Task {
-                                        await store.loadOlderEventsPage(for: sessionId)
-                                        try? await Task.sleep(nanoseconds: 250_000_000)
-                                        isLoadingOlderHistory = false
-                                    }
-                                } label: {
-                                    HStack(spacing: 5) {
-                                        if isLoadingOlderHistory {
-                                            ProgressView()
-                                                .scaleEffect(0.72)
-                                        } else {
-                                            Image(systemName: "arrow.up.circle")
-                                        }
-                                        Text(isLoadingOlderHistory ? "正在加载更早记录…" : "加载更早历史消息")
-                                    }
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
-                                }
-                                .frame(maxWidth: .infinity)
-                                .onAppear {
-                                    guard didInitialBottomScroll, !isLoadingOlderHistory, !turns.isEmpty else { return }
-                                    isLoadingOlderHistory = true
-                                    Task {
-                                        await store.loadOlderEventsPage(for: sessionId)
-                                        try? await Task.sleep(nanoseconds: 350_000_000)
-                                        isLoadingOlderHistory = false
-                                    }
-                                }
-                            }
-
-                            ForEach(Array(turns.enumerated()), id: \.element.id) { idx, turn in
-                                let isLatest = idx == turns.count - 1
-                                let turnRunning = isLatest && isSessionRunning
-                                let userTurnOrdinal = turns[0...idx].filter { $0.userEvent != nil }.count - 1
-
-                                TurnBlockView(
-                                    store: store,
-                                    turn: turn,
-                                    isTurnRunning: turnRunning,
-                                    turnStartedAt: isLatest ? store.turnStartedAtBySession[sessionId] : nil,
-                                    liveTps: isLatest ? store.liveTpsBySession[sessionId] : nil,
-                                    autoCollapseSteps: store.autoCollapseSteps,
-                                    waitingApproval: isLatest ? store.pendingApprovals[sessionId] : nil,
-                                    waitingQuestion: isLatest ? store.pendingQuestions[sessionId] : nil,
-                                    onPreviewImage: { ref in
-                                        previewImageItem = PreviewImageTarget(ref: ref)
-                                    },
-                                    onRequestMacLogin: { provider in
-                                        await store.requestMacCLILogin(provider: provider)
-                                    },
-                                    onRetry: (!isSessionRunning && turn.userEvent != nil) ? {
-                                        if let userEv = turn.userEvent {
-                                            let retryImages: [String] = {
-                                                if case .user(let imgs) = userEv.kind { return imgs }
-                                                return []
-                                            }()
-                                            Task {
-                                                await store.sendPrompt(
-                                                    sessionId: sessionId,
-                                                    text: userEv.content,
-                                                    model: selectedModelId,
-                                                    effort: selectedEffort,
-                                                    images: retryImages,
-                                                    truncateToUserTurn: max(0, userTurnOrdinal)
-                                                )
-                                            }
-                                        }
-                                    } : nil
-                                )
-                            }
-
-                            if let approval = store.pendingApprovals[sessionId] {
-                                ApprovalPromptCard(
-                                    prompt: approval,
-                                    onApprove: {
-                                        Task {
-                                            await store.resolveApproval(sessionId: sessionId, requestId: approval.id, approve: true)
-                                        }
-                                    },
-                                    onDeny: {
-                                        Task {
-                                            await store.resolveApproval(sessionId: sessionId, requestId: approval.id, approve: false)
-                                        }
-                                    }
-                                )
-                            }
-
-                            if let question = store.pendingQuestions[sessionId] {
-                                QuestionPromptCard(prompt: question) { chosen in
-                                    Task {
-                                        await store.answerQuestion(sessionId: sessionId, questionId: question.id, answers: chosen)
-                                    }
-                                }
-                            }
-
-                            Color.clear
-                                .frame(height: 6)
-                                .id("BOTTOM_ANCHOR")
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 14)
-                        .padding(.bottom, 12)
-                    }
-                    .scrollDismissesKeyboard(.interactively)
-                    .onChange(of: store.eventsBySession[sessionId]?.last?.id) { _, newTailId in
-                        guard let newTailId, newTailId != lastTailEventId else { return }
-                        lastTailEventId = newTailId
-                        guard let lastEv = store.eventsBySession[sessionId]?.last else { return }
-                        let shouldScroll: Bool = {
-                            if !store.autoCollapseSteps { return true }
-                            switch lastEv.kind {
-                            case .user, .assistant, .error:
-                                return true
-                            case .thinking, .toolCall:
-                                return false
-                            }
-                        }()
-                        if shouldScroll {
-                            withAnimation(.easeOut(duration: 0.22)) {
-                                proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
-                            }
-                        }
-                    }
-                    .onChange(of: session?.model) { _, newModel in
-                        if let newModel, !newModel.isEmpty {
-                            selectedModelId = newModel
-                        }
-                    }
-                    .onChange(of: sessionId) { _, newSid in
-                        didInitialBottomScroll = false
-                        if let s = store.sessions.first(where: { $0.id == newSid }) {
-                            selectedModelId = s.model
-                            selectedEffort = s.effort
-                        }
-                        Task {
-                            await store.loadEventsForSession(newSid)
-                            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
-                            try? await Task.sleep(nanoseconds: 350_000_000)
-                            didInitialBottomScroll = true
-                        }
-                    }
-                    .onAppear {
-                        didInitialBottomScroll = false
-                        if let s = session {
-                            selectedModelId = s.model
-                            selectedEffort = s.effort
-                        }
-                        Task {
-                            await store.loadEventsForSession(sessionId)
-                            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
-                            try? await Task.sleep(nanoseconds: 350_000_000)
-                            didInitialBottomScroll = true
-                        }
-                    }
-                }
-
-                // 3. Floating Specular Composer Card (Rare UI / Beautiful UI)
+                scrollStreamSection
                 floatingComposerDock
             }
         }
@@ -282,55 +113,7 @@ public struct ChatThreadView: View {
             }
 
             ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 8) {
-                    Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
-                            store.autoCollapseSteps.toggle()
-                        }
-                    } label: {
-                        Image(
-                            systemName: store.autoCollapseSteps
-                                ? "rectangle.compress.vertical"
-                                : "rectangle.expand.vertical"
-                        )
-                        .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(store.autoCollapseSteps ? VeloTheme.accentVioletSoft : .secondary)
-                    }
-                    .accessibilityLabel(store.autoCollapseSteps ? "默认收起执行流" : "默认展开执行流")
-
-                    Menu {
-                        Button {
-                            showModelSheet = true
-                        } label: {
-                            Label("切换模型 / 跨引擎接力", systemImage: "arrow.triangle.swap")
-                        }
-                        Button {
-                            let targetProv = (session?.agentKind == "codex") ? "claude" : "codex"
-                            Task {
-                                if let advId = await store.requestAdvisorReview(sessionId: sessionId, advisorProvider: targetProv) {
-                                    onSwitchedSession?(advId)
-                                }
-                            }
-                        } label: {
-                            Label("请求 Advisor 第二架构意见", systemImage: "person.2.wave.2")
-                        }
-                    } label: {
-                        Image(systemName: "arrow.triangle.swap")
-                            .font(.system(size: 13.5, weight: .semibold))
-                    }
-
-                    Button {
-                        showDiffSheet = true
-                        Task {
-                            await store.fetchDiff(for: sessionId)
-                            await store.fetchPrStatus(for: sessionId)
-                        }
-                    } label: {
-                        Image(systemName: "arrow.left.arrow.right.square")
-                            .font(.system(size: 14, weight: .semibold))
-                    }
-                }
+                trailingToolbarView
             }
         }
         .alert("重命名会话", isPresented: $showRenameAlert) {
@@ -391,6 +174,14 @@ public struct ChatThreadView: View {
         .fullScreenCover(item: $previewImageItem) { target in
             FullscreenImagePreviewSheet(store: store, ref: target.ref)
         }
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { annotatingImageId != nil },
+                set: { if !$0 { annotatingImageId = nil } }
+            )
+        ) {
+            annotatorSheetView
+        }
         .onChange(of: pickerItems) { _, newItems in
             guard !newItems.isEmpty else { return }
             let picked = newItems
@@ -402,6 +193,320 @@ public struct ChatThreadView: View {
                     {
                         enqueueComposerImage(rawUIImage, filename: "photo-\(Int(Date().timeIntervalSince1970))-\(i).jpg")
                     }
+                }
+            }
+        }
+    }
+
+    private var trailingToolbarView: some View {
+        HStack(spacing: 8) {
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                    store.autoCollapseSteps.toggle()
+                }
+            } label: {
+                Image(
+                    systemName: store.autoCollapseSteps
+                        ? "rectangle.compress.vertical"
+                        : "rectangle.expand.vertical"
+                )
+                .font(.system(size: 13.5, weight: .semibold))
+                .foregroundStyle(store.autoCollapseSteps ? VeloTheme.accentVioletSoft : .secondary)
+            }
+            .accessibilityLabel(store.autoCollapseSteps ? "默认收起执行流" : "默认展开执行流")
+
+            Menu {
+                Button {
+                    showModelSheet = true
+                } label: {
+                    Label("切换模型 / 跨引擎接力", systemImage: "arrow.triangle.swap")
+                }
+                if !turns.isEmpty && !isSessionRunning {
+                    Button {
+                        Task {
+                            if let forkedId = await store.forkSession(sessionId, upToUserTurn: nil) {
+                                onSwitchedSession?(forkedId)
+                            }
+                        }
+                    } label: {
+                        Label("从当前上下文分叉新会话 (Fork)", systemImage: "arrow.branch")
+                    }
+                }
+                if turns.count >= 2 {
+                    turnOutlineMenu
+                }
+                Button {
+                    let targetProv = (session?.agentKind == "codex") ? "claude" : "codex"
+                    Task {
+                        if let advId = await store.requestAdvisorReview(sessionId: sessionId, advisorProvider: targetProv) {
+                            onSwitchedSession?(advId)
+                        }
+                    }
+                } label: {
+                    Label("请求 Advisor 第二架构意见", systemImage: "person.2.wave.2")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 14.5, weight: .semibold))
+            }
+
+            Button {
+                showDiffSheet = true
+                Task {
+                    await store.fetchDiff(for: sessionId)
+                    await store.fetchPrStatus(for: sessionId)
+                }
+            } label: {
+                Image(systemName: "arrow.left.arrow.right.square")
+                    .font(.system(size: 14, weight: .semibold))
+            }
+        }
+    }
+
+    private var turnOutlineMenu: some View {
+        Menu {
+            ForEach(Array(turns.enumerated()), id: \.element.id) { idx, t in
+                let rawContent = t.userEvent?.content ?? "对话轮次"
+                let snippet = String(rawContent.replacingOccurrences(of: "\n", with: " ").prefix(34))
+                let titleStr = "#\(idx + 1) \(snippet)"
+                Button(titleStr) {
+                    jumpTargetTurnId = t.id
+                }
+            }
+        } label: {
+            Label("对话轮次导航 (\(turns.count))", systemImage: "list.bullet.indent")
+        }
+    }
+
+    @ViewBuilder
+    private var annotatorSheetView: some View {
+        if let targetId = annotatingImageId,
+           let idx = pendingImages.firstIndex(where: { $0.id == targetId })
+        {
+            let item = pendingImages[idx]
+            let fullImg = UIImage(data: item.jpegData) ?? item.preview
+            VeloImageAnnotatorSheet(
+                originalImage: fullImg,
+                onCommit: { newJpegData, renderedImage in
+                    if let curIdx = pendingImages.firstIndex(where: { $0.id == targetId }) {
+                        pendingImages[curIdx].jpegData = newJpegData
+                        pendingImages[curIdx].preview = renderedImage
+                        pendingImages[curIdx].uploadedPath = nil
+                        pendingImages[curIdx].uploadFailed = false
+                        retryComposerImageUpload(targetId)
+                    }
+                    annotatingImageId = nil
+                },
+                onCancel: {
+                    annotatingImageId = nil
+                }
+            )
+        }
+    }
+
+    private var scrollStreamSection: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    if turns.isEmpty {
+                        emptyThreadHero
+                    } else if store.hasMoreHistoryBySession[sessionId] == true {
+                        olderHistoryButton
+                    }
+
+                    ForEach(Array(turns.enumerated()), id: \.element.id) { idx, turn in
+                        turnRowView(idx: idx, turn: turn)
+                    }
+
+                    if let approval = store.pendingApprovals[sessionId] {
+                        ApprovalPromptCard(
+                            prompt: approval,
+                            onApprove: {
+                                Task {
+                                    await store.resolveApproval(sessionId: sessionId, requestId: approval.id, approve: true)
+                                }
+                            },
+                            onDeny: {
+                                Task {
+                                    await store.resolveApproval(sessionId: sessionId, requestId: approval.id, approve: false)
+                                }
+                            }
+                        )
+                    }
+
+                    if let question = store.pendingQuestions[sessionId] {
+                        QuestionPromptCard(prompt: question) { chosen in
+                            Task {
+                                await store.answerQuestion(sessionId: sessionId, questionId: question.id, answers: chosen)
+                            }
+                        }
+                    }
+
+                    Color.clear
+                        .frame(height: 6)
+                        .id("BOTTOM_ANCHOR")
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .onChange(of: store.eventsBySession[sessionId]?.last?.id) { _, newTailId in
+                handleTailEventChanged(newTailId: newTailId, proxy: proxy)
+            }
+            .onChange(of: jumpTargetTurnId) { _, targetId in
+                guard let targetId else { return }
+                jumpTargetTurnId = nil
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(targetId, anchor: .top)
+                }
+            }
+            .onChange(of: session?.model) { _, newModel in
+                if let newModel, !newModel.isEmpty {
+                    selectedModelId = newModel
+                }
+            }
+            .onChange(of: sessionId) { _, newSid in
+                syncAndScrollInitial(sid: newSid, proxy: proxy)
+            }
+            .onAppear {
+                syncAndScrollInitial(sid: sessionId, proxy: proxy)
+            }
+        }
+    }
+
+    private var olderHistoryButton: some View {
+        Button {
+            guard !isLoadingOlderHistory else { return }
+            isLoadingOlderHistory = true
+            Task {
+                await store.loadOlderEventsPage(for: sessionId)
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                isLoadingOlderHistory = false
+            }
+        } label: {
+            HStack(spacing: 5) {
+                if isLoadingOlderHistory {
+                    ProgressView().scaleEffect(0.72)
+                } else {
+                    Image(systemName: "arrow.up.circle")
+                }
+                Text(isLoadingOlderHistory ? "正在加载更早记录…" : "加载更早历史消息")
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+        }
+        .frame(maxWidth: .infinity)
+        .onAppear {
+            guard didInitialBottomScroll, !isLoadingOlderHistory, !turns.isEmpty else { return }
+            isLoadingOlderHistory = true
+            Task {
+                await store.loadOlderEventsPage(for: sessionId)
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                isLoadingOlderHistory = false
+            }
+        }
+    }
+
+    private func turnRowView(idx: Int, turn: ConversationTurnBlock) -> some View {
+        let isLatest = idx == turns.count - 1
+        let turnRunning = isLatest && isSessionRunning
+        let userTurnOrdinal = turns[0...idx].filter { $0.userEvent != nil }.count - 1
+
+        return TurnBlockView(
+            store: store,
+            turn: turn,
+            isTurnRunning: turnRunning,
+            turnStartedAt: isLatest ? store.turnStartedAtBySession[sessionId] : nil,
+            liveTps: isLatest ? store.liveTpsBySession[sessionId] : nil,
+            autoCollapseSteps: store.autoCollapseSteps,
+            waitingApproval: isLatest ? store.pendingApprovals[sessionId] : nil,
+            waitingQuestion: isLatest ? store.pendingQuestions[sessionId] : nil,
+            onPreviewImage: { ref in
+                previewImageItem = PreviewImageTarget(ref: ref)
+            },
+            onRequestMacLogin: { provider in
+                await store.requestMacCLILogin(provider: provider)
+            },
+            onRetry: retryTurnClosure(turn: turn, userTurnOrdinal: userTurnOrdinal),
+            onFork: forkTurnClosure(turn: turn, userTurnOrdinal: userTurnOrdinal)
+        )
+        .id(turn.id)
+    }
+
+    private func handleTailEventChanged(newTailId: String?, proxy: ScrollViewProxy) {
+        guard let newTailId, newTailId != lastTailEventId else { return }
+        lastTailEventId = newTailId
+        guard let lastEv = store.eventsBySession[sessionId]?.last else { return }
+        let shouldScroll: Bool = {
+            if !store.autoCollapseSteps { return true }
+            switch lastEv.kind {
+            case .user, .assistant, .error:
+                return true
+            case .thinking, .toolCall:
+                return false
+            }
+        }()
+        if shouldScroll {
+            withAnimation(.easeOut(duration: 0.22)) {
+                proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+            }
+        }
+    }
+
+    private func syncAndScrollInitial(sid: String, proxy: ScrollViewProxy) {
+        didInitialBottomScroll = false
+        if let s = store.sessions.first(where: { $0.id == sid }) {
+            selectedModelId = s.model
+            selectedEffort = s.effort
+        }
+        Task {
+            await store.loadEventsForSession(sid)
+            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            didInitialBottomScroll = true
+        }
+    }
+
+    private func retryTurnClosure(
+        turn: ConversationTurnBlock,
+        userTurnOrdinal: Int
+    ) -> (() -> Void)? {
+        guard !isSessionRunning, let userEv = turn.userEvent else { return nil }
+        return {
+            let retryImages: [String] = {
+                if case .user(let imgs) = userEv.kind { return imgs }
+                return []
+            }()
+            Task {
+                await store.sendPrompt(
+                    sessionId: sessionId,
+                    text: userEv.content,
+                    model: selectedModelId,
+                    effort: selectedEffort,
+                    images: retryImages,
+                    truncateToUserTurn: max(0, userTurnOrdinal)
+                )
+            }
+        }
+    }
+
+    private func forkTurnClosure(
+        turn: ConversationTurnBlock,
+        userTurnOrdinal: Int
+    ) -> (() -> Void)? {
+        guard !isSessionRunning, turn.userEvent != nil else { return nil }
+        return {
+            Task {
+                if let forkedId = await store.forkSession(
+                    sessionId,
+                    upToUserTurn: max(1, userTurnOrdinal + 1)
+                ) {
+                    onSwitchedSession?(forkedId)
                 }
             }
         }
@@ -683,9 +788,19 @@ public struct ChatThreadView: View {
                                         }
                                     }
                                     .onTapGesture {
-                                        if let ref = item.uploadedPath {
-                                            previewImageItem = PreviewImageTarget(ref: ref)
+                                        annotatingImageId = item.id
+                                    }
+                                    .overlay(alignment: .bottomLeading) {
+                                        Button {
+                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                            annotatingImageId = item.id
+                                        } label: {
+                                            Image(systemName: "pencil.tip.crop.circle.fill")
+                                                .font(.system(size: 16))
+                                                .symbolRenderingMode(.palette)
+                                                .foregroundStyle(.white, VeloTheme.accentViolet)
                                         }
+                                        .offset(x: -4, y: 4)
                                     }
 
                                 Button {
@@ -1234,6 +1349,7 @@ private struct TurnBlockView: View {
     let onPreviewImage: (String) -> Void
     let onRequestMacLogin: (String) async -> Bool
     let onRetry: (() -> Void)?
+    let onFork: (() -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -1428,7 +1544,11 @@ private struct TurnBlockView: View {
                             workingVerb: workingVerb,
                             summary: summary,
                             output: output,
-                            isError: isError
+                            isError: isError,
+                            inlineDiffOld: item.inlineDiffOld,
+                            inlineDiffNew: item.inlineDiffNew,
+                            subagentRole: item.subagentRole,
+                            subagentPrompt: item.subagentPrompt
                         )
 
                     case .assistant(let isStreaming):
@@ -1471,7 +1591,8 @@ private struct TurnBlockView: View {
                     liveTps: isTurnRunning ? liveTps : nil,
                     telemetry: hasErrorWithoutAnswer ? nil : turn.userEvent?.telemetry,
                     assistantText: lastAssistantText,
-                    onRetry: onRetry
+                    onRetry: onRetry,
+                    onFork: onFork
                 )
             }
         }

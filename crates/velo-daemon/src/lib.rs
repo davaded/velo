@@ -35,9 +35,11 @@ use velo_worktree::{WorktreeManager, default_velo_home};
 
 pub mod automations;
 pub mod cli_sessions;
+pub mod hosts;
 pub mod pr;
 pub mod pricing;
 pub mod push;
+pub mod quota;
 pub mod relay_bridge;
 pub mod service;
 pub mod storage;
@@ -118,6 +120,7 @@ fn event_timestamp_ms(ev: &AgentEvent) -> i64 {
         | AgentEvent::MessageChunk { timestamp, .. }
         | AgentEvent::MessageDelta { timestamp, .. }
         | AgentEvent::UsageUpdated { timestamp, .. }
+        | AgentEvent::RateLimitsUpdated { timestamp, .. }
         | AgentEvent::TerminalOutput { timestamp, .. }
         | AgentEvent::ToolCallRequested { timestamp, .. }
         | AgentEvent::ToolCallCompleted { timestamp, .. }
@@ -616,11 +619,20 @@ fn fallback_workspace_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| velo_worktree::default_general_workspace())
 }
 
+pub struct WarmAgentEntry {
+    pub handle: AgentHandle,
+    pub provider: AgentProvider,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub approval_mode: String,
+}
+
 pub struct DaemonInner {
     pub sessions: HashMap<Uuid, SessionInfo>,
     pub event_history: HashMap<Uuid, Vec<AgentEvent>>,
     pub live_turns: HashMap<Uuid, LiveTurnMetrics>,
     pub handles: HashMap<Uuid, AgentHandle>,
+    pub warm_handles: HashMap<Uuid, WarmAgentEntry>,
     pub shells: HashMap<Uuid, InteractiveShellHandle>,
     pub pending_approvals: HashMap<String, oneshot::Sender<String>>,
     pub pending_questions: HashMap<String, oneshot::Sender<Vec<String>>>,
@@ -628,6 +640,8 @@ pub struct DaemonInner {
     pub repo_hooks: HashMap<String, String>,
     pub workspaces: Vec<String>,
     pub push_config: push::PushConfig,
+    pub quota_cache: quota::PersistedQuotaCache,
+    pub remote_hosts: Vec<hosts::RemoteHostNode>,
 }
 
 #[derive(Clone)]
@@ -645,6 +659,8 @@ pub struct DaemonState {
     pub hooks_file: PathBuf,
     pub workspaces_file: PathBuf,
     pub push_config_file: PathBuf,
+    pub quota_cache_file: PathBuf,
+    pub hosts_file: PathBuf,
     pub daemon_http_base: Option<String>,
 }
 
@@ -660,6 +676,8 @@ impl DaemonState {
         let hooks_file = velo_home.join("repo_hooks.json");
         let workspaces_file = velo_home.join("workspaces.json");
         let push_config_file = velo_home.join("push_config.json");
+        let quota_cache_file = velo_home.join("quotas.json");
+        let hosts_file = velo_home.join("hosts.json");
         tokio::fs::create_dir_all(&events_dir).await?;
         tokio::fs::create_dir_all(&attachments_dir).await?;
 
@@ -672,6 +690,8 @@ impl DaemonState {
         }
         let (sessions, event_history) = db.load_all()?;
         let push_cfg = push::load_push_config(&push_config_file).await;
+        let quota_cache = quota::load_quota_cache(&quota_cache_file);
+        let remote_hosts = hosts::load_remote_hosts(&hosts_file);
 
         let automations_list = if let Ok(raw) = tokio::fs::read_to_string(&automations_file).await {
             serde_json::from_str::<Vec<automations::AutomationRule>>(&raw).unwrap_or_default()
@@ -719,6 +739,7 @@ impl DaemonState {
                 event_history,
                 live_turns: HashMap::new(),
                 handles: HashMap::new(),
+                warm_handles: HashMap::new(),
                 shells: HashMap::new(),
                 pending_approvals: HashMap::new(),
                 pending_questions: HashMap::new(),
@@ -726,6 +747,8 @@ impl DaemonState {
                 repo_hooks: repo_hooks_map,
                 workspaces: workspaces_list,
                 push_config: push_cfg,
+                quota_cache,
+                remote_hosts,
             })),
             db,
             agent_event_tx,
@@ -739,6 +762,8 @@ impl DaemonState {
             hooks_file,
             workspaces_file,
             push_config_file,
+            quota_cache_file,
+            hosts_file,
             daemon_http_base: Some(format!(
                 "http://127.0.0.1:{}",
                 velo_protocol::DEFAULT_DAEMON_PORT
@@ -1201,6 +1226,17 @@ impl DaemonState {
                             guard.live_turns.remove(&session_id);
                         }
 
+                        if let AgentEvent::RateLimitsUpdated {
+                            provider, windows, ..
+                        } = &event
+                        {
+                            guard
+                                .quota_cache
+                                .by_provider
+                                .insert(provider.clone(), windows.clone());
+                            quota::save_quota_cache(&state.quota_cache_file, &guard.quota_cache);
+                        }
+
                         if !matches!(
                             event,
                             AgentEvent::UserMessage { .. }
@@ -1208,6 +1244,7 @@ impl DaemonState {
                                 | AgentEvent::ThinkingChunk { .. }
                                 | AgentEvent::MessageChunk { .. }
                                 | AgentEvent::TerminalOutput { .. }
+                                | AgentEvent::RateLimitsUpdated { .. }
                         ) {
                             guard
                                 .event_history
@@ -1217,9 +1254,14 @@ impl DaemonState {
                             db_event_to_append = Some(event.clone());
                         }
 
-                        let p_cfg = guard.push_config.clone();
-                        if let Some(session) = guard.sessions.get_mut(&session_id) {
+                        let g = &mut *guard;
+                        let p_cfg = g.push_config.clone();
+                        if let Some(session) = g.sessions.get_mut(&session_id) {
                             session.updated_at = Utc::now();
+                            let s_prov_snap = session.provider.clone();
+                            let s_model_snap = session.model.clone();
+                            let s_effort_snap = session.effort.clone();
+                            let s_appr_snap = session.approval_mode.clone();
                             match &event {
                                 AgentEvent::StatusChanged {
                                     status, message, ..
@@ -1227,6 +1269,28 @@ impl DaemonState {
                                     session.status = *status;
                                     should_refresh_diff = true;
                                     should_persist_sessions = true;
+                                    if *status == SessionStatus::Completed {
+                                        if let Some(active_h) = g.handles.remove(&session_id) {
+                                            g.warm_handles.insert(
+                                                session_id,
+                                                WarmAgentEntry {
+                                                    handle: active_h,
+                                                    provider: s_prov_snap,
+                                                    model: s_model_snap,
+                                                    effort: s_effort_snap,
+                                                    approval_mode: s_appr_snap,
+                                                },
+                                            );
+                                        }
+                                    } else if matches!(
+                                        status,
+                                        SessionStatus::Failed | SessionStatus::Stopped
+                                    ) {
+                                        g.handles.remove(&session_id);
+                                        if let Some(mut wh) = g.warm_handles.remove(&session_id) {
+                                            wh.handle.stop();
+                                        }
+                                    }
                                     if matches!(
                                         status,
                                         SessionStatus::Completed | SessionStatus::Failed
@@ -1455,13 +1519,70 @@ impl DaemonState {
         self.list_workspaces().await
     }
 
-    pub async fn remove_workspace(&self, raw_path: &str) -> Vec<String> {
+    pub async fn remove_workspace(&self, raw_path: &str, delete_sessions: bool) -> Vec<String> {
         let clean = canonical_workspace_path(raw_path);
-        {
+        let matching_sids: Vec<Uuid> = {
             let mut guard = self.inner.write().await;
-            guard.workspaces.retain(|w| w != &clean);
+            guard.workspaces.retain(|w| canonical_workspace_path(w) != clean);
+            if delete_sessions {
+                guard
+                    .sessions
+                    .values()
+                    .filter(|s| canonical_workspace_path(&s.repo_root) == clean)
+                    .map(|s| s.id)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for sid in matching_sids {
+            let _ = self.delete_session_by_id(sid, true).await;
         }
         let _ = self.persist_workspaces().await;
+        let _ = self.persist_sessions().await;
+        self.list_workspaces().await
+    }
+
+    pub async fn relocate_workspace(&self, old_raw: &str, new_raw: &str) -> Vec<String> {
+        let old_clean = canonical_workspace_path(old_raw);
+        let new_clean = canonical_workspace_path(new_raw);
+        if new_clean.is_empty() || old_clean == new_clean {
+            return self.list_workspaces().await;
+        }
+        let _ = velo_worktree::ensure_usable_workspace_dir(Path::new(&new_clean)).await;
+        {
+            let mut guard = self.inner.write().await;
+            let mut replaced = false;
+            let mut deduped = Vec::new();
+            for w in &guard.workspaces {
+                let cw = canonical_workspace_path(w);
+                if cw == old_clean {
+                    if !deduped.contains(&new_clean) {
+                        deduped.push(new_clean.clone());
+                    }
+                    replaced = true;
+                } else if !deduped.contains(&cw) {
+                    deduped.push(cw);
+                }
+            }
+            if !replaced && !deduped.contains(&new_clean) {
+                deduped.push(new_clean.clone());
+            }
+            guard.workspaces = deduped;
+
+            for s in guard.sessions.values_mut() {
+                if canonical_workspace_path(&s.repo_root) == old_clean {
+                    let was_main_dir = canonical_workspace_path(&s.worktree_path) == old_clean;
+                    s.repo_root = new_clean.clone();
+                    if was_main_dir {
+                        s.worktree_path = new_clean.clone();
+                    }
+                    s.updated_at = Utc::now();
+                }
+            }
+        }
+        let _ = self.persist_workspaces().await;
+        let _ = self.persist_sessions().await;
         self.list_workspaces().await
     }
 
@@ -1927,6 +2048,7 @@ impl DaemonState {
             approval_mode: approval_mode.clone(),
             preview_url: None,
             queued_prompts: Vec::new(),
+            archived: false,
         };
 
         let initial_user_ev = if !prompt.trim().is_empty() || !images.is_empty() {
@@ -2075,6 +2197,7 @@ pub fn build_router(state: DaemonState) -> Router {
             "/api/workspaces",
             get(list_workspaces_handler)
                 .post(add_workspace_handler)
+                .patch(relocate_workspace_handler)
                 .delete(remove_workspace_handler),
         )
         .route("/api/open-editor", post(open_editor_handler))
@@ -2084,6 +2207,19 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/attachments-resolve", get(resolve_attachment_handler))
         .route("/api/search", get(global_search_handler))
         .route("/api/analytics/usage", get(usage_analytics_handler))
+        .route("/api/analytics/quotas", get(quotas_analytics_handler))
+        .route(
+            "/api/hosts",
+            get(list_hosts_handler).post(add_host_handler),
+        )
+        .route(
+            "/api/hosts/{id}",
+            axum::routing::delete(remove_host_handler),
+        )
+        .route("/api/hosts/{id}/probe", post(probe_host_handler))
+        .route("/api/hosts/{id}/dispatch", post(dispatch_ssh_host_handler))
+        .route("/api/sessions/{id}/archive", post(archive_session_handler))
+        .route("/api/sessions/{id}/fork", post(fork_session_handler))
         .route(
             "/api/push/config",
             get(get_push_config_handler).post(set_push_config_handler),
@@ -2843,6 +2979,13 @@ pub(crate) async fn build_models_catalog_json() -> Value {
 #[derive(Debug, serde::Deserialize)]
 struct WorkspaceMutationRequest {
     path: String,
+    delete_sessions: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RelocateWorkspaceRequest {
+    old_path: String,
+    new_path: String,
 }
 
 async fn list_workspaces_handler(State(state): State<DaemonState>) -> impl IntoResponse {
@@ -2862,8 +3005,23 @@ async fn remove_workspace_handler(
     State(state): State<DaemonState>,
     Json(req): Json<WorkspaceMutationRequest>,
 ) -> impl IntoResponse {
-    let list = state.remove_workspace(&req.path).await;
+    let delete_sessions = req.delete_sessions.unwrap_or(true);
+    let list = state.remove_workspace(&req.path, delete_sessions).await;
     Json(json!({ "workspaces": list }))
+}
+
+async fn relocate_workspace_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<RelocateWorkspaceRequest>,
+) -> impl IntoResponse {
+    let list = state.relocate_workspace(&req.old_path, &req.new_path).await;
+    let sessions: Vec<SessionInfo> = {
+        let guard = state.inner.read().await;
+        let mut s: Vec<SessionInfo> = guard.sessions.values().cloned().collect();
+        s.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        s
+    };
+    Json(json!({ "ok": true, "workspaces": list, "sessions": sessions }))
 }
 
 async fn pick_folder_handler() -> impl IntoResponse {
@@ -3038,9 +3196,23 @@ impl DaemonState {
         effort: Option<String>,
         approval_mode: Option<String>,
         preview_url: Option<String>,
+        repo_path: Option<String>,
     ) -> Option<SessionInfo> {
+        let clean_new_repo = repo_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(canonical_workspace_path);
+        if let Some(ref nr) = clean_new_repo {
+            let _ = velo_worktree::ensure_usable_workspace_dir(Path::new(nr)).await;
+        }
         let updated = {
             let mut guard = self.inner.write().await;
+            if let Some(ref nr) = clean_new_repo {
+                if !guard.workspaces.iter().any(|w| canonical_workspace_path(w) == *nr) {
+                    guard.workspaces.push(nr.clone());
+                }
+            }
             let has_history = guard
                 .event_history
                 .get(&id)
@@ -3060,6 +3232,13 @@ impl DaemonState {
                 let is_engine_bound = s.provider_session_id.is_some() || has_history;
                 if let Some(n) = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
                     s.name = n;
+                }
+                if let Some(ref nr) = clean_new_repo {
+                    let is_isolated_wt = s.worktree_path.contains("/.velo/worktrees/");
+                    s.repo_root = nr.clone();
+                    if !is_isolated_wt {
+                        s.worktree_path = nr.clone();
+                    }
                 }
                 let mut provider_conflict = false;
                 if let Some(new_prov) = provider {
@@ -3102,6 +3281,9 @@ impl DaemonState {
         };
 
         if updated.is_some() {
+            if clean_new_repo.is_some() {
+                let _ = self.persist_workspaces().await;
+            }
             let _ = self.persist_sessions().await;
         }
         updated
@@ -3134,6 +3316,7 @@ struct UpdateSessionRequest {
     effort: Option<String>,
     approval_mode: Option<String>,
     preview_url: Option<String>,
+    repo_path: Option<String>,
 }
 
 async fn update_session_handler(
@@ -3150,6 +3333,7 @@ async fn update_session_handler(
             req.effort,
             req.approval_mode,
             req.preview_url,
+            req.repo_path,
         )
         .await;
 
@@ -4263,6 +4447,60 @@ impl DaemonState {
             }
         }
 
+        let effective_effort = req.effort.clone().or_else(|| session.effort.clone());
+
+        // Attempt 0ms hot turn dispatch via warm persistent process pool (Claude stream-json / Codex app-server)
+        if !stopped_active_handle && req.truncate_to_user_turn.is_none() && !req.reset_thread {
+            let mut warm_candidate = {
+                let mut guard = self.inner.write().await;
+                guard.warm_handles.remove(&id)
+            };
+            if let Some(mut warm) = warm_candidate.take() {
+                let can_reuse_warm = warm.provider == target_provider
+                    && warm.approval_mode == effective_approval
+                    && (target_provider == AgentProvider::Codex
+                        || (warm.model == effective_model && warm.effort == effective_effort));
+                if can_reuse_warm
+                    && warm.handle.try_send_warm_turn(
+                        &req.input,
+                        &req.images,
+                        effective_model.as_deref(),
+                        effective_effort.as_deref(),
+                    )
+                {
+                    let pid = warm.handle.pid;
+                    {
+                        let mut guard = self.inner.write().await;
+                        if let Some(s) = guard.sessions.get_mut(&id) {
+                            if effective_model.is_some() {
+                                s.model = effective_model;
+                            }
+                            if effective_effort.is_some() {
+                                s.effort = effective_effort;
+                            }
+                            s.status = SessionStatus::Running;
+                            s.pid = pid;
+                            s.updated_at = Utc::now();
+                        }
+                        guard.handles.insert(id, warm.handle);
+                    }
+                    let _ = self.persist_sessions().await;
+                    return Ok(json!({
+                        "ok": true,
+                        "session_id": id,
+                        "warm_reused": true,
+                    }));
+                } else {
+                    warm.handle.stop();
+                }
+            }
+        } else {
+            let mut guard = self.inner.write().await;
+            if let Some(mut wh) = guard.warm_handles.remove(&id) {
+                wh.handle.stop();
+            }
+        }
+
         let new_handle = match AgentSpawner::spawn_agent_turn_configured(
             id,
             target_provider.clone(),
@@ -4270,7 +4508,7 @@ impl DaemonState {
             wt_path,
             false,
             effective_model.clone(),
-            req.effort.clone().or_else(|| session.effort.clone()),
+            effective_effort,
             resume_session_id.clone(),
             req.images.clone(),
             effective_approval.clone(),
@@ -4531,6 +4769,7 @@ impl DaemonState {
                     approval_mode: default_approval_mode(),
                     preview_url: None,
                     queued_prompts: Vec::new(),
+                    archived: false,
                 };
                 guard.sessions.insert(target_id, s.clone());
                 guard.event_history.insert(target_id, parsed.events.clone());
@@ -4544,6 +4783,504 @@ impl DaemonState {
         }
         let _ = self.persist_sessions().await;
         Ok(out_session)
+    }
+
+    pub async fn archive_session_core(&self, id: Uuid, archived: bool) -> Result<SessionInfo> {
+        let mut clean_wt_to_prune: Option<(PathBuf, PathBuf)> = None;
+        let updated = {
+            let mut guard = self.inner.write().await;
+            if archived {
+                if let Some(mut h) = guard.handles.remove(&id) {
+                    h.stop();
+                }
+                if let Some(mut wh) = guard.warm_handles.remove(&id) {
+                    wh.handle.stop();
+                }
+            }
+            let Some(s) = guard.sessions.get_mut(&id) else {
+                anyhow::bail!("Session not found");
+            };
+            s.archived = archived;
+            s.updated_at = Utc::now();
+            if archived
+                && s.worktree_path != s.repo_root
+                && s.worktree_path.contains("/.velo/worktrees/")
+                && s.diff_stats.files_changed == 0
+            {
+                clean_wt_to_prune = Some((PathBuf::from(&s.repo_root), PathBuf::from(&s.worktree_path)));
+                s.worktree_path = s.repo_root.clone();
+            }
+            s.clone()
+        };
+
+        if let Some((repo_p, wt_p)) = clean_wt_to_prune {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force", &wt_p.to_string_lossy()])
+                .current_dir(&repo_p)
+                .output()
+                .await;
+        }
+        let _ = self.persist_sessions().await;
+        Ok(updated)
+    }
+
+    pub async fn fork_session_core(
+        &self,
+        source_id: Uuid,
+        up_to_user_turn: Option<usize>,
+        custom_title: Option<String>,
+    ) -> Result<SessionInfo> {
+        let (src, mut cloned_events) = {
+            let guard = self.inner.read().await;
+            let Some(s) = guard.sessions.get(&source_id).cloned() else {
+                anyhow::bail!("Source session not found");
+            };
+            let evs = guard
+                .event_history
+                .get(&source_id)
+                .cloned()
+                .unwrap_or_default();
+            (s, evs)
+        };
+
+        if let Some(limit_turn) = up_to_user_turn {
+            // Keep events up through the `limit_turn`-th user turn and its reply
+            truncate_events_at_user_turn(&mut cloned_events, limit_turn.saturating_add(1));
+        }
+
+        let new_id = Uuid::new_v4();
+        for ev in &mut cloned_events {
+            match ev {
+                AgentEvent::StatusChanged { session_id, .. }
+                | AgentEvent::UserMessage { session_id, .. }
+                | AgentEvent::ProviderSessionBound { session_id, .. }
+                | AgentEvent::ThinkingChunk { session_id, .. }
+                | AgentEvent::ThinkingDelta { session_id, .. }
+                | AgentEvent::MessageChunk { session_id, .. }
+                | AgentEvent::MessageDelta { session_id, .. }
+                | AgentEvent::UsageUpdated { session_id, .. }
+                | AgentEvent::RateLimitsUpdated { session_id, .. }
+                | AgentEvent::TerminalOutput { session_id, .. }
+                | AgentEvent::ToolCallRequested { session_id, .. }
+                | AgentEvent::ToolCallCompleted { session_id, .. }
+                | AgentEvent::PermissionRequested { session_id, .. }
+                | AgentEvent::PermissionResolved { session_id, .. }
+                | AgentEvent::UserQuestionRequested { session_id, .. }
+                | AgentEvent::UserQuestionAnswered { session_id, .. }
+                | AgentEvent::BrowserCommand { session_id, .. }
+                | AgentEvent::SetupHookOutput { session_id, .. }
+                | AgentEvent::PtyOutput { session_id, .. }
+                | AgentEvent::DiffUpdated { session_id, .. }
+                | AgentEvent::Error { session_id, .. } => {
+                    *session_id = new_id;
+                }
+            }
+        }
+
+        let now = Utc::now();
+        let fork_title = custom_title
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| format!("Fork · {}", src.name));
+
+        let forked = SessionInfo {
+            id: new_id,
+            name: fork_title,
+            provider: src.provider.clone(),
+            prompt: src.prompt.clone(),
+            repo_root: src.repo_root.clone(),
+            worktree_path: src.worktree_path.clone(),
+            branch: src.branch.clone(),
+            status: SessionStatus::Completed,
+            pid: None,
+            diff_stats: src.diff_stats.clone(),
+            created_at: now,
+            updated_at: now,
+            parent_session_id: Some(source_id),
+            // Clear provider_session_id so next turn reconstructs exact forked transcript without mutating parent's CLI thread!
+            provider_session_id: None,
+            model: src.model.clone(),
+            effort: src.effort.clone(),
+            tokens_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            context_window: src.context_window,
+            cost_usd: 0.0,
+            approval_mode: src.approval_mode.clone(),
+            preview_url: None,
+            queued_prompts: Vec::new(),
+            archived: false,
+        };
+
+        {
+            let mut guard = self.inner.write().await;
+            guard.sessions.insert(new_id, forked.clone());
+            guard.event_history.insert(new_id, cloned_events.clone());
+        }
+        let _ = self.db.replace_session_events(new_id, &cloned_events);
+        let _ = self.persist_sessions().await;
+        Ok(forked)
+    }
+
+    pub async fn get_quotas_dto(&self) -> Value {
+        let (cache_snap, sessions_snap, hist_snap) = {
+            let guard = self.inner.read().await;
+            (
+                guard.quota_cache.clone(),
+                guard.sessions.clone(),
+                guard.event_history.clone(),
+            )
+        };
+        let cards = tokio::task::spawn_blocking(move || {
+            quota::build_subscription_quotas_snapshot(&cache_snap, &sessions_snap, &hist_snap)
+        })
+        .await
+        .unwrap_or_default();
+        json!({ "ok": true, "providers": cards })
+    }
+
+    pub async fn list_hosts_dto(&self) -> Value {
+        let remote = {
+            let guard = self.inner.read().await;
+            guard.remote_hosts.clone()
+        };
+        let mut all = vec![hosts::local_host_summary_json()];
+        for h in remote {
+            if let Ok(v) = serde_json::to_value(h) {
+                all.push(v);
+            }
+        }
+        json!({ "ok": true, "hosts": all })
+    }
+
+    pub async fn add_remote_host_core(
+        &self,
+        label: &str,
+        ssh_target: &str,
+        default_cwd: Option<&str>,
+        prefer_hush: bool,
+    ) -> Result<hosts::RemoteHostNode> {
+        if ssh_target.trim().is_empty() {
+            anyhow::bail!("SSH target cannot be empty");
+        }
+        let created = hosts::create_host_node(label, ssh_target, default_cwd, prefer_hush);
+        let probed = hosts::probe_ssh_host(created).await;
+        {
+            let mut guard = self.inner.write().await;
+            guard.remote_hosts.retain(|h| h.ssh_target != probed.ssh_target);
+            guard.remote_hosts.push(probed.clone());
+            hosts::save_remote_hosts(&self.hosts_file, &guard.remote_hosts);
+        }
+        Ok(probed)
+    }
+
+    pub async fn remove_remote_host_core(&self, host_id: &str) -> bool {
+        let mut guard = self.inner.write().await;
+        let before = guard.remote_hosts.len();
+        guard.remote_hosts.retain(|h| h.id != host_id);
+        let changed = guard.remote_hosts.len() != before;
+        if changed {
+            hosts::save_remote_hosts(&self.hosts_file, &guard.remote_hosts);
+        }
+        changed
+    }
+
+    pub async fn probe_remote_host_core(&self, host_id: &str) -> Option<hosts::RemoteHostNode> {
+        let existing = {
+            let guard = self.inner.read().await;
+            guard.remote_hosts.iter().find(|h| h.id == host_id).cloned()
+        }?;
+        let updated = hosts::probe_ssh_host(existing).await;
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(slot) = guard.remote_hosts.iter_mut().find(|h| h.id == host_id) {
+                *slot = updated.clone();
+            }
+            hosts::save_remote_hosts(&self.hosts_file, &guard.remote_hosts);
+        }
+        Some(updated)
+    }
+
+    pub async fn dispatch_ssh_host_session_core(
+        &self,
+        host_id: &str,
+        provider_str: &str,
+        prompt: &str,
+        remote_cwd: Option<&str>,
+    ) -> Result<SessionInfo> {
+        let host = {
+            let guard = self.inner.read().await;
+            guard
+                .remote_hosts
+                .iter()
+                .find(|h| h.id == host_id)
+                .cloned()
+        }
+        .ok_or_else(|| anyhow::anyhow!("Remote SSH host not found"))?;
+
+        let cwd = remote_cwd
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&host.default_cwd)
+            .to_string();
+        let prov = AgentProvider::from_str_loose(provider_str);
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+        let short_title: String = prompt.trim().chars().take(42).collect();
+        let sess_name = format!("[{}] {}", host.label, if short_title.is_empty() { "SSH 任务" } else { &short_title });
+        let repo_tag = format!("ssh://{}/{}", host.ssh_target, cwd.trim_start_matches('/'));
+
+        let sess = SessionInfo {
+            id: sid,
+            name: sess_name,
+            provider: prov.clone(),
+            prompt: prompt.to_string(),
+            repo_root: repo_tag.clone(),
+            worktree_path: repo_tag,
+            branch: host.ssh_target.clone(),
+            status: SessionStatus::Running,
+            pid: None,
+            diff_stats: Default::default(),
+            created_at: now,
+            updated_at: now,
+            parent_session_id: None,
+            provider_session_id: None,
+            model: None,
+            effort: Some("high".to_string()),
+            tokens_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            context_window: 0,
+            cost_usd: 0.0,
+            approval_mode: default_approval_mode(),
+            preview_url: None,
+            queued_prompts: Vec::new(),
+            archived: false,
+        };
+
+        let user_ev = AgentEvent::UserMessage {
+            session_id: sid,
+            text: prompt.to_string(),
+            images: Vec::new(),
+            timestamp: now,
+        };
+
+        {
+            let mut guard = self.inner.write().await;
+            guard.sessions.insert(sid, sess.clone());
+            guard.event_history.insert(sid, vec![user_ev.clone()]);
+            guard.live_turns.insert(sid, LiveTurnMetrics::new(0, 0.0));
+        }
+        let _ = self.db.append_event(sid, &user_ev);
+        let _ = self.persist_sessions().await;
+        let _ = self.event_tx.send(user_ev);
+
+        let quoted_prompt = hosts::shell_quote_single(prompt);
+        let remote_cmd = match prov {
+            AgentProvider::Codex => format!(
+                "cd {} 2>/dev/null || true; if command -v codex >/dev/null 2>&1; then codex exec --skip-git-repo-check {}; else echo 'Codex CLI not installed on remote host'; exit 1; fi",
+                cwd, quoted_prompt
+            ),
+            AgentProvider::Claude => format!(
+                "cd {} 2>/dev/null || true; if command -v claude >/dev/null 2>&1; then claude -p --permission-mode acceptEdits {}; else echo 'Claude CLI not installed on remote host'; exit 1; fi",
+                cwd, quoted_prompt
+            ),
+            _ => format!("cd {} 2>/dev/null || true; {}", cwd, prompt),
+        };
+
+        let tx = self.agent_event_tx.clone();
+        tokio::spawn(async move {
+            let mut cmd = hosts::build_ssh_command(&host, &remote_cmd);
+            match cmd.output().await {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let combined = if !stdout.is_empty() && !stderr.is_empty() {
+                        format!("{}\n\n```\n{}\n```", stdout, stderr)
+                    } else if !stdout.is_empty() {
+                        stdout
+                    } else {
+                        stderr
+                    };
+                    if !combined.is_empty() {
+                        let _ = tx.send(AgentEvent::MessageDelta {
+                            session_id: sid,
+                            text: combined,
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    let _ = tx.send(AgentEvent::StatusChanged {
+                        session_id: sid,
+                        status: if out.status.success() {
+                            SessionStatus::Completed
+                        } else {
+                            SessionStatus::Failed
+                        },
+                        message: None,
+                        timestamp: Utc::now(),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(AgentEvent::Error {
+                        session_id: sid,
+                        error: format!("SSH dispatch failed: {}", err),
+                        timestamp: Utc::now(),
+                    });
+                    let _ = tx.send(AgentEvent::StatusChanged {
+                        session_id: sid,
+                        status: SessionStatus::Failed,
+                        message: Some(err.to_string()),
+                        timestamp: Utc::now(),
+                    });
+                }
+            }
+        });
+
+        Ok(sess)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ArchiveSessionRequest {
+    archived: bool,
+}
+
+async fn archive_session_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<ArchiveSessionRequest>,
+) -> impl IntoResponse {
+    match state.archive_session_core(id, req.archived).await {
+        Ok(sess) => (StatusCode::OK, Json(json!({ "ok": true, "session": sess }))).into_response(),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ForkSessionRequest {
+    up_to_user_turn: Option<usize>,
+    title: Option<String>,
+}
+
+async fn fork_session_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<ForkSessionRequest>,
+) -> impl IntoResponse {
+    match state
+        .fork_session_core(id, req.up_to_user_turn, req.title)
+        .await
+    {
+        Ok(sess) => (
+            StatusCode::CREATED,
+            Json(json!({ "ok": true, "session": sess })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn quotas_analytics_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    Json(state.get_quotas_dto().await)
+}
+
+async fn list_hosts_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    Json(state.list_hosts_dto().await)
+}
+
+#[derive(serde::Deserialize)]
+struct AddHostRequest {
+    label: Option<String>,
+    ssh_target: String,
+    default_cwd: Option<String>,
+    #[serde(default = "default_prefer_hush")]
+    prefer_hush: bool,
+}
+
+fn default_prefer_hush() -> bool {
+    true
+}
+
+async fn add_host_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<AddHostRequest>,
+) -> impl IntoResponse {
+    match state
+        .add_remote_host_core(
+            req.label.as_deref().unwrap_or(""),
+            &req.ssh_target,
+            req.default_cwd.as_deref(),
+            req.prefer_hush,
+        )
+        .await
+    {
+        Ok(node) => (StatusCode::CREATED, Json(json!({ "ok": true, "host": node }))).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn remove_host_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let ok = state.remove_remote_host_core(&id).await;
+    Json(json!({ "ok": ok, "id": id }))
+}
+
+async fn probe_host_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.probe_remote_host_core(&id).await {
+        Some(node) => (StatusCode::OK, Json(json!({ "ok": true, "host": node }))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "Host not found" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DispatchSshHostRequest {
+    #[serde(default = "default_ssh_provider")]
+    provider: String,
+    prompt: String,
+    cwd: Option<String>,
+}
+
+fn default_ssh_provider() -> String {
+    "claude".to_string()
+}
+
+async fn dispatch_ssh_host_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<DispatchSshHostRequest>,
+) -> impl IntoResponse {
+    match state
+        .dispatch_ssh_host_session_core(&id, &req.provider, &req.prompt, req.cwd.as_deref())
+        .await
+    {
+        Ok(sess) => (StatusCode::CREATED, Json(json!({ "ok": true, "session": sess }))).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -6414,6 +7151,7 @@ mod tests {
                 event_history: HashMap::new(),
                 live_turns: HashMap::new(),
                 handles: HashMap::new(),
+                warm_handles: HashMap::new(),
                 shells: HashMap::new(),
                 pending_approvals: HashMap::new(),
                 pending_questions: HashMap::new(),
@@ -6421,6 +7159,8 @@ mod tests {
                 repo_hooks: HashMap::new(),
                 workspaces: Vec::new(),
                 push_config: push::PushConfig::default(),
+                quota_cache: quota::PersistedQuotaCache::default(),
+                remote_hosts: Vec::new(),
             })),
             db,
             agent_event_tx,
@@ -6434,6 +7174,8 @@ mod tests {
             hooks_file: temp_base.join("repo_hooks.json"),
             workspaces_file: temp_base.join("workspaces.json"),
             push_config_file: temp_base.join("push_config.json"),
+            quota_cache_file: temp_base.join("quotas.json"),
+            hosts_file: temp_base.join("hosts.json"),
             daemon_http_base: None,
         };
         state.spawn_event_supervisor();
@@ -6796,6 +7538,7 @@ mod tests {
             approval_mode: "auto_edit".to_string(),
             preview_url: None,
             queued_prompts: Vec::new(),
+            archived: false,
         };
         db.upsert_session(&sess)?;
 

@@ -785,6 +785,7 @@ fn print_agent_event(ev: &AgentEvent) {
         AgentEvent::Error { error, .. } => {
             eprintln!("❗ [error] {}", error);
         }
+        AgentEvent::RateLimitsUpdated { .. } => {}
     }
 }
 

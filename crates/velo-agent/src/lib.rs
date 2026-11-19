@@ -10,7 +10,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info};
@@ -398,6 +398,26 @@ impl AgentHandle {
             .map_err(|_| anyhow::anyhow!("Agent input channel closed"))
     }
 
+    pub fn try_send_warm_turn(
+        &self,
+        prompt: &str,
+        images: &[String],
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> bool {
+        if self.input_tx.is_closed() {
+            return false;
+        }
+        let payload = json!({
+            "__velo_warm_turn": true,
+            "prompt": prompt,
+            "images": images,
+            "model": model,
+            "effort": effort,
+        });
+        self.input_tx.send(format!("{}\n", payload)).is_ok()
+    }
+
     pub fn stop(&mut self) {
         if let Some(tx) = self.kill_tx.take() {
             let _ = tx.send(());
@@ -588,6 +608,7 @@ impl AgentSpawner {
         daemon_http_base: Option<String>,
         event_tx: broadcast::Sender<AgentEvent>,
     ) -> Result<AgentHandle> {
+        let is_warm_claude = matches!(provider, AgentProvider::Claude);
         let mut cmd = Self::build_tokio_command(
             session_id,
             &provider,
@@ -601,7 +622,11 @@ impl AgentSpawner {
             daemon_http_base.as_deref(),
         );
         cmd.current_dir(&worktree_path)
-            .stdin(Stdio::null())
+            .stdin(if is_warm_claude {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -646,11 +671,88 @@ impl AgentSpawner {
             timestamp: Utc::now(),
         });
 
+        let mut child_stdin = child.stdin.take();
         let stdout = child.stdout.take().context("Failed to capture stdout")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
 
-        let (input_tx, _input_rx) = mpsc::unbounded_channel::<String>();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+        let turn_idle_warm = Arc::new(AtomicBool::new(false));
+
+        if is_warm_claude {
+            if let Some(mut sin) = child_stdin.take() {
+                let first_text = if images.is_empty() {
+                    prompt.clone()
+                } else {
+                    format!(
+                        "{}\n\n[Attached local image(s) — inspect directly with Read tool: {}]",
+                        prompt,
+                        images.join(", ")
+                    )
+                };
+                let first_frame = json!({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": first_text,
+                    }
+                });
+                let _ = sin.write_all(format!("{}\n", first_frame).as_bytes()).await;
+                let _ = sin.flush().await;
+
+                let tx_warm = event_tx.clone();
+                let warm_flag = Arc::clone(&turn_idle_warm);
+                tokio::spawn(async move {
+                    while let Some(raw_in) = input_rx.recv().await {
+                        if let Ok(warm_cmd) = serde_json::from_str::<Value>(raw_in.trim()) {
+                            if warm_cmd.get("__velo_warm_turn").and_then(|v| v.as_bool()) == Some(true) {
+                                let w_prompt = warm_cmd.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                                let w_imgs: Vec<String> = warm_cmd
+                                    .get("images")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                                    .unwrap_or_default();
+                                let full_txt = if w_imgs.is_empty() {
+                                    w_prompt.to_string()
+                                } else {
+                                    format!(
+                                        "{}\n\n[Attached local image(s) — inspect directly with Read tool: {}]",
+                                        w_prompt,
+                                        w_imgs.join(", ")
+                                    )
+                                };
+                                warm_flag.store(false, Ordering::SeqCst);
+                                let _ = tx_warm.send(AgentEvent::StatusChanged {
+                                    session_id,
+                                    status: SessionStatus::Running,
+                                    message: Some("Agent `claude` hot turn resumed (0ms)".to_string()),
+                                    timestamp: Utc::now(),
+                                });
+                                let user_frame = json!({
+                                    "type": "user",
+                                    "message": {
+                                        "role": "user",
+                                        "content": full_txt,
+                                    }
+                                });
+                                if sin.write_all(format!("{}\n", user_frame).as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                let _ = sin.flush().await;
+                                continue;
+                            }
+                        }
+                        if sin.write_all(raw_in.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = sin.flush().await;
+                    }
+                });
+            }
+        } else {
+            // Non-warm single-turn providers drop `input_rx` so `try_send_warm_turn` returns false immediately
+            drop(input_rx);
+        }
 
         let emitted_error = Arc::new(AtomicBool::new(false));
         let saw_assistant_output = Arc::new(AtomicBool::new(false));
@@ -661,6 +763,7 @@ impl AgentSpawner {
         let provider_clone = provider.clone();
         let emitted_err_out = Arc::clone(&emitted_error);
         let saw_out_flag = Arc::clone(&saw_assistant_output);
+        let stdout_warm_flag = Arc::clone(&turn_idle_warm);
         let stdout_task = tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stdout).lines();
             let mut saw_message_delta = false;
@@ -696,6 +799,28 @@ impl AgentSpawner {
                         _ => {}
                     }
                     let _ = tx_out.send(ev.clone());
+                }
+                // Warm Claude stream-json emits `{"type":"result"}` at end of each turn while staying alive for next stdin line
+                if is_warm_claude {
+                    let t = line.trim();
+                    if t.starts_with('{') && t.contains("\"type\":\"result\"") {
+                        if let Ok(rj) = serde_json::from_str::<Value>(t) {
+                            if rj.get("type").and_then(|v| v.as_str()) == Some("result") {
+                                let is_err = rj.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                                stdout_warm_flag.store(true, Ordering::SeqCst);
+                                let _ = tx_out.send(AgentEvent::StatusChanged {
+                                    session_id,
+                                    status: if is_err {
+                                        SessionStatus::Failed
+                                    } else {
+                                        SessionStatus::Completed
+                                    },
+                                    message: Some("Turn completed (warm session ready)".to_string()),
+                                    timestamp: Utc::now(),
+                                });
+                            }
+                        }
+                    }
                 }
                 // Fallback for Cursor CLI if all assistant chunks carried `timestamp_ms` and final text only appeared in `result.result`
                 if matches!(provider_clone, AgentProvider::Cursor) && !saw_message_delta {
@@ -833,11 +958,34 @@ impl AgentSpawner {
             }
         });
 
-        // Supervise process exit or manual stop
+        // Supervise process exit, 15m idle warm reap, or manual stop
         let tx_status = event_tx.clone();
         let provider_exit = provider.clone();
+        let sup_warm_flag = Arc::clone(&turn_idle_warm);
         tokio::spawn(async move {
             tokio::select! {
+                _ = async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        if sup_warm_flag.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_secs(840)).await;
+                            if sup_warm_flag.load(Ordering::SeqCst) {
+                                break;
+                            }
+                        }
+                    }
+                }, if is_warm_claude => {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    #[cfg(unix)]
+                    if let Some(p) = pid {
+                        let _ = Command::new("kill")
+                            .args(["-9", &format!("-{}", p)])
+                            .status()
+                            .await;
+                    }
+                    let _ = child.kill().await;
+                }
                 _ = &mut kill_rx => {
                     info!("Stopping agent session {} (pid={:?})", session_id, pid);
                     stdout_task.abort();
@@ -862,12 +1010,14 @@ impl AgentSpawner {
                     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                     match status_res {
                         Ok(exit) if exit.success() => {
-                            let _ = tx_status.send(AgentEvent::StatusChanged {
-                                session_id,
-                                status: SessionStatus::Completed,
-                                message: Some("Agent finished successfully".to_string()),
-                                timestamp: Utc::now(),
-                            });
+                            if !sup_warm_flag.load(Ordering::SeqCst) {
+                                let _ = tx_status.send(AgentEvent::StatusChanged {
+                                    session_id,
+                                    status: SessionStatus::Completed,
+                                    message: Some("Agent finished successfully".to_string()),
+                                    timestamp: Utc::now(),
+                                });
+                            }
                         }
                         Ok(exit) => {
                             if !emitted_error.load(Ordering::SeqCst)
@@ -1078,25 +1228,15 @@ impl AgentSpawner {
                 if let Some(rid) = resume_session_id.filter(|s| !s.trim().is_empty()) {
                     c.args(["--resume", rid]);
                 }
-                let effective_prompt = if images.is_empty() {
-                    prompt.to_string()
-                } else {
-                    format!(
-                        "{}\n\n[Attached local image(s) — inspect directly with Read tool: {}]",
-                        prompt,
-                        images.join(", ")
-                    )
-                };
                 let perm_mode = if approval_mode == "bypass" {
                     "bypassPermissions"
                 } else {
                     "acceptEdits"
                 };
                 c.args([
-                    "-p",
-                    &effective_prompt,
-                    "--output-format",
-                    "stream-json",
+                    "--print",
+                    "--input-format=stream-json",
+                    "--output-format=stream-json",
                     "--include-partial-messages",
                     "--verbose",
                     "--permission-mode",

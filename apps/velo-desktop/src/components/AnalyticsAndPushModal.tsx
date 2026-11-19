@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { BarChart3, Bell, Check, Search, Shield, Sparkles, X } from "lucide-react";
+import { ProviderQuotaCard } from "./SidebarQuotaBar";
 
 interface BucketStats {
   key: string;
@@ -80,6 +81,7 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
 }) => {
   const [tab, setTab] = useState<"analytics" | "search" | "push">(initialTab);
   const [analytics, setAnalytics] = useState<UsageAnalyticsDto | null>(null);
+  const [quotaCards, setQuotaCards] = useState<ProviderQuotaCard[]>([]);
   const [loadingAnalytics, setLoadingAnalytics] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -108,6 +110,12 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
     if (!open) return;
     if (tab === "analytics") {
       setLoadingAnalytics(true);
+      fetch(`${daemonUrl}/api/analytics/quotas`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (Array.isArray(d?.providers)) setQuotaCards(d.providers as ProviderQuotaCard[]);
+        })
+        .catch(() => {});
       fetch(`${daemonUrl}/api/analytics/usage`)
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => {
@@ -236,6 +244,63 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                 </div>
               ) : analytics ? (
                 <>
+                  {/* 5h & 7d Subscription Rate-Limit Windows */}
+                  {quotaCards.length > 0 && (
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      {quotaCards.map((card) => (
+                        <div
+                          key={card.provider}
+                          className="rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/45 p-3.5"
+                        >
+                          <div className="mb-2.5 flex items-center justify-between">
+                            <span className="text-[12.5px] font-semibold text-[var(--v-fg-primary)]">
+                              {card.label}
+                            </span>
+                            <span className="rounded-md bg-[var(--v-bg-active)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--v-fg-muted)]">
+                              {card.plan_badge}
+                            </span>
+                          </div>
+                          <div className="space-y-2">
+                            {card.windows.map((w) => {
+                              const rem = Math.max(0, Math.min(100, w.remaining_percent));
+                              const resetHrs =
+                                typeof w.reset_in_seconds === "number" && w.reset_in_seconds > 0
+                                  ? w.reset_in_seconds >= 86400
+                                    ? `${Math.floor(w.reset_in_seconds / 86400)}d ${Math.floor((w.reset_in_seconds % 86400) / 3600)}h 后重置`
+                                    : `${Math.floor(w.reset_in_seconds / 3600)}h ${Math.floor((w.reset_in_seconds % 3600) / 60)}m 后重置`
+                                  : "";
+                              return (
+                                <div key={w.id} className="space-y-1">
+                                  <div className="flex items-center justify-between text-[11px]">
+                                    <span className="text-[var(--v-fg-secondary)]">{w.label}</span>
+                                    <span className="font-mono text-[10.5px] text-[var(--v-fg-muted)] tabular-nums">
+                                      剩余 {Math.round(rem)}% (已用 {Math.round(w.used_percent)}%)
+                                      {resetHrs ? ` · ${resetHrs}` : ""}
+                                    </span>
+                                  </div>
+                                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
+                                    <div
+                                      style={{ width: `${Math.max(3, rem)}%` }}
+                                      className={`h-full rounded-full ${
+                                        w.status === "exhausted"
+                                          ? "bg-[#f87171]"
+                                          : w.status === "warning"
+                                          ? "bg-[#fbbf24]"
+                                          : card.provider === "claude"
+                                          ? "bg-[#fb923c]"
+                                          : "bg-[#34d399]"
+                                      }`}
+                                    />
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {/* KPI Cards */}
                   <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                     <div className="rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/50 p-3.5">

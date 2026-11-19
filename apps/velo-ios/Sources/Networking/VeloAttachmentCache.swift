@@ -9,8 +9,8 @@ public enum AttachmentTier: String, Sendable {
 
 public struct PendingComposerImage: Identifiable, Equatable {
     public let id: UUID
-    public let preview: UIImage
-    public let jpegData: Data
+    public var preview: UIImage
+    public var jpegData: Data
     public let filename: String
     public var uploadedPath: String?
     public var uploadFailed: Bool

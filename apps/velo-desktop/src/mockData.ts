@@ -384,6 +384,7 @@ export interface VeloSession {
   approval_mode: ApprovalMode;
   preview_url?: string | null;
   queued_prompts?: QueuedPromptDto[];
+  archived?: boolean;
   tokens_used: number;
   input_tokens?: number;
   output_tokens?: number;
@@ -642,6 +643,7 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     queued_prompts: Array.isArray(r.queued_prompts)
       ? (r.queued_prompts as QueuedPromptDto[])
       : [],
+    archived: Boolean(r.archived),
     tokens_used: Number(r.tokens_used ?? 0),
     input_tokens: Number(r.input_tokens ?? 0),
     output_tokens: Number(r.output_tokens ?? 0),

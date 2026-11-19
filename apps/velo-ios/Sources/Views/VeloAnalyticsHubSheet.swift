@@ -81,6 +81,7 @@ public struct VeloAnalyticsHubSheet: View {
                 switch selectedTab {
                 case .analytics:
                     await store.fetchUsageAnalytics()
+                    await store.fetchQuotas()
                 case .push:
                     await store.fetchPushConfig()
                     pushDraft = store.pushConfig
@@ -104,6 +105,69 @@ public struct VeloAnalyticsHubSheet: View {
 
     @ViewBuilder
     private var analyticsSection: some View {
+        if !store.quotaCards.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("5h / 7d 订阅窗口实时余量")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                ForEach(store.quotaCards) { card in
+                    VStack(alignment: .leading, spacing: 9) {
+                        HStack {
+                            Text(card.label)
+                                .font(.system(size: 14, weight: .bold))
+                            Spacer()
+                            Text(card.planBadge)
+                                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2.5)
+                                .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                        }
+
+                        ForEach(card.windows) { w in
+                            let rem = max(0, min(100, w.remainingPercent))
+                            let barColor: Color = {
+                                if w.status == "exhausted" { return VeloTheme.coral }
+                                if w.status == "warning" { return VeloTheme.amber }
+                                return card.provider == "claude"
+                                    ? Color(red: 0.98, green: 0.57, blue: 0.24)
+                                    : VeloTheme.emerald
+                            }()
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(w.label)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text("剩余 \(Int(rem.rounded()))% · 已用 \(Int(w.usedPercent.rounded()))%\(w.resetCountdownLabel.isEmpty ? "" : " · \(w.resetCountdownLabel)")")
+                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                }
+                                GeometryReader { geo in
+                                    ZStack(alignment: .leading) {
+                                        Capsule()
+                                            .fill(VeloTheme.elevatedSurface(colorScheme))
+                                        Capsule()
+                                            .fill(barColor)
+                                            .frame(width: max(6, geo.size.width * CGFloat(rem / 100.0)))
+                                    }
+                                }
+                                .frame(height: 6)
+                            }
+                        }
+                    }
+                    .padding(13)
+                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
+                    )
+                }
+            }
+        }
+
         if let a = store.usageAnalytics {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 metricCard(

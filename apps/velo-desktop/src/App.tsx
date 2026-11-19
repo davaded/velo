@@ -37,8 +37,13 @@ import { AutomationsModal } from "./components/AutomationsModal";
 import { AnalyticsAndPushModal } from "./components/AnalyticsAndPushModal";
 import { CliSessionsModal, ExternalCliSessionItem } from "./components/CliSessionsModal";
 import { QueuedPromptsBar } from "./components/QueuedPromptsBar";
+import { ChatOutlineRail, OutlineTurnSummary } from "./components/ChatOutlineRail";
+import { SidebarQuotaBar } from "./components/SidebarQuotaBar";
+import { RemoteHostsModal } from "./components/RemoteHostsModal";
 import { e2eeOpenFrame, e2eeSealJson } from "./utils/e2eeRelayClient";
 import {
+  Archive,
+  ArchiveRestore,
   ArrowDown,
   ArrowUp,
   CalendarClock,
@@ -52,6 +57,7 @@ import {
   FolderPlus,
   GitBranch,
   GitCommitHorizontal,
+  GitFork,
   GitMerge,
   GitPullRequest,
   Globe,
@@ -741,6 +747,31 @@ export function App() {
   const [newRepoPath, setNewRepoPath] = useState<string>("~/velo");
   const [analyticsModalOpen, setAnalyticsModalOpen] = useState<boolean>(false);
   const [cliImportOpen, setCliImportOpen] = useState<boolean>(false);
+  const [hostsModalOpen, setHostsModalOpen] = useState<boolean>(false);
+  const [relocateTarget, setRelocateTarget] = useState<{
+    mode: "workspace" | "session";
+    oldPath: string;
+    sessionId?: string;
+    newPath: string;
+  } | null>(null);
+  const [showArchivedDrawer, setShowArchivedDrawer] = useState<boolean>(false);
+  const [chatFindOpen, setChatFindOpen] = useState<boolean>(false);
+  const [chatFindQuery, setChatFindQuery] = useState<string>("");
+  const [unreadSessionIds, setUnreadSessionIds] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem("velo.unread.v1");
+      return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+    } catch {
+      return {};
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("velo.unread.v1", JSON.stringify(unreadSessionIds));
+    } catch {
+      // ignore
+    }
+  }, [unreadSessionIds]);
   const [e2eeCliSessions, setE2eeCliSessions] = useState<ExternalCliSessionItem[] | null>(null);
   const [analyticsInitialTab, setAnalyticsInitialTab] = useState<"analytics" | "search" | "push">(
     "analytics"
@@ -800,7 +831,10 @@ export function App() {
   }, []);
 
   const activeSession = useMemo<VeloSession>(() => {
-    const found = sessions.find((s) => s.id === activeId) || sessions[0];
+    const found =
+      sessions.find((s) => s.id === activeId) ||
+      sessions.find((s) => !s.archived) ||
+      sessions[0];
     if (found) return found;
     const defaultRepo = repos[0] || DEMO_REPOS[0];
     return {
@@ -828,14 +862,35 @@ export function App() {
   }, [sessions, activeId, repos]);
 
   const activeRepo = useMemo(
-    () => repos.find((r) => r.id === activeSession.repo_id) || repos[0],
-    [repos, activeSession.repo_id]
+    () =>
+      repos.find(
+        (r) =>
+          r.id === activeSession.repo_id ||
+          canonicalRepoPath(r.path) === canonicalRepoPath(activeSession.project_path)
+      ) ||
+      repos[0] ||
+      DEMO_REPOS[0],
+    [repos, activeSession.repo_id, activeSession.project_path]
   );
 
   const activeEvents = useMemo(
     () => eventsBySession[activeSession.id] || [],
     [eventsBySession, activeSession.id]
   );
+
+  const outlineTurns = useMemo<OutlineTurnSummary[]>(() => {
+    const out: OutlineTurnSummary[] = [];
+    for (const ev of activeEvents) {
+      if (ev.kind === "user") {
+        out.push({
+          index: out.length,
+          key: ev.id,
+          promptSnippet: ev.content.replace(/\s+/g, " ").trim().slice(0, 60) || "Turn",
+        });
+      }
+    }
+    return out;
+  }, [activeEvents]);
 
   const activeDiffFiles = useMemo(
     () => diffsBySession[activeSession.id] || [],
@@ -864,44 +919,32 @@ export function App() {
           fetch(`${daemonUrl}/api/workspaces`)
             .then((r) => (r.ok ? r.json() : null))
             .then((wsObj: { workspaces?: string[] } | null) => {
-              const daemonPaths = Array.isArray(wsObj?.workspaces)
-                ? wsObj!.workspaces.map(canonicalRepoPath)
-                : [];
-              const allPaths = [
-                ...daemonPaths,
-                ...normalized.map((s) => canonicalRepoPath(s.project_path)),
-              ].filter(Boolean);
-              if (allPaths.length === 0) return;
+              if (!wsObj || !Array.isArray(wsObj.workspaces)) return;
+              const daemonPaths = wsObj.workspaces.map(canonicalRepoPath);
+              const allPaths = Array.from(
+                new Set([
+                  ...daemonPaths,
+                  ...normalized.map((s) => canonicalRepoPath(s.project_path)),
+                ].filter(Boolean))
+              );
 
               setRepos((prevRepos) => {
-                const sessionPathSet = new Set(
-                  normalized.map((s) => canonicalRepoPath(s.project_path))
-                );
-                // Drop unused demo placeholder `velo-cloud` once real daemon workspaces exist
-                const cleanedPrev = prevRepos.filter(
-                  (r) =>
-                    !canonicalRepoPath(r.path).endsWith("/code/velo-cloud") ||
-                    Array.from(sessionPathSet).some((p) => p.endsWith("/code/velo-cloud")) ||
-                    daemonPaths.some((p) => p.endsWith("/code/velo-cloud"))
-                );
-                const byPath = new Map<string, VeloRepo>();
-                for (const r of cleanedPrev) {
-                  const cp = canonicalRepoPath(r.path);
-                  byPath.set(cp, { ...r, id: repoIdFromPath(cp), path: cp });
+                if (allPaths.length === 0) return [];
+                const prevByPath = new Map<string, VeloRepo>();
+                for (const r of prevRepos) {
+                  prevByPath.set(canonicalRepoPath(r.path), r);
                 }
-                for (const cp of allPaths) {
-                  if (!byPath.has(cp)) {
-                    const folder = cp.split("/").filter(Boolean).pop() || "workspace";
-                    byPath.set(cp, {
-                      id: repoIdFromPath(cp),
-                      code: folder.slice(0, 2).toUpperCase(),
-                      name: folder,
-                      path: cp,
-                      default_branch: "main",
-                    });
-                  }
-                }
-                return Array.from(byPath.values());
+                return allPaths.map((cp) => {
+                  const existing = prevByPath.get(cp);
+                  const folder = cp.split("/").filter(Boolean).pop() || "workspace";
+                  return {
+                    id: repoIdFromPath(cp),
+                    code: existing?.code || folder.slice(0, 2).toUpperCase(),
+                    name: folder,
+                    path: cp,
+                    default_branch: existing?.default_branch || "main",
+                  };
+                });
               });
             })
             .catch(() => {});
@@ -1044,6 +1087,12 @@ export function App() {
   const activeSessionIdRef = useRef<string>(activeSession.id);
   useEffect(() => {
     activeSessionIdRef.current = activeSession.id;
+    setUnreadSessionIds((prev) => {
+      if (!prev[activeSession.id]) return prev;
+      const next = { ...prev };
+      delete next[activeSession.id];
+      return next;
+    });
   }, [activeSession.id]);
 
   // Authoritative sync of persisted event history from ~/.velo/events/<session-id>.json
@@ -1300,27 +1349,27 @@ export function App() {
       }
       if (raw.type === "workspaces_snapshot" && Array.isArray(raw.workspaces)) {
         const wsPaths = (raw.workspaces as string[]).map(canonicalRepoPath).filter(Boolean);
-        if (wsPaths.length > 0) {
-          setRepos((prev) => {
-            const byPath = new Map<string, VeloRepo>();
-            for (const cp of wsPaths) {
-              const existing = prev.find((r) => canonicalRepoPath(r.path) === cp);
-              const folder = cp.split("/").filter(Boolean).pop() || "workspace";
-              byPath.set(cp, {
-                id: repoIdFromPath(cp),
-                code: existing?.code || folder.slice(0, 2).toUpperCase(),
-                name: existing?.name || folder,
-                path: cp,
-                default_branch: existing?.default_branch || "main",
-              });
-            }
-            return Array.from(byPath.values());
-          });
-        }
+        setRepos((prev) => {
+          if (wsPaths.length === 0) return [];
+          const byPath = new Map<string, VeloRepo>();
+          for (const cp of wsPaths) {
+            const existing = prev.find((r) => canonicalRepoPath(r.path) === cp);
+            const folder = cp.split("/").filter(Boolean).pop() || "workspace";
+            byPath.set(cp, {
+              id: repoIdFromPath(cp),
+              code: existing?.code || folder.slice(0, 2).toUpperCase(),
+              name: folder,
+              path: cp,
+              default_branch: existing?.default_branch || "main",
+            });
+          }
+          return Array.from(byPath.values());
+        });
         return;
       }
       if (raw.kind === "sessions_snapshot" && Array.isArray(raw.sessions)) {
         const normalized = raw.sessions.map((item, idx) => normalizeToVeloSession(item, idx));
+        setSessions(normalized);
         if (normalized.length > 0) {
           setRepos((prev) => {
             const byPath = new Map(prev.map((r) => [canonicalRepoPath(r.path), { ...r, id: repoIdFromPath(r.path), path: canonicalRepoPath(r.path) }]));
@@ -1339,7 +1388,6 @@ export function App() {
             }
             return Array.from(byPath.values());
           });
-          setSessions(normalized);
           if (!initialDaemonSyncedRef.current) {
             initialDaemonSyncedRef.current = true;
             setActiveId((curId) =>
@@ -1360,6 +1408,18 @@ export function App() {
         setSessions((prev) => [imported, ...prev.filter((s) => s.id !== imported.id)]);
         setActiveId(imported.id);
         syncSessionEventsFromDaemon(imported.id);
+        return;
+      }
+
+      if (
+        (raw.type === "session_forked" || raw.type === "ssh_session_started") &&
+        raw.ok &&
+        raw.session
+      ) {
+        const created = normalizeToVeloSession(raw.session, 0);
+        setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)]);
+        setActiveId(created.id);
+        syncSessionEventsFromDaemon(created.id);
         return;
       }
 
@@ -1484,6 +1544,9 @@ export function App() {
       }
 
       if (evType === "permission_requested") {
+        if (sid && sid !== activeSessionIdRef.current) {
+          setUnreadSessionIds((prev) => ({ ...prev, [sid]: true }));
+        }
         const reqId = String(evObj.request_id ?? `perm-${Date.now()}`);
         const toolName = String(evObj.tool_name ?? "Bash");
         const cmdPreview = String(evObj.command_preview ?? evObj.description ?? toolName);
@@ -1514,6 +1577,9 @@ export function App() {
       }
 
       if (evType === "user_question_requested") {
+        if (sid && sid !== activeSessionIdRef.current) {
+          setUnreadSessionIds((prev) => ({ ...prev, [sid]: true }));
+        }
         const qId = String(evObj.question_id ?? `q-${Date.now()}`);
         const question = String(evObj.question ?? "Please select an option:");
         const options = Array.isArray(evObj.options) ? evObj.options.map(String) : [];
@@ -1724,6 +1790,9 @@ export function App() {
           )
         );
         if (st === "completed" || st === "failed") {
+          if (sid && sid !== activeSessionIdRef.current) {
+            setUnreadSessionIds((prev) => ({ ...prev, [sid]: true }));
+          }
           if (st === "completed") {
             refreshSessionDiffAndFiles(sid);
           }
@@ -2361,12 +2430,20 @@ export function App() {
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "j") {
         e.preventDefault();
         setDrawerOpen((o) => !o);
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+        if (!activeModal) {
+          e.preventDefault();
+          setChatFindOpen(true);
+        }
       } else if ((e.metaKey || e.ctrlKey) && e.key === ",") {
         e.preventDefault();
         setActiveModal((m) => (m === "settings" ? null : "settings"));
       } else if (e.key === "Escape") {
         if (activeModal) setActiveModal(null);
-        else if (slashFilter !== null) setSlashFilter(null);
+        else if (chatFindOpen) {
+          setChatFindOpen(false);
+          setChatFindQuery("");
+        } else if (slashFilter !== null) setSlashFilter(null);
         else if (modelPickerOpen) setModelPickerOpen(false);
         else if (effortPickerOpen) setEffortPickerOpen(false);
         else if (drawerOpen) setDrawerOpen(false);
@@ -2377,6 +2454,7 @@ export function App() {
   }, [
     activeModal,
     activeSession.status,
+    chatFindOpen,
     drawerOpen,
     slashFilter,
     modelPickerOpen,
@@ -3142,6 +3220,89 @@ export function App() {
     }, 30);
   };
 
+  // Soft-archive or restore a thread while preserving all commits, worktree & event history
+  const handleArchiveSession = async (
+    sessionId: string,
+    archived: boolean,
+    e?: React.MouseEvent
+  ) => {
+    e?.stopPropagation();
+    setSessions((prev) => {
+      const next = prev.map((s) => (s.id === sessionId ? { ...s, archived } : s));
+      if (archived && activeSession.id === sessionId) {
+        const nextActive = next.find((s) => !s.archived && s.id !== sessionId);
+        setActiveId(nextActive ? nextActive.id : "");
+      }
+      return next;
+    });
+    try {
+      const res = await fetch(`${daemonUrl}/api/sessions/${sessionId}/archive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived }),
+      });
+      if (!res.ok) {
+        sendE2eeCommand({ cmd: "archive_session", session_id: sessionId, archived });
+      }
+    } catch {
+      sendE2eeCommand({ cmd: "archive_session", session_id: sessionId, archived });
+    }
+  };
+
+  // Fork current conversation at any turn (`POST /api/sessions/{id}/fork`)
+  const handleForkSession = async (upToUserTurn?: number) => {
+    const sid = activeSession.id;
+    if (!sid || sid === "draft-empty") return;
+    try {
+      const res = await fetch(`${daemonUrl}/api/sessions/${sid}/fork`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ up_to_user_turn: upToUserTurn }),
+      });
+      if (res.ok) {
+        const d = (await res.json()) as { ok?: boolean; session?: Record<string, unknown> };
+        if (d.ok && d.session) {
+          const forked = normalizeToVeloSession(d.session, 0);
+          setSessions((prev) => [forked, ...prev.filter((s) => s.id !== forked.id)]);
+          setActiveId(forked.id);
+          syncSessionEventsFromDaemon(forked.id);
+          return;
+        }
+      }
+      sendE2eeCommand({
+        cmd: "fork_session",
+        session_id: sid,
+        up_to_user_turn: upToUserTurn,
+      });
+    } catch {
+      sendE2eeCommand({
+        cmd: "fork_session",
+        session_id: sid,
+        up_to_user_turn: upToUserTurn,
+      });
+    }
+  };
+
+  const handleJumpToTurn = useCallback(
+    (turnKey: string) => {
+      setShowAllTurnsBySession((prev) =>
+        prev[activeSession.id] ? prev : { ...prev, [activeSession.id]: true }
+      );
+      requestAnimationFrame(() => {
+        const container = chatScrollRef.current;
+        if (!container) return;
+        const target = container.querySelector(
+          `[data-turn-key="${CSS.escape(turnKey)}"]`
+        ) as HTMLElement | null;
+        if (target) {
+          isPinnedToBottomRef.current = false;
+          target.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      });
+    },
+    [activeSession.id]
+  );
+
   // Delete / archive a thread from sidebar, daemon state, events history & isolated Git worktree
   const handleDeleteSession = async (sessionId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -3189,32 +3350,144 @@ export function App() {
     }
   };
 
-  // Remove a project workspace from sidebar
-  const handleRemoveRepo = (repoId: string, e: React.MouseEvent) => {
+  // Remove a project workspace and its bound sessions permanently from sidebar & daemon
+  const handleRemoveRepo = async (repoId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (repos.length <= 1) return;
     const target = repos.find((r) => r.id === repoId);
-    if (target) {
-      fetch(`${daemonUrl}/api/workspaces`, {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: target.path }),
-      }).catch(() => {});
-    }
-    setRepos((prev) => prev.filter((r) => r.id !== repoId));
+    if (!target) return;
+    const targetCanon = canonicalRepoPath(target.path);
+
+    const removedSessionIds = sessions
+      .filter((s) => s.repo_id === repoId || canonicalRepoPath(s.project_path) === targetCanon)
+      .map((s) => s.id);
+
+    setRepos((prev) => prev.filter((r) => r.id !== repoId && canonicalRepoPath(r.path) !== targetCanon));
     setSessions((prev) => {
       const remaining = prev.filter(
-        (s) =>
-          s.repo_id !== repoId &&
-          (!target || canonicalRepoPath(s.project_path) !== canonicalRepoPath(target.path))
+        (s) => s.repo_id !== repoId && canonicalRepoPath(s.project_path) !== targetCanon
       );
-      if (remaining.length > 0 && activeSession.repo_id === repoId) {
+      if (
+        remaining.length > 0 &&
+        (activeSession.repo_id === repoId ||
+          canonicalRepoPath(activeSession.project_path) === targetCanon)
+      ) {
         setActiveId(remaining[0].id);
       } else if (remaining.length === 0) {
         setActiveId("");
       }
       return remaining;
     });
+    if (removedSessionIds.length > 0) {
+      setEventsBySession((prev) => {
+        const next = { ...prev };
+        for (const sid of removedSessionIds) {
+          delete next[sid];
+        }
+        return next;
+      });
+    }
+
+    try {
+      const res = await fetch(`${daemonUrl}/api/workspaces`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: target.path, delete_sessions: true }),
+      });
+      if (!res.ok) {
+        sendE2eeCommand({
+          cmd: "remove_workspace",
+          path: target.path,
+          delete_sessions: true,
+        });
+      }
+      refreshSessions();
+    } catch {
+      sendE2eeCommand({
+        cmd: "remove_workspace",
+        path: target.path,
+        delete_sessions: true,
+      });
+    }
+  };
+
+  // Relocate an entire workspace folder OR move an individual session to a new folder path
+  const handleCommitRelocatePath = async () => {
+    if (!relocateTarget) return;
+    const cleanNew = canonicalRepoPath(relocateTarget.newPath.trim());
+    const cleanOld = canonicalRepoPath(relocateTarget.oldPath.trim());
+    if (!cleanNew) return;
+    const targetSnap = relocateTarget;
+    setRelocateTarget(null);
+
+    if (targetSnap.mode === "session" && targetSnap.sessionId) {
+      const sid = targetSnap.sessionId;
+      const newRepoId = repoIdFromPath(cleanNew);
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === sid
+            ? {
+                ...s,
+                repo_id: newRepoId,
+                project_path: cleanNew,
+                worktree_path: s.worktree_path.includes("/.velo/worktrees/")
+                  ? s.worktree_path
+                  : cleanNew,
+              }
+            : s
+        )
+      );
+      try {
+        const res = await fetch(`${daemonUrl}/api/sessions/${sid}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ repo_path: cleanNew }),
+        });
+        if (!res.ok) {
+          sendE2eeCommand({ cmd: "update_session", session_id: sid, repo_path: cleanNew });
+        }
+      } catch {
+        sendE2eeCommand({ cmd: "update_session", session_id: sid, repo_path: cleanNew });
+      }
+      refreshSessions();
+      return;
+    }
+
+    // Relocate entire workspace folder and all its sessions
+    try {
+      const res = await fetch(`${daemonUrl}/api/workspaces`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ old_path: cleanOld, new_path: cleanNew }),
+      });
+      if (!res.ok) {
+        sendE2eeCommand({
+          cmd: "relocate_workspace",
+          old_path: cleanOld,
+          new_path: cleanNew,
+        });
+      }
+    } catch {
+      sendE2eeCommand({
+        cmd: "relocate_workspace",
+        old_path: cleanOld,
+        new_path: cleanNew,
+      });
+    }
+    refreshSessions();
+  };
+
+  const handlePickRelocateFolder = async () => {
+    try {
+      const res = await fetch(`${daemonUrl}/api/pick-folder`, { method: "POST" });
+      if (res.ok) {
+        const data = (await res.json()) as { path?: string };
+        if (data.path) {
+          setRelocateTarget((prev) => (prev ? { ...prev, newPath: data.path! } : prev));
+        }
+      }
+    } catch {
+      // ignore if cancelled
+    }
   };
 
   // Real Worktree Command Execution via POST /api/sessions/{id}/exec
@@ -3783,8 +4056,22 @@ export function App() {
     setActiveModal(null);
   };
 
-  const handleCreateRepo = () => {
+  const handleCreateRepo = async () => {
     const cleanPath = canonicalRepoPath(newRepoPath.trim() || "~/workspace");
+    setActiveModal(null);
+    try {
+      const res = await fetch(`${daemonUrl}/api/workspaces`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: cleanPath }),
+      });
+      if (res.ok) {
+        refreshSessions();
+        return;
+      }
+    } catch {
+      sendE2eeCommand({ cmd: "add_workspace", path: cleanPath });
+    }
     const name = cleanPath.split("/").filter(Boolean).pop() || "repo";
     const code = name.slice(0, 2).toUpperCase();
     const id = repoIdFromPath(cleanPath);
@@ -3798,12 +4085,6 @@ export function App() {
     setRepos((prev) =>
       prev.some((r) => canonicalRepoPath(r.path) === cleanPath) ? prev : [...prev, newRepo]
     );
-    fetch(`${daemonUrl}/api/workspaces`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: cleanPath }),
-    }).catch(() => {});
-    setActiveModal(null);
   };
 
   const handlePickRepoFolder = async () => {
@@ -4047,6 +4328,13 @@ export function App() {
               <span>接管终端会话</span>
             </button>
             <button
+              onClick={() => setHostsModalOpen(true)}
+              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            >
+              <Server className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+              <span>远端 SSH 主机</span>
+            </button>
+            <button
               onClick={() => setActiveModal("automations")}
               className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
             >
@@ -4073,7 +4361,8 @@ export function App() {
               const canonRepoPath = canonicalRepoPath(repo.path);
               const repoItems = sessions.filter(
                 (s) =>
-                  canonicalRepoPath(s.project_path) === canonRepoPath || s.repo_id === repo.id
+                  !s.archived &&
+                  (canonicalRepoPath(s.project_path) === canonRepoPath || s.repo_id === repo.id)
               );
               const isCollapsed = !!collapsedRepos[repo.id];
 
@@ -4104,20 +4393,32 @@ export function App() {
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
                         onClick={() => handleQuickNewThread(repo)}
-                        title={`New thread in ${repo.name}`}
-                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
+                        title={`在 ${repo.name} 中新建会话`}
+                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                       >
                         <Plus className="h-3.5 w-3.5" />
                       </button>
-                      {repos.length > 1 && (
-                        <button
-                          onClick={(e) => handleRemoveRepo(repo.id, e)}
-                          title={`Remove ${repo.name} from workspaces`}
-                          className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171]"
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      )}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setRelocateTarget({
+                            mode: "workspace",
+                            oldPath: repo.path,
+                            newPath: repo.path,
+                          });
+                        }}
+                        title={`修改 ${repo.name} 的归属文件夹路径`}
+                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                      >
+                        <SquarePen className="h-3 w-3" />
+                      </button>
+                      <button
+                        onClick={(e) => void handleRemoveRepo(repo.id, e)}
+                        title={`移除文件夹 ${repo.name} 及旗下会话`}
+                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171] cursor-pointer"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
                     </div>
                   </div>
 
@@ -4154,13 +4455,18 @@ export function App() {
                             <div className="mt-[4px] flex h-3.5 w-3.5 shrink-0 items-center justify-center">
                               {hasPending || w.status === "waiting_approval" ? (
                                 <span
-                                  className="h-2 w-2 rounded-full bg-[#fbbf24]"
-                                  title="Waiting for permission approval or user answer"
+                                  className="h-2 w-2 rounded-full bg-[#fbbf24] ring-2 ring-[#fbbf24]/30 animate-pulse"
+                                  title="等待你的审批或确认"
                                 />
                               ) : w.status === "running" ? (
                                 <span
                                   className="h-2.5 w-2.5 rounded-full border-[1.5px] border-[#34d399] border-t-transparent animate-spin"
                                   title="Running"
+                                />
+                              ) : unreadSessionIds[w.id] && !isSelected ? (
+                                <span
+                                  className="h-2 w-2 rounded-full bg-[#38bdf8] shadow-[0_0_6px_rgba(56,189,248,0.65)]"
+                                  title="后台任务已完成 · 未读新进展"
                                 />
                               ) : null}
                             </div>
@@ -4220,11 +4526,11 @@ export function App() {
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={(e) => handleDeleteSession(w.id, e)}
-                                    title="Archive / remove thread"
-                                    className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171] group-hover:flex"
+                                    onClick={(e) => handleArchiveSession(w.id, true, e)}
+                                    title="归档会话（完整保留 Git 提交与对话历史）"
+                                    className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] group-hover:flex"
                                   >
-                                    <X className="h-3 w-3" />
+                                    <Archive className="h-2.5 w-2.5" />
                                   </button>
                                 </div>
                               </div>
@@ -4248,8 +4554,77 @@ export function App() {
                 </div>
               );
             })}
+
+            {/* Collapsible Archived Sessions Drawer (Preserves Commits & History) */}
+            {(() => {
+              const archivedList = sessions.filter((s) => Boolean(s.archived));
+              if (archivedList.length === 0) return null;
+              return (
+                <div className="mt-2 border-t border-[var(--v-border-subtle)] pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowArchivedDrawer((v) => !v)}
+                    className="flex w-full items-center justify-between rounded-md px-2 py-1 text-[11.5px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <Archive className="h-3 w-3" />
+                      <span>已归档会话 ({archivedList.length})</span>
+                    </span>
+                    {showArchivedDrawer ? (
+                      <ChevronDown className="h-3 w-3" />
+                    ) : (
+                      <ChevronRight className="h-3 w-3" />
+                    )}
+                  </button>
+                  {showArchivedDrawer && (
+                    <div className="mt-1 space-y-0.5">
+                      {archivedList.map((arch) => (
+                        <div
+                          key={arch.id}
+                          onClick={() => setActiveId(arch.id)}
+                          className={`group flex cursor-pointer items-center justify-between gap-1.5 rounded-md px-2 py-1.5 text-[12px] ${
+                            arch.id === activeSession.id
+                              ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                              : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-body)]"
+                          }`}
+                        >
+                          <span className="truncate">{arch.title}</span>
+                          <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                            <button
+                              type="button"
+                              onClick={(e) => handleArchiveSession(arch.id, false, e)}
+                              title="取消归档并恢复到主列表"
+                              className="rounded p-0.5 text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#34d399]"
+                            >
+                              <ArchiveRestore className="h-3 w-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => handleDeleteSession(arch.id, e)}
+                              title="永久清理会话与 Worktree"
+                              className="rounded p-0.5 text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171]"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
+
+        {/* Real 5h / 7d Subscription Rate-Limit Window Balance Bar */}
+        <SidebarQuotaBar
+          daemonUrl={daemonUrl}
+          onOpenAnalytics={() => {
+            setAnalyticsInitialTab("analytics");
+            setAnalyticsModalOpen(true);
+          }}
+        />
 
         {/* Bottom Icon-Only Footer (Paseo / Codex SidebarFooter) */}
         <div className="flex h-[40px] shrink-0 items-center justify-between border-t border-[var(--v-border-subtle)] px-2.5 text-[var(--v-fg-muted)]">
@@ -4262,11 +4637,11 @@ export function App() {
               <FolderPlus className="h-4 w-4" />
             </button>
             <button
-              onClick={() => setCliImportOpen(true)}
-              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              onClick={() => setHostsModalOpen(true)}
+              title="远端 SSH 主机与多节点管理"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
-              <Terminal className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
-              <span>接管终端会话</span>
+              <Server className="h-4 w-4" />
             </button>
             <button
               onClick={() => setActiveModal("automations")}
@@ -4360,13 +4735,28 @@ export function App() {
             <span className="truncate text-[13px] font-medium text-[var(--v-fg-primary)]">
               {activeSession.title}
             </span>
-            <span
-              title={activeSession.worktree_path}
-              className="hidden sm:inline-flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-secondary)]"
+            <button
+              type="button"
+              onClick={() =>
+                setRelocateTarget({
+                  mode: activeSession.id && activeSession.id !== "draft-empty" ? "session" : "workspace",
+                  oldPath: activeSession.project_path || activeRepo.path,
+                  sessionId:
+                    activeSession.id && activeSession.id !== "draft-empty"
+                      ? activeSession.id
+                      : undefined,
+                  newPath: activeSession.project_path || activeRepo.path,
+                })
+              }
+              title={`当前归属路径: ${activeSession.worktree_path}（点击可修改归属目录）`}
+              className="hidden sm:inline-flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
+              <Folder className="h-3 w-3 text-[var(--v-fg-muted)]" />
+              <span>{activeRepo.name}</span>
+              <span className="text-[var(--v-fg-faint)]">/</span>
               <GitBranch className="h-3 w-3 text-[var(--v-fg-muted)]" />
-              {activeSession.branch_name}
-            </span>
+              <span>{activeSession.branch_name}</span>
+            </button>
             {(() => {
               const isRunning =
                 activeSession.status === "running" ||
@@ -4550,6 +4940,28 @@ export function App() {
               <Terminal className="h-4 w-4" />
             </button>
 
+            <button
+              type="button"
+              onClick={() => setChatFindOpen((v) => !v)}
+              title="在当前会话中搜索提问轮次 (⌘F)"
+              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors cursor-pointer ${
+                chatFindOpen
+                  ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                  : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              }`}
+            >
+              <Search className="h-3.5 w-3.5" />
+            </button>
+            {activeEvents.length > 0 && (
+              <button
+                type="button"
+                onClick={() => void handleForkSession()}
+                title="从当前会话一键分叉探索新思路 (Fork)"
+                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              >
+                <GitFork className="h-3.5 w-3.5" />
+              </button>
+            )}
             {!mobileMode && (
               <button
                 onClick={() => setActiveModal("qr")}
@@ -4574,7 +4986,7 @@ export function App() {
               <Plus className="h-3 w-3" />
               <span>新建</span>
             </button>
-            {sessions.map((s) => {
+            {sessions.filter((s) => !s.archived).map((s) => {
               const active = s.id === activeSession.id;
               return (
                 <button
@@ -4605,6 +5017,17 @@ export function App() {
         {/* Body Area: Centered Conversation Stream + On-Demand Right Drawer */}
         <div className="relative flex flex-1 overflow-hidden">
           <main className="relative flex flex-1 flex-col items-center overflow-hidden">
+            <ChatOutlineRail
+              turns={outlineTurns}
+              onJumpToTurn={handleJumpToTurn}
+              findOpen={chatFindOpen}
+              findQuery={chatFindQuery}
+              onChangeFindQuery={setChatFindQuery}
+              onCloseFind={() => {
+                setChatFindOpen(false);
+                setChatFindQuery("");
+              }}
+            />
             {/* Scrollable Stream (Authentic Paseo Stream Layout) */}
             <div
               ref={chatScrollRef}
@@ -4775,7 +5198,11 @@ export function App() {
                         }
 
                         return (
-                          <div key={turn.key} className="flex flex-col gap-1.5 pb-3">
+                          <div
+                            key={turn.key}
+                            data-turn-key={turn.key}
+                            className="flex flex-col gap-1.5 pb-3"
+                          >
                             {/* 1. User Message (Right-aligned Paseo Bubble + Hover Trailing Actions) */}
                             {turn.userEv &&
                               (() => {
@@ -5189,6 +5616,11 @@ export function App() {
                               onRetry={
                                 turn.userEv && !isSessionRunning
                                   ? () => handleRetryUserMessage(turn.userEv!)
+                                  : undefined
+                              }
+                              onFork={
+                                turn.userEv && !isSessionRunning
+                                  ? () => void handleForkSession(turnIdx + 1)
                                   : undefined
                               }
                             />
@@ -7184,6 +7616,143 @@ export function App() {
         }}
         onClose={() => setCliImportOpen(false)}
       />
+      <RemoteHostsModal
+        open={hostsModalOpen}
+        daemonUrl={daemonUrl}
+        onDispatchedSession={(rawSess) => {
+          const created = normalizeToVeloSession(rawSess, 0);
+          setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)]);
+          setActiveId(created.id);
+          syncSessionEventsFromDaemon(created.id);
+        }}
+        onClose={() => setHostsModalOpen(false)}
+      />
+
+      {/* Relocate Folder / Rebind Session Workspace Path Modal */}
+      {relocateTarget && (
+        <div
+          onClick={() => setRelocateTarget(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[460px] rounded-2xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-5 shadow-2xl"
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Folder className="h-4 w-4 text-[#a78bfa]" />
+                <span className="text-[14px] font-semibold text-[var(--v-fg-primary)]">
+                  修改文件夹归属路径
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRelocateTarget(null)}
+                className="rounded-lg p-1 text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {relocateTarget.sessionId && (
+              <div className="mb-3 flex gap-1.5 rounded-lg bg-[var(--v-bg-hover)] p-1 text-[11.5px]">
+                <button
+                  type="button"
+                  onClick={() => setRelocateTarget({ ...relocateTarget, mode: "session" })}
+                  className={`flex-1 rounded-md py-1.5 font-medium transition-colors cursor-pointer ${
+                    relocateTarget.mode === "session"
+                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                  }`}
+                >
+                  仅更改当前会话归属目录
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRelocateTarget({ ...relocateTarget, mode: "workspace" })}
+                  className={`flex-1 rounded-md py-1.5 font-medium transition-colors cursor-pointer ${
+                    relocateTarget.mode === "workspace"
+                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                  }`}
+                >
+                  迁移整个文件夹及旗下会话
+                </button>
+              </div>
+            )}
+
+            <div className="mb-2 text-[11.5px] text-[var(--v-fg-muted)]">
+              原路径：<code className="font-mono text-[var(--v-fg-secondary)]">{relocateTarget.oldPath}</code>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                autoFocus
+                type="text"
+                value={relocateTarget.newPath}
+                onChange={(e) =>
+                  setRelocateTarget({ ...relocateTarget, newPath: e.target.value })
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void handleCommitRelocatePath();
+                  if (e.key === "Escape") setRelocateTarget(null);
+                }}
+                placeholder="/Users/you/code/project"
+                className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-canvas)] px-3 py-2 font-mono text-[12.5px] text-[var(--v-fg-primary)] focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => void handlePickRelocateFolder()}
+                className="shrink-0 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-hover)] px-3 py-2 text-[12px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+              >
+                浏览选择…
+              </button>
+            </div>
+
+            {repos.length > 0 && (
+              <div className="mt-3">
+                <div className="mb-1.5 text-[11px] text-[var(--v-fg-muted)]">快速选择已有工作区目录：</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {repos.map((r) => (
+                    <button
+                      key={r.id}
+                      type="button"
+                      onClick={() =>
+                        setRelocateTarget({ ...relocateTarget, newPath: r.path })
+                      }
+                      className={`rounded-md border px-2 py-1 font-mono text-[11px] cursor-pointer ${
+                        canonicalRepoPath(relocateTarget.newPath) === canonicalRepoPath(r.path)
+                          ? "border-[#8b5cf6] bg-[#8b5cf6]/15 text-[var(--v-fg-primary)]"
+                          : "border-[var(--v-border-subtle)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]"
+                      }`}
+                    >
+                      {r.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setRelocateTarget(null)}
+                className="rounded-lg px-3.5 py-1.5 text-[12.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleCommitRelocatePath()}
+                disabled={!relocateTarget.newPath.trim()}
+                className="rounded-lg bg-[var(--v-btn-bg)] px-4 py-1.5 text-[12.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90 disabled:opacity-40 cursor-pointer"
+              >
+                保存归属路径
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

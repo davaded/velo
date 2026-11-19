@@ -9,6 +9,8 @@ public struct RootSessionsView: View {
     @State private var showPairSheet = false
     @State private var showNewThreadSheet = false
     @State private var showCliImportSheet = false
+    @State private var showRemoteHostsSheet = false
+    @State private var showArchivedSection = false
     @State private var showAnalyticsHub = false
     @State private var analyticsInitialTab: VeloAnalyticsHubSheet.HubTab = .analytics
     @State private var prefillRepoForNewSession: String?
@@ -17,16 +19,24 @@ public struct RootSessionsView: View {
     @State private var navigationPath: [String] = []
     @State private var renamingSessionId: String?
     @State private var renameDraftTitle: String = ""
+    @State private var relocatingFolderOldPath: String?
+    @State private var relocatingSessionId: String?
+    @State private var relocateDraftPath: String = ""
 
     public init(store: VeloStore) {
         self.store = store
     }
 
     private var filteredSessions: [VeloSessionItem] {
+        let activeOnly = store.sessions.filter { !$0.isArchived }
         guard let filter = selectedEngineFilter else {
-            return store.sessions
+            return activeOnly
         }
-        return store.sessions.filter { $0.engineCategory == filter }
+        return activeOnly.filter { $0.engineCategory == filter }
+    }
+
+    private var archivedSessions: [VeloSessionItem] {
+        store.sessions.filter { $0.isArchived }
     }
 
     private var groupedByProject: [(repoRoot: String, projectName: String, sessions: [VeloSessionItem])] {
@@ -78,6 +88,11 @@ public struct RootSessionsView: View {
                             // 1. Live Specular Connection Status Card
                             connectionStatusCard
 
+                            // 1b. Compact 5h / 7d Subscription Quota Balance Strip
+                            if !store.quotaCards.isEmpty {
+                                compactQuotaStrip
+                            }
+
                             // 2. Categorized Engine Filter Strip
                             engineFilterStrip
 
@@ -98,6 +113,11 @@ public struct RootSessionsView: View {
                                     projectSectionView(group: group)
                                 }
                             }
+
+                            // 4. Collapsible Archived Sessions Drawer
+                            if !archivedSessions.isEmpty {
+                                archivedDrawerView
+                            }
                         }
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
@@ -105,6 +125,7 @@ public struct RootSessionsView: View {
                     }
                     .refreshable {
                         await store.refreshSessionsAndActiveEvents()
+                        await store.fetchQuotas()
                     }
                 }
 
@@ -145,7 +166,19 @@ public struct RootSessionsView: View {
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 7) {
+                        Button {
+                            showRemoteHostsSheet = true
+                        } label: {
+                            Image(systemName: "server.rack")
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 30, height: 30)
+                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
+                        .accessibilityLabel("多机与远端 SSH 主机")
+
                         Button {
                             showCliImportSheet = true
                         } label: {
@@ -212,6 +245,11 @@ public struct RootSessionsView: View {
                     navigationPath = [importedSid]
                 }
             }
+            .sheet(isPresented: $showRemoteHostsSheet) {
+                VeloRemoteHostsSheet(store: store) {
+                    showPairSheet = true
+                }
+            }
             .sheet(isPresented: $showAnalyticsHub) {
                 VeloAnalyticsHubSheet(store: store, initialTab: analyticsInitialTab) { targetSid in
                     store.activeSessionId = targetSid
@@ -253,6 +291,42 @@ public struct RootSessionsView: View {
             } message: {
                 Text("修改后将自动同步至 Mac 桌面端")
             }
+            .alert(
+                relocatingSessionId != nil ? "修改会话归属目录" : "修改文件夹归属路径",
+                isPresented: Binding(
+                    get: { relocatingFolderOldPath != nil || relocatingSessionId != nil },
+                    set: {
+                        if !$0 {
+                            relocatingFolderOldPath = nil
+                            relocatingSessionId = nil
+                        }
+                    }
+                )
+            ) {
+                TextField("/Users/you/code/project", text: $relocateDraftPath)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button("取消", role: .cancel) {
+                    relocatingFolderOldPath = nil
+                    relocatingSessionId = nil
+                }
+                Button("保存路径") {
+                    let targetNew = relocateDraftPath
+                    let sid = relocatingSessionId
+                    let oldFolder = relocatingFolderOldPath
+                    relocatingSessionId = nil
+                    relocatingFolderOldPath = nil
+                    Task {
+                        if let sid {
+                            await store.moveSessionToRepo(sessionId: sid, newRepoPath: targetNew)
+                        } else if let oldFolder {
+                            await store.relocateWorkspace(oldPath: oldFolder, newPath: targetNew)
+                        }
+                    }
+                }
+            } message: {
+                Text("将同步更新 Mac 守护进程的目录映射关系")
+            }
             .onChange(of: store.latestCreatedOrHandoffSessionId) { _, newSid in
                 guard let newSid, !newSid.isEmpty else { return }
                 if navigationPath.last != newSid {
@@ -268,6 +342,124 @@ public struct RootSessionsView: View {
     }
 
     // MARK: - Subviews
+
+    private var compactQuotaStrip: some View {
+        Button {
+            analyticsInitialTab = .analytics
+            showAnalyticsHub = true
+        } label: {
+            HStack(spacing: 12) {
+                ForEach(store.quotaCards) { card in
+                    if let w5h = card.windows.first(where: { $0.id == "5h" }) ?? card.windows.first {
+                        let rem = max(0, min(100, w5h.remainingPercent))
+                        let barColor: Color = {
+                            if w5h.status == "exhausted" { return VeloTheme.coral }
+                            if w5h.status == "warning" { return VeloTheme.amber }
+                            return card.provider == "claude"
+                                ? Color(red: 0.98, green: 0.57, blue: 0.24)
+                                : VeloTheme.emerald
+                        }()
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(card.provider == "claude" ? "Claude 5h" : "Codex 5h")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Text("余 \(Int(rem.rounded()))%\(w5h.resetCountdownLabel.isEmpty ? "" : " · \(w5h.resetCountdownLabel)")")
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            GeometryReader { geo in
+                                ZStack(alignment: .leading) {
+                                    Capsule()
+                                        .fill(VeloTheme.elevatedSurface(colorScheme))
+                                    Capsule()
+                                        .fill(barColor)
+                                        .frame(width: max(6, geo.size.width * CGFloat(rem / 100.0)))
+                                }
+                            }
+                            .frame(height: 5)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 9)
+            .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
+            )
+        }
+        .buttonStyle(VeloPressableButtonStyle(scale: 0.99))
+    }
+
+    private var archivedDrawerView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showArchivedSection.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "archivebox")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Text("已归档会话 (\(archivedSessions.count))")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(showArchivedSection ? 90 : 0))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(VeloTheme.cardSurface(colorScheme).opacity(0.6), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .buttonStyle(.plain)
+
+            if showArchivedSection {
+                ForEach(archivedSessions) { arch in
+                    HStack(spacing: 10) {
+                        NavigationLink(value: arch.id) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(arch.title)
+                                    .font(.system(size: 13.5, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Text("\(arch.projectName) · \(arch.branchName)")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .buttonStyle(.plain)
+
+                        Spacer()
+
+                        Button {
+                            Task { await store.archiveSession(arch.id, archived: false) }
+                        } label: {
+                            Image(systemName: "tray.and.arrow.up")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(VeloTheme.emerald)
+                                .padding(7)
+                                .background(VeloTheme.emerald.opacity(0.13), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
 
     private var connectionStatusCard: some View {
         Button {
@@ -459,6 +651,28 @@ public struct RootSessionsView: View {
                     }
                 }
                 .buttonStyle(.plain)
+                .contextMenu {
+                    Button {
+                        relocateDraftPath = group.repoRoot
+                        relocatingSessionId = nil
+                        relocatingFolderOldPath = group.repoRoot
+                    } label: {
+                        Label("修改文件夹归属路径", systemImage: "folder.badge.gearshape")
+                    }
+
+                    Button {
+                        prefillRepoForNewSession = group.repoRoot
+                        showNewThreadSheet = true
+                    } label: {
+                        Label("在此文件夹新建对话", systemImage: "plus.bubble")
+                    }
+
+                    Button(role: .destructive) {
+                        Task { await store.removeWorkspaceFolder(group.repoRoot) }
+                    } label: {
+                        Label("移除文件夹及旗下会话", systemImage: "trash")
+                    }
+                }
 
                 Spacer(minLength: 4)
 
@@ -506,7 +720,10 @@ public struct RootSessionsView: View {
                     VStack(spacing: 9) {
                         ForEach(group.sessions) { session in
                             NavigationLink(value: session.id) {
-                                SessionCardView(session: session)
+                                SessionCardView(
+                                    session: session,
+                                    isUnread: store.unreadSessionIds.contains(session.id)
+                                )
                             }
                             .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
                             .contextMenu {
@@ -518,15 +735,29 @@ public struct RootSessionsView: View {
                                 }
 
                                 Button {
+                                    relocateDraftPath = session.repoRoot
+                                    relocatingFolderOldPath = nil
+                                    relocatingSessionId = session.id
+                                } label: {
+                                    Label("修改归属目录路径", systemImage: "folder.badge.gearshape")
+                                }
+
+                                Button {
                                     navigationPath.append(session.id)
                                 } label: {
                                     Label("进入对话", systemImage: "bubble.left.and.bubble.right")
                                 }
 
+                                Button {
+                                    Task { await store.archiveSession(session.id, archived: true) }
+                                } label: {
+                                    Label("归档会话 (保留代码与历史)", systemImage: "archivebox")
+                                }
+
                                 Button(role: .destructive) {
                                     Task { await store.deleteSession(session.id) }
                                 } label: {
-                                    Label("删除此会话", systemImage: "trash")
+                                    Label("永久删除会话", systemImage: "trash")
                                 }
                             }
                         }
@@ -664,6 +895,7 @@ public struct RootSessionsView: View {
 
 private struct SessionCardView: View {
     let session: VeloSessionItem
+    var isUnread: Bool = false
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
@@ -678,6 +910,11 @@ private struct SessionCardView: View {
                     OrbitalStatusIcon(phase: .working)
                 } else if isWaiting {
                     OrbitalStatusIcon(phase: .waiting(label: ""))
+                } else if isUnread {
+                    Circle()
+                        .fill(Color(red: 0.22, green: 0.74, blue: 0.97))
+                        .frame(width: 8, height: 8)
+                        .shadow(color: Color(red: 0.22, green: 0.74, blue: 0.97).opacity(0.65), radius: 3)
                 }
 
                 EngineBadgePill(category: cat, compact: true)

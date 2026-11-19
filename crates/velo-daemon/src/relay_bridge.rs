@@ -107,7 +107,7 @@ fn compact_event_for_relay(ev: &AgentEvent, max_tool_output_chars: usize) -> Age
             session_id: *session_id,
             tool_id: tool_id.clone(),
             tool_name: tool_name.clone(),
-            arguments: compact_json_value(arguments, 800),
+            arguments: compact_json_value(arguments, 1400),
             timestamp: *timestamp,
         },
         AgentEvent::UserMessage {
@@ -1106,7 +1106,36 @@ async fn run_supervised_e2ee_bridge(
                                 }
                                 "remove_workspace" => {
                                     if let Some(p) = cmd_val.get("path").and_then(|v| v.as_str()) {
-                                        let ws_list = state.remove_workspace(p).await;
+                                        let delete_sessions = cmd_val
+                                            .get("delete_sessions")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(true);
+                                        let ws_list = state.remove_workspace(p, delete_sessions).await;
+                                        let ws_snap = json!({
+                                            "type": "workspaces_snapshot",
+                                            "workspaces": ws_list,
+                                        });
+                                        if let Some(frame_txt) = send_sealed_with_key(
+                                            &ws_snap,
+                                            &active_key_hex,
+                                            &mut out_nonce,
+                                        ) {
+                                            let _ =
+                                                writer.send(WsMsg::Text(frame_txt.into())).await;
+                                        }
+                                    }
+                                }
+                                "relocate_workspace" => {
+                                    let old_p = cmd_val
+                                        .get("old_path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let new_p = cmd_val
+                                        .get("new_path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !old_p.is_empty() && !new_p.is_empty() {
+                                        let ws_list = state.relocate_workspace(old_p, new_p).await;
                                         let ws_snap = json!({
                                             "type": "workspaces_snapshot",
                                             "workspaces": ws_list,
@@ -1344,6 +1373,10 @@ async fn run_supervised_e2ee_bridge(
                                                 .get("approval_mode")
                                                 .and_then(|v| v.as_str())
                                                 .map(str::to_string);
+                                            let repo_path = cmd_val
+                                                .get("repo_path")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
                                             if state
                                                 .update_session_fields(
                                                     sid,
@@ -1353,6 +1386,7 @@ async fn run_supervised_e2ee_bridge(
                                                     effort,
                                                     approval_mode,
                                                     None,
+                                                    repo_path,
                                                 )
                                                 .await
                                                 .is_some()
@@ -1828,6 +1862,126 @@ async fn run_supervised_e2ee_bridge(
                                         send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
                                     {
                                         let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "get_quotas" => {
+                                    let q_dto = state.get_quotas_dto().await;
+                                    let resp = json!({
+                                        "type": "quotas_snapshot",
+                                        "providers": q_dto.get("providers").cloned().unwrap_or(Value::Array(Vec::new())),
+                                    });
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "archive_session" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let arch = cmd_val
+                                                .get("archived")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(true);
+                                            let _ = state.archive_session_core(sid, arch).await;
+                                        }
+                                    }
+                                }
+                                "fork_session" => {
+                                    if let Some(sid_s) =
+                                        cmd_val.get("session_id").and_then(|v| v.as_str())
+                                    {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let up_to = cmd_val
+                                                .get("up_to_user_turn")
+                                                .and_then(|v| v.as_u64())
+                                                .map(|n| n as usize);
+                                            let title = cmd_val
+                                                .get("title")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            if let Ok(forked) =
+                                                state.fork_session_core(sid, up_to, title).await
+                                            {
+                                                let ack = json!({
+                                                    "type": "session_forked",
+                                                    "ok": true,
+                                                    "session": forked,
+                                                });
+                                                if let Some(f) = send_sealed_with_key(
+                                                    &ack,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer.send(WsMsg::Text(f.into())).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "list_hosts" => {
+                                    let h_dto = state.list_hosts_dto().await;
+                                    let resp = json!({
+                                        "type": "hosts_snapshot",
+                                        "hosts": h_dto.get("hosts").cloned().unwrap_or(Value::Array(Vec::new())),
+                                    });
+                                    if let Some(f) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(f.into())).await;
+                                    }
+                                }
+                                "add_host" => {
+                                    let label = cmd_val.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                                    let target = cmd_val.get("ssh_target").and_then(|v| v.as_str()).unwrap_or("");
+                                    let cwd = cmd_val.get("default_cwd").and_then(|v| v.as_str());
+                                    if !target.is_empty() {
+                                        let _ = state.add_remote_host_core(label, target, cwd, true).await;
+                                        let h_dto = state.list_hosts_dto().await;
+                                        let resp = json!({
+                                            "type": "hosts_snapshot",
+                                            "hosts": h_dto.get("hosts").cloned().unwrap_or(Value::Array(Vec::new())),
+                                        });
+                                        if let Some(f) =
+                                            send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                        {
+                                            let _ = writer.send(WsMsg::Text(f.into())).await;
+                                        }
+                                    }
+                                }
+                                "remove_host" => {
+                                    if let Some(hid) = cmd_val.get("host_id").and_then(|v| v.as_str()) {
+                                        let _ = state.remove_remote_host_core(hid).await;
+                                        let h_dto = state.list_hosts_dto().await;
+                                        let resp = json!({
+                                            "type": "hosts_snapshot",
+                                            "hosts": h_dto.get("hosts").cloned().unwrap_or(Value::Array(Vec::new())),
+                                        });
+                                        if let Some(f) =
+                                            send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                        {
+                                            let _ = writer.send(WsMsg::Text(f.into())).await;
+                                        }
+                                    }
+                                }
+                                "dispatch_ssh_session" => {
+                                    let hid = cmd_val.get("host_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let prov = cmd_val.get("provider").and_then(|v| v.as_str()).unwrap_or("claude");
+                                    let prm = cmd_val.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                                    let cwd = cmd_val.get("cwd").and_then(|v| v.as_str());
+                                    if !hid.is_empty() && !prm.is_empty() {
+                                        if let Ok(sess) = state.dispatch_ssh_host_session_core(hid, prov, prm, cwd).await {
+                                            let ack = json!({
+                                                "type": "ssh_session_started",
+                                                "ok": true,
+                                                "session": sess,
+                                            });
+                                            if let Some(f) = send_sealed_with_key(&ack, &active_key_hex, &mut out_nonce) {
+                                                let _ = writer.send(WsMsg::Text(f.into())).await;
+                                            }
+                                        }
                                     }
                                 }
                                 "remove_queued_prompt" => {

@@ -186,6 +186,23 @@ pub struct SessionInfo {
     pub preview_url: Option<String>,
     #[serde(default)]
     pub queued_prompts: Vec<QueuedPromptItem>,
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// Normalized subscription rate-limit window (e.g., 5h rolling window or 7d weekly window).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitWindowDto {
+    pub id: String,
+    pub label: String,
+    pub used_percent: f64,
+    pub remaining_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_in_seconds: Option<i64>,
+    pub status: String, // "healthy" | "warning" | "exhausted"
+    pub source: String, // "provider_header" | "local_window"
 }
 
 /// A follow-up user prompt queued on the server to run automatically when the active turn completes.
@@ -264,6 +281,12 @@ pub enum AgentEvent {
         output_tps: f64,
         #[serde(default)]
         is_turn_total: bool,
+        timestamp: DateTime<Utc>,
+    },
+    RateLimitsUpdated {
+        session_id: Uuid,
+        provider: String,
+        windows: Vec<RateLimitWindowDto>,
         timestamp: DateTime<Utc>,
     },
     TerminalOutput {
@@ -358,6 +381,7 @@ impl AgentEvent {
             | Self::MessageChunk { session_id, .. }
             | Self::MessageDelta { session_id, .. }
             | Self::UsageUpdated { session_id, .. }
+            | Self::RateLimitsUpdated { session_id, .. }
             | Self::TerminalOutput { session_id, .. }
             | Self::ToolCallRequested { session_id, .. }
             | Self::ToolCallCompleted { session_id, .. }

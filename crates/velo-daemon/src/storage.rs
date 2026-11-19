@@ -145,6 +145,11 @@ fn extract_event_metadata(ev: &AgentEvent) -> (&'static str, i64, String) {
             timestamp.timestamp_millis(),
             String::new(),
         ),
+        AgentEvent::RateLimitsUpdated { timestamp, .. } => (
+            "rate_limits_updated",
+            timestamp.timestamp_millis(),
+            String::new(),
+        ),
     }
 }
 

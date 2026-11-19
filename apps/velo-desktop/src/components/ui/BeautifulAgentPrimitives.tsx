@@ -7,6 +7,7 @@ import {
   Copy,
   Eye,
   FileSymlink,
+  GitFork,
   Pencil,
   RotateCcw,
   Search,
@@ -178,6 +179,7 @@ export const PaseoTurnFooter: React.FC<{
   telemetry?: PaseoTurnTelemetry;
   onOpenDiff?: () => void;
   onRetry?: () => void;
+  onFork?: () => void;
 }> = ({
   isRunning,
   phase = "thinking",
@@ -190,6 +192,7 @@ export const PaseoTurnFooter: React.FC<{
   telemetry,
   onOpenDiff,
   onRetry,
+  onFork,
 }) => {
   const [copied, setCopied] = useState(false);
   const [hoveredTiming, setHoveredTiming] = useState(false);
@@ -334,10 +337,20 @@ export const PaseoTurnFooter: React.FC<{
         <button
           type="button"
           onClick={onRetry}
-          title="Retry turn"
+          title="重试本轮 (Retry turn)"
           className="flex h-6 w-6 items-center justify-center rounded-md transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
         >
           <RotateCcw className="h-3.5 w-3.5" style={{ color: "var(--fg-muted)" }} />
+        </button>
+      )}
+      {onFork && (
+        <button
+          type="button"
+          onClick={onFork}
+          title="从此处克隆出新分支会话 (Fork session from this turn)"
+          className="flex h-6 w-6 items-center justify-center rounded-md transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
+        >
+          <GitFork className="h-3.5 w-3.5" style={{ color: "var(--fg-muted)" }} />
         </button>
       )}
 
@@ -877,6 +890,110 @@ export function resolvePaseoToolPresentation(
   };
 }
 
+type InlineDiffRow = { kind: "del" | "add" | "ctx"; text: string };
+
+function extractInlineDiffFromToolInput(input: unknown): {
+  rows: InlineDiffRow[];
+  added: number;
+  removed: number;
+} | null {
+  if (!input || typeof input !== "object") return null;
+  const obj = input as Record<string, unknown>;
+
+  // 1. Unified patch (`patch` / `diff`)
+  const rawPatch =
+    typeof obj.patch === "string"
+      ? obj.patch
+      : typeof obj.diff === "string"
+      ? obj.diff
+      : null;
+  if (rawPatch && rawPatch.trim()) {
+    const rows: InlineDiffRow[] = [];
+    let added = 0;
+    let removed = 0;
+    for (const line of rawPatch.split("\n").slice(0, 140)) {
+      if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) continue;
+      if (line.startsWith("+")) {
+        added++;
+        rows.push({ kind: "add", text: line.slice(1) });
+      } else if (line.startsWith("-")) {
+        removed++;
+        rows.push({ kind: "del", text: line.slice(1) });
+      } else {
+        rows.push({ kind: "ctx", text: line.startsWith(" ") ? line.slice(1) : line });
+      }
+    }
+    if (added > 0 || removed > 0) return { rows, added, removed };
+  }
+
+  // 2. Claude MultiEdit (`edits: [{ old_string, new_string }]`)
+  const editPairs: Array<{ oldStr: string; newStr: string }> = [];
+  if (Array.isArray(obj.edits)) {
+    for (const e of obj.edits) {
+      if (e && typeof e === "object") {
+        const eo = e as Record<string, unknown>;
+        const o = String(eo.old_string ?? eo.Target ?? "");
+        const n = String(eo.new_string ?? eo.Replacement ?? "");
+        if (o || n) editPairs.push({ oldStr: o, newStr: n });
+      }
+    }
+  } else if (
+    typeof obj.old_string === "string" ||
+    typeof obj.new_string === "string" ||
+    typeof obj.Target === "string" ||
+    typeof obj.Replacement === "string"
+  ) {
+    editPairs.push({
+      oldStr: String(obj.old_string ?? obj.Target ?? ""),
+      newStr: String(obj.new_string ?? obj.Replacement ?? ""),
+    });
+  } else if (typeof obj.content === "string" || typeof obj.Content === "string") {
+    const written = String(obj.content ?? obj.Content ?? "");
+    const lines = written.split("\n").slice(0, 80);
+    return {
+      rows: lines.map((l) => ({ kind: "add" as const, text: l })),
+      added: written.split("\n").length,
+      removed: 0,
+    };
+  }
+
+  if (editPairs.length === 0) return null;
+
+  const rows: InlineDiffRow[] = [];
+  let added = 0;
+  let removed = 0;
+  for (const pair of editPairs) {
+    const oldLines = pair.oldStr ? pair.oldStr.split("\n") : [];
+    const newLines = pair.newStr ? pair.newStr.split("\n") : [];
+    for (const l of oldLines.slice(0, 60)) {
+      removed++;
+      rows.push({ kind: "del", text: l });
+    }
+    for (const l of newLines.slice(0, 60)) {
+      added++;
+      rows.push({ kind: "add", text: l });
+    }
+  }
+  return rows.length > 0 ? { rows, added, removed } : null;
+}
+
+function extractSubagentDelegation(
+  toolName: string,
+  input: unknown
+): { role: string; prompt: string } | null {
+  const lower = toolName.trim().toLowerCase();
+  if (!lower.includes("task") && !lower.includes("subagent") && !lower.includes("delegate")) {
+    return null;
+  }
+  if (!input || typeof input !== "object") return null;
+  const obj = input as Record<string, unknown>;
+  const role = String(
+    obj.description ?? obj.Role ?? obj.subagent_type ?? obj.TypeName ?? "Subagent"
+  );
+  const prompt = String(obj.prompt ?? obj.Prompt ?? "");
+  return { role, prompt };
+}
+
 export const BeautifulToolCallCard: React.FC<{
   toolName: string;
   input: unknown;
@@ -889,12 +1006,32 @@ export const BeautifulToolCallCard: React.FC<{
     () => resolvePaseoToolPresentation(toolName, input, output),
     [toolName, input, output]
   );
+  const inlineDiff = useMemo(
+    () => (pres.kind === "edit" ? extractInlineDiffFromToolInput(input) : null),
+    [pres.kind, input]
+  );
+  const subagentInfo = useMemo(
+    () => extractSubagentDelegation(toolName, input),
+    [toolName, input]
+  );
   const isRunning = output === undefined;
+
+  const enrichedSecondary = useMemo(() => {
+    if (subagentInfo) {
+      return `${subagentInfo.role}${isRunning ? " · 运行中" : ""}`;
+    }
+    const base = isRunning ? (pres.kind === "shell" ? pres.summary : undefined) : pres.summary;
+    if (inlineDiff && !isRunning) {
+      const stat = `+${inlineDiff.added}${inlineDiff.removed > 0 ? ` −${inlineDiff.removed}` : ""}`;
+      return base ? `${base}  (${stat})` : stat;
+    }
+    return base;
+  }, [subagentInfo, isRunning, pres.kind, pres.summary, inlineDiff]);
 
   return (
     <PaseoExpandableBadge
-      label={isRunning ? pres.workingVerb : pres.displayName}
-      secondaryLabel={isRunning ? (pres.kind === "shell" ? pres.summary : undefined) : pres.summary}
+      label={subagentInfo ? "Subagent" : isRunning ? pres.workingVerb : pres.displayName}
+      secondaryLabel={enrichedSecondary}
       icon={pres.icon}
       isExpanded={expanded}
       onToggle={() => setExpanded((v) => !v)}
@@ -902,7 +1039,67 @@ export const BeautifulToolCallCard: React.FC<{
       isLoading={isRunning}
       isError={isError}
     >
-      {pres.kind === "shell" ? (
+      {subagentInfo ? (
+        <div className="space-y-2 px-3.5 py-2.5 text-[12px]">
+          <div className="flex items-center gap-2">
+            <span className="rounded-full bg-[#a78bfa]/15 px-2 py-0.5 font-mono-code text-[10.5px] font-medium text-[#a78bfa]">
+              {subagentInfo.role}
+            </span>
+            <span className="text-[11px]" style={{ color: "var(--fg-muted)" }}>
+              {isRunning ? "子代理正在独立执行…" : "子代理已完成汇报"}
+            </span>
+          </div>
+          {subagentInfo.prompt && (
+            <div
+              className="rounded-lg bg-[var(--surface-2)] px-2.5 py-1.5 text-[11.5px] whitespace-pre-wrap"
+              style={{ color: "var(--fg-muted)" }}
+            >
+              {subagentInfo.prompt.slice(0, 420)}
+              {subagentInfo.prompt.length > 420 ? "…" : ""}
+            </div>
+          )}
+          {output && (
+            <pre
+              className="max-h-[220px] overflow-auto whitespace-pre-wrap font-mono-code text-[11.5px]"
+              style={{ color: isError ? "var(--status-danger)" : "var(--fg)" }}
+            >
+              {output}
+            </pre>
+          )}
+        </div>
+      ) : inlineDiff ? (
+        <div className="max-h-[300px] overflow-auto font-mono-code text-[11.5px] leading-[1.55]">
+          <div
+            className="flex items-center justify-between border-b px-3 py-1.5 text-[11px]"
+            style={{ borderColor: "var(--border-subtle)", color: "var(--fg-muted)" }}
+          >
+            <span className="truncate">{pres.summary || "Inline changes"}</span>
+            <span className="shrink-0 tabular-nums">
+              <span style={{ color: "var(--status-success)" }}>+{inlineDiff.added}</span>{" "}
+              <span style={{ color: "var(--status-danger)" }}>−{inlineDiff.removed}</span>
+            </span>
+          </div>
+          <div className="py-1">
+            {inlineDiff.rows.map((row, idx) => (
+              <div
+                key={idx}
+                className={`flex px-3 py-0.2 whitespace-pre overflow-x-auto ${
+                  row.kind === "add"
+                    ? "bg-[#34d399]/12 text-[#34d399]"
+                    : row.kind === "del"
+                    ? "bg-[#f87171]/12 text-[#f87171]"
+                    : "text-[var(--fg-muted)]"
+                }`}
+              >
+                <span className="mr-2 w-3 shrink-0 select-none opacity-75">
+                  {row.kind === "add" ? "+" : row.kind === "del" ? "−" : " "}
+                </span>
+                <span>{row.text}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : pres.kind === "shell" ? (
         <div className="max-h-[280px] overflow-auto px-3.5 py-2.5 font-mono-code text-[12px] leading-[1.55]">
           {pres.command && (
             <div className="whitespace-pre-wrap" style={{ color: "var(--fg)" }}>

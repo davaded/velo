@@ -430,6 +430,10 @@ public struct ExecutionTraceGroupView: View {
                                     summary: summary,
                                     output: output,
                                     isError: isError,
+                                    inlineDiffOld: item.inlineDiffOld,
+                                    inlineDiffNew: item.inlineDiffNew,
+                                    subagentRole: item.subagentRole,
+                                    subagentPrompt: item.subagentPrompt,
                                     nested: true
                                 )
                             default:
@@ -520,6 +524,10 @@ public struct ToolCallGroupRowView: View {
                                     summary: summary,
                                     output: output,
                                     isError: isError,
+                                    inlineDiffOld: item.inlineDiffOld,
+                                    inlineDiffNew: item.inlineDiffNew,
+                                    subagentRole: item.subagentRole,
+                                    subagentPrompt: item.subagentPrompt,
                                     nested: true
                                 )
                             }
@@ -542,6 +550,10 @@ public struct ToolCallRowView: View {
     public let summary: String
     public let output: String?
     public let isError: Bool
+    public var inlineDiffOld: String? = nil
+    public var inlineDiffNew: String? = nil
+    public var subagentRole: String? = nil
+    public var subagentPrompt: String? = nil
     public var nested: Bool = false
 
     @Environment(\.colorScheme) private var colorScheme
@@ -554,6 +566,10 @@ public struct ToolCallRowView: View {
         summary: String,
         output: String?,
         isError: Bool,
+        inlineDiffOld: String? = nil,
+        inlineDiffNew: String? = nil,
+        subagentRole: String? = nil,
+        subagentPrompt: String? = nil,
         nested: Bool = false
     ) {
         self.toolName = toolName
@@ -562,13 +578,32 @@ public struct ToolCallRowView: View {
         self.summary = summary
         self.output = output
         self.isError = isError
+        self.inlineDiffOld = inlineDiffOld
+        self.inlineDiffNew = inlineDiffNew
+        self.subagentRole = subagentRole
+        self.subagentPrompt = subagentPrompt
         self.nested = nested
     }
 
     private var isRunning: Bool { output == nil }
 
+    private var hasInlineDiff: Bool {
+        (inlineDiffOld?.isEmpty == false) || (inlineDiffNew?.isEmpty == false)
+    }
+
+    private var oldLines: [String] {
+        guard let inlineDiffOld, !inlineDiffOld.isEmpty else { return [] }
+        return Array(inlineDiffOld.components(separatedBy: .newlines).prefix(18))
+    }
+
+    private var newLines: [String] {
+        guard let inlineDiffNew, !inlineDiffNew.isEmpty else { return [] }
+        return Array(inlineDiffNew.components(separatedBy: .newlines).prefix(18))
+    }
+
     private var iconName: String {
-        VeloFormatting.presentTool(toolName: toolName, argsDict: nil, output: output).iconSystemName
+        if subagentRole != nil { return "point.3.connected.trianglepath.dotted" }
+        return VeloFormatting.presentTool(toolName: toolName, argsDict: nil, output: output).iconSystemName
     }
 
     public var body: some View {
@@ -585,11 +620,26 @@ public struct ToolCallRowView: View {
                     } else {
                         Image(systemName: isError ? "exclamationmark.triangle.fill" : iconName)
                             .font(.system(size: 11.5, weight: .semibold))
-                            .foregroundStyle(isError ? VeloTheme.coral : .secondary)
+                            .foregroundStyle(
+                                isError
+                                    ? VeloTheme.coral
+                                    : (subagentRole != nil ? VeloTheme.accentVioletSoft : .secondary)
+                            )
                             .frame(width: 15)
                     }
 
-                    if isRunning {
+                    if let role = subagentRole, !role.isEmpty {
+                        Text("Subagent")
+                            .font(.system(size: 10.5, weight: .bold))
+                            .foregroundStyle(VeloTheme.accentVioletSoft)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(VeloTheme.accentViolet.opacity(0.15), in: Capsule())
+                        Text(role)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                    } else if isRunning {
                         ShimmerTextView(workingVerb, font: .system(size: 12.5, weight: .medium))
                             .lineLimit(1)
                     } else {
@@ -606,7 +656,22 @@ public struct ToolCallRowView: View {
 
                     Spacer(minLength: 4)
 
-                    if output != nil {
+                    if hasInlineDiff {
+                        HStack(spacing: 3) {
+                            if !newLines.isEmpty {
+                                Text("+\(newLines.count)")
+                                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(VeloTheme.emerald)
+                            }
+                            if !oldLines.isEmpty {
+                                Text("−\(oldLines.count)")
+                                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(VeloTheme.coral)
+                            }
+                        }
+                    }
+
+                    if output != nil || hasInlineDiff || subagentPrompt != nil {
                         Image(systemName: "chevron.right")
                             .font(.system(size: 9.5, weight: .bold))
                             .foregroundStyle(.quaternary)
@@ -644,7 +709,42 @@ public struct ToolCallRowView: View {
                         .background(VeloTheme.codeHeader(colorScheme))
                     }
 
-                    if let output, !output.isEmpty {
+                    if let sp = subagentPrompt, !sp.isEmpty {
+                        Text(sp)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            .padding(9)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(VeloTheme.accentViolet.opacity(0.06))
+                    }
+
+                    if hasInlineDiff {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                ForEach(Array(oldLines.enumerated()), id: \.offset) { _, line in
+                                    Text("− \(line)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(VeloTheme.coral)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 1.5)
+                                        .background(VeloTheme.coral.opacity(0.11))
+                                }
+                                ForEach(Array(newLines.enumerated()), id: \.offset) { _, line in
+                                    Text("+ \(line)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(VeloTheme.emerald)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 1.5)
+                                        .background(VeloTheme.emerald.opacity(0.11))
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+
+                    if let output, !output.isEmpty, (!hasInlineDiff || isError) {
                         ScrollView(.horizontal, showsIndicators: false) {
                             Text(String(output.prefix(2600)))
                                 .font(.system(size: 11, design: .monospaced))
@@ -704,6 +804,7 @@ public struct TurnStatusFooterView: View {
     public let telemetry: TurnUsageTelemetry?
     public let assistantText: String?
     public let onRetry: (() -> Void)?
+    public let onFork: (() -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var copied = false
@@ -718,7 +819,8 @@ public struct TurnStatusFooterView: View {
         liveTps: Double? = nil,
         telemetry: TurnUsageTelemetry? = nil,
         assistantText: String?,
-        onRetry: (() -> Void)?
+        onRetry: (() -> Void)?,
+        onFork: (() -> Void)? = nil
     ) {
         self.isRunning = isRunning
         self.phase = phase
@@ -729,6 +831,7 @@ public struct TurnStatusFooterView: View {
         self.telemetry = telemetry
         self.assistantText = assistantText
         self.onRetry = onRetry
+        self.onFork = onFork
     }
 
     private var phaseIdentity: String {
@@ -895,6 +998,22 @@ public struct TurnStatusFooterView: View {
                                 Image(systemName: "arrow.counterclockwise")
                                     .font(.system(size: 10.5, weight: .semibold))
                                 Text("重试")
+                                    .font(.system(size: 11.5, weight: .medium))
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                        }
+                        .buttonStyle(VeloPressableButtonStyle())
+                    }
+
+                    if let onFork {
+                        Button(action: onFork) {
+                            HStack(spacing: 3.5) {
+                                Image(systemName: "arrow.branch")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                Text("分叉")
                                     .font(.system(size: 11.5, weight: .medium))
                             }
                             .foregroundStyle(.secondary)
