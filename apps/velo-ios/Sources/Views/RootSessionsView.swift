@@ -354,18 +354,32 @@ public struct RootSessionsView: View {
                 ForEach(activeCards) { card in
                     if let wPrimary = card.windows.first(where: { $0.id == "5h" }) ?? card.windows.first {
                         let rem = max(0, min(100, wPrimary.remainingPercent))
+                        let shortName: String = {
+                            switch card.provider {
+                            case "antigravity": return "Antigravity"
+                            case "cursor": return "Cursor"
+                            case "claude": return "Claude"
+                            case "codex": return "Codex"
+                            default: return card.label
+                            }
+                        }()
                         let barColor: Color = {
                             if wPrimary.status == "exhausted" { return VeloTheme.coral }
                             if wPrimary.status == "warning" { return VeloTheme.amber }
-                            return card.provider == "claude"
-                                ? Color(red: 0.98, green: 0.57, blue: 0.24)
-                                : VeloTheme.emerald
+                            switch card.provider {
+                            case "antigravity": return Color(red: 0.38, green: 0.65, blue: 0.98)
+                            case "cursor": return Color(red: 0.65, green: 0.55, blue: 0.98)
+                            case "claude": return Color(red: 0.98, green: 0.57, blue: 0.24)
+                            default: return VeloTheme.emerald
+                            }
                         }()
                         let rightSummary: String = {
                             let w7d = card.windows.first(where: { $0.id == "7d" })
                             var s = "余 \(Int(rem.rounded()))%"
                             if let w7d {
                                 s += " · 7d \(Int(w7d.remainingPercent.rounded()))%"
+                            } else if let dt = wPrimary.detailText, !dt.isEmpty {
+                                s += " · \(dt)"
                             }
                             if !wPrimary.resetCountdownLabel.isEmpty {
                                 s += " · \(wPrimary.resetCountdownLabel)"
@@ -375,7 +389,7 @@ public struct RootSessionsView: View {
 
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 6) {
-                                Text(card.provider == "claude" ? "Claude" : "Codex")
+                                Text(shortName)
                                     .font(.system(size: 11.5, weight: .semibold))
                                     .foregroundStyle(.primary)
                                 Text(card.planBadge)

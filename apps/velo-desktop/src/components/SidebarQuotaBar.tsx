@@ -33,6 +33,36 @@ function formatResetCountdown(sec?: number | null): string {
   return `${Math.max(1, mins)}m`;
 }
 
+function providerShortLabel(provider: string, fallback: string): string {
+  switch (provider) {
+    case "antigravity":
+      return "Antigravity";
+    case "cursor":
+      return "Cursor";
+    case "claude":
+      return "Claude";
+    case "codex":
+      return "Codex";
+    default:
+      return fallback;
+  }
+}
+
+function providerBarClass(provider: string, status: string): string {
+  if (status === "exhausted") return "bg-[#f87171]";
+  if (status === "warning") return "bg-[#fbbf24]";
+  switch (provider) {
+    case "antigravity":
+      return "bg-[#60a5fa]";
+    case "cursor":
+      return "bg-[#a78bfa]";
+    case "claude":
+      return "bg-[#fb923c]";
+    default:
+      return "bg-[#34d399]";
+  }
+}
+
 export const SidebarQuotaBar: React.FC<{
   daemonUrl: string;
   onOpenAnalytics: () => void;
@@ -40,10 +70,11 @@ export const SidebarQuotaBar: React.FC<{
   const [cards, setCards] = useState<ProviderQuotaCard[]>([]);
   const [refreshing, setRefreshing] = useState(false);
 
-  const fetchQuotas = async () => {
+  const fetchQuotas = async (force = false) => {
     setRefreshing(true);
     try {
-      const res = await fetch(`${daemonUrl}/api/analytics/quotas`);
+      const qs = force ? "?refresh=1" : "";
+      const res = await fetch(`${daemonUrl}/api/analytics/quotas${qs}`);
       if (res.ok) {
         const data = (await res.json()) as { providers?: ProviderQuotaCard[] };
         if (Array.isArray(data.providers)) {
@@ -58,12 +89,12 @@ export const SidebarQuotaBar: React.FC<{
   };
 
   useEffect(() => {
-    void fetchQuotas();
-    const id = setInterval(() => void fetchQuotas(), 45_000);
+    void fetchQuotas(false);
+    const id = setInterval(() => void fetchQuotas(false), 60_000);
     return () => clearInterval(id);
   }, [daemonUrl]);
 
-  // Strictly show 5h/7d quota bars ONLY when official OAuth or gateway returns real rate-limit windows
+  // Strictly show quota bars ONLY for real subscription/rate-limit windows
   const subscriptionCards = cards.filter(
     (c) => c.mode === "subscription" && c.windows.length > 0
   );
@@ -78,11 +109,11 @@ export const SidebarQuotaBar: React.FC<{
           onClick={onOpenAnalytics}
           className="text-[10.5px] font-medium text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)] cursor-pointer"
         >
-          5h / 7d 订阅配额监控
+          实时订阅配额监控
         </button>
         <button
           type="button"
-          onClick={() => void fetchQuotas()}
+          onClick={() => void fetchQuotas(true)}
           title="刷新实时配额"
           className="text-[var(--v-fg-faint)] hover:text-[var(--v-fg-primary)] cursor-pointer"
         >
@@ -92,25 +123,23 @@ export const SidebarQuotaBar: React.FC<{
 
       <div className="space-y-1.5">
         {subscriptionCards.map((card) => {
-          const shortName = card.provider === "claude" ? "Claude" : "Codex";
+          const shortName = providerShortLabel(card.provider, card.label);
           const wPrimary = card.windows.find((w) => w.id === "5h") || card.windows[0];
           const w7d = card.windows.find((w) => w.id === "7d");
           if (!wPrimary) return null;
 
           const remPct = Math.max(0, Math.min(100, wPrimary.remaining_percent));
           const resetTxt = formatResetCountdown(wPrimary.reset_in_seconds);
-          const barColor =
-            wPrimary.status === "exhausted"
-              ? "bg-[#f87171]"
-              : wPrimary.status === "warning"
-              ? "bg-[#fbbf24]"
-              : card.provider === "claude"
-              ? "bg-[#fb923c]"
-              : "bg-[#34d399]";
+          const barColor = providerBarClass(card.provider, wPrimary.status);
 
-          const rightSummary = `余 ${Math.round(remPct)}%${
-            w7d ? ` · 7d ${Math.round(w7d.remaining_percent)}%` : ""
-          }${resetTxt ? ` · ${resetTxt}` : ""}`;
+          const middleSegment = w7d
+            ? ` · 7d ${Math.round(w7d.remaining_percent)}%`
+            : wPrimary.detail_text
+            ? ` · ${wPrimary.detail_text}`
+            : "";
+          const rightSummary = `余 ${Math.round(remPct)}%${middleSegment}${
+            resetTxt ? ` · ${resetTxt}` : ""
+          }`;
 
           return (
             <div key={card.provider} className="space-y-0.5">

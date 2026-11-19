@@ -140,9 +140,12 @@ public struct VeloAnalyticsHubSheet: View {
                                 let barColor: Color = {
                                     if w.status == "exhausted" { return VeloTheme.coral }
                                     if w.status == "warning" { return VeloTheme.amber }
-                                    return card.provider == "claude"
-                                        ? Color(red: 0.98, green: 0.57, blue: 0.24)
-                                        : VeloTheme.emerald
+                                    switch card.provider {
+                                    case "antigravity": return Color(red: 0.38, green: 0.65, blue: 0.98)
+                                    case "cursor": return Color(red: 0.65, green: 0.55, blue: 0.98)
+                                    case "claude": return Color(red: 0.98, green: 0.57, blue: 0.24)
+                                    default: return VeloTheme.emerald
+                                    }
                                 }()
                                 let rightTxt: String = {
                                     var parts: [String] = []

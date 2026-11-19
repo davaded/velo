@@ -4923,16 +4923,16 @@ impl DaemonState {
     }
 
     pub async fn get_quotas_dto(&self) -> Value {
-        let (cache_snap, sessions_snap, hist_snap) = {
+        self.get_quotas_dto_opts(false).await
+    }
+
+    pub async fn get_quotas_dto_opts(&self, force_refresh: bool) -> Value {
+        let cache_snap = {
             let guard = self.inner.read().await;
-            (
-                guard.quota_cache.clone(),
-                guard.sessions.clone(),
-                guard.event_history.clone(),
-            )
+            guard.quota_cache.clone()
         };
         let cards = tokio::task::spawn_blocking(move || {
-            quota::build_subscription_quotas_snapshot(&cache_snap, &sessions_snap, &hist_snap)
+            quota::build_subscription_quotas_snapshot_opts(&cache_snap, force_refresh)
         })
         .await
         .unwrap_or_default();
@@ -5189,8 +5189,17 @@ async fn fork_session_handler(
     }
 }
 
-async fn quotas_analytics_handler(State(state): State<DaemonState>) -> impl IntoResponse {
-    Json(state.get_quotas_dto().await)
+#[derive(Debug, Default, serde::Deserialize)]
+struct QuotasQueryParams {
+    refresh: Option<String>,
+}
+
+async fn quotas_analytics_handler(
+    State(state): State<DaemonState>,
+    axum::extract::Query(q): axum::extract::Query<QuotasQueryParams>,
+) -> impl IntoResponse {
+    let force = matches!(q.refresh.as_deref(), Some("1" | "true"));
+    Json(state.get_quotas_dto_opts(force).await)
 }
 
 async fn list_hosts_handler(State(state): State<DaemonState>) -> impl IntoResponse {

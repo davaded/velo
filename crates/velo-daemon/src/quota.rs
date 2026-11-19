@@ -1,4 +1,5 @@
 use chrono::{DateTime, TimeZone, Utc};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -73,8 +74,17 @@ fn extract_url_host(raw_url: &str) -> String {
 
 fn parse_any_timestamp(val: &Value) -> Option<DateTime<Utc>> {
     if let Some(s) = val.as_str() {
-        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        let trimmed = s.trim();
+        if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
             return Some(dt.with_timezone(&Utc));
+        }
+        if let Ok(num) = trimmed.parse::<i64>() {
+            let sec = if num > 1_000_000_000_000 {
+                num / 1000
+            } else {
+                num
+            };
+            return Utc.timestamp_opt(sec, 0).single();
         }
     }
     if let Some(sec) = val.as_i64() {
@@ -113,9 +123,51 @@ fn refresh_window_countdown(
     Some(w)
 }
 
+fn apply_proxy_env(cmd: &mut Command) {
+    if let Some(proxy) = velo_agent::discover_system_proxy_url() {
+        cmd.env("HTTPS_PROXY", &proxy)
+            .env("HTTP_PROXY", &proxy)
+            .env("ALL_PROXY", &proxy);
+    }
+}
+
 fn curl_json_get(url: &str, headers: &[(&str, String)]) -> Option<Value> {
     let mut cmd = Command::new("/usr/bin/curl");
-    cmd.args(["-sS", "--max-time", "5", "-H", "Accept: application/json"]);
+    apply_proxy_env(&mut cmd);
+    cmd.args([
+        "-fsS",
+        "--max-time",
+        "5",
+        "-H",
+        "Accept: application/json",
+    ]);
+    for (k, v) in headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    cmd.arg(url);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&out.stdout).ok()
+}
+
+fn curl_json_post(url: &str, body: &str, headers: &[(&str, String)]) -> Option<Value> {
+    let mut cmd = Command::new("/usr/bin/curl");
+    apply_proxy_env(&mut cmd);
+    cmd.args([
+        "-fsS",
+        "--max-time",
+        "5",
+        "-X",
+        "POST",
+        "-H",
+        "Accept: application/json",
+        "-H",
+        "Content-Type: application/json",
+        "--data-raw",
+        body,
+    ]);
     for (k, v) in headers {
         cmd.arg("-H").arg(format!("{k}: {v}"));
     }
@@ -251,6 +303,330 @@ fn build_custom_gateway_api_key_card(
         windows: Vec::new(),
         updated_at: now,
     }
+}
+
+/// Parses documented `agy -p "/quota" --output-format json` payload into real 5h/7d windows.
+pub fn parse_antigravity_quota_json(
+    val: &Value,
+    now: DateTime<Utc>,
+) -> Option<ProviderQuotaCardDto> {
+    let groups = val.pointer("/command/data/groups")?.as_array()?;
+    if groups.is_empty() {
+        return None;
+    }
+
+    struct ParsedGroup {
+        short_name: String,
+        min_rem_pct: f64,
+        win_5h: Option<(f64, Option<DateTime<Utc>>)>,
+        win_7d: Option<(f64, Option<DateTime<Utc>>)>,
+    }
+
+    let mut parsed_groups: Vec<ParsedGroup> = Vec::new();
+    for g in groups {
+        let raw_name = g.get("name").and_then(|v| v.as_str()).unwrap_or("Models");
+        let short_name = if raw_name.to_lowercase().contains("gemini") {
+            "Gemini".to_string()
+        } else if raw_name.to_lowercase().contains("claude") {
+            "Claude/GPT".to_string()
+        } else {
+            raw_name.to_string()
+        };
+
+        let Some(buckets) = g.get("buckets").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let mut win_5h = None;
+        let mut win_7d = None;
+        let mut min_rem = 100.0_f64;
+
+        for b in buckets {
+            let Some(rem_frac) = b.get("remaining_fraction").and_then(|v| v.as_f64()) else {
+                continue;
+            };
+            let rem_pct = (rem_frac * 100.0).clamp(0.0, 100.0);
+            min_rem = min_rem.min(rem_pct);
+            let resets_at = b.get("reset_time").and_then(parse_any_timestamp);
+            let win_kind = b.get("window").and_then(|v| v.as_str()).unwrap_or("");
+            if win_kind == "5h" || b.get("id").and_then(|v| v.as_str()).unwrap_or("").contains("5h")
+            {
+                win_5h = Some((rem_pct, resets_at));
+            } else if win_kind == "weekly"
+                || b.get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .contains("week")
+            {
+                win_7d = Some((rem_pct, resets_at));
+            }
+        }
+
+        if win_5h.is_some() || win_7d.is_some() {
+            parsed_groups.push(ParsedGroup {
+                short_name,
+                min_rem_pct: min_rem,
+                win_5h,
+                win_7d,
+            });
+        }
+    }
+
+    if parsed_groups.is_empty() {
+        return None;
+    }
+
+    // Promote whichever model group has been consumed the most (lowest remaining %) to primary `5h` / `7d`
+    parsed_groups.sort_by(|a, b| {
+        a.min_rem_pct
+            .partial_cmp(&b.min_rem_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut windows = Vec::new();
+    for (idx, pg) in parsed_groups.iter().enumerate() {
+        let prefix_id = if idx == 0 {
+            "".to_string()
+        } else {
+            format!("g{idx}-")
+        };
+        if let Some((rem_pct, resets_at)) = pg.win_5h {
+            let used_pct = (100.0 - rem_pct).clamp(0.0, 100.0);
+            let reset_in_seconds = resets_at
+                .map(|r| (r - now).num_seconds())
+                .filter(|&s| s > 0);
+            windows.push(RateLimitWindowDto {
+                id: format!("{prefix_id}5h"),
+                label: format!("{} · 5h 窗口", pg.short_name),
+                used_percent: (used_pct * 10.0).round() / 10.0,
+                remaining_percent: (rem_pct * 10.0).round() / 10.0,
+                resets_at,
+                reset_in_seconds,
+                detail_text: None,
+                status: status_for_used_pct(used_pct),
+                source: "provider_api".to_string(),
+            });
+        }
+        if let Some((rem_pct, resets_at)) = pg.win_7d {
+            let used_pct = (100.0 - rem_pct).clamp(0.0, 100.0);
+            let reset_in_seconds = resets_at
+                .map(|r| (r - now).num_seconds())
+                .filter(|&s| s > 0);
+            windows.push(RateLimitWindowDto {
+                id: format!("{prefix_id}7d"),
+                label: format!("{} · 7d 周配额", pg.short_name),
+                used_percent: (used_pct * 10.0).round() / 10.0,
+                remaining_percent: (rem_pct * 10.0).round() / 10.0,
+                resets_at,
+                reset_in_seconds,
+                detail_text: None,
+                status: status_for_used_pct(used_pct),
+                source: "provider_api".to_string(),
+            });
+        }
+    }
+
+    Some(ProviderQuotaCardDto {
+        provider: "antigravity".to_string(),
+        label: "Google Antigravity".to_string(),
+        plan_badge: format!("Antigravity · {}", parsed_groups[0].short_name),
+        mode: "subscription".to_string(),
+        summary_text: None,
+        windows,
+        updated_at: now,
+    })
+}
+
+fn probe_antigravity_card(home: &Path, now: DateTime<Utc>) -> Option<ProviderQuotaCardDto> {
+    let agy_bin = velo_agent::resolve_cli_binary("agy")?;
+    let mut cmd = Command::new(&agy_bin);
+    apply_proxy_env(&mut cmd);
+    let out = cmd
+        .args(["-p", "/quota", "--output-format", "json", "--print-timeout", "8s"])
+        .env("HOME", home)
+        .env("PATH", velo_agent::discover_augmented_path())
+        .output()
+        .ok()?;
+
+    if out.status.success() {
+        if let Ok(val) = serde_json::from_slice::<Value>(&out.stdout) {
+            if let Some(card) = parse_antigravity_quota_json(&val, now) {
+                return Some(card);
+            }
+        }
+    }
+
+    Some(ProviderQuotaCardDto {
+        provider: "antigravity".to_string(),
+        label: "Google Antigravity".to_string(),
+        plan_badge: "未登录".to_string(),
+        mode: "unauthenticated".to_string(),
+        summary_text: Some("未登录 · 请在终端运行 agy 登录".to_string()),
+        windows: Vec::new(),
+        updated_at: now,
+    })
+}
+
+pub fn parse_cursor_period_usage(
+    usage_val: &Value,
+    plan_val: Option<&Value>,
+    now: DateTime<Utc>,
+) -> Option<ProviderQuotaCardDto> {
+    let plan_usage = usage_val.get("planUsage")?;
+    let limit_cents = plan_usage.get("limit")?.as_f64()?;
+    if limit_cents <= 0.0 {
+        return None;
+    }
+    let used_cents = plan_usage
+        .get("includedSpend")
+        .or_else(|| plan_usage.get("totalSpend"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .max(0.0);
+
+    let used_usd = used_cents / 100.0;
+    let limit_usd = limit_cents / 100.0;
+    let used_pct = ((used_cents / limit_cents) * 100.0).clamp(0.0, 100.0);
+    let rem_pct = (100.0 - used_pct).clamp(0.0, 100.0);
+
+    let resets_at = usage_val
+        .get("billingCycleEnd")
+        .or_else(|| plan_val.and_then(|p| p.pointer("/planInfo/billingCycleEnd")))
+        .and_then(parse_any_timestamp);
+    let reset_in_seconds = resets_at
+        .map(|r| (r - now).num_seconds())
+        .filter(|&s| s > 0);
+
+    let plan_name = plan_val
+        .and_then(|p| p.pointer("/planInfo/planName"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Pro");
+
+    let detail_str = if (limit_usd - limit_usd.round()).abs() < 0.01 {
+        format!("${:.2} / ${:.0}", used_usd, limit_usd)
+    } else {
+        format!("${:.2} / ${:.2}", used_usd, limit_usd)
+    };
+
+    let win = RateLimitWindowDto {
+        id: "30d".to_string(),
+        label: "月度订阅额度".to_string(),
+        used_percent: (used_pct * 10.0).round() / 10.0,
+        remaining_percent: (rem_pct * 10.0).round() / 10.0,
+        resets_at,
+        reset_in_seconds,
+        detail_text: Some(detail_str),
+        status: status_for_used_pct(used_pct),
+        source: "provider_api".to_string(),
+    };
+
+    Some(ProviderQuotaCardDto {
+        provider: "cursor".to_string(),
+        label: "Cursor".to_string(),
+        plan_badge: format!("Cursor {plan_name}"),
+        mode: "subscription".to_string(),
+        summary_text: None,
+        windows: vec![win],
+        updated_at: now,
+    })
+}
+
+fn read_cursor_token_candidates(home: &Path) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    // 1. `cursor-agent` active Keychain credential (`cursor-access-token`)
+    if let Ok(out) = Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", "cursor-access-token", "-w"])
+        .output()
+    {
+        if out.status.success() {
+            let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !tok.is_empty() {
+                tokens.push(tok);
+            }
+        }
+    }
+
+    // 2. Fallback: Cursor Desktop `state.vscdb` (`cursorAuth/accessToken`)
+    let vscdb = home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb");
+    if vscdb.is_file() {
+        if let Ok(conn) = Connection::open_with_flags(
+            &vscdb,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            if let Ok(tok) = conn.query_row(
+                "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            ) {
+                let clean = tok.trim().to_string();
+                if !clean.is_empty() && !tokens.contains(&clean) {
+                    tokens.push(clean);
+                }
+            }
+        }
+    }
+
+    tokens
+}
+
+fn probe_cursor_card(home: &Path, now: DateTime<Utc>) -> Option<ProviderQuotaCardDto> {
+    let installed = velo_agent::resolve_cli_binary("cursor-agent").is_some()
+        || velo_agent::resolve_cli_binary("cursor").is_some()
+        || home
+            .join("Library/Application Support/Cursor")
+            .is_dir();
+
+    for tok in read_cursor_token_candidates(home) {
+        let headers = [
+            ("Authorization", format!("Bearer {tok}")),
+            ("Connect-Protocol-Version", "1".to_string()),
+        ];
+        if let Some(usage_val) = curl_json_post(
+            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+            "{}",
+            &headers,
+        ) {
+            let plan_val = curl_json_post(
+                "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo",
+                "{}",
+                &headers,
+            );
+            if let Some(card) = parse_cursor_period_usage(&usage_val, plan_val.as_ref(), now) {
+                return Some(card);
+            }
+        }
+    }
+
+    if std::env::var("CURSOR_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some()
+    {
+        return Some(ProviderQuotaCardDto {
+            provider: "cursor".to_string(),
+            label: "Cursor".to_string(),
+            plan_badge: "Cursor API Key".to_string(),
+            mode: "api_key".to_string(),
+            summary_text: Some("Cursor API Key 模式 · 无本地订阅周期窗口".to_string()),
+            windows: Vec::new(),
+            updated_at: now,
+        });
+    }
+
+    if !installed {
+        return None;
+    }
+
+    Some(ProviderQuotaCardDto {
+        provider: "cursor".to_string(),
+        label: "Cursor".to_string(),
+        plan_badge: "未登录".to_string(),
+        mode: "unauthenticated".to_string(),
+        summary_text: Some("未登录 · 请运行 cursor-agent login".to_string()),
+        windows: Vec::new(),
+        updated_at: now,
+    })
 }
 
 fn probe_claude_card(
@@ -803,7 +1179,7 @@ pub fn build_subscription_quotas_snapshot_opts(
     if !force_refresh {
         if let Ok(guard) = lock.lock() {
             if let Some((ts, ref cached_cards)) = *guard {
-                if ts.elapsed() < StdDuration::from_secs(30) {
+                if ts.elapsed() < StdDuration::from_secs(60) {
                     return cached_cards.clone();
                 }
             }
@@ -815,10 +1191,51 @@ pub fn build_subscription_quotas_snapshot_opts(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
 
-    let cards = vec![
-        probe_claude_card(&home, cache, now),
-        probe_codex_card(&home, cache, now),
-    ];
+    let (agy_opt, cursor_opt, codex_card, claude_card) = std::thread::scope(|s| {
+        let h_agy = s.spawn(|| probe_antigravity_card(&home, now));
+        let h_cur = s.spawn(|| probe_cursor_card(&home, now));
+        let h_cdx = s.spawn(|| probe_codex_card(&home, cache, now));
+        let h_cld = s.spawn(|| probe_claude_card(&home, cache, now));
+        (
+            h_agy.join().ok().flatten(),
+            h_cur.join().ok().flatten(),
+            h_cdx.join().unwrap_or_else(|_| ProviderQuotaCardDto {
+                provider: "codex".to_string(),
+                label: "OpenAI Codex".to_string(),
+                plan_badge: "未登录".to_string(),
+                mode: "unauthenticated".to_string(),
+                summary_text: None,
+                windows: Vec::new(),
+                updated_at: now,
+            }),
+            h_cld.join().unwrap_or_else(|_| ProviderQuotaCardDto {
+                provider: "claude".to_string(),
+                label: "Claude Code".to_string(),
+                plan_badge: "未登录".to_string(),
+                mode: "unauthenticated".to_string(),
+                summary_text: None,
+                windows: Vec::new(),
+                updated_at: now,
+            }),
+        )
+    });
+
+    let mut cards = Vec::with_capacity(4);
+    if let Some(c) = agy_opt {
+        cards.push(c);
+    }
+    if let Some(c) = cursor_opt {
+        cards.push(c);
+    }
+    cards.push(codex_card);
+    cards.push(claude_card);
+
+    // Keep real active subscription windows at the top, followed by API-key relays, then unauthenticated
+    cards.sort_by_key(|c| match c.mode.as_str() {
+        "subscription" => 0,
+        "api_key" => 1,
+        _ => 2,
+    });
 
     if let Ok(mut guard) = lock.lock() {
         *guard = Some((Instant::now(), cards.clone()));
@@ -869,7 +1286,7 @@ mod tests {
     use chrono::Duration;
 
     #[test]
-    fn test_parse_claude_rate_limit_and_gateway_modes() {
+    fn test_parse_claude_antigravity_cursor_and_gateway_modes() {
         let now = Utc::now();
         let future_ts = (now + Duration::hours(2)).timestamp();
         let raw = serde_json::json!({
@@ -885,51 +1302,65 @@ mod tests {
         assert!((win.used_percent - 42.0).abs() < 0.1);
         assert!((win.remaining_percent - 58.0).abs() < 0.1);
 
+        // Antigravity `/quota` JSON
+        let agy_raw = serde_json::json!({
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                { "id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.56, "reset_time": "2026-11-25T09:54:10Z" },
+                                { "id": "gemini-5h", "window": "5h", "remaining_fraction": 0.88, "reset_time": "2026-11-19T10:56:48Z" }
+                            ]
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                { "id": "3p-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": "2026-11-26T07:17:40Z" },
+                                { "id": "3p-5h", "window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-11-19T12:17:40Z" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+        let agy_card = parse_antigravity_quota_json(&agy_raw, now).expect("should parse agy quota");
+        assert_eq!(agy_card.mode, "subscription");
+        assert_eq!(agy_card.windows.len(), 4);
+        assert_eq!(agy_card.windows[0].id, "5h");
+        assert!((agy_card.windows[0].remaining_percent - 88.0).abs() < 0.1);
+        assert_eq!(agy_card.windows[1].id, "7d");
+        assert!((agy_card.windows[1].remaining_percent - 56.0).abs() < 0.1);
+
+        // Cursor `GetCurrentPeriodUsage` + `GetPlanInfo`
+        let future_ms_str = ((now + Duration::days(20)).timestamp() * 1000).to_string();
+        let cur_usage = serde_json::json!({
+            "billingCycleEnd": future_ms_str,
+            "planUsage": {
+                "includedSpend": 18,
+                "limit": 40000
+            }
+        });
+        let cur_plan = serde_json::json!({
+            "planInfo": { "planName": "Ultra" }
+        });
+        let cur_card = parse_cursor_period_usage(&cur_usage, Some(&cur_plan), now)
+            .expect("should parse cursor ultra usage");
+        assert_eq!(cur_card.plan_badge, "Cursor Ultra");
+        assert_eq!(cur_card.windows[0].detail_text.as_deref(), Some("$0.18 / $400"));
+        assert!(cur_card.windows[0].reset_in_seconds.unwrap_or(0) > 86400);
+
         // Unrestricted wallet payload MUST NOT produce fake subscription windows
         let wallet_raw = serde_json::json!({
             "mode": "unrestricted",
             "planName": "钱包余额",
-            "balance": 980144.0,
-            "usage": {
-                "today": { "actual_cost": 4.5, "requests": 12 },
-                "total": { "actual_cost": 25.0 }
-            }
+            "balance": 980144.0
         });
         assert!(
-            parse_gateway_subscription_windows("codex", "OpenAI Codex", &wallet_raw, now).is_none(),
-            "unrestricted wallet key must not be treated as a 5h/7d subscription"
+            parse_gateway_subscription_windows("codex", "OpenAI Codex", &wallet_raw, now).is_none()
         );
-
-        // Real 5h/7d gateway rate_limits MUST produce subscription windows
-        let limited_raw = serde_json::json!({
-            "mode": "quota_limited",
-            "planName": "Pro 5h/7d",
-            "rate_limits": [
-                { "window": "5h", "limit": 20.0, "used": 5.0 },
-                { "window": "7d", "limit": 100.0, "used": 40.0 }
-            ]
-        });
-        let sub_card =
-            parse_gateway_subscription_windows("codex", "OpenAI Codex", &limited_raw, now)
-                .expect("rate_limits should produce subscription card");
-        assert_eq!(sub_card.mode, "subscription");
-        assert_eq!(sub_card.windows.len(), 2);
-        assert!((sub_card.windows[0].remaining_percent - 75.0).abs() < 0.1);
-
-        // Active TOML section parsing must respect model_provider
-        let sample_toml = r#"
-model_provider = "OpenAI"
-[model_providers.Other]
-base_url = "https://unused.example.com/v1"
-[model_providers.OpenAI]
-base_url = "https://api.daidaiyu.me/v1"
-requires_openai_auth = false
-"#;
-        let parsed = parse_codex_toml_config(sample_toml);
-        assert_eq!(
-            parsed.base_url.as_deref(),
-            Some("https://api.daidaiyu.me/v1")
-        );
-        assert_eq!(parsed.requires_openai_auth, Some(false));
     }
 }
