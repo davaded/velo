@@ -472,6 +472,98 @@ function parseAgentErrorBanner(
   };
 }
 
+const MAX_EVENTS_CACHE_BYTES = 512 * 1024; // 512 KB cap; SQLite WAL daemon is source of truth
+
+function safeStorageGet(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function purgeBloatedStorageCaches(): void {
+  try {
+    window.localStorage.removeItem("velo.events.v4");
+    window.localStorage.removeItem("velo.events.v3");
+    window.localStorage.removeItem("velo.events.v2");
+    window.localStorage.removeItem("velo.events.v1");
+    window.localStorage.removeItem("velo.repos.v2");
+  } catch {
+    // ignore
+  }
+}
+
+function safeStorageSet(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // WKWebView 5 MB localStorage quota exceeded — evict disposable event cache and retry once
+    purgeBloatedStorageCaches();
+    if (key === "velo.events.v4") return;
+    try {
+      window.localStorage.setItem(key, value);
+    } catch {
+      // Never throw out of a React render/effect
+    }
+  }
+}
+
+function compactEventsForLocalStorage(
+  eventsBySession: Record<string, AgentEvent[]>,
+  activeId: string
+): string | null {
+  try {
+    const keys = Object.keys(eventsBySession);
+    if (keys.length === 0) return "{}";
+    const prioritized = [
+      ...(activeId && eventsBySession[activeId] ? [activeId] : []),
+      ...keys.filter((k) => k !== activeId).slice(-4),
+    ];
+    const compact: Record<string, AgentEvent[]> = {};
+    for (const sid of prioritized) {
+      const list = eventsBySession[sid];
+      if (!Array.isArray(list) || list.length === 0) continue;
+      compact[sid] = list.slice(-20).map((ev) => ({
+        ...ev,
+        content:
+          typeof ev.content === "string" && ev.content.length > 1200
+            ? `${ev.content.slice(0, 1200)}…`
+            : ev.content,
+        tool_output:
+          typeof ev.tool_output === "string" && ev.tool_output.length > 600
+            ? `${ev.tool_output.slice(0, 600)}…`
+            : ev.tool_output,
+        tool_args:
+          typeof ev.tool_args === "string" && ev.tool_args.length > 400
+            ? `${ev.tool_args.slice(0, 400)}…`
+            : ev.tool_args,
+        tool_input: undefined,
+        images: Array.isArray(ev.images)
+          ? ev.images.filter((img) => typeof img === "string" && !img.startsWith("data:") && img.length < 512)
+          : undefined,
+      }));
+    }
+    const serialized = JSON.stringify(compact);
+    if (serialized.length > MAX_EVENTS_CACHE_BYTES) {
+      return null;
+    }
+    return serialized;
+  } catch {
+    return null;
+  }
+}
+
+// Self-heal bloated pre-existing localStorage event cache immediately on module load
+try {
+  const existingEventsRaw = window.localStorage.getItem("velo.events.v4");
+  if (existingEventsRaw && existingEventsRaw.length > MAX_EVENTS_CACHE_BYTES) {
+    purgeBloatedStorageCaches();
+  }
+} catch {
+  // ignore
+}
+
 export function App() {
   const [daemonUrl] = useState<string>(() => {
     const sp = new URLSearchParams(window.location.search);
@@ -500,12 +592,12 @@ export function App() {
 
   const [variant, setVariant] = useState<VariantId>("a");
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
-    const saved = localStorage.getItem("velo.themeMode");
+    const saved = safeStorageGet("velo.themeMode");
     if (saved === "light" || saved === "dark" || saved === "system") return saved;
     return "system";
   });
   const [tone, setTone] = useState<ToneId>(() => {
-    const saved = localStorage.getItem("velo.tone");
+    const saved = safeStorageGet("velo.tone");
     if (saved === "zinc" || saved === "claude" || saved === "paseo") return saved;
     return "zinc";
   });
@@ -528,8 +620,8 @@ export function App() {
     themeMode === "system" ? (systemDark ? "dark" : "light") : themeMode;
 
   useEffect(() => {
-    localStorage.setItem("velo.themeMode", themeMode);
-    localStorage.setItem("velo.tone", tone);
+    safeStorageSet("velo.themeMode", themeMode);
+    safeStorageSet("velo.tone", tone);
     document.documentElement.setAttribute("data-theme", resolvedTheme);
     document.documentElement.setAttribute("data-tone", tone);
 
@@ -550,16 +642,16 @@ export function App() {
   });
   const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
   const [autoCollapseSteps, setAutoCollapseSteps] = useState<boolean>(() => {
-    const saved = localStorage.getItem("velo.autoCollapseSteps");
+    const saved = safeStorageGet("velo.autoCollapseSteps");
     return saved === null ? true : saved !== "false";
   });
   useEffect(() => {
-    localStorage.setItem("velo.autoCollapseSteps", String(autoCollapseSteps));
+    safeStorageSet("velo.autoCollapseSteps", String(autoCollapseSteps));
   }, [autoCollapseSteps]);
   const [repos, setRepos] = useState<VeloRepo[]>(() => {
     try {
       const saved =
-        localStorage.getItem("velo.repos.v3") || localStorage.getItem("velo.repos.v2");
+        safeStorageGet("velo.repos.v3") || safeStorageGet("velo.repos.v2");
       if (saved) {
         const parsed = JSON.parse(saved) as VeloRepo[];
         if (Array.isArray(parsed) && parsed.length > 0) return parsed;
@@ -574,7 +666,7 @@ export function App() {
   // Core Sessions & Events (Persisted across restarts; zero fake demo threads)
   const [sessions, setSessions] = useState<VeloSession[]>(() => {
     try {
-      const saved = localStorage.getItem("velo.sessions.v3");
+      const saved = safeStorageGet("velo.sessions.v3");
       if (saved) {
         const parsed = (JSON.parse(saved) as VeloSession[]).filter(
           (s) => s.id !== "sess-default"
@@ -601,12 +693,12 @@ export function App() {
     return [];
   });
   const [activeId, setActiveId] = useState<string>(() => {
-    const saved = localStorage.getItem("velo.activeId.v3");
+    const saved = safeStorageGet("velo.activeId.v3");
     return saved && saved !== "sess-default" ? saved : "";
   });
   const [eventsBySession, setEventsBySession] = useState<Record<string, AgentEvent[]>>(() => {
     try {
-      const saved = localStorage.getItem("velo.events.v4");
+      const saved = safeStorageGet("velo.events.v4");
       if (saved) {
         const parsed = JSON.parse(saved) as Record<string, AgentEvent[]>;
         if (parsed && typeof parsed === "object") return parsed;
@@ -619,7 +711,7 @@ export function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem("velo.repos.v3", JSON.stringify(repos));
+      safeStorageSet("velo.repos.v3", JSON.stringify(repos));
     } catch {
       // ignore
     }
@@ -627,23 +719,24 @@ export function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem("velo.sessions.v3", JSON.stringify(sessions));
+      safeStorageSet("velo.sessions.v3", JSON.stringify(sessions));
     } catch {
       // ignore
     }
   }, [sessions]);
 
   useEffect(() => {
-    localStorage.setItem("velo.activeId.v3", activeId);
+    safeStorageSet("velo.activeId.v3", activeId);
   }, [activeId]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem("velo.events.v4", JSON.stringify(eventsBySession));
-    } catch {
-      // ignore
+    const compact = compactEventsForLocalStorage(eventsBySession, activeId);
+    if (compact !== null) {
+      safeStorageSet("velo.events.v4", compact);
+    } else {
+      purgeBloatedStorageCaches();
     }
-  }, [eventsBySession]);
+  }, [eventsBySession, activeId]);
 
   const [connected, setConnected] = useState<boolean>(false);
   const [runtimes, setRuntimes] = useState<LocalRuntimeDto[]>([
@@ -783,7 +876,7 @@ export function App() {
   const [chatFindQuery, setChatFindQuery] = useState<string>("");
   const [unreadSessionIds, setUnreadSessionIds] = useState<Record<string, boolean>>(() => {
     try {
-      const raw = localStorage.getItem("velo.unread.v1");
+      const raw = safeStorageGet("velo.unread.v1");
       return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
     } catch {
       return {};
@@ -791,7 +884,7 @@ export function App() {
   });
   useEffect(() => {
     try {
-      localStorage.setItem("velo.unread.v1", JSON.stringify(unreadSessionIds));
+      safeStorageSet("velo.unread.v1", JSON.stringify(unreadSessionIds));
     } catch {
       // ignore
     }
