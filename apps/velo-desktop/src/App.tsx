@@ -5416,10 +5416,10 @@ export function App() {
                   void loadOlderEventsForSession(activeSession.id);
                 }
               }}
-              className="w-full flex-1 overflow-y-auto px-3.5 py-4 sm:px-6 sm:py-6"
+              className="w-full flex-1 overflow-y-auto overflow-x-hidden px-3.5 py-4 sm:px-6 sm:py-6"
               data-testid="agent-chat-scroll"
             >
-              <div className="mx-auto flex max-w-[680px] flex-col gap-1.5">
+              <div className="mx-auto flex w-full min-w-0 max-w-[680px] flex-col gap-1.5">
                 {hasMoreHistoryBySession[activeSession.id] && (
                   <div className="mb-2 flex justify-center">
                     <button
@@ -5772,7 +5772,7 @@ export function App() {
                                 return (
                                   <div
                                     data-testid="user-message"
-                                    className="group mt-2 mb-0.5 flex flex-col items-end"
+                                    className="group mt-2 mb-0.5 flex min-w-0 max-w-full flex-col items-end"
                                   >
                                     <div
                                       onClick={() => {
@@ -5781,7 +5781,7 @@ export function App() {
                                         }
                                       }}
                                       title={!isSessionRunning ? "点击可编辑并重新发送" : undefined}
-                                      className={`max-w-[82%] whitespace-pre-wrap rounded-2xl rounded-tr-[4px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-[1.48] text-[var(--v-fg-primary)] transition-colors ${
+                                      className={`min-w-0 max-w-[82%] overflow-hidden whitespace-pre-wrap break-words [overflow-wrap:anywhere] rounded-2xl rounded-tr-[4px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-[1.48] text-[var(--v-fg-primary)] transition-colors ${
                                         !isSessionRunning
                                           ? "cursor-pointer hover:brightness-105"
                                           : ""

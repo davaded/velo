@@ -80,6 +80,8 @@ pub async fn spawn_codex_app_server(
 
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+    let alive_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let loop_alive = std::sync::Arc::clone(&alive_flag);
 
     let _ = event_tx.send(AgentEvent::StatusChanged {
         session_id,
@@ -911,6 +913,7 @@ pub async fn spawn_codex_app_server(
         }
 
         // Fallback if process exited before `turn/completed`
+        loop_alive.store(false, std::sync::atomic::Ordering::SeqCst);
         stderr_task.abort();
         let exit_ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
         if !emitted_final_message && !accumulated_message.trim().is_empty() {
@@ -937,5 +940,7 @@ pub async fn spawn_codex_app_server(
         pid,
         input_tx,
         kill_tx: Some(kill_tx),
+        alive: alive_flag,
+        warm_tx: None,
     })
 }

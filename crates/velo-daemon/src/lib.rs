@@ -690,7 +690,17 @@ impl DaemonState {
                 db_path.display()
             );
         }
-        let (sessions, event_history) = db.load_all()?;
+        let (mut sessions, event_history) = db.load_all()?;
+        for s in sessions.values_mut() {
+            if matches!(
+                s.status,
+                SessionStatus::Running | SessionStatus::WaitingForPermission
+            ) {
+                s.status = SessionStatus::Stopped;
+                s.pid = None;
+                let _ = db.upsert_session(s);
+            }
+        }
         let push_cfg = push::load_push_config(&push_config_file).await;
         let quota_cache = quota::load_quota_cache(&quota_cache_file);
         let remote_hosts = hosts::load_remote_hosts(&hosts_file);
@@ -4893,17 +4903,21 @@ impl DaemonState {
                 guard.warm_handles.remove(&id)
             };
             if let Some(mut warm) = warm_candidate.take() {
-                let can_reuse_warm = warm.provider == target_provider
+                let can_reuse_warm = warm.handle.is_alive()
+                    && warm.provider == target_provider
                     && warm.approval_mode == effective_approval
                     && (target_provider == AgentProvider::Codex
                         || (warm.model == effective_model && warm.effort == effective_effort));
                 if can_reuse_warm
-                    && warm.handle.try_send_warm_turn(
-                        &req.input,
-                        &req.images,
-                        effective_model.as_deref(),
-                        effective_effort.as_deref(),
-                    )
+                    && warm
+                        .handle
+                        .try_send_warm_turn(
+                            &req.input,
+                            &req.images,
+                            effective_model.as_deref(),
+                            effective_effort.as_deref(),
+                        )
+                        .await
                 {
                     let pid = warm.handle.pid;
                     {

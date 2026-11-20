@@ -1102,7 +1102,7 @@ export const BeautifulToolCallCard: React.FC<{
       ) : pres.kind === "shell" ? (
         <div className="max-h-[280px] overflow-auto px-3.5 py-2.5 font-mono-code text-[12px] leading-[1.55]">
           {pres.command && (
-            <div className="whitespace-pre-wrap" style={{ color: "var(--fg)" }}>
+            <div className="min-w-0 whitespace-pre-wrap break-words [overflow-wrap:anywhere]" style={{ color: "var(--fg)" }}>
               <span style={{ color: "var(--fg-muted)" }}>$ </span>
               {pres.command}
             </div>
@@ -1738,7 +1738,7 @@ export const PaseoMarkdown: React.FC<{
 
   return (
     <div
-      className={`w-full space-y-1.5 text-[13.5px] leading-[1.68] ${className}`}
+      className={`w-full min-w-0 space-y-1.5 break-words [overflow-wrap:anywhere] text-[13.5px] leading-[1.68] ${className}`}
       style={{ color: "var(--v-fg-body)" }}
     >
       {blocks.map((b, idx) =>

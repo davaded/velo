@@ -383,28 +383,68 @@ pub async fn detect_local_runtimes() -> Vec<LocalRuntimeInfo> {
     out
 }
 
+struct WarmTurnDispatch {
+    prompt: String,
+    images: Vec<String>,
+    ack: oneshot::Sender<bool>,
+}
+
 /// Handle to control an active agent process (send input or stop).
 pub struct AgentHandle {
     pub session_id: Uuid,
     pub pid: Option<u32>,
     input_tx: mpsc::UnboundedSender<String>,
     kill_tx: Option<oneshot::Sender<()>>,
+    alive: Arc<AtomicBool>,
+    warm_tx: Option<mpsc::UnboundedSender<WarmTurnDispatch>>,
 }
 
 impl AgentHandle {
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+            && (!self.input_tx.is_closed()
+                || self.warm_tx.as_ref().map(|t| !t.is_closed()).unwrap_or(false))
+    }
+
     pub fn send_input(&self, data: String) -> Result<()> {
         self.input_tx
             .send(data)
             .map_err(|_| anyhow::anyhow!("Agent input channel closed"))
     }
 
-    pub fn try_send_warm_turn(
+    /// Dispatches a follow-up turn to a warm persistent process and awaits real pipe write+flush
+    /// confirmation (never returning `true` on a dead/reaped warm process!).
+    pub async fn try_send_warm_turn(
         &self,
         prompt: &str,
         images: &[String],
         model: Option<&str>,
         effort: Option<&str>,
     ) -> bool {
+        if !self.alive.load(Ordering::SeqCst) {
+            return false;
+        }
+        if let Some(ref wtx) = self.warm_tx {
+            if wtx.is_closed() {
+                return false;
+            }
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if wtx
+                .send(WarmTurnDispatch {
+                    prompt: prompt.to_string(),
+                    images: images.to_vec(),
+                    ack: ack_tx,
+                })
+                .is_err()
+            {
+                return false;
+            }
+            return tokio::time::timeout(std::time::Duration::from_secs(3), ack_rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(false);
+        }
         if self.input_tx.is_closed() {
             return false;
         }
@@ -419,6 +459,7 @@ impl AgentHandle {
     }
 
     pub fn stop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
         if let Some(tx) = self.kill_tx.take() {
             let _ = tx.send(());
         }
@@ -680,9 +721,14 @@ impl AgentSpawner {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
         let turn_idle_warm = Arc::new(AtomicBool::new(false));
+        let alive_flag = Arc::new(AtomicBool::new(true));
+        let mut warm_tx_handle: Option<mpsc::UnboundedSender<WarmTurnDispatch>> = None;
+        let mut stdin_task: Option<tokio::task::JoinHandle<()>> = None;
 
         if is_warm_stream {
             if let Some(mut sin) = child_stdin.take() {
+                let (wtx, mut wrx) = mpsc::unbounded_channel::<WarmTurnDispatch>();
+                warm_tx_handle = Some(wtx);
                 let img_hint_tool = if is_warm_agy { "view_file" } else { "Read tool" };
                 let first_text = if images.is_empty() {
                     prompt.clone()
@@ -716,34 +762,27 @@ impl AgentSpawner {
 
                 let tx_warm = event_tx.clone();
                 let warm_flag = Arc::clone(&turn_idle_warm);
+                let stdin_alive = Arc::clone(&alive_flag);
                 let warm_prov_name = if is_warm_agy { "agy" } else { "claude" };
-                tokio::spawn(async move {
-                    while let Some(raw_in) = input_rx.recv().await {
-                        if let Ok(warm_cmd) = serde_json::from_str::<Value>(raw_in.trim()) {
-                            if warm_cmd.get("__velo_warm_turn").and_then(|v| v.as_bool()) == Some(true) {
-                                let w_prompt = warm_cmd.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-                                let w_imgs: Vec<String> = warm_cmd
-                                    .get("images")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-                                    .unwrap_or_default();
-                                let full_txt = if w_imgs.is_empty() {
-                                    w_prompt.to_string()
+                stdin_task = Some(tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            maybe_warm = wrx.recv() => {
+                                let Some(dispatch) = maybe_warm else { break; };
+                                if !stdin_alive.load(Ordering::SeqCst) {
+                                    let _ = dispatch.ack.send(false);
+                                    break;
+                                }
+                                let full_txt = if dispatch.images.is_empty() {
+                                    dispatch.prompt
                                 } else {
                                     format!(
                                         "{}\n\n[Attached local image(s) — inspect directly with {}: {}]",
-                                        w_prompt,
+                                        dispatch.prompt,
                                         img_hint_tool,
-                                        w_imgs.join(", ")
+                                        dispatch.images.join(", ")
                                     )
                                 };
-                                warm_flag.store(false, Ordering::SeqCst);
-                                let _ = tx_warm.send(AgentEvent::StatusChanged {
-                                    session_id,
-                                    status: SessionStatus::Running,
-                                    message: Some(format!("Agent `{}` hot turn resumed (0ms)", warm_prov_name)),
-                                    timestamp: Utc::now(),
-                                });
                                 let user_frame = if is_warm_agy {
                                     json!({
                                         "event": "user",
@@ -761,19 +800,40 @@ impl AgentSpawner {
                                         }
                                     })
                                 };
-                                if sin.write_all(format!("{}\n", user_frame).as_bytes()).await.is_err() {
+                                // Write + flush BEFORE confirming or emitting Running so EPIPE triggers clean cold-spawn fallback!
+                                let wrote_ok = sin
+                                    .write_all(format!("{}\n", user_frame).as_bytes())
+                                    .await
+                                    .is_ok()
+                                    && sin.flush().await.is_ok()
+                                    && stdin_alive.load(Ordering::SeqCst);
+                                if !wrote_ok {
+                                    stdin_alive.store(false, Ordering::SeqCst);
+                                    let _ = dispatch.ack.send(false);
                                     break;
                                 }
-                                let _ = sin.flush().await;
-                                continue;
+                                warm_flag.store(false, Ordering::SeqCst);
+                                let _ = tx_warm.send(AgentEvent::StatusChanged {
+                                    session_id,
+                                    status: SessionStatus::Running,
+                                    message: Some(format!("Agent `{}` hot turn resumed (0ms)", warm_prov_name)),
+                                    timestamp: Utc::now(),
+                                });
+                                let _ = dispatch.ack.send(true);
+                            }
+                            maybe_raw = input_rx.recv() => {
+                                let Some(raw_in) = maybe_raw else { break; };
+                                if !stdin_alive.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                if sin.write_all(raw_in.as_bytes()).await.is_err() || sin.flush().await.is_err() {
+                                    stdin_alive.store(false, Ordering::SeqCst);
+                                    break;
+                                }
                             }
                         }
-                        if sin.write_all(raw_in.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        let _ = sin.flush().await;
                     }
-                });
+                }));
             }
         } else {
             // Non-warm single-turn providers drop `input_rx` so `try_send_warm_turn` returns false immediately
@@ -999,6 +1059,7 @@ impl AgentSpawner {
         let tx_status = event_tx.clone();
         let provider_exit = provider.clone();
         let sup_warm_flag = Arc::clone(&turn_idle_warm);
+        let sup_alive = Arc::clone(&alive_flag);
         tokio::spawn(async move {
             tokio::select! {
                 _ = async {
@@ -1012,6 +1073,10 @@ impl AgentSpawner {
                         }
                     }
                 }, if is_warm_stream => {
+                    sup_alive.store(false, Ordering::SeqCst);
+                    if let Some(t) = stdin_task.take() {
+                        t.abort();
+                    }
                     stdout_task.abort();
                     stderr_task.abort();
                     #[cfg(unix)]
@@ -1025,6 +1090,10 @@ impl AgentSpawner {
                 }
                 _ = &mut kill_rx => {
                     info!("Stopping agent session {} (pid={:?})", session_id, pid);
+                    sup_alive.store(false, Ordering::SeqCst);
+                    if let Some(t) = stdin_task.take() {
+                        t.abort();
+                    }
                     stdout_task.abort();
                     stderr_task.abort();
                     #[cfg(unix)]
@@ -1043,6 +1112,10 @@ impl AgentSpawner {
                     });
                 }
                 status_res = child.wait() => {
+                    sup_alive.store(false, Ordering::SeqCst);
+                    if let Some(t) = stdin_task.take() {
+                        t.abort();
+                    }
                     // Allow stdout/stderr tasks a brief moment to flush final lines before checking fallback
                     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                     match status_res {
@@ -1106,6 +1179,8 @@ impl AgentSpawner {
             pid,
             input_tx,
             kill_tx: Some(kill_tx),
+            alive: alive_flag,
+            warm_tx: warm_tx_handle,
         })
     }
 
@@ -1238,6 +1313,8 @@ impl AgentSpawner {
             pid,
             input_tx,
             kill_tx: Some(kill_tx),
+            alive: Arc::new(AtomicBool::new(true)),
+            warm_tx: None,
         })
     }
 
@@ -3252,6 +3329,28 @@ mod tests {
         assert_eq!(
             resolve_agy_model_and_effort(Some("gpt-oss-120b-medium"), Some("high")),
             (Some("gpt-oss-120b".to_string()), Some("medium".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dead_warm_handle_rejects_turn_cleanly() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel::<String>();
+        let (warm_tx, _warm_rx) = mpsc::unbounded_channel::<WarmTurnDispatch>();
+        let (kill_tx, _kill_rx) = oneshot::channel::<()>();
+        let alive = Arc::new(AtomicBool::new(false));
+        let handle = AgentHandle {
+            session_id: Uuid::new_v4(),
+            pid: Some(999999),
+            input_tx,
+            kill_tx: Some(kill_tx),
+            alive,
+            warm_tx: Some(warm_tx),
+        };
+        assert!(!handle.is_alive());
+        assert!(
+            !handle
+                .try_send_warm_turn("hello after reap", &[], None, None)
+                .await
         );
     }
 }

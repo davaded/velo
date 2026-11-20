@@ -87,6 +87,8 @@ pub async fn spawn_acp_agent(
     });
 
     let wt_clone = worktree_path.clone();
+    let alive_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let loop_alive = std::sync::Arc::clone(&alive_flag);
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
 
@@ -396,6 +398,7 @@ pub async fn spawn_acp_agent(
         }
 
         let status = child.wait().await;
+        loop_alive.store(false, std::sync::atomic::Ordering::SeqCst);
         let ok = status.map(|s| s.success()).unwrap_or(false);
         if ok && !accumulated_text.trim().is_empty() {
             let _ = event_tx.send(AgentEvent::MessageDelta {
@@ -421,6 +424,8 @@ pub async fn spawn_acp_agent(
         pid,
         input_tx,
         kill_tx: Some(kill_tx),
+        alive: alive_flag,
+        warm_tx: None,
     })
 }
 
