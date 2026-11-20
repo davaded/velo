@@ -125,7 +125,7 @@ export function pickFeaturedModelsForEngine(
       add(inEngine.find((m) => !seen.has(m.id) && pat.test(m.id)));
     }
   } else if (engine === "agy") {
-    const priorityPatterns = [/neon-high/i, /carbon-high/i, /opus.*high/i, /sonnet/i, /flash/i];
+    const priorityPatterns = [/neon/i, /carbon/i, /opus/i, /sonnet/i, /flash/i];
     for (const pat of priorityPatterns) {
       if (picked.length >= maxCount) break;
       add(inEngine.find((m) => !seen.has(m.id) && pat.test(m.id)));

@@ -538,6 +538,8 @@ public struct VeloModelOption: Identifiable, Codable, Equatable, Sendable {
     public let desc: String
     public let installed: Bool
     public let isDefault: Bool
+    public let supportedEfforts: [String]?
+    public let defaultEffort: String?
 
     public init(
         id: String,
@@ -547,7 +549,9 @@ public struct VeloModelOption: Identifiable, Codable, Equatable, Sendable {
         agentKind: String,
         desc: String = "",
         installed: Bool = true,
-        isDefault: Bool = false
+        isDefault: Bool = false,
+        supportedEfforts: [String]? = nil,
+        defaultEffort: String? = nil
     ) {
         self.id = id
         self.label = label
@@ -557,6 +561,25 @@ public struct VeloModelOption: Identifiable, Codable, Equatable, Sendable {
         self.desc = desc
         self.installed = installed
         self.isDefault = isDefault
+        self.supportedEfforts = supportedEfforts
+        self.defaultEffort = defaultEffort
+    }
+
+    public var resolvedSupportedEfforts: [String] {
+        if let supportedEfforts {
+            return supportedEfforts
+        }
+        return category.supportedEfforts
+    }
+
+    public func alignedEffort(from current: String) -> String {
+        let supported = resolvedSupportedEfforts
+        guard !supported.isEmpty else { return "medium" }
+        if supported.contains(current) { return current }
+        if let def = defaultEffort, supported.contains(def) { return def }
+        if supported.contains("high") { return "high" }
+        if supported.contains("medium") { return "medium" }
+        return supported[0]
     }
 
     public var category: VeloEngineCategory {

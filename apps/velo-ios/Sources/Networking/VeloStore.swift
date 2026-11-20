@@ -537,6 +537,8 @@ public final class VeloStore: ObservableObject {
             let desc = (item["desc"] as? String) ?? ""
             let installed = (item["installed"] as? Bool) ?? true
             let isDefault = (item["isDefault"] as? Bool) ?? false
+            let supportedEfforts = item["supportedEfforts"] as? [String]
+            let defaultEffort = item["defaultEffort"] as? String
             return VeloModelOption(
                 id: id,
                 label: label,
@@ -545,7 +547,9 @@ public final class VeloStore: ObservableObject {
                 agentKind: kind,
                 desc: desc,
                 installed: installed,
-                isDefault: isDefault
+                isDefault: isDefault,
+                supportedEfforts: supportedEfforts,
+                defaultEffort: defaultEffort
             )
         }
         if !parsed.isEmpty {

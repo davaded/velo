@@ -9,7 +9,7 @@ export type AgentKind =
   | "qwen"
   | string;
 export type ApprovalMode = "auto_edit" | "ask_before_edit" | "bypass";
-export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "ultra" | "max";
+export type EffortLevel = "none" | "low" | "medium" | "high" | "xhigh" | "ultra" | "max";
 
 export interface ModelOption {
   id: string;
@@ -30,6 +30,8 @@ export interface ModelOption {
   desc: string;
   installed?: boolean;
   isDefault?: boolean;
+  supportedEfforts?: EffortLevel[];
+  defaultEffort?: EffortLevel | null;
 }
 
 export const MODEL_CATALOG: ModelOption[] = [
@@ -192,41 +194,49 @@ export const MODEL_CATALOG: ModelOption[] = [
   },
   // Google Antigravity CLI (`agy` — curl -fsSL https://antigravity.google/cli/install.sh | bash)
   {
-    id: "gemini-4-carbon-high",
-    label: "Gemini 4 Carbon (High)",
-    shortLabel: "Gemini 4 Carbon High",
+    id: "gemini-4-neon",
+    label: "Gemini 4 Neon",
+    shortLabel: "Gemini 4 Neon",
     family: "Google Antigravity",
     runtimeId: "agy",
     agentKind: "agy",
-    desc: "Google Antigravity CLI (`agy`) · Gemini 4 Carbon flagship coding & reasoning",
+    desc: "Google Antigravity CLI (`agy`) · Gemini 4 Neon flagship coding & reasoning",
     isDefault: true,
+    supportedEfforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "high",
   },
   {
-    id: "gemini-4-carbon-medium",
-    label: "Gemini 4 Carbon (Medium)",
+    id: "gemini-4-carbon",
+    label: "Gemini 4 Carbon",
     shortLabel: "Gemini 4 Carbon",
     family: "Google Antigravity",
     runtimeId: "agy",
     agentKind: "agy",
-    desc: "Google Antigravity CLI (`agy`) · Balanced speed and reasoning depth",
+    desc: "Google Antigravity CLI (`agy`) · Gemini 4 Carbon balanced reasoning",
+    supportedEfforts: ["low", "medium", "high"],
+    defaultEffort: "high",
   },
   {
-    id: "gemini-4-argon-high",
-    label: "Gemini 4 Argon (High)",
-    shortLabel: "Gemini 4 Argon High",
+    id: "gemini-4-argon",
+    label: "Gemini 4 Argon",
+    shortLabel: "Gemini 4 Argon",
     family: "Google Antigravity",
     runtimeId: "agy",
     agentKind: "agy",
-    desc: "Google Antigravity CLI (`agy`) · Gemini 4 Argon high-effort reasoning",
+    desc: "Google Antigravity CLI (`agy`) · Gemini 4 Argon coding & analysis",
+    supportedEfforts: ["low", "medium", "high"],
+    defaultEffort: "high",
   },
   {
-    id: "gemini-3.8-flash-high",
-    label: "Gemini 3.8 Flash (High)",
+    id: "gemini-3.8-flash",
+    label: "Gemini 3.8 Flash",
     shortLabel: "Gemini 3.8 Flash",
     family: "Google Antigravity",
     runtimeId: "agy",
     agentKind: "agy",
     desc: "Google Antigravity CLI (`agy`) · Low-latency Flash agentic execution",
+    supportedEfforts: ["low", "medium", "high"],
+    defaultEffort: "high",
   },
   {
     id: "gpt-oss-120b-medium",

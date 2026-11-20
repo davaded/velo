@@ -1325,7 +1325,19 @@ impl AgentSpawner {
                     c.args(["--model", cli_model]);
                 }
                 if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
-                    c.args(["--effort", eff]);
+                    let mapped_eff = match eff.trim().to_lowercase().as_str() {
+                        "none" | "low" => "low",
+                        "medium" => "medium",
+                        "xhigh" | "max" | "ultra" => {
+                            if model.unwrap_or("").contains("haiku") {
+                                "high"
+                            } else {
+                                "max"
+                            }
+                        }
+                        _ => "high",
+                    };
+                    c.args(["--effort", mapped_eff]);
                 }
                 c
             }
@@ -1376,7 +1388,12 @@ impl AgentSpawner {
                         c.args(["-m", m]);
                     }
                     if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
-                        c.args(["-c", &format!("model_reasoning_effort=\"{}\"", eff)]);
+                        let mapped = if eff.trim().eq_ignore_ascii_case("none") {
+                            "low"
+                        } else {
+                            eff.trim()
+                        };
+                        c.args(["-c", &format!("model_reasoning_effort=\"{}\"", mapped)]);
                     }
                     for img in images {
                         if !img.trim().is_empty() {
@@ -1403,7 +1420,12 @@ impl AgentSpawner {
                         c.args(["-m", m]);
                     }
                     if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
-                        c.args(["-c", &format!("model_reasoning_effort=\"{}\"", eff)]);
+                        let mapped = if eff.trim().eq_ignore_ascii_case("none") {
+                            "low"
+                        } else {
+                            eff.trim()
+                        };
+                        c.args(["-c", &format!("model_reasoning_effort=\"{}\"", mapped)]);
                     }
                     for img in images {
                         if !img.trim().is_empty() {
@@ -1443,8 +1465,8 @@ impl AgentSpawner {
                     c.args(["-m", m]);
                 }
                 if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
-                    let mapped_eff = match eff.trim() {
-                        "low" => "low",
+                    let mapped_eff = match eff.trim().to_lowercase().as_str() {
+                        "none" | "low" => "low",
                         "medium" => "medium",
                         "xhigh" | "ultra" | "max" => "xhigh",
                         _ => "high",
@@ -1527,21 +1549,13 @@ impl AgentSpawner {
                     "stream-json",
                     "-p=",
                 ]);
-                if let Some(m) = model.filter(|s| {
-                    let t = s.trim();
-                    !t.is_empty() && t != "agy" && t != "agy-default" && t != "acp-gemini-cli"
-                }) {
-                    c.args(["--model", m]);
+                let (resolved_model, resolved_effort) =
+                    resolve_agy_model_and_effort(model, effort);
+                if let Some(m) = resolved_model {
+                    c.args(["--model", &m]);
                 }
-                if let Some(eff) = effort.filter(|s| !s.trim().is_empty()) {
-                    let mapped_eff = match eff.trim() {
-                        "low" => "low",
-                        "medium" => "medium",
-                        "xhigh" => "xhigh",
-                        "max" => "max",
-                        _ => "high",
-                    };
-                    c.args(["--effort", mapped_eff]);
+                if let Some(eff) = resolved_effort {
+                    c.args(["--effort", &eff]);
                 }
                 if approval_mode == "auto_edit" || approval_mode == "bypass" {
                     c.arg("--dangerously-skip-permissions");
@@ -2939,6 +2953,84 @@ fn kill_rx_guard_noop(tx: oneshot::Sender<()>) -> oneshot::Sender<()> {
     tx
 }
 
+/// Splits an Antigravity (`agy`) model slug into its canonical base model and optional embedded effort suffix
+/// (e.g. `gemini-4-neon-xhigh` -> `("gemini-4-neon", Some("xhigh"))`), and resolves the final non-conflicting
+/// `(--model, --effort)` pair accepted by `agy`.
+pub fn split_effort_suffix(slug: &str) -> (&str, Option<&str>) {
+    for suffix in ["-xhigh", "-medium", "-high", "-low", "-max", "-none"] {
+        if let Some(base) = slug.strip_suffix(suffix) {
+            if !base.is_empty() {
+                return (base, Some(&suffix[1..]));
+            }
+        }
+    }
+    (slug, None)
+}
+
+pub fn resolve_agy_model_and_effort(
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let raw_model = model
+        .map(str::trim)
+        .map(|t| t.strip_prefix("agy:").unwrap_or(t))
+        .filter(|t| !t.is_empty() && *t != "agy" && *t != "agy-default" && *t != "acp-gemini-cli");
+
+    let (base_model, embedded_effort) = match raw_model {
+        Some(m) => {
+            let (b, emb) = split_effort_suffix(m);
+            (Some(b.to_string()), emb.map(str::to_string))
+        }
+        None => (None, None),
+    };
+
+    // Orchestrator models in `agy` reject `--effort` completely.
+    if base_model
+        .as_deref()
+        .map(|m| m.contains("orchestrator"))
+        .unwrap_or(false)
+    {
+        return (base_model, None);
+    }
+
+    let desired = effort
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .or(embedded_effort);
+
+    let resolved_effort = desired.map(|eff| {
+        let m = base_model.as_deref().unwrap_or("");
+        if m == "gpt-oss-120b" {
+            return "medium".to_string();
+        }
+        let supports_xhigh = m.contains("neon") || m.contains("hydrogen");
+        let max_is_high_only = m.contains("carbon")
+            || m.contains("argon")
+            || m.contains("flash")
+            || m.starts_with("claude-");
+        match eff.as_str() {
+            "none" | "low" => "low".to_string(),
+            "medium" => "medium".to_string(),
+            "high" => "high".to_string(),
+            "xhigh" | "max" | "ultra" => {
+                if supports_xhigh {
+                    "xhigh".to_string()
+                } else if max_is_high_only {
+                    "high".to_string()
+                } else if eff == "ultra" {
+                    "max".to_string()
+                } else {
+                    eff
+                }
+            }
+            _ => "high".to_string(),
+        }
+    });
+
+    (base_model, resolved_effort)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3132,5 +3224,34 @@ mod tests {
             e,
             AgentEvent::MessageDelta { text, .. } if text == "All checks passed."
         )));
+    }
+
+    #[test]
+    fn test_resolve_agy_model_and_effort_never_conflicts() {
+        // Legacy suffixed slug + different effort must strip suffix cleanly so `agy` never conflicts
+        assert_eq!(
+            resolve_agy_model_and_effort(Some("gemini-4-neon-xhigh"), Some("medium")),
+            (Some("gemini-4-neon".to_string()), Some("medium".to_string()))
+        );
+        // Legacy suffixed slug with no explicit effort preserves embedded effort
+        assert_eq!(
+            resolve_agy_model_and_effort(Some("gemini-4-neon-xhigh"), None),
+            (Some("gemini-4-neon".to_string()), Some("xhigh".to_string()))
+        );
+        // Models whose max effort is `high` clamp `xhigh`/`max` down to `high`
+        assert_eq!(
+            resolve_agy_model_and_effort(Some("gemini-4-carbon"), Some("xhigh")),
+            (Some("gemini-4-carbon".to_string()), Some("high".to_string()))
+        );
+        // Orchestrator models reject `--effort` completely
+        assert_eq!(
+            resolve_agy_model_and_effort(Some("gemini-pro-orchestrator-neon"), Some("medium")),
+            (Some("gemini-pro-orchestrator-neon".to_string()), None)
+        );
+        // GPT-OSS 120B only supports medium
+        assert_eq!(
+            resolve_agy_model_and_effort(Some("gpt-oss-120b-medium"), Some("high")),
+            (Some("gpt-oss-120b".to_string()), Some("medium".to_string()))
+        );
     }
 }

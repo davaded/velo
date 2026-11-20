@@ -939,7 +939,8 @@ public struct ChatThreadView: View {
 
     private var floatingComposerDock: some View {
         let cat = activeModelOption.category
-        let supportedEfforts = cat.supportedEfforts
+        let supportedEfforts = activeModelOption.resolvedSupportedEfforts
+        let effectiveEffort = activeModelOption.alignedEffort(from: selectedEffort)
         let hasText = !draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let uploadedPaths = pendingImages.compactMap(\.uploadedPath)
         let isUploadingAny = pendingImages.contains(where: \.isUploading)
@@ -1225,38 +1226,40 @@ public struct ChatThreadView: View {
                 }
                 .buttonStyle(VeloPressableButtonStyle())
 
-                // Effort Quick Menu
-                Menu {
-                    ForEach(supportedEfforts, id: \.self) { level in
-                        Button {
-                            selectedEffort = level
-                            Task {
-                                await store.updateSessionModelAndEffort(
-                                    sessionId: sessionId,
-                                    modelOption: activeModelOption,
-                                    effort: level
-                                )
-                            }
-                        } label: {
-                            HStack {
-                                Text("推理强度 · \(level.uppercased())")
-                                if level == selectedEffort {
-                                    Image(systemName: "checkmark")
+                // Effort Quick Menu (Only shown when active model supports configurable effort)
+                if !supportedEfforts.isEmpty {
+                    Menu {
+                        ForEach(supportedEfforts, id: \.self) { level in
+                            Button {
+                                selectedEffort = level
+                                Task {
+                                    await store.updateSessionModelAndEffort(
+                                        sessionId: sessionId,
+                                        modelOption: activeModelOption,
+                                        effort: level
+                                    )
+                                }
+                            } label: {
+                                HStack {
+                                    Text("推理强度 · \(level.uppercased())")
+                                    if level == effectiveEffort {
+                                        Image(systemName: "checkmark")
+                                    }
                                 }
                             }
                         }
+                    } label: {
+                        HStack(spacing: 3.5) {
+                            Image(systemName: "dial.medium.fill")
+                                .font(.system(size: 10))
+                            Text(effectiveEffort.uppercased())
+                                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                     }
-                } label: {
-                    HStack(spacing: 3.5) {
-                        Image(systemName: "dial.medium.fill")
-                            .font(.system(size: 10))
-                        Text(selectedEffort.uppercased())
-                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                    }
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                 }
 
                 Spacer(minLength: 2)
@@ -1435,37 +1438,41 @@ private struct ModelAndHandoffSheet: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        // Effort Selector Card for Current Session
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("推理强度 (Effort)")
-                                .font(.system(size: 12, weight: .bold))
-                                .foregroundStyle(.secondary)
+                        // Effort Selector Card for Current Model
+                        let currentModelOpt = store.models.first(where: { $0.id == selectedModelId })
+                        let currentModelEfforts = currentModelOpt?.resolvedSupportedEfforts ?? currentCategory.supportedEfforts
+                        if !currentModelEfforts.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("推理强度 (Effort)")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundStyle(.secondary)
 
-                            HStack(spacing: 8) {
-                                ForEach(currentCategory.supportedEfforts, id: \.self) { lv in
-                                    let isSel = selectedEffort == lv
-                                    Button {
-                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                        selectedEffort = lv
-                                        if let curOpt = store.models.first(where: { $0.id == selectedModelId }) {
-                                            onSelectInPlace(curOpt, lv)
+                                HStack(spacing: 8) {
+                                    ForEach(currentModelEfforts, id: \.self) { lv in
+                                        let isSel = (currentModelOpt?.alignedEffort(from: selectedEffort) ?? selectedEffort) == lv
+                                        Button {
+                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                            selectedEffort = lv
+                                            if let curOpt = currentModelOpt {
+                                                onSelectInPlace(curOpt, lv)
+                                            }
+                                        } label: {
+                                            Text(lv.uppercased())
+                                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                                .foregroundStyle(isSel ? .white : .secondary)
+                                                .frame(maxWidth: .infinity)
+                                                .padding(.vertical, 8)
+                                                .background(
+                                                    isSel ? currentCategory.accentColor : VeloTheme.cardSurface(colorScheme),
+                                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                )
+                                                .overlay(
+                                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: isSel ? 0 : 0.8)
+                                                )
                                         }
-                                    } label: {
-                                        Text(lv.uppercased())
-                                            .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                            .foregroundStyle(isSel ? .white : .secondary)
-                                            .frame(maxWidth: .infinity)
-                                            .padding(.vertical, 8)
-                                            .background(
-                                                isSel ? currentCategory.accentColor : VeloTheme.cardSurface(colorScheme),
-                                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                            )
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                    .stroke(VeloTheme.hairline(colorScheme), lineWidth: isSel ? 0 : 0.8)
-                                            )
+                                        .buttonStyle(VeloPressableButtonStyle())
                                     }
-                                    .buttonStyle(VeloPressableButtonStyle())
                                 }
                             }
                         }
@@ -1509,9 +1516,7 @@ private struct ModelAndHandoffSheet: View {
                                         let isCurrent = m.id == selectedModelId && !requiresHandoff
                                         Button {
                                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                                            let eff = group.category.supportedEfforts.contains(selectedEffort)
-                                                ? selectedEffort
-                                                : (group.category.supportedEfforts.contains("high") ? "high" : "medium")
+                                            let eff = m.alignedEffort(from: selectedEffort)
                                             dismiss()
                                             if requiresHandoff {
                                                 onHandoffToEngine(m, eff)

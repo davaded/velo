@@ -2135,14 +2135,16 @@ impl DaemonState {
             .await;
         }
 
+        let (spawn_model, spawn_effort) =
+            resolve_cli_model_for_spawn(&provider, model, effort).await;
         let handle = match AgentSpawner::spawn_agent_turn_configured(
             session_id,
             provider,
             prompt,
             worktree_path,
             use_pty,
-            model,
-            effort,
+            spawn_model,
+            spawn_effort,
             None,
             images,
             approval_mode,
@@ -2379,21 +2381,133 @@ async fn health_handler() -> impl IntoResponse {
     }))
 }
 
-static AGY_MODELS_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<Vec<(String, String)>>>> =
+#[derive(Debug, Clone)]
+struct GroupedCliModel {
+    id: String,
+    label: String,
+    short_label: String,
+    supported_efforts: Vec<String>,
+    default_effort: Option<String>,
+    /// For engines like Cursor that encode reasoning effort inside `--model`, maps normalized effort -> exact CLI slug
+    effort_slugs: HashMap<String, String>,
+}
+
+const CANONICAL_EFFORT_ORDER: [&str; 7] = [
+    "none", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+fn sort_and_pick_default_effort(efforts: &mut Vec<String>) -> Option<String> {
+    efforts.sort_by_key(|e| {
+        CANONICAL_EFFORT_ORDER
+            .iter()
+            .position(|c| *c == e.as_str())
+            .unwrap_or(99)
+    });
+    efforts.dedup();
+    if efforts.is_empty() {
+        return None;
+    }
+    for pref in ["high", "medium", "low", "xhigh", "max", "none"] {
+        if efforts.iter().any(|e| e == pref) {
+            return Some(pref.to_string());
+        }
+    }
+    efforts.first().cloned()
+}
+
+fn clean_effort_words_from_label(raw: &str) -> String {
+    let mut s = raw
+        .replace("(Extra High)", "")
+        .replace("(XHigh)", "")
+        .replace("(Medium)", "")
+        .replace("(High)", "")
+        .replace("(Low)", "")
+        .replace("(Max)", "")
+        .replace("(None)", "")
+        .replace(" Extra High", "")
+        .replace(" XHigh", "");
+    let tokens: Vec<&str> = s
+        .split_whitespace()
+        .filter(|tok| {
+            !matches!(
+                *tok,
+                "Low" | "Medium" | "High" | "Max" | "None" | "XHigh"
+            )
+        })
+        .collect();
+    s = tokens.join(" ").trim().to_string();
+    if s.is_empty() {
+        raw.trim().to_string()
+    } else {
+        s
+    }
+}
+
+fn split_cursor_slug_effort(slug: &str) -> (String, Option<String>) {
+    // Handle `<base>-<effort>-thinking` (e.g. `claude-4.6-opus-high-thinking` -> `claude-4.6-opus-thinking`, Some("high"))
+    if let Some(prefix) = slug.strip_suffix("-thinking") {
+        for (suf, norm) in [
+            ("-extra-high", "xhigh"),
+            ("-xhigh", "xhigh"),
+            ("-medium", "medium"),
+            ("-high", "high"),
+            ("-low", "low"),
+            ("-max", "max"),
+            ("-none", "none"),
+        ] {
+            if let Some(base) = prefix.strip_suffix(suf) {
+                if !base.is_empty() {
+                    return (format!("{base}-thinking"), Some(norm.to_string()));
+                }
+            }
+        }
+    }
+    for (suf, norm) in [
+        ("-extra-high", "xhigh"),
+        ("-xhigh", "xhigh"),
+        ("-medium", "medium"),
+        ("-high", "high"),
+        ("-low", "low"),
+        ("-max", "max"),
+        ("-none", "none"),
+    ] {
+        if let Some(base) = slug.strip_suffix(suf) {
+            if !base.is_empty() {
+                return (base.to_string(), Some(norm.to_string()));
+            }
+        }
+    }
+    (slug.to_string(), None)
+}
+
+static AGY_MODELS_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<Vec<GroupedCliModel>>>> =
     std::sync::OnceLock::new();
 static AGY_MODELS_FETCHING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 static CURSOR_MODELS_CACHE: std::sync::OnceLock<
-    tokio::sync::RwLock<Option<Vec<(String, String)>>>,
+    tokio::sync::RwLock<Option<Vec<GroupedCliModel>>>,
 > = std::sync::OnceLock::new();
 static CURSOR_MODELS_FETCHING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn parse_cursor_models_stdout(raw: &str) -> Vec<(String, String)> {
-    let mut parsed = Vec::new();
+fn parse_cursor_models_stdout(raw: &str) -> Vec<GroupedCliModel> {
+    struct Acc {
+        base_slug: String,
+        label: String,
+        bare_slug: Option<String>,
+        effort_slugs: HashMap<String, String>,
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut map: HashMap<String, Acc> = HashMap::new();
+
     for line in raw.lines() {
-        let clean = line.trim().trim_start_matches('-').trim_start_matches('*').trim();
+        let clean = line
+            .trim()
+            .trim_start_matches('-')
+            .trim_start_matches('*')
+            .trim();
         if clean.is_empty()
             || clean.starts_with("Available")
             || clean.starts_with("Loading")
@@ -2402,7 +2516,6 @@ fn parse_cursor_models_stdout(raw: &str) -> Vec<(String, String)> {
         {
             continue;
         }
-        // Cursor `--list-models` formats lines like `gpt-5 - GPT-5` or `claude-sonnet-4-6 (default)` or bare `composer`
         let (slug_raw, label_opt) = if let Some((l, r)) = clean.split_once(" - ") {
             (l.trim(), Some(r.trim()))
         } else {
@@ -2420,17 +2533,76 @@ fn parse_cursor_models_stdout(raw: &str) -> Vec<(String, String)> {
         {
             continue;
         }
-        let display = match label_opt {
-            Some(lbl) if !lbl.starts_with('(') => format!("Cursor · {}", lbl),
-            _ => format!("Cursor · {}", slug_raw),
+        // Skip duplicate `-fast` variants so every model appears once cleanly
+        if slug_raw.ends_with("-fast") {
+            continue;
+        }
+        let (base_slug, eff_opt) = split_cursor_slug_effort(slug_raw);
+        if base_slug == "auto" {
+            continue;
+        }
+        let raw_lbl = match label_opt {
+            Some(lbl) if !lbl.starts_with('(') => clean_effort_words_from_label(lbl),
+            _ => base_slug.clone(),
         };
-        parsed.push((format!("cursor:{}", slug_raw), display));
+
+        if !map.contains_key(&base_slug) {
+            order.push(base_slug.clone());
+            map.insert(
+                base_slug.clone(),
+                Acc {
+                    base_slug: base_slug.clone(),
+                    label: raw_lbl,
+                    bare_slug: None,
+                    effort_slugs: HashMap::new(),
+                },
+            );
+        }
+        if let Some(acc) = map.get_mut(&base_slug) {
+            if let Some(eff) = eff_opt {
+                acc.effort_slugs.entry(eff).or_insert_with(|| slug_raw.to_string());
+            } else {
+                acc.bare_slug = Some(slug_raw.to_string());
+            }
+        }
     }
-    parsed
+
+    let mut out = Vec::new();
+    for key in order {
+        let Some(mut acc) = map.remove(&key) else {
+            continue;
+        };
+        // If Cursor exposes bare slug (e.g. `gpt-5.3-codex`) alongside `-low`/`-high`, map bare -> `medium`
+        if let Some(bare) = acc.bare_slug.clone() {
+            if !acc.effort_slugs.is_empty() && !acc.effort_slugs.contains_key("medium") {
+                acc.effort_slugs.insert("medium".to_string(), bare);
+            }
+        }
+        let mut supported_efforts: Vec<String> = acc.effort_slugs.keys().cloned().collect();
+        let default_effort = sort_and_pick_default_effort(&mut supported_efforts);
+        let display = format!("Cursor · {}", acc.label);
+        out.push(GroupedCliModel {
+            id: format!("cursor:{}", acc.base_slug),
+            label: display,
+            short_label: acc.label,
+            supported_efforts,
+            default_effort,
+            effort_slugs: acc.effort_slugs,
+        });
+    }
+    out
 }
 
-fn parse_agy_models_stdout(raw: &str) -> Vec<(String, String)> {
-    let mut parsed = Vec::new();
+fn parse_agy_models_stdout(raw: &str) -> Vec<GroupedCliModel> {
+    struct Acc {
+        base_slug: String,
+        label: String,
+        efforts: Vec<String>,
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut map: HashMap<String, Acc> = HashMap::new();
+
     for raw_line in raw.lines() {
         let clean = raw_line.rsplit('\r').next().unwrap_or(raw_line).trim();
         if clean.is_empty() || clean.contains("Fetching available models") {
@@ -2448,14 +2620,123 @@ fn parse_agy_models_stdout(raw: &str) -> Vec<(String, String)> {
         {
             continue;
         }
-        let label = parts
+        let raw_label = parts
             .next()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(slug);
-        parsed.push((slug.to_string(), label.to_string()));
+        let (base_raw, eff_opt) = velo_agent::split_effort_suffix(slug);
+        let base_slug = base_raw.to_string();
+        let clean_label = clean_effort_words_from_label(raw_label);
+
+        if !map.contains_key(&base_slug) {
+            order.push(base_slug.clone());
+            map.insert(
+                base_slug.clone(),
+                Acc {
+                    base_slug: base_slug.clone(),
+                    label: clean_label,
+                    efforts: Vec::new(),
+                },
+            );
+        }
+        if let Some(acc) = map.get_mut(&base_slug) {
+            if let Some(eff) = eff_opt {
+                if !acc.efforts.iter().any(|e| e == eff) {
+                    acc.efforts.push(eff.to_string());
+                }
+            }
+        }
     }
-    parsed
+
+    let mut out = Vec::new();
+    for key in order {
+        let Some(mut acc) = map.remove(&key) else {
+            continue;
+        };
+        let default_effort = sort_and_pick_default_effort(&mut acc.efforts);
+        // Prefix Antigravity's Claude models with `agy:` so IDs never collide with Anthropic Claude Code
+        let id = if acc.base_slug.starts_with("claude-") {
+            format!("agy:{}", acc.base_slug)
+        } else {
+            acc.base_slug.clone()
+        };
+        out.push(GroupedCliModel {
+            id,
+            label: acc.label.clone(),
+            short_label: acc.label,
+            supported_efforts: acc.efforts,
+            default_effort,
+            effort_slugs: HashMap::new(),
+        });
+    }
+    out
+}
+
+async fn resolve_cli_model_for_spawn(
+    provider: &AgentProvider,
+    model: Option<String>,
+    effort: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match provider {
+        AgentProvider::Antigravity => {
+            velo_agent::resolve_agy_model_and_effort(model.as_deref(), effort.as_deref())
+        }
+        AgentProvider::Cursor => {
+            let Some(raw_m) = model.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                return (model, None);
+            };
+            let stripped = raw_m.strip_prefix("cursor:").unwrap_or(raw_m);
+            if stripped == "auto" || stripped == "default" || stripped == "cursor" {
+                return (Some(format!("cursor:{stripped}")), None);
+            }
+            let (base_slug, embedded_eff) = split_cursor_slug_effort(stripped);
+            let desired_eff = effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_lowercase())
+                .or(embedded_eff);
+
+            let cache_lock = CURSOR_MODELS_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
+            if let Some(list) = cache_lock.read().await.as_ref() {
+                let target_id = format!("cursor:{base_slug}");
+                if let Some(entry) = list.iter().find(|m| m.id == target_id) {
+                    if entry.effort_slugs.is_empty() {
+                        return (Some(target_id), None);
+                    }
+                    if let Some(ref eff) = desired_eff {
+                        if let Some(exact) = entry.effort_slugs.get(eff) {
+                            return (Some(format!("cursor:{exact}")), None);
+                        }
+                        // Clamp to closest supported effort along canonical ladder
+                        let target_rank = CANONICAL_EFFORT_ORDER
+                            .iter()
+                            .position(|c| *c == eff.as_str())
+                            .unwrap_or(3) as isize;
+                        if let Some(best_eff) = entry.supported_efforts.iter().min_by_key(|e| {
+                            let r = CANONICAL_EFFORT_ORDER
+                                .iter()
+                                .position(|c| *c == e.as_str())
+                                .unwrap_or(3) as isize;
+                            (r - target_rank).abs()
+                        }) {
+                            if let Some(exact) = entry.effort_slugs.get(best_eff) {
+                                return (Some(format!("cursor:{exact}")), None);
+                            }
+                        }
+                    }
+                    if let Some(def_eff) = entry.default_effort.as_deref() {
+                        if let Some(exact) = entry.effort_slugs.get(def_eff) {
+                            return (Some(format!("cursor:{exact}")), None);
+                        }
+                    }
+                }
+            }
+            (Some(raw_m.to_string()), None)
+        }
+        _ => (model, effort),
+    }
 }
 
 async fn list_runtimes_handler() -> impl IntoResponse {
@@ -2479,6 +2760,11 @@ pub(crate) async fn build_models_catalog_json() -> Value {
     // 1. Discover Anthropic / Claude Code models from local ~/.claude.json & Claude Desktop config
     let mut push_claude = |id: &str, label: &str, short_label: &str, desc: &str, is_default: bool| {
         if seen_ids.insert(id.to_string()) {
+            let efforts: Vec<&str> = if id.contains("haiku") {
+                vec!["low", "medium", "high"]
+            } else {
+                vec!["low", "medium", "high", "max"]
+            };
             models.push(json!({
                 "id": id,
                 "label": label,
@@ -2488,6 +2774,8 @@ pub(crate) async fn build_models_catalog_json() -> Value {
                 "runtimeId": "claude",
                 "desc": desc,
                 "isDefault": is_default,
+                "supportedEfforts": efforts,
+                "defaultEffort": "high",
             }));
         }
     };
@@ -2586,7 +2874,8 @@ pub(crate) async fn build_models_catalog_json() -> Value {
         }
     }
 
-    let mut codex_entries: Vec<(String, String, String, bool)> = Vec::new();
+    let mut codex_entries: Vec<(String, String, String, bool, Vec<String>, Option<String>)> =
+        Vec::new();
     for file_name in ["codex-models.json", "models_cache.json"] {
         let p = codex_dir.join(file_name);
         if let Ok(raw) = tokio::fs::read_to_string(&p).await {
@@ -2613,12 +2902,42 @@ pub(crate) async fn build_models_catalog_json() -> Value {
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                             .unwrap_or("Codex CLI model");
+                        let mut efforts: Vec<String> = item
+                            .get("supported_reasoning_levels")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|e| {
+                                        e.get("effort")
+                                            .and_then(|x| x.as_str())
+                                            .or_else(|| e.as_str())
+                                            .map(|s| s.to_lowercase())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if efforts.is_empty() {
+                            efforts = vec![
+                                "low".to_string(),
+                                "medium".to_string(),
+                                "high".to_string(),
+                                "xhigh".to_string(),
+                            ];
+                        }
+                        let def_eff = item
+                            .get("default_reasoning_level")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_lowercase())
+                            .or_else(|| sort_and_pick_default_effort(&mut efforts));
+                        let _ = sort_and_pick_default_effort(&mut efforts);
                         let is_def = slug == default_codex_model;
                         codex_entries.push((
                             slug.to_string(),
                             display.to_string(),
                             desc.to_string(),
                             is_def,
+                            efforts,
+                            def_eff,
                         ));
                     }
                 }
@@ -2629,7 +2948,7 @@ pub(crate) async fn build_models_catalog_json() -> Value {
     // Sort so default_codex_model (e.g. gpt-6.1-sol) is first among Codex models
     codex_entries.sort_by(|a, b| b.3.cmp(&a.3));
 
-    for (slug, display, desc, is_def) in codex_entries {
+    for (slug, display, desc, is_def, efforts, def_eff) in codex_entries {
         if seen_ids.insert(slug.clone()) {
             models.push(json!({
                 "id": slug,
@@ -2640,6 +2959,8 @@ pub(crate) async fn build_models_catalog_json() -> Value {
                 "runtimeId": "codex",
                 "desc": if is_def { format!("Default in ~/.codex/config.toml · {}", desc) } else { desc },
                 "isDefault": is_def,
+                "supportedEfforts": efforts,
+                "defaultEffort": def_eff.unwrap_or_else(|| default_codex_effort.clone()),
             }));
         }
     }
@@ -2680,51 +3001,82 @@ pub(crate) async fn build_models_catalog_json() -> Value {
         }
     }
 
-    let agy_entries: Vec<(String, String)> = cached_agy.unwrap_or_else(|| {
+    let agy_entries: Vec<GroupedCliModel> = cached_agy.unwrap_or_else(|| {
         vec![
-            (
-                "gemini-4-carbon-high".to_string(),
-                "Gemini 4 Carbon (High)".to_string(),
-            ),
-            (
-                "gemini-4-carbon-medium".to_string(),
-                "Gemini 4 Carbon (Medium)".to_string(),
-            ),
-            (
-                "gemini-4-argon-high".to_string(),
-                "Gemini 4 Argon (High)".to_string(),
-            ),
-            (
-                "gemini-3.8-flash-high".to_string(),
-                "Gemini 3.8 Flash (High)".to_string(),
-            ),
-            (
-                "gpt-oss-120b-medium".to_string(),
-                "GPT-OSS 120B (Medium)".to_string(),
-            ),
+            GroupedCliModel {
+                id: "gemini-4-neon".to_string(),
+                label: "Gemini 4 Neon".to_string(),
+                short_label: "Gemini 4 Neon".to_string(),
+                supported_efforts: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ],
+                default_effort: Some("high".into()),
+                effort_slugs: HashMap::new(),
+            },
+            GroupedCliModel {
+                id: "gemini-4-carbon".to_string(),
+                label: "Gemini 4 Carbon".to_string(),
+                short_label: "Gemini 4 Carbon".to_string(),
+                supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+                default_effort: Some("high".into()),
+                effort_slugs: HashMap::new(),
+            },
+            GroupedCliModel {
+                id: "gemini-4-argon".to_string(),
+                label: "Gemini 4 Argon".to_string(),
+                short_label: "Gemini 4 Argon".to_string(),
+                supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+                default_effort: Some("high".into()),
+                effort_slugs: HashMap::new(),
+            },
+            GroupedCliModel {
+                id: "gemini-3.8-flash".to_string(),
+                label: "Gemini 3.8 Flash".to_string(),
+                short_label: "Gemini 3.8 Flash".to_string(),
+                supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+                default_effort: Some("high".into()),
+                effort_slugs: HashMap::new(),
+            },
+            GroupedCliModel {
+                id: "agy:claude-opus-5-5".to_string(),
+                label: "Claude Opus 5.5".to_string(),
+                short_label: "Claude Opus 5.5".to_string(),
+                supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+                default_effort: Some("high".into()),
+                effort_slugs: HashMap::new(),
+            },
+            GroupedCliModel {
+                id: "gpt-oss-120b".to_string(),
+                label: "GPT-OSS 120B".to_string(),
+                short_label: "GPT-OSS 120B".to_string(),
+                supported_efforts: vec!["medium".into()],
+                default_effort: Some("medium".into()),
+                effort_slugs: HashMap::new(),
+            },
         ]
     });
 
-    for (idx, (slug, display)) in agy_entries.into_iter().enumerate() {
-        if seen_ids.insert(slug.clone()) {
-            let short_lbl = display
-                .replace(" (Medium)", "")
-                .replace(" (High)", " High")
-                .replace(" (Low)", " Low");
+    for (idx, item) in agy_entries.into_iter().enumerate() {
+        if seen_ids.insert(item.id.clone()) {
             models.push(json!({
-                "id": slug,
-                "label": display,
-                "shortLabel": short_lbl,
+                "id": item.id,
+                "label": item.label,
+                "shortLabel": item.short_label,
                 "family": "Google Antigravity",
                 "agentKind": "agy",
                 "runtimeId": "agy",
                 "installed": agy_installed,
                 "desc": if agy_installed {
-                    "Installed · Google Antigravity CLI (`agy --output-format stream-json`)"
+                    "Installed · Google Antigravity CLI (`agy --model <base> --effort <level>`)"
                 } else {
                     "Install via `curl -fsSL https://antigravity.google/cli/install.sh | bash`"
                 },
                 "isDefault": idx == 0,
+                "supportedEfforts": item.supported_efforts,
+                "defaultEffort": item.default_effort,
             }));
         }
     }
@@ -2839,6 +3191,8 @@ pub(crate) async fn build_models_catalog_json() -> Value {
                     desc
                 },
                 "isDefault": is_def,
+                "supportedEfforts": ["low", "medium", "high", "xhigh"],
+                "defaultEffort": "high",
             }));
         }
     }
@@ -2879,56 +3233,86 @@ pub(crate) async fn build_models_catalog_json() -> Value {
         }
     }
 
-    let mut cursor_entries: Vec<(String, String, String, String, bool)> = vec![(
-        "cursor:auto".to_string(),
-        "Cursor Auto".to_string(),
-        "Cursor Auto".to_string(),
-        if cursor_installed {
-            "Installed · Cursor Agent CLI auto-router (`cursor-agent -p --output-format stream-json`)"
-                .to_string()
-        } else {
-            "Install Cursor CLI (`cursor-agent`)"
-                .to_string()
-        },
-        true,
-    )];
+    let mut cursor_entries: Vec<(String, String, String, String, bool, Vec<String>, Option<String>)> =
+        vec![(
+            "cursor:auto".to_string(),
+            "Cursor Auto".to_string(),
+            "Cursor Auto".to_string(),
+            if cursor_installed {
+                "Installed · Cursor Agent CLI auto-router (`cursor-agent -p --output-format stream-json`)"
+                    .to_string()
+            } else {
+                "Install Cursor CLI (`cursor-agent`)".to_string()
+            },
+            true,
+            Vec::new(),
+            None,
+        )];
 
     if let Some(dynamic_list) = cached_cursor {
-        for (id, display) in dynamic_list {
-            let short = display.replace("Cursor · ", "Cursor ");
+        for item in dynamic_list {
             cursor_entries.push((
-                id,
-                display,
-                short,
-                "Cursor Agent CLI model (`--list-models`)".to_string(),
+                item.id,
+                item.label,
+                item.short_label,
+                "Cursor Agent CLI model (推理强度自动映射到对应变体)".to_string(),
                 false,
+                item.supported_efforts,
+                item.default_effort,
             ));
         }
     } else {
-        for (id, label, short_lbl, desc) in [
+        for (id, label, short_lbl, desc, efforts, def_eff) in [
             (
-                "cursor:composer",
-                "Cursor Composer",
-                "Cursor Composer",
-                "Cursor native multi-file fast coding model (`--model composer`)",
+                "cursor:composer-2.5",
+                "Cursor · Composer 2.5",
+                "Composer 2.5",
+                "Cursor native multi-file fast coding model",
+                Vec::<String>::new(),
+                None,
             ),
             (
-                "cursor:claude-sonnet-4-6",
-                "Cursor · Claude Sonnet 4.6",
-                "Cursor Sonnet 4.6",
-                "Claude Sonnet 4.6 routed via Cursor Agent CLI",
+                "cursor:claude-opus-5-5",
+                "Cursor · Claude Opus 5.5 1M",
+                "Claude Opus 5.5 1M",
+                "Claude Opus 5.5 routed via Cursor Agent CLI",
+                vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                ],
+                Some("high".into()),
             ),
             (
-                "cursor:claude-opus-4-8",
-                "Cursor · Claude Opus 4.8",
-                "Cursor Opus 4.8",
-                "Claude Opus 4.8 routed via Cursor Agent CLI",
+                "cursor:claude-sonnet-5",
+                "Cursor · Claude Sonnet 5 1M",
+                "Claude Sonnet 5 1M",
+                "Claude Sonnet 5 routed via Cursor Agent CLI",
+                vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                ],
+                Some("high".into()),
             ),
             (
-                "cursor:gpt-5",
-                "Cursor · GPT-5",
-                "Cursor GPT-5",
-                "OpenAI GPT-5 routed via Cursor Agent CLI",
+                "cursor:gpt-5.6-sol",
+                "Cursor · GPT-5.6 Sol 1M",
+                "GPT-5.6 Sol 1M",
+                "OpenAI GPT-5.6 Sol routed via Cursor Agent CLI",
+                vec![
+                    "none".into(),
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                ],
+                Some("high".into()),
             ),
         ] {
             cursor_entries.push((
@@ -2937,11 +3321,13 @@ pub(crate) async fn build_models_catalog_json() -> Value {
                 short_lbl.to_string(),
                 desc.to_string(),
                 false,
+                efforts,
+                def_eff,
             ));
         }
     }
 
-    for (id, label, short_lbl, desc, is_def) in cursor_entries {
+    for (id, label, short_lbl, desc, is_def, efforts, def_eff) in cursor_entries {
         if seen_ids.insert(id.clone()) {
             models.push(json!({
                 "id": id,
@@ -2953,6 +3339,8 @@ pub(crate) async fn build_models_catalog_json() -> Value {
                 "installed": cursor_installed,
                 "desc": desc,
                 "isDefault": is_def,
+                "supportedEfforts": efforts,
+                "defaultEffort": def_eff,
             }));
         }
     }
@@ -4550,14 +4938,20 @@ impl DaemonState {
             }
         }
 
+        let (spawn_model, spawn_effort) = resolve_cli_model_for_spawn(
+            &target_provider,
+            effective_model.clone(),
+            effective_effort.clone(),
+        )
+        .await;
         let new_handle = match AgentSpawner::spawn_agent_turn_configured(
             id,
             target_provider.clone(),
             effective_prompt,
             wt_path,
             false,
-            effective_model.clone(),
-            effective_effort,
+            spawn_model,
+            spawn_effort,
             resume_session_id.clone(),
             req.images.clone(),
             effective_approval.clone(),
@@ -7345,6 +7739,58 @@ async fn ui_asset_handler(AxumPath(file): AxumPath<String>) -> impl IntoResponse
 mod tests {
     use super::*;
     use tokio::process::Command;
+
+    #[test]
+    fn test_parse_agy_and_cursor_grouped_models_with_efforts() {
+        let agy_raw = "\
+gemini-4-neon-high             Gemini 4 Neon (High)
+gemini-4-neon-xhigh            Gemini 4 Neon (XHigh)
+gemini-4-neon-medium           Gemini 4 Neon (Medium)
+gemini-4-neon-low              Gemini 4 Neon (Low)
+gemini-pro-orchestrator-neon   Orchestrator (Neon)
+claude-opus-5-5-low            Claude Opus 5.5 (Low)
+claude-opus-5-5-high           Claude Opus 5.5 (High)
+";
+        let agy = parse_agy_models_stdout(agy_raw);
+        assert_eq!(agy.len(), 3);
+        assert_eq!(agy[0].id, "gemini-4-neon");
+        assert_eq!(agy[0].label, "Gemini 4 Neon");
+        assert_eq!(agy[0].supported_efforts, vec!["low", "medium", "high", "xhigh"]);
+        assert_eq!(agy[1].id, "gemini-pro-orchestrator-neon");
+        assert!(agy[1].supported_efforts.is_empty());
+        assert_eq!(agy[2].id, "agy:claude-opus-5-5");
+        assert_eq!(agy[2].supported_efforts, vec!["low", "high"]);
+
+        let cursor_raw = "\
+Available models
+auto - Auto (default)
+gpt-5.3-codex-low - Codex 5.3 Low
+gpt-5.3-codex-low-fast - Codex 5.3 Low Fast
+gpt-5.3-codex - Codex 5.3
+gpt-5.3-codex-high - Codex 5.3 High
+gpt-5.3-codex-xhigh - Codex 5.3 Extra High
+claude-opus-5-5-medium - Claude Opus 5.5 1M
+claude-opus-5-5-high - Claude Opus 5.5 1M High
+claude-opus-5-5-max - Claude Opus 5.5 1M Max
+composer-2.5 - Composer 2.5
+";
+        let cur = parse_cursor_models_stdout(cursor_raw);
+        assert_eq!(cur.len(), 3);
+        assert_eq!(cur[0].id, "cursor:gpt-5.3-codex");
+        assert_eq!(cur[0].supported_efforts, vec!["low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            cur[0].effort_slugs.get("medium").map(String::as_str),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(
+            cur[0].effort_slugs.get("xhigh").map(String::as_str),
+            Some("gpt-5.3-codex-xhigh")
+        );
+        assert_eq!(cur[1].id, "cursor:claude-opus-5-5");
+        assert_eq!(cur[1].supported_efforts, vec!["medium", "high", "max"]);
+        assert_eq!(cur[2].id, "cursor:composer-2.5");
+        assert!(cur[2].supported_efforts.is_empty());
+    }
 
     #[tokio::test]
     async fn test_daemon_session_lifecycle_and_diff() -> Result<()> {

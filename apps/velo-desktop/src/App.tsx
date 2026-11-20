@@ -2971,6 +2971,9 @@ export function App() {
     );
 
     const providerName = activeSession.agent_kind || "claude";
+    const resolvedModelId = activeCatalogModel?.id || activeSession.model;
+    const resolvedEffortValue =
+      activeSupportedEfforts.length > 0 ? activeEffectiveEffort : undefined;
 
     try {
       // 1. Send clean user input to existing daemon session (uses native `codex exec resume` / `claude --resume` or ACP session/load)
@@ -2979,8 +2982,8 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           input: text,
-          model: activeSession.model,
-          effort: activeSession.effort || "medium",
+          model: resolvedModelId,
+          effort: resolvedEffortValue,
           provider: providerName,
           approval_mode: activeSession.approval_mode,
           truncate_to_user_turn: truncateToUserTurn,
@@ -3009,8 +3012,8 @@ export function App() {
           repo_path: activeRepo.path || "~/velo",
           branch: wantsIsolatedWorktree ? activeSession.branch_name : null,
           use_pty: false,
-          model: activeSession.model,
-          effort: activeSession.effort || "medium",
+          model: resolvedModelId,
+          effort: resolvedEffortValue,
           approval_mode: activeSession.approval_mode,
           images: attachedPaths,
           use_worktree: wantsIsolatedWorktree,
@@ -4120,15 +4123,129 @@ export function App() {
     [activeRepo, repos]
   );
 
+  const EFFORT_DISPLAY_LABELS: Record<EffortLevel, string> = {
+    none: "None",
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+    xhigh: "xHigh",
+    max: "Max",
+    ultra: "Ultra",
+  };
+
+  const resolveCatalogModel = useCallback(
+    (modelId: string, agentKind: string): ModelOption | undefined => {
+      const exact = modelCatalog.find((m) => m.id === modelId);
+      if (exact) return exact;
+      // Gracefully match legacy suffixed slugs like `gemini-4-neon-xhigh` or `cursor:claude-opus-5-5-high`
+      const stripped = modelId.replace(/-(none|low|medium|high|xhigh|max)$/i, "");
+      return (
+        modelCatalog.find((m) => m.id === stripped) ||
+        modelCatalog.find((m) => m.id === `agy:${stripped}` && m.agentKind === agentKind) ||
+        modelCatalog.find((m) => m.agentKind === agentKind && m.isDefault)
+      );
+    },
+    [modelCatalog]
+  );
+
+  const resolveSupportedEfforts = useCallback(
+    (modelOpt: ModelOption | undefined, agentKind: string): EffortLevel[] => {
+      if (modelOpt && Array.isArray(modelOpt.supportedEfforts)) {
+        return modelOpt.supportedEfforts;
+      }
+      if (agentKind === "codex") return ["low", "medium", "high", "xhigh", "max"];
+      if (agentKind === "grok") return ["low", "medium", "high", "xhigh"];
+      if (agentKind === "agy") return ["low", "medium", "high"];
+      if (agentKind === "cursor") return [];
+      if (agentKind === "claude") return ["low", "medium", "high", "max"];
+      return ["low", "medium", "high"];
+    },
+    []
+  );
+
+  const alignEffortForModel = useCallback(
+    (
+      currentEffort: EffortLevel | undefined,
+      modelOpt: ModelOption | undefined,
+      agentKind: string
+    ): EffortLevel => {
+      const supported = resolveSupportedEfforts(modelOpt, agentKind);
+      if (supported.length === 0) return "medium";
+      if (currentEffort && supported.includes(currentEffort)) {
+        return currentEffort;
+      }
+      if (modelOpt?.defaultEffort && supported.includes(modelOpt.defaultEffort)) {
+        return modelOpt.defaultEffort;
+      }
+      if (supported.includes("high")) return "high";
+      if (supported.includes("medium")) return "medium";
+      return supported[0];
+    },
+    [resolveSupportedEfforts]
+  );
+
+  const activeCatalogModel = useMemo(
+    () => resolveCatalogModel(activeSession.model, activeSession.agent_kind),
+    [resolveCatalogModel, activeSession.model, activeSession.agent_kind]
+  );
+
+  const activeSupportedEfforts = useMemo(
+    () => resolveSupportedEfforts(activeCatalogModel, activeSession.agent_kind),
+    [resolveSupportedEfforts, activeCatalogModel, activeSession.agent_kind]
+  );
+
+  const activeEffectiveEffort = useMemo(
+    () => alignEffortForModel(activeSession.effort, activeCatalogModel, activeSession.agent_kind),
+    [alignEffortForModel, activeSession.effort, activeCatalogModel, activeSession.agent_kind]
+  );
+
+  const handleSelectSessionEffort = useCallback(
+    (eff: EffortLevel) => {
+      setEffortPickerOpen(false);
+      if (activeSession.id === "draft-empty") {
+        const newId = `wt-${Date.now()}`;
+        const materialized: VeloSession = {
+          ...activeSession,
+          id: newId,
+          repo_id: activeRepo.id,
+          worktree_path: activeRepo.path,
+          project_path: activeRepo.path,
+          effort: eff,
+          updated_at: "now",
+        };
+        setSessions((prev) => [materialized, ...prev]);
+        setEventsBySession((prev) => ({ ...prev, [newId]: [] }));
+        setActiveId(newId);
+        return;
+      }
+      setSessions((prev) =>
+        prev.map((s) => (s.id === activeSession.id ? { ...s, effort: eff } : s))
+      );
+      if (!activeSession.id.startsWith("wt-") && !activeSession.id.startsWith("sess-")) {
+        fetch(`${daemonUrl}/api/sessions/${activeSession.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ effort: eff }),
+        }).catch(() => {
+          sendE2eeCommand({
+            cmd: "update_session",
+            session_id: activeSession.id,
+            effort: eff,
+          });
+        });
+      }
+    },
+    [activeRepo, activeSession, daemonUrl, sendE2eeCommand]
+  );
+
   const handleSelectSessionModel = useCallback(
     async (m: ModelOption, isCrossEngineHandoff: boolean) => {
       setModelPickerOpen(false);
-      const defaultEffortForEngine: EffortLevel =
-        m.agentKind === "codex"
-          ? activeSession.effort || "high"
-          : activeSession.effort === "xhigh" || activeSession.effort === "ultra"
-          ? "high"
-          : activeSession.effort || "medium";
+      const defaultEffortForEngine = alignEffortForModel(
+        activeSession.effort,
+        m,
+        m.agentKind
+      );
 
       if (isCrossEngineHandoff && activeSession.id !== "draft-empty") {
         try {
@@ -4231,7 +4348,7 @@ export function App() {
       }
       setTimeout(() => composerTextareaRef.current?.focus(), 20);
     },
-    [activeRepo, activeSession, daemonUrl, sendE2eeCommand]
+    [activeRepo, activeSession, alignEffortForModel, daemonUrl, sendE2eeCommand]
   );
 
   const handleCreateRepo = async () => {
@@ -5407,7 +5524,7 @@ export function App() {
                           {featuredModels.length > 0 && (
                             <div className="mt-2.5 flex flex-wrap items-center justify-center gap-1.5 border-t border-[var(--v-border-subtle)] pt-2.5">
                               {featuredModels.map((m) => {
-                                const isSel = activeSession.model === m.id;
+                                const isSel = (activeCatalogModel?.id || activeSession.model) === m.id;
                                 const avail = isModelAvailable(m, runtimes);
                                 return (
                                   <button
@@ -5438,6 +5555,32 @@ export function App() {
                                   <span>+{totalInEngine - featuredModels.length} 更多</span>
                                 </button>
                               )}
+                            </div>
+                          )}
+
+                          {/* Row 3: Orthogonal Reasoning Effort for Selected Model */}
+                          {activeSupportedEfforts.length > 1 && (
+                            <div className="mt-2.5 flex flex-wrap items-center justify-center gap-1.5 border-t border-[var(--v-border-subtle)] pt-2">
+                              <span className="mr-1 text-[10.5px] text-[var(--v-fg-muted)]">
+                                思考强度:
+                              </span>
+                              {activeSupportedEfforts.map((eff) => {
+                                const isSel = activeEffectiveEffort === eff;
+                                return (
+                                  <button
+                                    key={eff}
+                                    type="button"
+                                    onClick={() => handleSelectSessionEffort(eff)}
+                                    className={`rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors cursor-pointer ${
+                                      isSel
+                                        ? "bg-[#8b5cf6]/20 text-[#a78bfa] ring-1 ring-[#8b5cf6]/40"
+                                        : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                    }`}
+                                  >
+                                    {EFFORT_DISPLAY_LABELS[eff] || eff}
+                                  </button>
+                                );
+                              })}
                             </div>
                           )}
                         </div>
@@ -6333,7 +6476,7 @@ export function App() {
                         modelCatalog={modelCatalog}
                         runtimes={runtimes}
                         activeAgentKind={activeSession.agent_kind}
-                        activeModelId={activeSession.model}
+                        activeModelId={activeCatalogModel?.id || activeSession.model}
                         isSessionBound={(eventsBySession[activeSession.id]?.length ?? 0) > 0}
                         customAcpCmd={customAcpCmd}
                         onChangeCustomAcpCmd={setCustomAcpCmd}
@@ -6368,65 +6511,41 @@ export function App() {
                       />
                     )}
 
-                    {/* 2. Reasoning Effort Popover */}
-                    {effortPickerOpen && (
-                      <div className="absolute bottom-9 left-[165px] z-30 w-[160px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
-                        <div className="px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
-                          Reasoning Effort
+                    {/* 2. Reasoning Effort Popover (Strictly scoped to active model's real supportedEfforts) */}
+                    {effortPickerOpen && activeSupportedEfforts.length > 0 && (
+                      <>
+                        <div
+                          className="fixed inset-0 z-20"
+                          onClick={() => setEffortPickerOpen(false)}
+                          aria-hidden="true"
+                        />
+                        <div
+                          onClick={(e) => e.stopPropagation()}
+                          className="absolute bottom-9 left-[165px] z-30 w-[176px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl"
+                        >
+                          <div className="px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
+                            思考 / 推理强度
+                          </div>
+                          {activeSupportedEfforts.map((eff) => {
+                            const active = activeEffectiveEffort === eff;
+                            return (
+                              <button
+                                key={eff}
+                                type="button"
+                                onClick={() => handleSelectSessionEffort(eff)}
+                                className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] cursor-pointer ${
+                                  active
+                                    ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                                    : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
+                                }`}
+                              >
+                                <span>{EFFORT_DISPLAY_LABELS[eff] || eff}</span>
+                                {active && <Check className="h-3.5 w-3.5 text-[#34d399]" />}
+                              </button>
+                            );
+                          })}
                         </div>
-                        {(activeSession.agent_kind === "codex"
-                          ? ([
-                              { id: "low", label: "Low" },
-                              { id: "medium", label: "Medium" },
-                              { id: "high", label: "High" },
-                              { id: "xhigh", label: "xHigh" },
-                              { id: "ultra", label: "Ultra" },
-                              { id: "max", label: "Max" },
-                            ] as { id: EffortLevel; label: string }[])
-                          : activeSession.agent_kind === "grok"
-                          ? ([
-                              { id: "low", label: "Low" },
-                              { id: "medium", label: "Medium" },
-                              { id: "high", label: "High" },
-                              { id: "xhigh", label: "xHigh" },
-                            ] as { id: EffortLevel; label: string }[])
-                          : ([
-                              { id: "low", label: "Low" },
-                              { id: "medium", label: "Medium" },
-                              { id: "high", label: "High" },
-                              { id: "max", label: "Max" },
-                            ] as { id: EffortLevel; label: string }[])
-                        ).map((eff) => {
-                          const currentEff = activeSession.effort || "high";
-                          const active = currentEff === eff.id;
-                          return (
-                            <button
-                              key={eff.id}
-                              onClick={() => {
-                                setSessions((prev) =>
-                                  prev.map((s) =>
-                                    s.id === activeSession.id ? { ...s, effort: eff.id } : s
-                                  )
-                                );
-                                fetch(`${daemonUrl}/api/sessions/${activeSession.id}`, {
-                                  method: "PATCH",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ effort: eff.id }),
-                                }).catch(() => {});
-                                setEffortPickerOpen(false);
-                              }}
-                              className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] ${
-                                active
-                                  ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
-                                  : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
-                              }`}
-                            >
-                              <span>{eff.label}</span>
-                              {active && <Check className="h-3.5 w-3.5 text-[#34d399]" />}
-                            </button>
-                          );
-                        })}
-                      </div>
+                      </>
                     )}
 
                     <div className="flex flex-wrap items-center gap-1.5">
@@ -6455,7 +6574,7 @@ export function App() {
                               </span>
                             )}
                             <span>
-                              {modelCatalog.find((m) => m.id === activeSession.model)?.label ||
+                              {activeCatalogModel?.label ||
                                 activeSession.model_short ||
                                 activeSession.model}
                             </span>
@@ -6464,18 +6583,30 @@ export function App() {
                         );
                       })()}
 
-                      {/* Pill 2: Reasoning Effort */}
-                      <button
-                        onClick={() => {
-                          setModelPickerOpen(false);
-                          setEffortPickerOpen((o) => !o);
-                        }}
-                        title="Reasoning Effort (--effort)"
-                        className="flex items-center gap-1 rounded-full px-2.5 py-1 text-[11.5px] capitalize text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)]"
-                      >
-                        <span>{activeSession.effort || "medium"}</span>
-                        <ChevronDown className="h-3 w-3 opacity-60" />
-                      </button>
+                      {/* Pill 2: Reasoning Effort (Only shown when the selected model supports configurable effort) */}
+                      {activeSupportedEfforts.length > 0 && (
+                        <button
+                          type="button"
+                          disabled={activeSupportedEfforts.length === 1}
+                          onClick={() => {
+                            setModelPickerOpen(false);
+                            setEffortPickerOpen((o) => !o);
+                          }}
+                          title="当前模型支持的思考 / 推理强度"
+                          className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-[11.5px] text-[var(--v-fg-muted)] transition-colors ${
+                            activeSupportedEfforts.length > 1
+                              ? "hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)] cursor-pointer"
+                              : "opacity-65 cursor-default"
+                          }`}
+                        >
+                          <span>
+                            {EFFORT_DISPLAY_LABELS[activeEffectiveEffort] || activeEffectiveEffort}
+                          </span>
+                          {activeSupportedEfforts.length > 1 && (
+                            <ChevronDown className="h-3 w-3 opacity-60" />
+                          )}
+                        </button>
+                      )}
 
                       {/* Pill 3: Worktree Permission Mode (`auto_edit` / `ask_before_edit` / `bypass`) */}
                       <button
