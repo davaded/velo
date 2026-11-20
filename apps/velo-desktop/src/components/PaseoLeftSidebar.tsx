@@ -523,7 +523,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
 
           <button
             onClick={() => setShowThemeMenu((v) => !v)}
-            title="Switch Paseo Theme"
+            title="Switch Theme"
             className="h-6 px-2 rounded-[5px] flex items-center gap-1 text-[11px] transition-colors cursor-pointer hover:bg-[var(--surface-2)] rare-specular-pill"
             style={{
               backgroundColor: showThemeMenu ? "var(--surface-2)" : "var(--surface-1)",
@@ -547,7 +547,7 @@ export const PaseoLeftSidebar: React.FC<PaseoLeftSidebarProps> = ({
               className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider"
               style={{ color: "var(--fg-extra-muted)" }}
             >
-              Paseo Themes
+              Themes
             </div>
             {(Object.keys(PASEO_THEMES) as PaseoThemeId[]).map((id) => {
               const spec = PASEO_THEMES[id];

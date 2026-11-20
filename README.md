@@ -11,7 +11,7 @@
 - **Single-Engine Session Binding & Clean Handoff**: Every thread binds cleanly to one engine with lossless in-place or Git Worktree isolation, plus one-tap **Context Handoff**, **Architect Advisor**, **Committee Race**, and **TDD Verification Loops**.
 - **Authoritative Server-Side Telemetry & Billing**: Real-time `tok/s` throughput engine (excluding CLI cold-boot, 200k prompt prefill TTFT, and tool execution pauses), prompt cache hit %, and model-accurate USD cost tracking across desktop and mobile.
 - **Zero-Trust Blind E2EE Relay (`velo-relay`)**: Pair your iPhone in 2 seconds via QR code (`X25519` ECDH + ephemeral forward-secret ratchet + `ChaCha20-Poly1305` AEAD). The relay server routes opaque ciphertext frames and never sees prompts, code, or images.
-- **Paseo-Style Tiered Encrypted Attachments**: Send and inspect screenshots across Mac and iOS (`800px` fast preview + `2200px` pinch-to-zoom HD) directly over the blind E2EE channel with zero third-party cloud storage.
+- **Tiered Encrypted Attachments**: Send and inspect screenshots across Mac and iOS (`800px` fast preview + `2200px` pinch-to-zoom HD) directly over the blind E2EE channel with zero third-party cloud storage.
 - **SQLite WAL Storage & Global Search**: `O(1)` incremental event persistence (`~/.velo/velo.db`), cursor pagination for 1,000+ step threads, and instant cross-workspace full-text transcript search.
 - **Full Mobile Git / PR / Voice / Blind Push**: Review unified diffs, Commit & Push, open/merge GitHub PRs with CI status, dictate prompts via voice, view Live Activities, and receive zero-plaintext lock-screen wakeup notifications (Bark / Webhook).
 

@@ -7925,7 +7925,7 @@ export function App() {
                         [
                           { id: "zinc", label: "Carbon Zinc" },
                           { id: "claude", label: "Claude Warm" },
-                          { id: "paseo", label: "Paseo Forest" },
+                          { id: "paseo", label: "Forest" },
                         ] as { id: ToneId; label: string }[]
                       ).map((t) => (
                         <button
