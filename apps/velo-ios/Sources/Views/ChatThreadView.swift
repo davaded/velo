@@ -140,6 +140,7 @@ public struct ChatThreadView: View {
             VeloExtensionsAndCheckpointsSheet(
                 store: store,
                 sessionId: sessionId,
+                workspacePath: session?.repoRoot,
                 initialTab: extensionsCheckpointsTab,
                 onInjectSkillPrompt: { injected in
                     draftPrompt = draftPrompt.isEmpty ? injected : "\(draftPrompt)\n\(injected)"
@@ -211,6 +212,9 @@ public struct ChatThreadView: View {
                 }
             }
         }
+        .task(id: session?.repoRoot ?? sessionId) {
+            await store.fetchExtensions(workspace: session?.repoRoot)
+        }
     }
 
     private var trailingToolbarView: some View {
@@ -247,9 +251,9 @@ public struct ChatThreadView: View {
                 Button {
                     extensionsCheckpointsTab = 1
                     showExtensionsCheckpointsSheet = true
-                    Task { await store.fetchExtensions() }
+                    Task { await store.fetchExtensions(workspace: session?.repoRoot) }
                 } label: {
-                    Label("MCP 与 Skills 检查器", systemImage: "puzzlepiece.extension")
+                    Label("跨引擎 Skills 与 MCP", systemImage: "puzzlepiece.extension")
                 }
                 if !turns.isEmpty && !isSessionRunning {
                     Button {
@@ -841,22 +845,47 @@ public struct ChatThreadView: View {
         let cmd: String
         let title: String
         let icon: String
+        let skillPrompt: String?
+        let isProjectSkill: Bool
     }
 
     private var matchingSlashActions: [SlashQuickAction] {
         let trimmed = draftPrompt.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix("/") else { return [] }
         let query = trimmed.lowercased()
-        let catalog: [SlashQuickAction] = [
-            SlashQuickAction(id: "rewind", cmd: "/rewind", title: "回滚检查点", icon: "clock.arrow.circlepath"),
-            SlashQuickAction(id: "mcp", cmd: "/mcp", title: "MCP & Skills", icon: "puzzlepiece.extension"),
-            SlashQuickAction(id: "fork", cmd: "/fork", title: "分叉上下文", icon: "arrow.branch"),
-            SlashQuickAction(id: "plan", cmd: "/plan", title: "先写实施方案", icon: "checklist"),
-            SlashQuickAction(id: "review", cmd: "/review", title: "代码审查", icon: "magnifyingglass.circle"),
-            SlashQuickAction(id: "compact", cmd: "/compact", title: "压缩总结上下文", icon: "arrow.down.right.and.arrow.up.left"),
+        let keyword = String(query.dropFirst())
+        let builtinCatalog: [SlashQuickAction] = [
+            SlashQuickAction(id: "rewind", cmd: "/rewind", title: "回滚检查点", icon: "clock.arrow.circlepath", skillPrompt: nil, isProjectSkill: false),
+            SlashQuickAction(id: "mcp", cmd: "/mcp", title: "Skills & MCP", icon: "puzzlepiece.extension", skillPrompt: nil, isProjectSkill: false),
+            SlashQuickAction(id: "fork", cmd: "/fork", title: "分叉上下文", icon: "arrow.branch", skillPrompt: nil, isProjectSkill: false),
+            SlashQuickAction(id: "plan", cmd: "/plan", title: "先写实施方案", icon: "checklist", skillPrompt: nil, isProjectSkill: false),
+            SlashQuickAction(id: "review", cmd: "/review", title: "代码审查", icon: "magnifyingglass.circle", skillPrompt: nil, isProjectSkill: false),
+            SlashQuickAction(id: "compact", cmd: "/compact", title: "压缩总结上下文", icon: "arrow.down.right.and.arrow.up.left", skillPrompt: nil, isProjectSkill: false),
         ]
-        if query == "/" { return catalog }
-        return catalog.filter { $0.cmd.hasPrefix(query) || $0.title.lowercased().contains(query.dropFirst()) }
+
+        let skillCatalog: [SlashQuickAction] = store.installedSkills.map { sk in
+            let isProj = sk.scope == "project"
+            let label = isProj ? "项目·\(sk.engine)" : (sk.engine == "velo" ? "Velo技能" : sk.engine)
+            return SlashQuickAction(
+                id: "sk:\(sk.path)",
+                cmd: "/\(sk.name)",
+                title: label,
+                icon: isProj ? "folder.badge.gearshape" : "sparkles",
+                skillPrompt: sk.crossEnginePrompt,
+                isProjectSkill: isProj
+            )
+        }
+
+        if query == "/" {
+            return builtinCatalog + Array(skillCatalog.prefix(8))
+        }
+        let matchedBuiltins = builtinCatalog.filter {
+            $0.cmd.lowercased().contains(keyword) || $0.title.lowercased().contains(keyword)
+        }
+        let matchedSkills = skillCatalog.filter { act in
+            act.cmd.lowercased().contains(keyword) || act.title.lowercased().contains(keyword)
+        }
+        return matchedBuiltins + Array(matchedSkills.prefix(10))
     }
 
     @ViewBuilder
@@ -868,12 +897,12 @@ public struct ChatThreadView: View {
                     ForEach(items) { act in
                         Button {
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            executeSlashQuickAction(act.cmd)
+                            executeSlashQuickAction(act)
                         } label: {
                             HStack(spacing: 4.5) {
                                 Image(systemName: act.icon)
                                     .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                                    .foregroundStyle(act.isProjectSkill ? VeloTheme.emerald : VeloTheme.accentVioletSoft)
                                 Text(act.cmd)
                                     .font(.system(size: 11.5, weight: .bold, design: .monospaced))
                                     .foregroundStyle(.primary)
@@ -889,7 +918,7 @@ public struct ChatThreadView: View {
                             )
                             .overlay(
                                 Capsule()
-                                    .stroke(VeloTheme.accentViolet.opacity(0.28), lineWidth: 0.75)
+                                    .stroke((act.isProjectSkill ? VeloTheme.emerald : VeloTheme.accentViolet).opacity(0.28), lineWidth: 0.75)
                             )
                         }
                         .buttonStyle(.plain)
@@ -898,6 +927,15 @@ public struct ChatThreadView: View {
                 .padding(.horizontal, 2)
             }
         }
+    }
+
+    private func executeSlashQuickAction(_ act: SlashQuickAction) {
+        if let skillPrompt = act.skillPrompt {
+            draftPrompt = skillPrompt
+            composerFocused = true
+            return
+        }
+        executeSlashQuickAction(act.cmd)
     }
 
     private func executeSlashQuickAction(_ cmd: String) {
@@ -913,7 +951,7 @@ public struct ChatThreadView: View {
             composerFocused = false
             extensionsCheckpointsTab = 1
             showExtensionsCheckpointsSheet = true
-            Task { await store.fetchExtensions() }
+            Task { await store.fetchExtensions(workspace: session?.repoRoot) }
         case "/fork":
             draftPrompt = ""
             composerFocused = false

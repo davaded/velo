@@ -1871,6 +1871,8 @@ public struct VeloSkillItem: Identifiable, Equatable, Sendable {
     public let id: String
     public let name: String
     public let engine: String
+    public let scope: String
+    public let editable: Bool
     public let description: String
     public let path: String
 
@@ -1880,9 +1882,15 @@ public struct VeloSkillItem: Identifiable, Equatable, Sendable {
             id: id,
             name: (d["name"] as? String) ?? id,
             engine: (d["engine"] as? String) ?? "local",
+            scope: (d["scope"] as? String) ?? "global",
+            editable: (d["editable"] as? Bool) ?? false,
             description: (d["description"] as? String) ?? "",
             path: (d["path"] as? String) ?? ""
         )
+    }
+
+    public var crossEnginePrompt: String {
+        "请先读取并严格遵循技能 `\(name)`（路径：`\(path)`）中的规范与步骤，协助完成以下任务：\n"
     }
 }
 

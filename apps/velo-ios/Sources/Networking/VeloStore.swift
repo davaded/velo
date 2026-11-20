@@ -64,6 +64,7 @@ public final class VeloStore: ObservableObject {
     private var attachmentChunkBuffers: [String: IncomingAttachmentBuffer] = [:]
     private var attachmentUploadWaiters: [String: CheckedContinuation<(path: String, url: String)?, Never>] = [:]
     private var transcriptionWaiters: [String: CheckedContinuation<String?, Never>] = [:]
+    private var skillContentWaiters: [String: CheckedContinuation<String?, Never>] = [:]
     private var e2eeNonceCounter: UInt64 = UInt64(Date().timeIntervalSince1970 * 1_000_000)
     private var ephemeralPrivateKey: Curve25519.KeyAgreement.PrivateKey?
     private var e2eeActiveKeyHex: String?
@@ -1039,10 +1040,15 @@ public final class VeloStore: ObservableObject {
         }
     }
 
-    public func fetchExtensions() async {
+    public func fetchExtensions(workspace: String? = nil) async {
+        let trimmedWs = workspace?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         switch connectionConfig {
         case .direct(let baseURL):
-            guard let url = URL(string: "\(baseURL)/api/extensions"),
+            var components = URLComponents(string: "\(baseURL)/api/extensions")
+            if !trimmedWs.isEmpty {
+                components?.queryItems = [URLQueryItem(name: "workspace", value: trimmedWs)]
+            }
+            guard let url = components?.url,
                   let (data, _) = try? await URLSession.shared.data(from: url),
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             else { return }
@@ -1053,9 +1059,136 @@ public final class VeloStore: ObservableObject {
                 installedSkills = arr.compactMap(VeloSkillItem.fromJSON)
             }
         case .e2eeRelay:
-            sendEncryptedCommand(["cmd": "get_extensions"])
+            var payload: [String: Any] = ["cmd": "get_extensions"]
+            if !trimmedWs.isEmpty {
+                payload["workspace"] = trimmedWs
+            }
+            sendEncryptedCommand(payload)
         case .none:
             break
+        }
+    }
+
+    public func readSkillContent(path: String) async -> String? {
+        let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else { return nil }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            var components = URLComponents(string: "\(baseURL)/api/extensions/skill-content")
+            components?.queryItems = [URLQueryItem(name: "path", value: trimmedPath)]
+            guard let url = components?.url,
+                  let (data, resp) = try? await URLSession.shared.data(from: url),
+                  let http = resp as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { return nil }
+            return obj["content"] as? String
+        case .e2eeRelay:
+            let reqId = "sk-\(UUID().uuidString.prefix(8))"
+            return await withCheckedContinuation { cont in
+                self.skillContentWaiters[reqId] = cont
+                self.sendEncryptedCommand([
+                    "cmd": "read_skill_content",
+                    "request_id": reqId,
+                    "path": trimmedPath,
+                ])
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 12_000_000_000)
+                    if let waiter = self?.skillContentWaiters.removeValue(forKey: reqId) {
+                        waiter.resume(returning: nil)
+                    }
+                }
+            }
+        case .none:
+            return nil
+        }
+    }
+
+    public func saveCustomSkill(
+        name: String,
+        description: String,
+        content: String,
+        scope: String,
+        workspace: String? = nil,
+        existingPath: String? = nil
+    ) async -> Bool {
+        let trimmedWs = workspace?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var body: [String: Any] = [
+            "name": name,
+            "description": description,
+            "content": content,
+            "scope": scope,
+        ]
+        if !trimmedWs.isEmpty {
+            body["workspace"] = trimmedWs
+        }
+        if let existing = existingPath, !existing.isEmpty {
+            body["existing_path"] = existing
+        }
+
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/extensions/skills"),
+                  let payload = try? JSONSerialization.data(withJSONObject: body)
+            else { return false }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = payload
+            guard let (_, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode)
+            else {
+                lastActionBanner = "⚠️ 保存自定义 Skill 失败"
+                return false
+            }
+            lastActionBanner = "✅ 已保存自定义 Skill「\(name)」"
+            await fetchExtensions(workspace: workspace)
+            return true
+        case .e2eeRelay:
+            var cmd = body
+            cmd["cmd"] = "save_custom_skill"
+            sendEncryptedCommand(cmd)
+            lastActionBanner = "✅ 已同步保存自定义 Skill「\(name)」"
+            return true
+        case .none:
+            return false
+        }
+    }
+
+    public func deleteCustomSkill(path: String, workspace: String? = nil) async -> Bool {
+        let trimmedWs = workspace?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var body: [String: Any] = ["path": path]
+        if !trimmedWs.isEmpty {
+            body["workspace"] = trimmedWs
+        }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/extensions/skills"),
+                  let payload = try? JSONSerialization.data(withJSONObject: body)
+            else { return false }
+            var req = URLRequest(url: url)
+            req.httpMethod = "DELETE"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = payload
+            guard let (_, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode)
+            else {
+                lastActionBanner = "⚠️ 删除 Skill 失败"
+                return false
+            }
+            lastActionBanner = "🗑️ 已删除自定义 Skill"
+            await fetchExtensions(workspace: workspace)
+            return true
+        case .e2eeRelay:
+            var cmd = body
+            cmd["cmd"] = "delete_custom_skill"
+            sendEncryptedCommand(cmd)
+            lastActionBanner = "🗑️ 已同步删除自定义 Skill"
+            return true
+        case .none:
+            return false
         }
     }
 
@@ -2903,6 +3036,15 @@ public final class VeloStore: ObservableObject {
                 }
                 if let arr = raw["skills"] as? [[String: Any]] {
                     installedSkills = arr.compactMap(VeloSkillItem.fromJSON)
+                }
+                return
+            case "skill_content_result":
+                if let reqId = raw["request_id"] as? String,
+                   let waiter = skillContentWaiters.removeValue(forKey: reqId)
+                {
+                    let ok = (raw["ok"] as? Bool) ?? false
+                    let content = ok ? (raw["content"] as? String) : nil
+                    waiter.resume(returning: content)
                 }
                 return
             default:

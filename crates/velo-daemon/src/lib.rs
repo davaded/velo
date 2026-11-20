@@ -2310,6 +2310,11 @@ pub fn build_router(state: DaemonState) -> Router {
             post(rewind_checkpoint_handler),
         )
         .route("/api/extensions", get(list_extensions_handler))
+        .route("/api/extensions/skill-content", get(read_skill_content_handler))
+        .route(
+            "/api/extensions/skills",
+            post(save_custom_skill_handler).delete(delete_custom_skill_handler),
+        )
         .route("/api/sessions/{id}/rewind", post(rewind_session_handler))
         .route("/api/sessions/{id}/stop", post(stop_session_handler))
         .route("/api/sessions/{id}/git/commit", post(git_commit_handler))
@@ -5181,13 +5186,20 @@ impl DaemonState {
         Ok((restored, updated_list))
     }
 
-    pub async fn get_extensions_dto(&self) -> Value {
-        let snap = tokio::task::spawn_blocking(extensions::scan_local_extensions)
-            .await
-            .unwrap_or(extensions::LocalExtensionsSnapshotDto {
-                mcp_servers: Vec::new(),
-                skills: Vec::new(),
-            });
+    pub async fn get_extensions_dto(&self, workspace: Option<String>) -> Value {
+        let ws_path = workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| PathBuf::from(canonical_workspace_path(s)));
+        let snap = tokio::task::spawn_blocking(move || {
+            extensions::scan_local_extensions_for_workspace(ws_path.as_deref())
+        })
+        .await
+        .unwrap_or(extensions::LocalExtensionsSnapshotDto {
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+        });
         json!({
             "ok": true,
             "mcp_servers": snap.mcp_servers,
@@ -5883,8 +5895,112 @@ async fn rewind_checkpoint_handler(
     }
 }
 
-async fn list_extensions_handler(State(state): State<DaemonState>) -> impl IntoResponse {
-    Json(state.get_extensions_dto().await)
+#[derive(Debug, serde::Deserialize)]
+struct ExtensionsQuery {
+    workspace: Option<String>,
+}
+
+async fn list_extensions_handler(
+    State(state): State<DaemonState>,
+    Query(q): Query<ExtensionsQuery>,
+) -> impl IntoResponse {
+    Json(state.get_extensions_dto(q.workspace).await)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SkillContentQuery {
+    path: String,
+}
+
+async fn read_skill_content_handler(Query(q): Query<SkillContentQuery>) -> impl IntoResponse {
+    let p = q.path;
+    match tokio::task::spawn_blocking(move || extensions::read_skill_markdown(&p)).await {
+        Ok(Ok(content)) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "content": content })),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn save_custom_skill_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<extensions::SaveCustomSkillRequest>,
+) -> impl IntoResponse {
+    let ws = req.workspace.clone();
+    match tokio::task::spawn_blocking(move || extensions::save_custom_skill(req)).await {
+        Ok(Ok(saved)) => {
+            let snap = state.get_extensions_dto(ws).await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "skill": saved,
+                    "mcp_servers": snap.get("mcp_servers").cloned().unwrap_or(json!([])),
+                    "skills": snap.get("skills").cloned().unwrap_or(json!([])),
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DeleteSkillRequest {
+    path: String,
+    workspace: Option<String>,
+}
+
+async fn delete_custom_skill_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<DeleteSkillRequest>,
+) -> impl IntoResponse {
+    let p = req.path;
+    let ws = req.workspace;
+    match tokio::task::spawn_blocking(move || extensions::delete_custom_skill(&p)).await {
+        Ok(Ok(())) => {
+            let snap = state.get_extensions_dto(ws).await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "mcp_servers": snap.get("mcp_servers").cloned().unwrap_or(json!([])),
+                    "skills": snap.get("skills").cloned().unwrap_or(json!([])),
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_cli_sessions_handler(State(state): State<DaemonState>) -> impl IntoResponse {

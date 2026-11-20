@@ -1995,7 +1995,11 @@ async fn run_supervised_e2ee_bridge(
                                     }
                                 }
                                 "get_extensions" => {
-                                    let ext = state.get_extensions_dto().await;
+                                    let ws = cmd_val
+                                        .get("workspace")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string);
+                                    let ext = state.get_extensions_dto(ws).await;
                                     let resp = json!({
                                         "type": "extensions_snapshot",
                                         "mcp_servers": ext.get("mcp_servers").cloned().unwrap_or(json!([])),
@@ -2005,6 +2009,129 @@ async fn run_supervised_e2ee_bridge(
                                         send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
                                     {
                                         let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "read_skill_content" => {
+                                    let req_id = cmd_val
+                                        .get("request_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let p = cmd_val
+                                        .get("path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let resp = match tokio::task::spawn_blocking(move || {
+                                        crate::extensions::read_skill_markdown(&p)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(content)) => json!({
+                                            "type": "skill_content_result",
+                                            "request_id": req_id,
+                                            "ok": true,
+                                            "content": content,
+                                        }),
+                                        Ok(Err(err)) => json!({
+                                            "type": "skill_content_result",
+                                            "request_id": req_id,
+                                            "ok": false,
+                                            "error": err.to_string(),
+                                        }),
+                                        Err(err) => json!({
+                                            "type": "skill_content_result",
+                                            "request_id": req_id,
+                                            "ok": false,
+                                            "error": err.to_string(),
+                                        }),
+                                    };
+                                    if let Some(frame_txt) =
+                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
+                                    {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "save_custom_skill" => {
+                                    let ws = cmd_val
+                                        .get("workspace")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string);
+                                    let req = crate::extensions::SaveCustomSkillRequest {
+                                        name: cmd_val
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        description: cmd_val
+                                            .get("description")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        content: cmd_val
+                                            .get("content")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        scope: cmd_val
+                                            .get("scope")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("global")
+                                            .to_string(),
+                                        workspace: ws.clone(),
+                                        existing_path: cmd_val
+                                            .get("existing_path")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string),
+                                    };
+                                    if let Ok(Ok(_)) = tokio::task::spawn_blocking(move || {
+                                        crate::extensions::save_custom_skill(req)
+                                    })
+                                    .await
+                                    {
+                                        let ext = state.get_extensions_dto(ws).await;
+                                        let resp = json!({
+                                            "type": "extensions_snapshot",
+                                            "mcp_servers": ext.get("mcp_servers").cloned().unwrap_or(json!([])),
+                                            "skills": ext.get("skills").cloned().unwrap_or(json!([])),
+                                        });
+                                        if let Some(frame_txt) = send_sealed_with_key(
+                                            &resp,
+                                            &active_key_hex,
+                                            &mut out_nonce,
+                                        ) {
+                                            let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                        }
+                                    }
+                                }
+                                "delete_custom_skill" => {
+                                    let ws = cmd_val
+                                        .get("workspace")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string);
+                                    let p = cmd_val
+                                        .get("path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if let Ok(Ok(())) = tokio::task::spawn_blocking(move || {
+                                        crate::extensions::delete_custom_skill(&p)
+                                    })
+                                    .await
+                                    {
+                                        let ext = state.get_extensions_dto(ws).await;
+                                        let resp = json!({
+                                            "type": "extensions_snapshot",
+                                            "mcp_servers": ext.get("mcp_servers").cloned().unwrap_or(json!([])),
+                                            "skills": ext.get("skills").cloned().unwrap_or(json!([])),
+                                        });
+                                        if let Some(frame_txt) = send_sealed_with_key(
+                                            &resp,
+                                            &active_key_hex,
+                                            &mut out_nonce,
+                                        ) {
+                                            let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                        }
                                     }
                                 }
                                 "get_checkpoints" => {

@@ -40,7 +40,11 @@ import { QueuedPromptsBar } from "./components/QueuedPromptsBar";
 import { ChatOutlineRail, OutlineTurnSummary } from "./components/ChatOutlineRail";
 import { SidebarQuotaBar } from "./components/SidebarQuotaBar";
 import { RemoteHostsModal } from "./components/RemoteHostsModal";
-import { ExtensionsAndCheckpointsModal } from "./components/ExtensionsAndCheckpointsModal";
+import {
+  ExtensionsAndCheckpointsModal,
+  SkillEntryDto,
+  buildCrossEngineSkillPrompt,
+} from "./components/ExtensionsAndCheckpointsModal";
 import {
   ENGINE_TABS,
   InlineModelSelectorGrid,
@@ -767,6 +771,7 @@ export function App() {
   const [hostsModalOpen, setHostsModalOpen] = useState<boolean>(false);
   const [extCpModalOpen, setExtCpModalOpen] = useState<boolean>(false);
   const [extCpInitialTab, setExtCpInitialTab] = useState<"checkpoints" | "extensions">("checkpoints");
+  const [localSkills, setLocalSkills] = useState<SkillEntryDto[]>([]);
   const [relocateTarget, setRelocateTarget] = useState<{
     mode: "workspace" | "session";
     oldPath: string;
@@ -892,6 +897,26 @@ export function App() {
       DEMO_REPOS[0],
     [repos, activeSession.repo_id, activeSession.project_path]
   );
+
+  // Sync real local + project-level + Velo custom Skills for the active workspace so `/` slash completion is always live
+  useEffect(() => {
+    const wsPath = (activeSession.project_path || activeRepo?.path || "").trim();
+    let cancelled = false;
+    const qs = wsPath ? `?workspace=${encodeURIComponent(wsPath)}` : "";
+    fetch(`${daemonUrl}/api/extensions${qs}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!cancelled && data && Array.isArray(data.skills)) {
+          setLocalSkills(data.skills as SkillEntryDto[]);
+        }
+      })
+      .catch(() => {
+        // Offline or E2EE-only mode: keep previous skill list
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [daemonUrl, activeSession.project_path, activeRepo?.path]);
 
   const activeEvents = useMemo(
     () => eventsBySession[activeSession.id] || [],
@@ -4659,11 +4684,21 @@ export function App() {
               <span>Cron &amp; Webhooks</span>
             </button>
             <button
-              onClick={() => setActiveModal("skills")}
-              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              onClick={() => {
+                setExtCpInitialTab("extensions");
+                setExtCpModalOpen(true);
+              }}
+              className="flex h-[30px] w-full items-center justify-between rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
-              <Layers className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
-              <span>Skills &amp; Commands</span>
+              <span className="flex items-center gap-2.5">
+                <Layers className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                <span>Skills &amp; MCP</span>
+              </span>
+              {localSkills.length > 0 && (
+                <span className="rounded bg-[var(--v-bg-active)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--v-fg-muted)]">
+                  {localSkills.length}
+                </span>
+              )}
             </button>
           </div>
 
@@ -4999,9 +5034,12 @@ export function App() {
               <CalendarClock className="h-4 w-4" />
             </button>
             <button
-              onClick={() => setActiveModal("skills")}
+              onClick={() => {
+                setAnalyticsInitialTab("analytics");
+                setAnalyticsModalOpen(true);
+              }}
               title={`Usage: ${tokenPercent}% context window`}
-              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
               <CircleGauge className="h-4 w-4" />
             </button>
@@ -6233,86 +6271,186 @@ export function App() {
                   />
                 )}
 
-                {/* Slash Command Popover (Built-in Velo Workflow Actions + Prompt Skills) */}
-                {slashFilter !== null && (
-                  <div className="mb-2 max-h-[260px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
-                    {[
-                      {
-                        cmd: "/rewind",
-                        desc: "打开每轮 Git 检查点并一键回滚代码",
-                        run: () => {
-                          setPrompt("");
-                          setSlashFilter(null);
-                          setExtCpInitialTab("checkpoints");
-                          setExtCpModalOpen(true);
-                        },
+                {/* Slash Command Popover (Built-in Velo Workflow Actions + Prompt Skills + Real Local/Project Skills) */}
+                {slashFilter !== null && (() => {
+                  const q = slashFilter.trim().toLowerCase();
+                  const builtinItems: Array<{
+                    key: string;
+                    cmd: string;
+                    desc: string;
+                    badge: string;
+                    badgeTone: string;
+                    run: () => void;
+                  }> = [
+                    {
+                      key: "builtin:/rewind",
+                      cmd: "/rewind",
+                      desc: "打开每轮 Git 检查点并一键回滚代码",
+                      badge: "Velo",
+                      badgeTone: "bg-[#f59e0b]/15 text-[#fbbf24]",
+                      run: () => {
+                        setPrompt("");
+                        setSlashFilter(null);
+                        setExtCpInitialTab("checkpoints");
+                        setExtCpModalOpen(true);
                       },
-                      {
-                        cmd: "/mcp",
-                        desc: "查看本机 MCP 服务器与 Skills 目录",
-                        run: () => {
-                          setPrompt("");
-                          setSlashFilter(null);
-                          setExtCpInitialTab("extensions");
-                          setExtCpModalOpen(true);
-                        },
+                    },
+                    {
+                      key: "builtin:/mcp",
+                      cmd: "/mcp",
+                      desc: "管理跨引擎 Skills、自定义技能与 MCP",
+                      badge: "Velo",
+                      badgeTone: "bg-[#8b5cf6]/15 text-[#a78bfa]",
+                      run: () => {
+                        setPrompt("");
+                        setSlashFilter(null);
+                        setExtCpInitialTab("extensions");
+                        setExtCpModalOpen(true);
                       },
-                      {
-                        cmd: "/fork",
-                        desc: "从当前会话一键分叉探索新分支思路",
-                        run: () => {
-                          setPrompt("");
-                          setSlashFilter(null);
-                          void handleForkSession();
-                        },
+                    },
+                    {
+                      key: "builtin:/fork",
+                      cmd: "/fork",
+                      desc: "从当前会话一键分叉探索新分支思路",
+                      badge: "Velo",
+                      badgeTone: "bg-[#38bdf8]/15 text-[#38bdf8]",
+                      run: () => {
+                        setPrompt("");
+                        setSlashFilter(null);
+                        void handleForkSession();
                       },
-                      {
-                        cmd: "/cli",
-                        desc: "接管与清理本机终端历史会话",
-                        run: () => {
-                          setPrompt("");
-                          setSlashFilter(null);
-                          setCliImportOpen(true);
-                        },
+                    },
+                    {
+                      key: "builtin:/cli",
+                      cmd: "/cli",
+                      desc: "接管与清理本机终端历史会话",
+                      badge: "Velo",
+                      badgeTone: "bg-[#34d399]/15 text-[#34d399]",
+                      run: () => {
+                        setPrompt("");
+                        setSlashFilter(null);
+                        setCliImportOpen(true);
                       },
-                      {
-                        cmd: "/hosts",
-                        desc: "管理多机与 SSH 远程服务器派发",
-                        run: () => {
-                          setPrompt("");
-                          setSlashFilter(null);
-                          setHostsModalOpen(true);
-                        },
+                    },
+                    {
+                      key: "builtin:/hosts",
+                      cmd: "/hosts",
+                      desc: "管理多机与 SSH 远程服务器派发",
+                      badge: "Velo",
+                      badgeTone: "bg-[var(--v-bg-hover)] text-[var(--v-fg-muted)]",
+                      run: () => {
+                        setPrompt("");
+                        setSlashFilter(null);
+                        setHostsModalOpen(true);
                       },
-                      ...SLASH_SKILLS.map((s) => ({
-                        cmd: s.cmd,
-                        desc: s.desc,
-                        run: () => {
-                          setSlashFilter(null);
-                          void handleSendPrompt(`${s.cmd} `);
-                        },
-                      })),
-                    ]
-                      .filter(
-                        (item) =>
-                          item.cmd.toLowerCase().includes(slashFilter) ||
-                          item.desc.toLowerCase().includes(slashFilter)
-                      )
-                      .map((item) => (
-                        <button
-                          key={item.cmd}
-                          type="button"
-                          onClick={item.run}
-                          className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left text-[12.5px] hover:bg-[var(--v-bg-active)] cursor-pointer"
-                        >
-                          <span className="font-mono font-medium text-[var(--v-fg-primary)]">
-                            {item.cmd}
-                          </span>
-                          <span className="text-[12px] text-[var(--v-fg-muted)]">{item.desc}</span>
-                        </button>
-                      ))}
-                  </div>
-                )}
+                    },
+                    ...SLASH_SKILLS.map((s) => ({
+                      key: `slash:${s.cmd}`,
+                      cmd: s.cmd,
+                      desc: s.desc,
+                      badge: "指令",
+                      badgeTone: "bg-[var(--v-bg-hover)] text-[var(--v-fg-muted)]",
+                      run: () => {
+                        setSlashFilter(null);
+                        void handleSendPrompt(`${s.cmd} `);
+                      },
+                    })),
+                  ];
+
+                  const realSkillItems = localSkills.map((sk) => {
+                    const isProject = sk.scope === "project";
+                    const isVelo = sk.engine === "velo" || sk.editable;
+                    return {
+                      key: `skill:${sk.path}`,
+                      cmd: `/${sk.name}`,
+                      desc: sk.description || sk.path,
+                      badge: isProject ? `项目 · ${sk.engine}` : isVelo ? "Velo 技能" : sk.engine,
+                      badgeTone: isProject
+                        ? "bg-emerald-500/15 text-emerald-400"
+                        : isVelo
+                          ? "bg-[#8b5cf6]/15 text-[#a78bfa]"
+                          : "bg-sky-500/15 text-sky-400",
+                      run: () => {
+                        setSlashFilter(null);
+                        setPrompt(buildCrossEngineSkillPrompt(sk));
+                        setTimeout(() => composerTextareaRef.current?.focus(), 20);
+                      },
+                    };
+                  });
+
+                  const allItems = [...builtinItems, ...realSkillItems];
+                  const matched = allItems.filter(
+                    (item) =>
+                      !q ||
+                      item.cmd.toLowerCase().includes(q) ||
+                      item.desc.toLowerCase().includes(q) ||
+                      item.badge.toLowerCase().includes(q)
+                  );
+                  const visible = matched.slice(0, 14);
+                  const hiddenCount = Math.max(0, matched.length - visible.length);
+
+                  return (
+                    <div className="mb-2 max-h-[280px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
+                      {visible.length === 0 ? (
+                        <div className="flex items-center justify-between px-3 py-2 text-[12px] text-[var(--v-fg-muted)]">
+                          <span>没有匹配的指令或本地 Skill</span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSlashFilter(null);
+                              setExtCpInitialTab("extensions");
+                              setExtCpModalOpen(true);
+                            }}
+                            className="font-medium text-[#a78bfa] hover:underline cursor-pointer"
+                          >
+                            打开 Skills 面板新建
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          {visible.map((item) => (
+                            <button
+                              key={item.key}
+                              type="button"
+                              onClick={item.run}
+                              className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-1.5 text-left text-[12.5px] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                            >
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span className="shrink-0 font-mono font-medium text-[var(--v-fg-primary)]">
+                                  {item.cmd}
+                                </span>
+                                <span
+                                  className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${item.badgeTone}`}
+                                >
+                                  {item.badge}
+                                </span>
+                              </div>
+                              <span className="min-w-0 truncate text-[12px] text-[var(--v-fg-muted)]">
+                                {item.desc}
+                              </span>
+                            </button>
+                          ))}
+                          {hiddenCount > 0 && (
+                            <div className="flex items-center justify-between border-t border-[var(--v-border-subtle)] px-3 pt-1.5 pb-0.5 text-[11px] text-[var(--v-fg-faint)]">
+                              <span>还有 {hiddenCount} 个本地 Skill，继续输入关键词筛选</span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSlashFilter(null);
+                                  setExtCpInitialTab("extensions");
+                                  setExtCpModalOpen(true);
+                                }}
+                                className="text-[#a78bfa] hover:underline cursor-pointer"
+                              >
+                                查看全部 →
+                              </button>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 <div
                   onDragOver={(e) => {
@@ -8142,9 +8280,16 @@ export function App() {
         daemonUrl={daemonUrl}
         sessionId={activeSession?.id ?? null}
         sessionTitle={activeSession?.title ?? "当前会话"}
+        workspacePath={activeSession?.project_path || activeRepo?.path}
         onUseSkillPrompt={(txt) => {
           setPrompt(txt);
           setTimeout(() => composerTextareaRef.current?.focus(), 60);
+        }}
+        onRunSlashCommand={(cmd) => {
+          void handleSendPrompt(cmd);
+        }}
+        onSkillsUpdated={(skills) => {
+          setLocalSkills(skills);
         }}
         onRewound={() => {
           if (activeSession?.id) {
