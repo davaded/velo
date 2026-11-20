@@ -41,6 +41,15 @@ import { ChatOutlineRail, OutlineTurnSummary } from "./components/ChatOutlineRai
 import { SidebarQuotaBar } from "./components/SidebarQuotaBar";
 import { RemoteHostsModal } from "./components/RemoteHostsModal";
 import { ExtensionsAndCheckpointsModal } from "./components/ExtensionsAndCheckpointsModal";
+import {
+  ENGINE_TABS,
+  InlineModelSelectorGrid,
+  ModelPickerPopover,
+  getEngineTabForAgentKind,
+  getEngineTabForModel,
+  isModelAvailable,
+  pickFeaturedModelsForEngine,
+} from "./components/ModelPickerPopover";
 import { e2eeOpenFrame, e2eeSealJson } from "./utils/e2eeRelayClient";
 import {
   Archive,
@@ -748,7 +757,11 @@ export function App() {
   const [repoHooks, setRepoHooks] = useState<Record<string, string>>({});
   const [hookEditCmd, setHookEditCmd] = useState<string>("");
   const [customAcpCmd, setCustomAcpCmd] = useState<string>("");
-  const [newRepoPath, setNewRepoPath] = useState<string>("~/velo");
+  const [newRepoPath, setNewRepoPath] = useState<string>("~/code");
+  const [newRepoMode, setNewRepoMode] = useState<"existing" | "create">("existing");
+  const [newFolderParent, setNewFolderParent] = useState<string>("~/code");
+  const [newFolderName, setNewFolderName] = useState<string>("");
+  const [newFolderInitGit, setNewFolderInitGit] = useState<boolean>(true);
   const [analyticsModalOpen, setAnalyticsModalOpen] = useState<boolean>(false);
   const [cliImportOpen, setCliImportOpen] = useState<boolean>(false);
   const [hostsModalOpen, setHostsModalOpen] = useState<boolean>(false);
@@ -1376,7 +1389,29 @@ export function App() {
       }
       if (raw.kind === "sessions_snapshot" && Array.isArray(raw.sessions)) {
         const normalized = raw.sessions.map((item, idx) => normalizeToVeloSession(item, idx));
-        setSessions(normalized);
+        setSessions((prev) => {
+          const prevById = new Map(prev.map((s) => [s.id, s]));
+          const merged = normalized.map((n) => {
+            const existing = prevById.get(n.id);
+            if (!existing) return n;
+            return {
+              ...n,
+              title: n.title || existing.title,
+              agent_kind: n.agent_kind || existing.agent_kind,
+              model: n.model || existing.model,
+              model_short: n.model_short || existing.model_short,
+              effort: n.effort || existing.effort,
+            };
+          });
+          const mergedIds = new Set(merged.map((s) => s.id));
+          const remainingLocal = prev.filter(
+            (d) =>
+              !mergedIds.has(d.id) &&
+              !(normalized.length > 0 && d.id === "sess-default" && d.title === "New thread") &&
+              (d.id.startsWith("sess-") || d.id.startsWith("wt-"))
+          );
+          return [...remainingLocal, ...merged];
+        });
         if (normalized.length > 0) {
           setRepos((prev) => {
             const byPath = new Map(prev.map((r) => [canonicalRepoPath(r.path), { ...r, id: repoIdFromPath(r.path), path: canonicalRepoPath(r.path) }]));
@@ -4066,23 +4101,155 @@ export function App() {
     setActiveModal(null);
   };
 
-  const handleCreateRepo = async () => {
-    const cleanPath = canonicalRepoPath(newRepoPath.trim() || "~/workspace");
-    setActiveModal(null);
-    try {
-      const res = await fetch(`${daemonUrl}/api/workspaces`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: cleanPath }),
-      });
-      if (res.ok) {
-        refreshSessions();
+  const openAddWorkspaceModal = useCallback(
+    (initialMode: "existing" | "create" = "existing") => {
+      const samplePath = activeRepo?.path || repos[0]?.path || "~/code";
+      const cleanSample = canonicalRepoPath(samplePath);
+      const parts = cleanSample.split("/").filter(Boolean);
+      const guessedParent =
+        parts.length >= 2
+          ? `${cleanSample.startsWith("/") ? "/" : ""}${parts.slice(0, -1).join("/")}`
+          : "~/code";
+      setNewFolderParent(guessedParent);
+      setNewFolderName("");
+      setNewRepoPath(guessedParent);
+      setNewRepoMode(initialMode);
+      setNewFolderInitGit(true);
+      setActiveModal("new-repo");
+    },
+    [activeRepo, repos]
+  );
+
+  const handleSelectSessionModel = useCallback(
+    async (m: ModelOption, isCrossEngineHandoff: boolean) => {
+      setModelPickerOpen(false);
+      const defaultEffortForEngine: EffortLevel =
+        m.agentKind === "codex"
+          ? activeSession.effort || "high"
+          : activeSession.effort === "xhigh" || activeSession.effort === "ultra"
+          ? "high"
+          : activeSession.effort || "medium";
+
+      if (isCrossEngineHandoff && activeSession.id !== "draft-empty") {
+        try {
+          const res = await fetch(
+            `${daemonUrl}/api/sessions/${activeSession.id}/handoff`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                target_provider: m.agentKind,
+                model: m.id,
+                effort: defaultEffortForEngine,
+              }),
+            }
+          );
+          if (res.ok) {
+            const rawNew = await res.json();
+            const created = normalizeToVeloSession(rawNew, 0);
+            created.repo_id = activeSession.repo_id;
+            created.agent_kind = m.agentKind;
+            created.model = m.id;
+            created.model_short = m.shortLabel;
+            created.effort = defaultEffortForEngine;
+            setSessions((prev) => [
+              created,
+              ...prev.filter((s) => s.id !== created.id),
+            ]);
+            setActiveId(created.id);
+            setTimeout(() => composerTextareaRef.current?.focus(), 30);
+            return;
+          }
+        } catch {
+          // fallback to E2EE command
+        }
+        sendE2eeCommand({
+          cmd: "handoff_session",
+          session_id: activeSession.id,
+          target_provider: m.agentKind,
+          model: m.id,
+          effort: defaultEffortForEngine,
+        });
         return;
       }
-    } catch {
-      sendE2eeCommand({ cmd: "add_workspace", path: cleanPath });
-    }
-    const name = cleanPath.split("/").filter(Boolean).pop() || "repo";
+
+      // If current view is the virtual `draft-empty` placeholder (not yet in `sessions`),
+      // materialize a concrete draft thread so the selected model actually sticks!
+      if (activeSession.id === "draft-empty") {
+        const newId = `wt-${Date.now()}`;
+        const materialized: VeloSession = {
+          ...activeSession,
+          id: newId,
+          repo_id: activeRepo.id,
+          worktree_path: activeRepo.path,
+          project_path: activeRepo.path,
+          agent_kind: m.agentKind,
+          model: m.id,
+          model_short: m.shortLabel,
+          effort: defaultEffortForEngine,
+          updated_at: "now",
+        };
+        setSessions((prev) => [materialized, ...prev]);
+        setEventsBySession((prev) => ({ ...prev, [newId]: [] }));
+        setActiveId(newId);
+        setTimeout(() => composerTextareaRef.current?.focus(), 20);
+        return;
+      }
+
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === activeSession.id
+            ? {
+                ...s,
+                agent_kind: m.agentKind,
+                model: m.id,
+                model_short: m.shortLabel,
+                effort: defaultEffortForEngine,
+              }
+            : s
+        )
+      );
+
+      if (!activeSession.id.startsWith("wt-") && !activeSession.id.startsWith("sess-")) {
+        fetch(`${daemonUrl}/api/sessions/${activeSession.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: m.id,
+            provider: m.agentKind,
+            effort: defaultEffortForEngine,
+          }),
+        }).catch(() => {
+          sendE2eeCommand({
+            cmd: "update_session",
+            session_id: activeSession.id,
+            model: m.id,
+            provider: m.agentKind,
+            effort: defaultEffortForEngine,
+          });
+        });
+      }
+      setTimeout(() => composerTextareaRef.current?.focus(), 20);
+    },
+    [activeRepo, activeSession, daemonUrl, sendE2eeCommand]
+  );
+
+  const handleCreateRepo = async () => {
+    const rawTarget =
+      newRepoMode === "create"
+        ? (() => {
+            const parent = (newFolderParent.trim() || "~/code").replace(/\/+$/, "");
+            const folder = newFolderName.trim().replace(/^\/+/, "");
+            return folder ? `${parent}/${folder}` : parent;
+          })()
+        : newRepoPath.trim() || "~/code";
+
+    const cleanPath = canonicalRepoPath(rawTarget);
+    if (!cleanPath) return;
+    const initGit = newRepoMode === "create" && newFolderInitGit;
+    setActiveModal(null);
+
+    const name = cleanPath.split("/").filter(Boolean).pop() || "workspace";
     const code = name.slice(0, 2).toUpperCase();
     const id = repoIdFromPath(cleanPath);
     const newRepo: VeloRepo = {
@@ -4092,17 +4259,40 @@ export function App() {
       path: cleanPath,
       default_branch: "main",
     };
+
     setRepos((prev) =>
       prev.some((r) => canonicalRepoPath(r.path) === cleanPath) ? prev : [...prev, newRepo]
     );
+    setCollapsedRepos((prev) => ({ ...prev, [id]: false }));
+
+    try {
+      const res = await fetch(`${daemonUrl}/api/workspaces`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: cleanPath, init_git: initGit }),
+      });
+      if (res.ok) {
+        refreshSessions();
+      } else {
+        sendE2eeCommand({ cmd: "add_workspace", path: cleanPath });
+      }
+    } catch {
+      sendE2eeCommand({ cmd: "add_workspace", path: cleanPath });
+    }
+
+    // Immediately open a fresh empty thread inside the newly added/created workspace
+    handleQuickNewThread(newRepo);
   };
 
-  const handlePickRepoFolder = async () => {
+  const handlePickRepoFolder = async (target: "existing" | "parent" = "existing") => {
     try {
       const res = await fetch(`${daemonUrl}/api/pick-folder`, { method: "POST" });
       if (res.ok) {
         const data = (await res.json()) as { path?: string };
-        if (data.path) setNewRepoPath(data.path);
+        if (data.path) {
+          if (target === "parent") setNewFolderParent(data.path);
+          else setNewRepoPath(data.path);
+        }
       }
     } catch {
       // ignore if cancelled
@@ -4360,13 +4550,44 @@ export function App() {
             </button>
           </div>
 
-          {/* Section Header: Workspaces */}
-          <div className="flex items-center justify-between px-4 pb-1.5 pt-1">
-            <span className="text-[11px] font-medium text-[var(--v-fg-muted)]">Workspaces</span>
+          {/* Section Header: Workspaces (Direct Add / Create Folder Entry) */}
+          <div className="flex items-center justify-between px-3 pb-1.5 pt-1">
+            <span className="pl-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--v-fg-muted)]">
+              Workspaces
+            </span>
+            <div className="flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={() => openAddWorkspaceModal("create")}
+                title="新建本地文件夹作为工作区"
+                className="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              >
+                <FolderPlus className="h-3.5 w-3.5" />
+                <span>新建</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openAddWorkspaceModal("existing")}
+                title="添加已有项目文件夹"
+                className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
 
           {/* Scrollable Project -> Thread Hierarchy (Borderless, Clean Rows) */}
           <div className="flex-1 space-y-3 overflow-y-auto px-2 py-1">
+            {repos.length === 0 && (
+              <button
+                type="button"
+                onClick={() => openAddWorkspaceModal("create")}
+                className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-[var(--v-border-strong)] px-3 py-3 text-[12px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              >
+                <FolderPlus className="h-3.5 w-3.5" />
+                <span>添加或新建工作区文件夹</span>
+              </button>
+            )}
             {repos.map((repo) => {
               const canonRepoPath = canonicalRepoPath(repo.path);
               const repoItems = sessions.filter(
@@ -4400,11 +4621,11 @@ export function App() {
                       </span>
                     </button>
 
-                    <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                    <div className="flex items-center gap-0.5">
                       <button
                         onClick={() => handleQuickNewThread(repo)}
                         title={`在 ${repo.name} 中新建会话`}
-                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] opacity-60 transition-opacity hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:opacity-100 cursor-pointer"
                       >
                         <Plus className="h-3.5 w-3.5" />
                       </button>
@@ -4418,14 +4639,14 @@ export function App() {
                           });
                         }}
                         title={`修改 ${repo.name} 的归属文件夹路径`}
-                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                        className="hidden h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:flex cursor-pointer"
                       >
                         <SquarePen className="h-3 w-3" />
                       </button>
                       <button
                         onClick={(e) => void handleRemoveRepo(repo.id, e)}
                         title={`移除文件夹 ${repo.name} 及旗下会话`}
-                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171] cursor-pointer"
+                        className="hidden h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171] group-hover:flex cursor-pointer"
                       >
                         <X className="h-3 w-3" />
                       </button>
@@ -4640,9 +4861,9 @@ export function App() {
         <div className="flex h-[40px] shrink-0 items-center justify-between border-t border-[var(--v-border-subtle)] px-2.5 text-[var(--v-fg-muted)]">
           <div className="flex items-center gap-1">
             <button
-              onClick={() => setActiveModal("new-repo")}
-              title="Add project"
-              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              onClick={() => openAddWorkspaceModal("existing")}
+              title="添加或新建工作区文件夹"
+              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
               <FolderPlus className="h-4 w-4" />
             </button>
@@ -5100,25 +5321,140 @@ export function App() {
                 )}
 
                 {activeEvents.length === 0 && (
-                  <div className="my-20 flex flex-col items-center justify-center gap-3 text-center select-none">
-                    <div className="inline-flex items-center gap-2 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3 py-1 text-[12px] text-[var(--v-fg-secondary)]">
-                      <GitBranch className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                  <div className="my-12 flex flex-col items-center justify-center gap-4 text-center">
+                    <div className="inline-flex items-center gap-2 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3.5 py-1 text-[12px] text-[var(--v-fg-secondary)]">
+                      <Folder className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
                       <span className="font-medium text-[var(--v-fg-primary)]">
                         {activeRepo.name}
                       </span>
                       <span className="text-[var(--v-fg-faint)]">/</span>
+                      <GitBranch className="h-3 w-3 text-[var(--v-fg-muted)]" />
                       <span className="font-mono text-[11.5px]">{activeSession.branch_name}</span>
                     </div>
+
+                    {/* Direct New-Thread Engine & Model Launchpad */}
+                    {(() => {
+                      const activeEngineKey = getEngineTabForAgentKind(activeSession.agent_kind);
+                      const featuredModels = pickFeaturedModelsForEngine(
+                        modelCatalog,
+                        activeEngineKey,
+                        5
+                      );
+                      const totalInEngine = modelCatalog.filter(
+                        (m) => getEngineTabForModel(m) === activeEngineKey
+                      ).length;
+
+                      return (
+                        <div className="w-full max-w-[540px] rounded-2xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)]/80 p-3.5 shadow-sm">
+                          <div className="mb-2 flex items-center justify-between px-0.5 text-[11px]">
+                            <span className="font-medium text-[var(--v-fg-muted)]">
+                              选择本次新会话的引擎与模型
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEffortPickerOpen(false);
+                                setModelPickerOpen(true);
+                              }}
+                              className="font-medium text-[#a78bfa] hover:underline cursor-pointer"
+                            >
+                              搜索全部 {modelCatalog.length} 个模型 →
+                            </button>
+                          </div>
+
+                          {/* Row 1: 5 Major Coding Engines */}
+                          <div className="flex flex-wrap items-center justify-center gap-1.5">
+                            {ENGINE_TABS.filter((t) => t.key !== "acp").map((tab) => {
+                              const engineModels = modelCatalog.filter(
+                                (m) => getEngineTabForModel(m) === tab.key
+                              );
+                              if (engineModels.length === 0) return null;
+                              const isSel = activeEngineKey === tab.key;
+                              const rt = runtimes.find((r) => r.id === tab.runtimeId);
+                              const avail = rt
+                                ? rt.available
+                                : engineModels.some((m) => m.installed !== false);
+                              const defaultModel =
+                                engineModels.find((m) => m.isDefault) || engineModels[0];
+
+                              return (
+                                <button
+                                  key={tab.key}
+                                  type="button"
+                                  disabled={!avail}
+                                  onClick={() => void handleSelectSessionModel(defaultModel, false)}
+                                  className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[12px] font-medium transition-all ${
+                                    isSel
+                                      ? "border-[var(--v-border-strong)] bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                                      : avail
+                                      ? "border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/50 text-[var(--v-fg-secondary)] hover:border-[var(--v-border-strong)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                      : "cursor-not-allowed border-transparent text-[var(--v-fg-faint)] opacity-45"
+                                  }`}
+                                >
+                                  <span
+                                    className="h-2 w-2 rounded-full"
+                                    style={{
+                                      backgroundColor: avail ? tab.dotColor : "var(--v-fg-faint)",
+                                    }}
+                                  />
+                                  <span>{tab.shortLabel}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          {/* Row 2: Featured Models of Selected Engine */}
+                          {featuredModels.length > 0 && (
+                            <div className="mt-2.5 flex flex-wrap items-center justify-center gap-1.5 border-t border-[var(--v-border-subtle)] pt-2.5">
+                              {featuredModels.map((m) => {
+                                const isSel = activeSession.model === m.id;
+                                const avail = isModelAvailable(m, runtimes);
+                                return (
+                                  <button
+                                    key={m.id}
+                                    type="button"
+                                    disabled={!avail}
+                                    onClick={() => void handleSelectSessionModel(m, false)}
+                                    className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11.5px] transition-colors ${
+                                      isSel
+                                        ? "border-[#34d399]/50 bg-[#34d399]/12 font-medium text-[var(--v-fg-primary)]"
+                                        : "border-[var(--v-border-subtle)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                    }`}
+                                  >
+                                    <span>{m.label}</span>
+                                    {isSel && <Check className="h-3 w-3 text-[#34d399]" />}
+                                  </button>
+                                );
+                              })}
+                              {totalInEngine > featuredModels.length && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEffortPickerOpen(false);
+                                    setModelPickerOpen(true);
+                                  }}
+                                  className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--v-border-strong)] px-2.5 py-1 text-[11px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                >
+                                  <span>+{totalInEngine - featuredModels.length} 更多</span>
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
                     <button
                       type="button"
                       onClick={() => {
                         setTargetRepoIdForNewWt(activeRepo.id);
+                        setNewModelId(activeSession.model);
                         setNewSetupCommand(repoHooks[activeRepo.path] || "");
                         setActiveModal("new-worktree");
                       }}
                       className="text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-primary)] cursor-pointer"
                     >
-                      Configure isolated branch · Committee race · TDD loop →
+                      配置独立 Git Worktree · Committee 多模型竞速 · TDD 自动循环 →
                     </button>
                   </div>
                 )}
@@ -5991,270 +6327,45 @@ export function App() {
 
                   {/* Composer Bottom Toolbar: Concrete Model Picker (Claude / Codex / ACP) + Effort + Permission Mode + Voice */}
                   <div className="relative mt-1.5 flex flex-wrap items-center justify-between gap-2">
-                    {/* 1. Categorized Engine & Model Picker Popover (Same-Engine Switch vs Cross-Engine Handoff) */}
+                    {/* 1. Categorized & Searchable Engine + Model Picker Popover */}
                     {modelPickerOpen && (
-                      <div className="absolute bottom-9 left-0 z-30 w-[368px] max-w-[calc(100vw-32px)] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
-                        <div className="max-h-[360px] overflow-y-auto pr-0.5">
-                          {(() => {
-                            const isSessionBound =
-                              (eventsBySession[activeSession.id]?.length ?? 0) > 0;
-                            const allFamilies = Array.from(
-                              new Set(modelCatalog.map((m) => m.family))
-                            );
-                            const sortedFamilies = [...allFamilies].sort((a, b) => {
-                              const aMatch = modelCatalog.some(
-                                (m) =>
-                                  m.family === a && m.agentKind === activeSession.agent_kind
-                              );
-                              const bMatch = modelCatalog.some(
-                                (m) =>
-                                  m.family === b && m.agentKind === activeSession.agent_kind
-                              );
-                              return Number(bMatch) - Number(aMatch);
-                            });
-
-                            return sortedFamilies.map((family) => {
-                              const familyModels = modelCatalog.filter(
-                                (m) => m.family === family
-                              );
-                              if (familyModels.length === 0) return null;
-                              const familyAgentKind = familyModels[0].agentKind;
-                              const isSameEngine =
-                                familyAgentKind === activeSession.agent_kind;
-                              const isCrossEngineHandoff = isSessionBound && !isSameEngine;
-                              const runtimeId = familyModels[0].runtimeId;
-                              const rt = runtimes.find((r) => r.id === runtimeId);
-                              const isAcpFamily = String(family).startsWith("ACP");
-                              const isConnected = rt
-                                ? rt.available
-                                : familyModels[0].installed !== false;
-
-                              return (
-                                <div
-                                  key={family}
-                                  className={`mb-2 rounded-lg p-1 last:mb-0 ${
-                                    isSameEngine && isSessionBound
-                                      ? "border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/40"
-                                      : ""
-                                  }`}
-                                >
-                                  <div className="flex items-center justify-between px-2 py-1 text-[10.5px] font-semibold">
-                                    <span className="text-[var(--v-fg-body)]">
-                                      {family === "Anthropic"
-                                        ? "Anthropic · Claude Code"
-                                        : family === "OpenAI"
-                                        ? "OpenAI · Codex"
-                                        : family === "Google Antigravity"
-                                        ? "Google · Antigravity (agy)"
-                                        : family === "xAI Grok"
-                                        ? "xAI · Grok CLI"
-                                        : family === "Cursor"
-                                        ? "Cursor · Agent CLI"
-                                        : family}
-                                    </span>
-                                    <span
-                                      className={`font-mono text-[9.5px] ${
-                                        isCrossEngineHandoff
-                                          ? "text-[#A78BFA]"
-                                          : isSameEngine && isSessionBound
-                                          ? "text-[#34D399]"
-                                          : "text-[var(--v-fg-muted)]"
-                                      }`}
-                                    >
-                                      {!isConnected && !isAcpFamily
-                                        ? "Not configured"
-                                        : isCrossEngineHandoff
-                                        ? "Handoff New Session ↗"
-                                        : isSameEngine && isSessionBound
-                                        ? "Bound Engine · Switch"
-                                        : "Ready"}
-                                    </span>
-                                  </div>
-                                  {familyModels.map((m) => {
-                                    const isCurrent = activeSession.model === m.id;
-                                    const canSelect = isConnected || isAcpFamily;
-                                    return (
-                                      <button
-                                        key={m.id}
-                                        disabled={!canSelect}
-                                        onClick={async () => {
-                                          setModelPickerOpen(false);
-                                          if (isCrossEngineHandoff) {
-                                            try {
-                                              const res = await fetch(
-                                                `${daemonUrl}/api/sessions/${activeSession.id}/handoff`,
-                                                {
-                                                  method: "POST",
-                                                  headers: {
-                                                    "Content-Type": "application/json",
-                                                  },
-                                                  body: JSON.stringify({
-                                                    target_provider: m.agentKind,
-                                                    model: m.id,
-                                                    effort:
-                                                      activeSession.effort || "medium",
-                                                  }),
-                                                }
-                                              );
-                                              if (res.ok) {
-                                                const rawNew = await res.json();
-                                                const created = normalizeToVeloSession(
-                                                  rawNew,
-                                                  0
-                                                );
-                                                created.repo_id = activeSession.repo_id;
-                                                created.agent_kind = m.agentKind;
-                                                created.model = m.id;
-                                                created.model_short = m.shortLabel;
-                                                setSessions((prev) => [
-                                                  created,
-                                                  ...prev.filter(
-                                                    (s) => s.id !== created.id
-                                                  ),
-                                                ]);
-                                                setActiveId(created.id);
-                                                setTimeout(
-                                                  () =>
-                                                    composerTextareaRef.current?.focus(),
-                                                  30
-                                                );
-                                                return;
-                                              }
-                                            } catch {
-                                              // fallback to E2EE command
-                                            }
-                                            sendE2eeCommand({
-                                              cmd: "handoff_session",
-                                              session_id: activeSession.id,
-                                              target_provider: m.agentKind,
-                                              model: m.id,
-                                              effort: activeSession.effort || "medium",
-                                            });
-                                            return;
-                                          }
-
-                                          setSessions((prev) =>
-                                            prev.map((s) =>
-                                              s.id === activeSession.id
-                                                ? {
-                                                    ...s,
-                                                    agent_kind: m.agentKind,
-                                                    model: m.id,
-                                                    model_short: m.shortLabel,
-                                                  }
-                                                : s
-                                            )
-                                          );
-                                          fetch(
-                                            `${daemonUrl}/api/sessions/${activeSession.id}`,
-                                            {
-                                              method: "PATCH",
-                                              headers: {
-                                                "Content-Type": "application/json",
-                                              },
-                                              body: JSON.stringify({
-                                                model: m.id,
-                                                provider: m.agentKind,
-                                              }),
-                                            }
-                                          ).catch(() => {});
-                                        }}
-                                        className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
-                                          isCurrent
-                                            ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                                            : canSelect
-                                            ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
-                                            : "cursor-not-allowed text-[var(--v-fg-muted)] opacity-40"
-                                        }`}
-                                      >
-                                        <div className="min-w-0 pr-2">
-                                          <div className="flex items-center gap-1.5 font-medium">
-                                            <span>{m.label}</span>
-                                            {m.isDefault && (
-                                              <span className="rounded bg-[var(--v-bg-active)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
-                                                default
-                                              </span>
-                                            )}
-                                            {!isConnected && isAcpFamily && (
-                                              <span className="rounded bg-[var(--v-bg-hover)] px-1.5 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-faint)]">
-                                                install CLI
-                                              </span>
-                                            )}
-                                          </div>
-                                          <div className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
-                                            {m.desc}
-                                          </div>
-                                        </div>
-                                        {isCurrent ? (
-                                          <Check className="h-3.5 w-3.5 shrink-0 text-[#34d399]" />
-                                        ) : isCrossEngineHandoff && canSelect ? (
-                                          <span className="shrink-0 font-mono text-[10px] text-[#A78BFA]">
-                                            ↗ Fork
-                                          </span>
-                                        ) : null}
-                                      </button>
-                                    );
-                                  })}
-                                </div>
-                              );
-                            });
-                          })()}
-                        </div>
-
-                        {/* Custom ACP Command Quick-Bind (`acp:<cmd>`) */}
-                        <div className="mt-1.5 border-t border-[var(--v-border-subtle)] px-1.5 pt-2">
-                          <div className="mb-1 text-[10px] font-medium text-[var(--v-fg-muted)]">
-                            Custom ACP Stdio Agent (JSON-RPC 2.0)
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <input
-                              value={customAcpCmd}
-                              onChange={(e) => setCustomAcpCmd(e.target.value)}
-                              placeholder="e.g. opencode acp or goose acp"
-                              className="flex-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2 py-1 font-mono text-[11px] text-[var(--v-fg-primary)] focus:outline-none"
-                            />
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const cmd = customAcpCmd.trim();
-                                if (!cmd) return;
-                                const acpSpec = cmd.startsWith("acp:") ? cmd : `acp:${cmd}`;
-                                const short = cmd.split(/\s+/)[0] || "ACP";
-                                setSessions((prev) =>
-                                  prev.map((s) =>
-                                    s.id === activeSession.id
-                                      ? {
-                                          ...s,
-                                          agent_kind: acpSpec,
-                                          model: acpSpec,
-                                          model_short: `ACP · ${short}`,
-                                        }
-                                      : s
-                                  )
-                                );
-                                setModelPickerOpen(false);
-                              }}
-                              className="rounded-md bg-[var(--v-bg-active)] px-2 py-1 text-[11px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
-                            >
-                              Bind
-                            </button>
-                          </div>
-                        </div>
-
-                        <div className="mt-1 border-t border-[var(--v-border-subtle)] pt-1">
-                          <button
-                            onClick={() => {
-                              setModelPickerOpen(false);
-                              setHookEditCmd(repoHooks[activeRepo.path] || "");
-                              setActiveModal("settings");
-                            }}
-                            className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                          >
-                            <span>Manage CLI, ACP &amp; Worktree Hooks...</span>
-                            <Settings className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
-                          </button>
-                        </div>
-                      </div>
+                      <ModelPickerPopover
+                        modelCatalog={modelCatalog}
+                        runtimes={runtimes}
+                        activeAgentKind={activeSession.agent_kind}
+                        activeModelId={activeSession.model}
+                        isSessionBound={(eventsBySession[activeSession.id]?.length ?? 0) > 0}
+                        customAcpCmd={customAcpCmd}
+                        onChangeCustomAcpCmd={setCustomAcpCmd}
+                        onBindCustomAcp={() => {
+                          const cmd = customAcpCmd.trim();
+                          if (!cmd) return;
+                          const acpSpec = cmd.startsWith("acp:") ? cmd : `acp:${cmd}`;
+                          const short = cmd.split(/\s+/)[0] || "ACP";
+                          void handleSelectSessionModel(
+                            {
+                              id: acpSpec,
+                              label: `ACP · ${short}`,
+                              shortLabel: `ACP · ${short}`,
+                              family: "ACP · Custom",
+                              runtimeId: "acp",
+                              agentKind: acpSpec as AgentKind,
+                              desc: cmd,
+                              installed: true,
+                            },
+                            false
+                          );
+                        }}
+                        onSelectModel={(m, isHandoff) => {
+                          void handleSelectSessionModel(m, isHandoff);
+                        }}
+                        onOpenSettings={() => {
+                          setModelPickerOpen(false);
+                          setHookEditCmd(repoHooks[activeRepo.path] || "");
+                          setActiveModal("settings");
+                        }}
+                        onClose={() => setModelPickerOpen(false)}
+                      />
                     )}
 
                     {/* 2. Reasoning Effort Popover */}
@@ -6319,22 +6430,39 @@ export function App() {
                     )}
 
                     <div className="flex flex-wrap items-center gap-1.5">
-                      {/* Pill 1: Concrete Model Name */}
-                      <button
-                        onClick={() => {
-                          setEffortPickerOpen(false);
-                          setModelPickerOpen((o) => !o);
-                        }}
-                        className="flex items-center gap-1.5 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] transition-colors hover:bg-[var(--v-bg-hover)]"
-                      >
-                        <span className="h-1.5 w-1.5 rounded-full bg-[#34d399]" />
-                        <span>
-                          {modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-                            activeSession.model_short ||
-                            activeSession.model}
-                        </span>
-                        <ChevronDown className="h-3 w-3 text-[var(--v-fg-muted)]" />
-                      </button>
+                      {/* Pill 1: Concrete Engine + Model Picker */}
+                      {(() => {
+                        const engTab = ENGINE_TABS.find(
+                          (t) => t.key === getEngineTabForAgentKind(activeSession.agent_kind)
+                        );
+                        return (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEffortPickerOpen(false);
+                              setModelPickerOpen((o) => !o);
+                            }}
+                            title="切换引擎或模型（支持搜索与按厂商分类筛选）"
+                            className="flex items-center gap-1.5 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] transition-colors hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                          >
+                            <span
+                              className="h-1.5 w-1.5 rounded-full"
+                              style={{ backgroundColor: engTab?.dotColor || "#34d399" }}
+                            />
+                            {engTab && (
+                              <span className="font-mono text-[10px] text-[var(--v-fg-muted)]">
+                                {engTab.shortLabel}
+                              </span>
+                            )}
+                            <span>
+                              {modelCatalog.find((m) => m.id === activeSession.model)?.label ||
+                                activeSession.model_short ||
+                                activeSession.model}
+                            </span>
+                            <ChevronDown className="h-3 w-3 text-[var(--v-fg-muted)]" />
+                          </button>
+                        );
+                      })()}
 
                       {/* Pill 2: Reasoning Effort */}
                       <button
@@ -6960,27 +7088,15 @@ export function App() {
                   </div>
                   {dispatchMode !== "committee" && (
                     <div>
-                      <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                        Model / ACP Provider
+                      <label className="mb-1.5 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                        引擎与模型 (Model / ACP Provider)
                       </label>
-                      <div className="max-h-[164px] overflow-y-auto grid grid-cols-2 gap-1.5 pr-1">
-                        {modelCatalog.map((m) => (
-                          <button
-                            key={m.id}
-                            onClick={() => setNewModelId(m.id)}
-                            className={`flex items-center justify-between gap-1 rounded-lg border px-2.5 py-1.5 text-left text-[12px] ${
-                              newModelId === m.id
-                                ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
-                                : "border-[var(--v-border-strong)] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)]"
-                            }`}
-                          >
-                            <span className="truncate">{m.label}</span>
-                            <span className="shrink-0 font-mono text-[9.5px] opacity-60">
-                              {m.family.replace("ACP · ", "")}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
+                      <InlineModelSelectorGrid
+                        modelCatalog={modelCatalog}
+                        runtimes={runtimes}
+                        selectedModelId={newModelId}
+                        onSelectModelId={setNewModelId}
+                      />
                     </div>
                   )}
                   <div>
@@ -7084,47 +7200,168 @@ export function App() {
 
             {activeModal === "new-repo" && (
               <div>
-                <div className="mb-4 flex items-center justify-between">
+                <div className="mb-3.5 flex items-center justify-between">
                   <h3 className="text-[14px] font-semibold text-[var(--v-fg-primary)]">
-                    Add project
+                    添加 / 新建工作区文件夹
                   </h3>
                   <button
+                    type="button"
                     onClick={() => setActiveModal(null)}
-                    className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                    className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                   >
                     <X className="h-4 w-4" />
                   </button>
                 </div>
-                <div className="space-y-3 text-[12.5px]">
-                  <div className="flex items-center gap-2">
-                    <input
-                      value={newRepoPath}
-                      onChange={(e) => setNewRepoPath(e.target.value)}
-                      placeholder="/path/to/git/repo"
-                      className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
-                    />
-                    <button
-                      onClick={handlePickRepoFolder}
-                      className="shrink-0 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-3 py-2 text-[12px] text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)]"
-                    >
-                      Browse Finder...
-                    </button>
-                  </div>
-                  <div className="flex justify-end gap-2 pt-2">
-                    <button
-                      onClick={() => setActiveModal(null)}
-                      className="rounded-lg px-3 py-1.5 text-[12.5px] text-[var(--v-fg-secondary)]"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={handleCreateRepo}
-                      className="rounded-lg bg-[var(--v-btn-bg)] px-4 py-1.5 text-[12.5px] font-medium text-[var(--v-btn-fg)]"
-                    >
-                      Add
-                    </button>
-                  </div>
+
+                {/* Mode Switcher: Create New Local Folder vs Add Existing Folder */}
+                <div className="mb-3.5 grid grid-cols-2 gap-1 rounded-lg bg-[var(--v-bg-sidebar)] p-1 text-[12px]">
+                  <button
+                    type="button"
+                    onClick={() => setNewRepoMode("create")}
+                    className={`rounded-md py-1.5 font-medium transition-colors cursor-pointer ${
+                      newRepoMode === "create"
+                        ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                        : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                    }`}
+                  >
+                    新建本地文件夹
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setNewRepoMode("existing")}
+                    className={`rounded-md py-1.5 font-medium transition-colors cursor-pointer ${
+                      newRepoMode === "existing"
+                        ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
+                        : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
+                    }`}
+                  >
+                    选择已有文件夹
+                  </button>
                 </div>
+
+                {newRepoMode === "create" ? (
+                  <div className="space-y-3 text-[12.5px]">
+                    <div>
+                      <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                        存放位置（父目录）
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          value={newFolderParent}
+                          onChange={(e) => setNewFolderParent(e.target.value)}
+                          placeholder="~/code"
+                          className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void handlePickRepoFolder("parent")}
+                          className="shrink-0 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-3 py-2 text-[12px] text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                        >
+                          选择位置…
+                        </button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="mb-1 block text-[11.5px] text-[var(--v-fg-secondary)]">
+                        新文件夹名称
+                      </label>
+                      <input
+                        autoFocus
+                        value={newFolderName}
+                        onChange={(e) => setNewFolderName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && newFolderName.trim()) {
+                            void handleCreateRepo();
+                          }
+                        }}
+                        placeholder="例如 my-next-app 或 ai-demo"
+                        className="w-full rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:border-[var(--v-fg-muted)] focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="rounded-lg bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
+                      将创建：
+                      <span className="text-[var(--v-fg-primary)]">
+                        {`${(newFolderParent.trim() || "~/code").replace(/\/+$/, "")}/${
+                          newFolderName.trim().replace(/^\/+/, "") || "<文件夹名>"
+                        }`}
+                      </span>
+                    </div>
+
+                    <label className="flex items-center gap-2 text-[12px] text-[var(--v-fg-secondary)] cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={newFolderInitGit}
+                        onChange={(e) => setNewFolderInitGit(e.target.checked)}
+                        className="rounded border-[var(--v-border-strong)] accent-[#8b5cf6]"
+                      />
+                      <span>同时初始化 Git 仓库（支持 Diff 审查与每轮检查点回滚）</span>
+                    </label>
+
+                    <div className="flex justify-end gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setActiveModal(null)}
+                        className="rounded-lg px-3 py-1.5 text-[12.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!newFolderName.trim()}
+                        onClick={() => void handleCreateRepo()}
+                        className="rounded-lg bg-[var(--v-btn-bg)] px-4 py-1.5 text-[12.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90 disabled:opacity-40 cursor-pointer"
+                      >
+                        创建文件夹并开始
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-3 text-[12.5px]">
+                    <div className="flex items-center gap-2">
+                      <input
+                        autoFocus
+                        value={newRepoPath}
+                        onChange={(e) => setNewRepoPath(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && newRepoPath.trim()) {
+                            void handleCreateRepo();
+                          }
+                        }}
+                        placeholder="/path/to/project"
+                        className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3 py-2 font-mono text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handlePickRepoFolder("existing")}
+                        className="shrink-0 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-active)] px-3 py-2 text-[12px] text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                      >
+                        从 Finder 选择…
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-[var(--v-fg-muted)]">
+                      可直接从 Finder 选择已有项目目录，或手动输入完整路径（目录不存在时将自动创建）。
+                    </p>
+                    <div className="flex justify-end gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setActiveModal(null)}
+                        className="rounded-lg px-3 py-1.5 text-[12.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!newRepoPath.trim()}
+                        onClick={() => void handleCreateRepo()}
+                        className="rounded-lg bg-[var(--v-btn-bg)] px-4 py-1.5 text-[12.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90 disabled:opacity-40 cursor-pointer"
+                      >
+                        添加工作区
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

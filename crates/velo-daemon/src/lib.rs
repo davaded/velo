@@ -1509,8 +1509,26 @@ impl DaemonState {
     }
 
     pub async fn add_workspace(&self, raw_path: &str) -> Vec<String> {
+        self.add_workspace_with_options(raw_path, false).await
+    }
+
+    pub async fn add_workspace_with_options(&self, raw_path: &str, init_git: bool) -> Vec<String> {
         let clean = canonical_workspace_path(raw_path);
-        let _ = velo_worktree::ensure_usable_workspace_dir(Path::new(&clean)).await;
+        let resolved = velo_worktree::ensure_usable_workspace_dir(Path::new(&clean)).await;
+        if init_git && !resolved.join(".git").exists() {
+            let init_main = Command::new("git")
+                .args(["init", "-b", "main"])
+                .current_dir(&resolved)
+                .status()
+                .await;
+            if !matches!(init_main, Ok(s) if s.success()) {
+                let _ = Command::new("git")
+                    .arg("init")
+                    .current_dir(&resolved)
+                    .status()
+                    .await;
+            }
+        }
         {
             let mut guard = self.inner.write().await;
             if !clean.is_empty() && !guard.workspaces.contains(&clean) {
@@ -2998,6 +3016,7 @@ pub(crate) async fn build_models_catalog_json() -> Value {
 struct WorkspaceMutationRequest {
     path: String,
     delete_sessions: Option<bool>,
+    init_git: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3015,7 +3034,9 @@ async fn add_workspace_handler(
     State(state): State<DaemonState>,
     Json(req): Json<WorkspaceMutationRequest>,
 ) -> impl IntoResponse {
-    let list = state.add_workspace(&req.path).await;
+    let list = state
+        .add_workspace_with_options(&req.path, req.init_git.unwrap_or(false))
+        .await;
     Json(json!({ "workspaces": list }))
 }
 
@@ -3046,7 +3067,7 @@ async fn pick_folder_handler() -> impl IntoResponse {
     let out = Command::new("osascript")
         .args([
             "-e",
-            "POSIX path of (choose folder with prompt \"Select Git Repository for Velo:\")",
+            "POSIX path of (choose folder with prompt \"选择项目文件夹，或点击左下角「新建文件夹」创建工作区：\")",
         ])
         .output()
         .await;
