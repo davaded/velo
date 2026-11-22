@@ -183,6 +183,9 @@ public struct RootSessionsView: View {
                         .padding(.bottom, 96)
                     }
                     .refreshable {
+                        if !store.isConnected && store.connectionConfig != nil {
+                            store.connect()
+                        }
                         await store.refreshSessionsAndActiveEvents()
                         await store.fetchQuotas()
                     }

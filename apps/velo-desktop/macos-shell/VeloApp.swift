@@ -1,6 +1,7 @@
 import AVFoundation
 import Cocoa
 import Speech
+import UserNotifications
 import WebKit
 
 private final class MacSpeechRequestBox: @unchecked Sendable {
@@ -35,7 +36,7 @@ private struct MenuSessionSummary {
     let status: String
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler, UNUserNotificationCenterDelegate {
     var window: NSWindow!
     var webView: WKWebView!
     var daemonProcess: Process?
@@ -45,6 +46,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     private var cachedMenuSessions: [MenuSessionSummary] = []
     private var caffeinateActive = false
     private var lastMenuBarSignature = ""
+    private var lastStatusBySessionId: [String: String] = [:]
+    private var didPrimeStatusSnapshot = false
 
     // Native macOS Speech.framework + AVAudioEngine live dictation state
     private var audioEngine: AVAudioEngine?
@@ -212,6 +215,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                     let sig = "\(runningCount)|\(waitingCount)|\(caff)|" + summaries.map { "\($0.id):\($0.status):\($0.name)" }.joined(separator: ",")
                     DispatchQueue.main.async {
                         guard let self else { return }
+                        self.detectAndNotifyTransitions(from: summaries)
                         if sig == self.lastMenuBarSignature { return }
                         self.lastMenuBarSignature = sig
                         self.cachedMenuSessions = summaries
@@ -602,7 +606,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         window.minSize = NSSize(width: 960, height: 640)
         window.appearance = nil
         window.backgroundColor = NSColor.windowBackgroundColor
-        window.center()
+        if !window.setFrameUsingName("VeloMainWindow") {
+            window.center()
+        }
+        window.setFrameAutosaveName("VeloMainWindow")
+
+        setupDesktopNotifications()
 
         let contentController = WKUserContentController()
         contentController.add(self, name: "windowDrag")
@@ -675,6 +684,112 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         } else {
             decisionHandler(.prompt)
         }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        if let url = navigationAction.request.url,
+           let scheme = url.scheme?.lowercased(),
+           (scheme == "http" || scheme == "https"),
+           url.host != "127.0.0.1" && url.host != "localhost"
+        {
+            if navigationAction.navigationType == .linkActivated || navigationAction.targetFrame == nil {
+                NSWorkspace.shared.open(url)
+                decisionHandler(.cancel)
+                return
+            }
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if let url = navigationAction.request.url {
+            NSWorkspace.shared.open(url)
+        }
+        return nil
+    }
+
+    private func setupDesktopNotifications() {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private func detectAndNotifyTransitions(from summaries: [MenuSessionSummary]) {
+        if !didPrimeStatusSnapshot {
+            didPrimeStatusSnapshot = true
+            for s in summaries {
+                lastStatusBySessionId[s.id] = s.status
+            }
+            return
+        }
+        let appFocused = NSApp.isActive && (window?.isVisible ?? false) && (window?.isKeyWindow ?? false)
+        for s in summaries {
+            let prev = lastStatusBySessionId[s.id]
+            lastStatusBySessionId[s.id] = s.status
+            guard !appFocused else { continue }
+            if s.status.contains("waiting") && !(prev?.contains("waiting") ?? false) {
+                postDesktopNotification(
+                    title: "Velo · 等待权限审批",
+                    body: s.name,
+                    sessionId: s.id
+                )
+            } else if (prev == "running" || prev == "starting") && s.status == "completed" {
+                postDesktopNotification(
+                    title: "Velo · 任务已完成",
+                    body: s.name,
+                    sessionId: s.id
+                )
+            } else if (prev == "running" || prev == "starting") && s.status == "failed" {
+                postDesktopNotification(
+                    title: "Velo · 任务执行异常",
+                    body: s.name,
+                    sessionId: s.id
+                )
+            }
+        }
+    }
+
+    private func postDesktopNotification(title: String, body: String, sessionId: String) {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["session_id": sessionId]
+        let req = UNNotificationRequest(
+            identifier: "velo-\(sessionId)-\(Int(Date().timeIntervalSince1970))",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let sid = response.notification.request.content.userInfo["session_id"] as? String
+        DispatchQueue.main.async { [weak self] in
+            self?.showMainWindow()
+            if let sid,
+               let data = try? JSONSerialization.data(withJSONObject: [sid]),
+               let arr = String(data: data, encoding: .utf8)
+            {
+                self?.emitVoiceJS("window.__veloSelectSession && window.__veloSelectSession((\(arr))[0]);")
+            }
+        }
+        completionHandler()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

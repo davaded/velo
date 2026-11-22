@@ -5141,14 +5141,22 @@ async fn get_session_events_handler(
     state.flush_open_assistant_text(Some(id)).await;
     if let Some(after_seq) = params.after_seq {
         let lim = params.limit.unwrap_or(180);
-        match state.db.query_events_incremental(
-            id,
-            after_seq,
-            params.known_count,
-            params.known_ts_ms,
-            lim,
-        ) {
-            Ok(page) => return Json(json!(page)).into_response(),
+        let db = state.db.clone();
+        let known_count = params.known_count;
+        let known_ts_ms = params.known_ts_ms;
+        let res = tokio::task::spawn_blocking(move || {
+            db.query_events_incremental(id, after_seq, known_count, known_ts_ms, lim)
+        })
+        .await;
+        match res {
+            Ok(Ok(page)) => return Json(json!(page)).into_response(),
+            Ok(Err(err)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "error": err.to_string() })),
+                )
+                    .into_response();
+            }
             Err(err) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -5160,8 +5168,19 @@ async fn get_session_events_handler(
     }
     if params.before_seq.is_some() || params.limit.is_some() {
         let lim = params.limit.unwrap_or(180);
-        match state.db.query_events_page(id, params.before_seq, lim) {
-            Ok(page) => return Json(json!(page)).into_response(),
+        let db = state.db.clone();
+        let before_seq = params.before_seq;
+        let res = tokio::task::spawn_blocking(move || db.query_events_page(id, before_seq, lim))
+            .await;
+        match res {
+            Ok(Ok(page)) => return Json(json!(page)).into_response(),
+            Ok(Err(err)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "error": err.to_string() })),
+                )
+                    .into_response();
+            }
             Err(err) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -5186,7 +5205,11 @@ async fn global_search_handler(
 ) -> impl IntoResponse {
     let q = params.q.unwrap_or_default();
     let lim = params.limit.unwrap_or(30);
-    let hits = state.db.search_global(&q, lim).unwrap_or_default();
+    let db = state.db.clone();
+    let q_clone = q.clone();
+    let hits = tokio::task::spawn_blocking(move || db.search_global(&q_clone, lim).unwrap_or_default())
+        .await
+        .unwrap_or_default();
     Json(json!({ "ok": true, "query": q, "hits": hits }))
 }
 

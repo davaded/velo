@@ -71,7 +71,7 @@ public struct ChatThreadView: View {
     }
 
     private var turns: [ConversationTurnBlock] {
-        VeloStore.groupIntoTurns(store.eventsBySession[sessionId] ?? [])
+        store.cachedTurns(for: sessionId)
     }
 
     private var isEngineBound: Bool {
@@ -108,6 +108,36 @@ public struct ChatThreadView: View {
             VStack(spacing: 0) {
                 if let s = session {
                     threadContextBar(s)
+                }
+                if !store.isConnected && store.connectionConfig != nil {
+                    HStack(spacing: 8) {
+                        Image(systemName: "wifi.exclamationmark")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(VeloTheme.amber)
+                        Text("连接已断开，正在重连 Mac 守护进程…")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Button {
+                            store.triggerHaptic(.light)
+                            store.connect()
+                        } label: {
+                            Text("重连")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(VeloTheme.amber)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 3.5)
+                                .background(VeloTheme.amber.opacity(0.14), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(VeloTheme.amber.opacity(0.08))
+                    .overlay(alignment: .bottom) {
+                        Divider().opacity(0.5)
+                    }
                 }
                 scrollStreamSection
                 floatingComposerDock

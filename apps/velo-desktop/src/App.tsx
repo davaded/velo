@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AgentEvent,
   AgentKind,
@@ -108,6 +108,7 @@ import {
   Terminal,
   Trash2,
   Undo2,
+  WifiOff,
   X,
 } from "lucide-react";
 
@@ -229,6 +230,62 @@ function parseUserMessageWithFiles(raw: string): { files: string[]; body: string
     idx++;
   }
   return { files, body: lines.slice(idx).join("\n") };
+}
+
+interface LastModelPref {
+  agent_kind: AgentKind;
+  model: string;
+  model_short: string;
+  effort: EffortLevel;
+}
+
+const LAST_MODEL_PREF_KEY = "velo.lastModelPref.v1";
+
+function readLastModelPref(): LastModelPref | null {
+  try {
+    const raw = window.localStorage.getItem(LAST_MODEL_PREF_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<LastModelPref>;
+    if (parsed && parsed.agent_kind && parsed.model && parsed.model_short) {
+      return {
+        agent_kind: parsed.agent_kind,
+        model: parsed.model,
+        model_short: parsed.model_short,
+        effort: parsed.effort || "medium",
+      };
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function saveLastModelPref(pref: Partial<LastModelPref>): void {
+  try {
+    const existing = readLastModelPref();
+    const merged: LastModelPref = {
+      agent_kind: pref.agent_kind ?? existing?.agent_kind ?? "claude",
+      model: pref.model ?? existing?.model ?? "claude-fable-5-2",
+      model_short: pref.model_short ?? existing?.model_short ?? "Fable 5.2",
+      effort: pref.effort ?? existing?.effort ?? "medium",
+    };
+    window.localStorage.setItem(LAST_MODEL_PREF_KEY, JSON.stringify(merged));
+  } catch {
+    // ignore
+  }
+}
+
+function scheduleIdleWork(fn: () => void, timeoutMs = 1500): () => void {
+  const w = window as unknown as {
+    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+    cancelIdleCallback?: (id: number) => void;
+  };
+  if (typeof w.requestIdleCallback === "function") {
+    const id = w.requestIdleCallback(fn, { timeout: timeoutMs });
+    return () => w.cancelIdleCallback?.(id);
+  }
+  const id = window.setTimeout(fn, 60);
+  return () => window.clearTimeout(id);
 }
 
 const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {};
@@ -852,20 +909,36 @@ export function App() {
     return {};
   });
 
+  const reposLatestRef = useRef(repos);
+  reposLatestRef.current = repos;
+  const sessionsLatestRef = useRef(sessions);
+  sessionsLatestRef.current = sessions;
+  const activeIdLatestRef = useRef(activeId);
+  activeIdLatestRef.current = activeId;
+  const eventsLatestRef = useRef(eventsBySession);
+  eventsLatestRef.current = eventsBySession;
+
+  // Debounced idle persistence: avoids synchronous JSON.stringify/localStorage stalls during streaming
   useEffect(() => {
-    try {
-      safeStorageSet("velo.repos.v3", JSON.stringify(repos));
-    } catch {
-      // ignore
-    }
+    const timer = window.setTimeout(() => {
+      try {
+        safeStorageSet("velo.repos.v3", JSON.stringify(reposLatestRef.current));
+      } catch {
+        // ignore
+      }
+    }, 500);
+    return () => window.clearTimeout(timer);
   }, [repos]);
 
   useEffect(() => {
-    try {
-      safeStorageSet("velo.sessions.v3", JSON.stringify(sessions));
-    } catch {
-      // ignore
-    }
+    const timer = window.setTimeout(() => {
+      try {
+        safeStorageSet("velo.sessions.v3", JSON.stringify(sessionsLatestRef.current));
+      } catch {
+        // ignore
+      }
+    }, 650);
+    return () => window.clearTimeout(timer);
   }, [sessions]);
 
   useEffect(() => {
@@ -873,15 +946,38 @@ export function App() {
   }, [activeId]);
 
   useEffect(() => {
-    const compact = compactEventsForLocalStorage(eventsBySession, activeId);
-    if (compact !== null) {
-      safeStorageSet("velo.events.v4", compact);
-    } else {
-      purgeBloatedStorageCaches();
-    }
+    const hasStreaming = Object.values(eventsBySession).some((list) =>
+      list.some((ev) => ev.is_streaming_chunk)
+    );
+    // Defer heavy event-cache serialization while streaming; flush automatically when stream settles or on pagehide
+    const delayMs = hasStreaming ? 4000 : 1400;
+    let cancelIdle: (() => void) | null = null;
+    const timer = window.setTimeout(() => {
+      cancelIdle = scheduleIdleWork(() => {
+        const compact = compactEventsForLocalStorage(
+          eventsLatestRef.current,
+          activeIdLatestRef.current
+        );
+        if (compact !== null) {
+          safeStorageSet("velo.events.v4", compact);
+        } else {
+          purgeBloatedStorageCaches();
+        }
+      }, 1800);
+    }, delayMs);
+    return () => {
+      window.clearTimeout(timer);
+      cancelIdle?.();
+    };
   }, [eventsBySession, activeId]);
 
   const [connected, setConnected] = useState<boolean>(false);
+  const [wsReconnectNonce, setWsReconnectNonce] = useState<number>(0);
+  const [connectionGraceElapsed, setConnectionGraceElapsed] = useState<boolean>(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setConnectionGraceElapsed(true), 2500);
+    return () => window.clearTimeout(timer);
+  }, []);
   const [runtimes, setRuntimes] = useState<LocalRuntimeDto[]>([
     { id: "claude", name: "Claude Code", available: true, version: "2.1.317 (Claude Code)" },
     { id: "codex", name: "OpenAI Codex", available: true, version: "codex-cli 0.154.0" },
@@ -970,20 +1066,61 @@ export function App() {
   const [attachmentsBySession, setAttachmentsBySession] = useState<
     Record<string, PendingAttachmentItem[]>
   >({});
+  const draftsLatestRef = useRef(draftsBySession);
+  draftsLatestRef.current = draftsBySession;
   useEffect(() => {
-    try {
-      const compact: Record<string, string> = {};
-      for (const [k, v] of Object.entries(draftsBySession)) {
-        if (v && v.length <= 24_000) compact[k] = v;
+    const timer = window.setTimeout(() => {
+      try {
+        const compact: Record<string, string> = {};
+        for (const [k, v] of Object.entries(draftsLatestRef.current)) {
+          if (v && v.length <= 24_000) compact[k] = v;
+        }
+        const serialized = JSON.stringify(compact);
+        if (serialized.length <= 200_000) {
+          safeStorageSet("velo.drafts.v1", serialized);
+        }
+      } catch {
+        // ignore
       }
-      const serialized = JSON.stringify(compact);
-      if (serialized.length <= 200_000) {
-        safeStorageSet("velo.drafts.v1", serialized);
-      }
-    } catch {
-      // ignore
-    }
+    }, 600);
+    return () => window.clearTimeout(timer);
   }, [draftsBySession]);
+
+  // Flush debounced caches cleanly on app quit / tab hide so zero drafts or events are lost
+  useEffect(() => {
+    const flushAllCaches = () => {
+      try {
+        safeStorageSet("velo.repos.v3", JSON.stringify(reposLatestRef.current));
+        safeStorageSet("velo.sessions.v3", JSON.stringify(sessionsLatestRef.current));
+        const compactDrafts: Record<string, string> = {};
+        for (const [k, v] of Object.entries(draftsLatestRef.current)) {
+          if (v && v.length <= 24_000) compactDrafts[k] = v;
+        }
+        const serializedDrafts = JSON.stringify(compactDrafts);
+        if (serializedDrafts.length <= 200_000) {
+          safeStorageSet("velo.drafts.v1", serializedDrafts);
+        }
+        const compactEvents = compactEventsForLocalStorage(
+          eventsLatestRef.current,
+          activeIdLatestRef.current
+        );
+        if (compactEvents !== null) {
+          safeStorageSet("velo.events.v4", compactEvents);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flushAllCaches();
+    };
+    window.addEventListener("pagehide", flushAllCaches);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", flushAllCaches);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
   const [slashFilter, setSlashFilter] = useState<string | null>(null);
   const [slashSelectedIdx, setSlashSelectedIdx] = useState<number>(0);
   const slashActionRunnersRef = useRef<Array<() => void>>([]);
@@ -1174,14 +1311,15 @@ export function App() {
       sessions[0];
     if (found) return found;
     const defaultRepo = repos[0] || DEMO_REPOS[0];
+    const lastPref = readLastModelPref();
     return {
       id: "draft-empty",
       repo_id: defaultRepo.id,
       title: "New thread",
-      agent_kind: "claude",
-      model: "claude-fable-5-2",
-      model_short: "Fable 5.2",
-      effort: "medium",
+      agent_kind: lastPref?.agent_kind || "claude",
+      model: lastPref?.model || "claude-fable-5-2",
+      model_short: lastPref?.model_short || "Fable 5.2",
+      effort: lastPref?.effort || "medium",
       status: "idle",
       branch_name: defaultRepo.default_branch || "main",
       worktree_path: defaultRepo.path,
@@ -1202,6 +1340,14 @@ export function App() {
   activeSessionIdRef.current = activeSession.id;
 
   const prompt = draftsBySession[activeSession.id] ?? "";
+  // Smooth auto-growing composer textarea (2 lines baseline -> up to ~8 lines)
+  useLayoutEffect(() => {
+    const el = composerTextareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const nextHeight = Math.min(200, Math.max(44, el.scrollHeight));
+    el.style.height = `${nextHeight}px`;
+  }, [prompt, activeSession.id, isDictating]);
   const pendingAttachments = useMemo(
     () => attachmentsBySession[activeSession.id] ?? [],
     [attachmentsBySession, activeSession.id]
@@ -3024,7 +3170,7 @@ export function App() {
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (ws) ws.close();
     };
-  }, [daemonUrl, processServerPayload, refreshSessions, syncSessionEventsFromDaemon]);
+  }, [daemonUrl, wsReconnectNonce, processServerPayload, refreshSessions, syncSessionEventsFromDaemon]);
 
   // Connect to True E2EE Remote Relay (`ChaCha20-Poly1305`) when `?relay=...&room=...&key=...` is present
   useEffect(() => {
@@ -3105,14 +3251,15 @@ export function App() {
 
       const branch = targetRepo.default_branch || "main";
       const newId = `wt-${Date.now()}`;
+      const lastPref = readLastModelPref();
       const freshSession: VeloSession = {
         id: newId,
         repo_id: targetRepo.id,
         title: "New thread",
-        agent_kind: activeSession.agent_kind || "claude",
-        model: activeSession.model || "claude-fable-5-2",
-        model_short: activeSession.model_short || "Fable 5.2",
-        effort: activeSession.effort || "medium",
+        agent_kind: lastPref?.agent_kind || activeSession.agent_kind || "claude",
+        model: lastPref?.model || activeSession.model || "claude-fable-5-2",
+        model_short: lastPref?.model_short || activeSession.model_short || "Fable 5.2",
+        effort: lastPref?.effort || activeSession.effort || "medium",
         status: "idle",
         branch_name: branch,
         worktree_path: targetRepo.path,
@@ -3137,10 +3284,53 @@ export function App() {
   );
 
   const stopSessionRef = useRef<() => void>(() => {});
+  const sessionHistoryRef = useRef<{ ids: string[]; idx: number; navigating: boolean }>({
+    ids: [],
+    idx: -1,
+    navigating: false,
+  });
+
+  useEffect(() => {
+    if (!activeId || activeId === "draft-empty") return;
+    const h = sessionHistoryRef.current;
+    if (h.navigating) {
+      h.navigating = false;
+      return;
+    }
+    if (h.ids[h.idx] === activeId) return;
+    const trimmed = h.ids.slice(0, h.idx + 1);
+    trimmed.push(activeId);
+    if (trimmed.length > 40) trimmed.shift();
+    h.ids = trimmed;
+    h.idx = trimmed.length - 1;
+  }, [activeId]);
 
   // Global Shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if ((e.metaKey || e.ctrlKey) && (e.key === "[" || e.key === "]")) {
+        const h = sessionHistoryRef.current;
+        const delta = e.key === "[" ? -1 : 1;
+        let targetIdx = h.idx + delta;
+        while (targetIdx >= 0 && targetIdx < h.ids.length) {
+          const candId = h.ids[targetIdx];
+          const found = sessionsLatestRef.current.find((s) => s.id === candId && !s.archived);
+          if (found) {
+            e.preventDefault();
+            h.idx = targetIdx;
+            h.navigating = true;
+            const folderKey = canonicalRepoPath(found.project_path || found.worktree_path) || found.repo_id;
+            if (folderKey) {
+              setRepoFolderState((prev) => (prev[folderKey] === "open" ? prev : { ...prev, [folderKey]: "open" }));
+            }
+            setActiveId(found.id);
+            return;
+          }
+          targetIdx += delta;
+        }
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
         e.preventDefault();
         handleQuickNewThread();
@@ -3195,10 +3385,17 @@ export function App() {
 
   const openDiffForFile = (filePath?: string) => {
     if (filePath) {
-      const matched = activeDiffFiles.find(
-        (f) => filePath.includes(f.path) || f.path.includes(filePath)
-      );
+      const cleaned = filePath.replace(/^["'`]|["'`]$/g, "").trim();
+      const base = cleaned.split("/").pop() || cleaned;
+      const matched =
+        activeDiffFiles.find((f) => f.path === cleaned) ||
+        activeDiffFiles.find((f) => cleaned.endsWith(f.path) || f.path.endsWith(cleaned)) ||
+        activeDiffFiles.find((f) => cleaned.includes(f.path) || f.path.includes(cleaned)) ||
+        activeDiffFiles.find((f) => (f.path.split("/").pop() || f.path) === base);
       if (matched) setSelectedDiffPath(matched.path);
+    }
+    if (activeDiffFiles.length === 0) {
+      refreshSessionDiffAndFiles(activeSession.id);
     }
     setDrawerTab("diff");
     setDrawerOpen(true);
@@ -3425,6 +3622,16 @@ export function App() {
     };
     w.__veloSelectSession = (sid: string) => {
       if (sid) {
+        const target = sessionsLatestRef.current.find((s) => s.id === sid);
+        if (target) {
+          const folderKey =
+            canonicalRepoPath(target.project_path || target.worktree_path) || target.repo_id;
+          if (folderKey) {
+            setRepoFolderState((prev) =>
+              prev[folderKey] === "open" ? prev : { ...prev, [folderKey]: "open" }
+            );
+          }
+        }
         setActiveId(sid);
         syncSessionEventsFromDaemon(sid);
       }
@@ -5216,6 +5423,7 @@ export function App() {
   const handleSelectSessionEffort = useCallback(
     (eff: EffortLevel) => {
       setEffortPickerOpen(false);
+      saveLastModelPref({ effort: eff });
       if (activeSession.id === "draft-empty") {
         const newId = `wt-${Date.now()}`;
         const materialized: VeloSession = {
@@ -5274,6 +5482,12 @@ export function App() {
         m,
         m.agentKind
       );
+      saveLastModelPref({
+        agent_kind: m.agentKind,
+        model: m.id,
+        model_short: m.shortLabel,
+        effort: defaultEffortForEngine,
+      });
 
       if (isCrossEngineHandoff && activeSession.id !== "draft-empty") {
         try {
@@ -6784,6 +6998,35 @@ export function App() {
           </div>
         </header>
 
+        {/* Subtle Disconnect / Reconnecting Hairline Banner (appears only after startup grace) */}
+        {connectionGraceElapsed && !connected && !e2eeConnected && (
+          <div className="flex shrink-0 items-center justify-between gap-2 border-b border-amber-500/20 bg-amber-500/[0.07] px-3.5 py-1 text-[11.5px] text-amber-700 dark:text-amber-300">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <WifiOff className="h-3 w-3 shrink-0" />
+              <span className="truncate">
+                与节点{" "}
+                <span className="font-mono">
+                  {federatedHosts.find(
+                    (h) => (h.daemon_url || "").replace(/\/+$/, "") === daemonUrl
+                  )?.label || (daemonUrl === localDaemonUrl ? "本机 Daemon" : daemonUrl)}
+                </span>{" "}
+                连接已断开，正在自动重连…
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setWsReconnectNonce((n) => n + 1);
+                refreshSessions();
+              }}
+              className="flex shrink-0 items-center gap-1 rounded-md border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium transition-colors hover:bg-amber-500/20 cursor-pointer"
+            >
+              <RefreshCw className="h-2.5 w-2.5" />
+              <span>立即重连</span>
+            </button>
+          </div>
+        )}
+
         {/* Mobile Remote Controller Session & Worktree Strip */}
         {mobileMode && (
           <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-3 py-1.5">
@@ -8179,7 +8422,7 @@ export function App() {
                   ) : (
                     <textarea
                       ref={composerTextareaRef}
-                      rows={2}
+                      rows={1}
                       value={prompt}
                       onChange={(e) => handlePromptChange(e.target.value)}
                       onPaste={(e) => {
@@ -8279,7 +8522,7 @@ export function App() {
                               activeSession.model_short
                             } anything... (@ 引用文件 · / 技能 · 拖拽或 ⌘V 粘贴任意文件/截图)`
                       }
-                      className="w-full resize-none bg-transparent text-[13.5px] max-md:text-[16px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
+                      className="min-h-[44px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent text-[13.5px] max-md:text-[16px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                     />
                   )}
 

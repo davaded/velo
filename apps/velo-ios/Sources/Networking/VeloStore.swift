@@ -91,7 +91,17 @@ public final class VeloStore: ObservableObject {
     private static let offlineOutboxKey = "velo.ios.offlineOutbox.v1"
     private static let draftPromptsKey = "velo.ios.draftPrompts.v1"
 
+    private struct TurnCacheEntry {
+        let count: Int
+        let firstId: String
+        let lastEvent: TimelineEventItem
+        let prevContentLen: Int
+        let turns: [ConversationTurnBlock]
+    }
+
     public var draftPromptsBySession: [String: String] = [:]
+    private var draftPersistTask: Task<Void, Never>?
+    private var turnsCacheBySession: [String: TurnCacheEntry] = [:]
 
     public func draftPrompt(for sessionId: String) -> String {
         draftPromptsBySession[sessionId] ?? ""
@@ -106,9 +116,57 @@ public final class VeloStore: ObservableObject {
         } else {
             draftPromptsBySession[sessionId] = text
         }
+        // Debounce UserDefaults encoding (600ms) so typing never stalls the main thread
+        draftPersistTask?.cancel()
+        draftPersistTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            self?.flushDraftPromptsNow()
+        }
+    }
+
+    public func flushDraftPromptsNow() {
+        draftPersistTask?.cancel()
+        draftPersistTask = nil
         if let data = try? JSONEncoder().encode(draftPromptsBySession) {
             UserDefaults.standard.set(data, forKey: Self.draftPromptsKey)
         }
+    }
+
+    /// Cached turn grouping keyed by lightweight O(1) event signature so SwiftUI body
+    /// re-evaluations triggered by unrelated `@Published` properties never re-scan all events.
+    public func cachedTurns(for sessionId: String) -> [ConversationTurnBlock] {
+        let events = eventsBySession[sessionId] ?? []
+        if events.isEmpty {
+            return []
+        }
+        let firstId = events[0].id
+        let last = events[events.count - 1]
+        let prevLen = events.count >= 2 ? events[events.count - 2].content.utf8.count : 0
+        if let hit = turnsCacheBySession[sessionId],
+           hit.count == events.count,
+           hit.firstId == firstId,
+           hit.prevContentLen == prevLen,
+           hit.lastEvent == last
+        {
+            return hit.turns
+        }
+        let grouped = Self.groupIntoTurns(events)
+        turnsCacheBySession[sessionId] = TurnCacheEntry(
+            count: events.count,
+            firstId: firstId,
+            lastEvent: last,
+            prevContentLen: prevLen,
+            turns: grouped
+        )
+        if turnsCacheBySession.count > 24 {
+            let keepIds = Set([sessionId, activeSessionId].compactMap { $0 })
+            for key in turnsCacheBySession.keys where !keepIds.contains(key) {
+                turnsCacheBySession.removeValue(forKey: key)
+                if turnsCacheBySession.count <= 16 { break }
+            }
+        }
+        return grouped
     }
 
     public init() {
@@ -427,6 +485,7 @@ public final class VeloStore: ObservableObject {
     private var lastBackgroundedAt: Date?
 
     public func handleAppDidEnterBackground() {
+        flushDraftPromptsNow()
         reportPresence(focused: false)
         lastBackgroundedAt = Date()
         let hasLiveWork = sessions.contains(where: { $0.status == .running || $0.status == .waitingApproval })
@@ -4541,19 +4600,30 @@ public final class VeloStore: ObservableObject {
 
     // MARK: - Haptics & Native Local Notifications
 
+    private static let isoFracFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private static let isoPlainFormatter: ISO8601DateFormatter = {
+        ISO8601DateFormatter()
+    }()
+
+    private static let shortTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
     private static func parseServerDate(_ raw: Any?) -> Date? {
         guard let str = raw as? String, !str.isEmpty else { return nil }
-        let isoFrac = ISO8601DateFormatter()
-        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = isoFrac.date(from: str) { return d }
-        let isoPlain = ISO8601DateFormatter()
-        return isoPlain.date(from: str)
+        if let d = isoFracFormatter.date(from: str) { return d }
+        return isoPlainFormatter.date(from: str)
     }
 
     private static func shortTimeString(from date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        return f.string(from: date)
+        shortTimeFormatter.string(from: date)
     }
 
     public func triggerHaptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {

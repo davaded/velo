@@ -59,6 +59,7 @@ swiftc -O \
   -framework WebKit \
   -framework AVFoundation \
   -framework Speech \
+  -framework UserNotifications \
   -o "${MACOS_DIR}/Velo"
 
 echo "📦 [4/5] Packaging Standalone Velo.app Bundle (Zero Source-Tree Dependency)..."

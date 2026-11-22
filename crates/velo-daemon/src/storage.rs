@@ -170,6 +170,8 @@ impl VeloSqliteStore {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -16000;
              CREATE TABLE IF NOT EXISTS sessions (
                  id TEXT PRIMARY KEY,
                  created_at TEXT NOT NULL,
@@ -199,12 +201,17 @@ impl VeloSqliteStore {
         })
     }
 
+    #[inline]
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn migrate_from_legacy_json_if_needed(
         &self,
         state_file: &Path,
         events_dir: &Path,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn();
         let already: Option<String> = conn
             .query_row(
                 "SELECT value FROM kv_meta WHERE key = 'migrated_legacy_json_v1'",
@@ -299,7 +306,7 @@ impl VeloSqliteStore {
     }
 
     pub fn load_all(&self) -> Result<(HashMap<Uuid, SessionInfo>, HashMap<Uuid, Vec<AgentEvent>>)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut sessions = HashMap::new();
         let mut event_history: HashMap<Uuid, Vec<AgentEvent>> = HashMap::new();
 
@@ -373,7 +380,7 @@ impl VeloSqliteStore {
 
     pub fn upsert_session(&self, s: &SessionInfo) -> Result<()> {
         let blob = serde_json::to_string(s)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT OR REPLACE INTO sessions (id, created_at, updated_at, repo_root, name, prompt, json_blob)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -391,7 +398,7 @@ impl VeloSqliteStore {
     }
 
     pub fn upsert_sessions_batch(&self, list: &[SessionInfo]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         for s in list {
             let blob = serde_json::to_string(s)?;
@@ -415,7 +422,7 @@ impl VeloSqliteStore {
 
     pub fn delete_session(&self, session_id: Uuid) -> Result<()> {
         let sid_s = session_id.to_string();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![&sid_s])?;
         tx.execute(
@@ -427,7 +434,7 @@ impl VeloSqliteStore {
     }
 
     pub fn delete_event_seq(&self, session_id: Uuid, seq: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "DELETE FROM session_events WHERE seq = ?1 AND session_id = ?2",
             params![seq, session_id.to_string()],
@@ -445,7 +452,7 @@ impl VeloSqliteStore {
         if let Some(seq) = seq {
             let (etype, ts_ms, stext) = extract_event_metadata(ev);
             let blob = serde_json::to_string(ev)?;
-            let conn = self.conn.lock().unwrap();
+            let conn = self.lock_conn();
             let updated = conn.execute(
                 "UPDATE session_events
                  SET event_type = ?1, ts_ms = ?2, search_text = ?3, json_blob = ?4
@@ -463,7 +470,7 @@ impl VeloSqliteStore {
     pub fn append_event(&self, session_id: Uuid, ev: &AgentEvent) -> Result<i64> {
         let (etype, ts_ms, stext) = extract_event_metadata(ev);
         let blob = serde_json::to_string(ev)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO session_events (session_id, event_type, ts_ms, search_text, json_blob)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -477,7 +484,7 @@ impl VeloSqliteStore {
         let sid_s = session_id.to_string();
         let (_, ts_ms, _) = extract_event_metadata(usage_ev);
         let blob = serde_json::to_string(usage_ev)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
 
         let last_user_seq: i64 = conn
             .query_row(
@@ -520,7 +527,7 @@ impl VeloSqliteStore {
 
     pub fn replace_session_events(&self, session_id: Uuid, events: &[AgentEvent]) -> Result<()> {
         let sid_s = session_id.to_string();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM session_events WHERE session_id = ?1",
@@ -547,7 +554,7 @@ impl VeloSqliteStore {
     ) -> Result<EventsPageDto> {
         let sid_s = session_id.to_string();
         let capped = limit.clamp(10, 500);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
 
         let mut rows_desc: Vec<(i64, AgentEvent)> = Vec::new();
         if let Some(b_seq) = before_seq {
@@ -627,7 +634,7 @@ impl VeloSqliteStore {
         let sid_s = session_id.to_string();
         let capped = limit.clamp(10, 500);
         let (event_count, max_seq, latest_ts_ms, after_row_ts_ms) = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.lock_conn();
             let (cnt, m_seq, m_ts): (usize, Option<i64>, Option<i64>) = conn
                 .query_row(
                     "SELECT COUNT(*), MAX(seq), MAX(ts_ms) FROM session_events WHERE session_id = ?1",
@@ -682,7 +689,7 @@ impl VeloSqliteStore {
             && !tail_mutated_in_place
             && max_seq.is_some_and(|m| m > after_seq)
         {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.lock_conn();
             let mut stmt = conn.prepare(
                 "SELECT seq, json_blob FROM session_events
                  WHERE session_id = ?1 AND seq > ?2
@@ -726,7 +733,7 @@ impl VeloSqliteStore {
         }
         let capped = limit.clamp(5, 80);
         let pattern = format!("%{}%", q.replace('%', "\\%").replace('_', "\\_"));
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
 
         let mut hits: Vec<SearchHitDto> = Vec::new();
 
