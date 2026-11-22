@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AgentEvent,
   AgentKind,
@@ -43,6 +43,7 @@ import {
   ForkLaunchTarget,
 } from "./components/ForkBranchModal";
 import { ChatOutlineRail, OutlineTurnSummary } from "./components/ChatOutlineRail";
+import { IsolatedComposerTextarea } from "./components/IsolatedComposerTextarea";
 import { SidebarQuotaBar } from "./components/SidebarQuotaBar";
 import { RemoteHostDto, RemoteHostsModal } from "./components/RemoteHostsModal";
 import {
@@ -994,6 +995,7 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("diff");
   const [selectedDiffPath, setSelectedDiffPath] = useState<string>("");
+  const pendingDiffTargetPathRef = useRef<string | null>(null);
 
   // One-click Commit bar inside Changes Drawer
   const [commitBoxOpen, setCommitBoxOpen] = useState<boolean>(false);
@@ -1066,10 +1068,14 @@ export function App() {
   const [attachmentsBySession, setAttachmentsBySession] = useState<
     Record<string, PendingAttachmentItem[]>
   >({});
-  const draftsLatestRef = useRef(draftsBySession);
-  draftsLatestRef.current = draftsBySession;
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
+  const draftsLatestRef = useRef<Record<string, string>>(draftsBySession);
+  const draftPersistTimerRef = useRef<number | null>(null);
+  const scheduleDraftStoragePersist = useCallback(() => {
+    if (draftPersistTimerRef.current !== null) {
+      window.clearTimeout(draftPersistTimerRef.current);
+    }
+    draftPersistTimerRef.current = window.setTimeout(() => {
+      draftPersistTimerRef.current = null;
       try {
         const compact: Record<string, string> = {};
         for (const [k, v] of Object.entries(draftsLatestRef.current)) {
@@ -1083,8 +1089,12 @@ export function App() {
         // ignore
       }
     }, 600);
-    return () => window.clearTimeout(timer);
-  }, [draftsBySession]);
+  }, []);
+  useEffect(() => {
+    // Keep draftsLatestRef in sync when draftsBySession is updated structurally (e.g. draft-empty carry-over)
+    draftsLatestRef.current = { ...draftsBySession, ...draftsLatestRef.current };
+    scheduleDraftStoragePersist();
+  }, [draftsBySession, scheduleDraftStoragePersist]);
 
   // Flush debounced caches cleanly on app quit / tab hide so zero drafts or events are lost
   useEffect(() => {
@@ -1339,27 +1349,66 @@ export function App() {
   const activeSessionIdRef = useRef<string>(activeSession.id);
   activeSessionIdRef.current = activeSession.id;
 
-  const prompt = draftsBySession[activeSession.id] ?? "";
-  // Smooth auto-growing composer textarea (2 lines baseline -> up to ~8 lines)
-  useLayoutEffect(() => {
-    const el = composerTextareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    const nextHeight = Math.min(200, Math.max(44, el.scrollHeight));
-    el.style.height = `${nextHeight}px`;
-  }, [prompt, activeSession.id, isDictating]);
+  const [promptProgrammaticNonce, setPromptProgrammaticNonce] = useState<number>(0);
+  const [hasComposerText, setHasComposerText] = useState<boolean>(() =>
+    Boolean((draftsLatestRef.current[activeSession.id] ?? "").trim())
+  );
+  const hasComposerTextRef = useRef<boolean>(hasComposerText);
+  hasComposerTextRef.current = hasComposerText;
+
+  useEffect(() => {
+    const nextHas = Boolean((draftsLatestRef.current[activeSession.id] ?? "").trim());
+    if (nextHas !== hasComposerTextRef.current) {
+      hasComposerTextRef.current = nextHas;
+      setHasComposerText(nextHas);
+    }
+  }, [activeSession.id]);
+
   const pendingAttachments = useMemo(
     () => attachmentsBySession[activeSession.id] ?? [],
     [attachmentsBySession, activeSession.id]
   );
 
+  const commitDraftToState = useCallback((sid: string, val: string) => {
+    if (!sid) return;
+    if (!val) {
+      delete draftsLatestRef.current[sid];
+    } else {
+      draftsLatestRef.current[sid] = val;
+    }
+    setDraftsBySession((prev) => {
+      const cur = prev[sid] ?? "";
+      if (val === cur) return prev;
+      const next = { ...prev };
+      if (!val) {
+        delete next[sid];
+      } else {
+        next[sid] = val;
+      }
+      return next;
+    });
+  }, []);
+
   const setPrompt = useCallback(
     (updater: string | ((prev: string) => string), targetSid?: string) => {
       const sid = targetSid || activeSessionIdRef.current || "draft-empty";
+      const cur = draftsLatestRef.current[sid] ?? "";
+      const nextVal = typeof updater === "function" ? updater(cur) : updater;
+      if (nextVal === cur) return;
+      if (!nextVal) {
+        delete draftsLatestRef.current[sid];
+      } else {
+        draftsLatestRef.current[sid] = nextVal;
+      }
+      if (sid === activeSessionIdRef.current) {
+        const nextHas = Boolean(nextVal.trim());
+        if (nextHas !== hasComposerTextRef.current) {
+          hasComposerTextRef.current = nextHas;
+          setHasComposerText(nextHas);
+        }
+        setPromptProgrammaticNonce((n) => n + 1);
+      }
       setDraftsBySession((prev) => {
-        const cur = prev[sid] ?? "";
-        const nextVal = typeof updater === "function" ? updater(cur) : updater;
-        if (nextVal === cur) return prev;
         const next = { ...prev };
         if (!nextVal) {
           delete next[sid];
@@ -1368,8 +1417,9 @@ export function App() {
         }
         return next;
       });
+      scheduleDraftStoragePersist();
     },
-    []
+    [scheduleDraftStoragePersist]
   );
 
   const setPendingAttachments = useCallback(
@@ -1615,9 +1665,27 @@ export function App() {
                 })),
               }));
               setDiffsBySession((prev) => ({ ...prev, [sessionId]: converted }));
-              setSelectedDiffPath((prev) =>
-                converted.some((c) => c.path === prev) ? prev : converted[0].path
-              );
+              const pendingTarget = pendingDiffTargetPathRef.current;
+              const matchedPending = pendingTarget
+                ? (() => {
+                    const cleaned = pendingTarget.replace(/^["'`]|["'`]$/g, "").trim();
+                    const base = cleaned.split("/").pop() || cleaned;
+                    return (
+                      converted.find((c) => c.path === cleaned) ||
+                      converted.find((c) => cleaned.endsWith(c.path) || c.path.endsWith(cleaned)) ||
+                      converted.find((c) => cleaned.includes(c.path) || c.path.includes(cleaned)) ||
+                      converted.find((c) => (c.path.split("/").pop() || c.path) === base)
+                    );
+                  })()
+                : undefined;
+              if (matchedPending) {
+                pendingDiffTargetPathRef.current = null;
+                setSelectedDiffPath(matchedPending.path);
+              } else {
+                setSelectedDiffPath((prev) =>
+                  converted.some((c) => c.path === prev) ? prev : converted[0].path
+                );
+              }
             } else {
               setDiffsBySession((prev) => ({ ...prev, [sessionId]: [] }));
             }
@@ -3392,9 +3460,14 @@ export function App() {
         activeDiffFiles.find((f) => cleaned.endsWith(f.path) || f.path.endsWith(cleaned)) ||
         activeDiffFiles.find((f) => cleaned.includes(f.path) || f.path.includes(cleaned)) ||
         activeDiffFiles.find((f) => (f.path.split("/").pop() || f.path) === base);
-      if (matched) setSelectedDiffPath(matched.path);
+      if (matched) {
+        pendingDiffTargetPathRef.current = null;
+        setSelectedDiffPath(matched.path);
+      } else {
+        pendingDiffTargetPathRef.current = cleaned;
+      }
     }
-    if (activeDiffFiles.length === 0) {
+    if (activeDiffFiles.length === 0 || (filePath && pendingDiffTargetPathRef.current)) {
       refreshSessionDiffAndFiles(activeSession.id);
     }
     setDrawerTab("diff");
@@ -3459,40 +3532,57 @@ export function App() {
     [setPendingAttachments, setPrompt]
   );
 
-  // Composer input handler with `/` slash skills AND `@` workspace file mention search
-  const handlePromptChange = (val: string) => {
-    setPrompt(val);
+  // Composer live keystroke handler (ZERO App re-renders on normal typing!)
+  // Only touches React state when empty<->non-empty flips or `/` / `@` popover triggers change.
+  const handleComposerLiveChange = useCallback(
+    (sid: string, val: string) => {
+      if (!val) {
+        delete draftsLatestRef.current[sid];
+      } else {
+        draftsLatestRef.current[sid] = val;
+      }
+      scheduleDraftStoragePersist();
 
-    // Check `@file` mention at end of input (at start or after whitespace)
-    const mentionMatch = val.match(/(?:^|\s)@([^\s@]*)$/);
-    if (mentionMatch) {
-      setFileMentionQuery(mentionMatch[1] ?? "");
-      setSlashFilter(null);
-      return;
-    } else if (fileMentionQuery !== null) {
-      setFileMentionQuery(null);
-    }
+      if (sid === activeSessionIdRef.current) {
+        const nextHas = Boolean(val.trim());
+        if (nextHas !== hasComposerTextRef.current) {
+          hasComposerTextRef.current = nextHas;
+          setHasComposerText(nextHas);
+        }
+      }
 
-    if (!val.startsWith("/")) {
-      setSlashFilter(null);
-      return;
-    }
-    const body = val.slice(1);
-    // Once a skill or slash command is followed by whitespace (user is now typing the task body),
-    // close the slash popover unless the typed text is still a prefix of a multi-word skill name.
-    if (/\s/.test(body)) {
-      const lower = body.toLowerCase();
-      const stillCompletingMultiWordSkill =
-        !matchSkillInvocation(val, localSkills) &&
-        localSkills.some((sk) => sk.name.trim().toLowerCase().startsWith(lower));
-      if (!stillCompletingMultiWordSkill) {
-        setSlashFilter(null);
+      // Check `@file` mention at end of input (at start or after whitespace)
+      const mentionMatch = val.match(/(?:^|\s)@([^\s@]*)$/);
+      if (mentionMatch) {
+        setFileMentionQuery(mentionMatch[1] ?? "");
+        setSlashFilter((prev) => (prev === null ? prev : null));
+        return;
+      } else {
+        setFileMentionQuery((prev) => (prev === null ? prev : null));
+      }
+
+      if (!val.startsWith("/")) {
+        setSlashFilter((prev) => (prev === null ? prev : null));
         return;
       }
-    }
-    setSlashFilter(body.toLowerCase());
-    setSlashSelectedIdx(0);
-  };
+      const body = val.slice(1);
+      // Once a skill or slash command is followed by whitespace (user is now typing the task body),
+      // close the slash popover unless the typed text is still a prefix of a multi-word skill name.
+      if (/\s/.test(body)) {
+        const lower = body.toLowerCase();
+        const stillCompletingMultiWordSkill =
+          !matchSkillInvocation(val, localSkills) &&
+          localSkills.some((sk) => sk.name.trim().toLowerCase().startsWith(lower));
+        if (!stillCompletingMultiWordSkill) {
+          setSlashFilter((prev) => (prev === null ? prev : null));
+          return;
+        }
+      }
+      setSlashFilter(body.toLowerCase());
+      setSlashSelectedIdx(0);
+    },
+    [localSkills, scheduleDraftStoragePersist]
+  );
 
   const resolveAttachmentUrl = useCallback(
     (imgRef: string): string => {
@@ -3659,7 +3749,10 @@ export function App() {
       overrideImages !== undefined
         ? []
         : pendingAttachments.filter((a) => a.isImage === false);
-    const rawTyped = (customText ?? prompt).trim();
+    const rawTyped = (
+      customText ??
+      (draftsLatestRef.current[activeSession.id] ?? "")
+    ).trim();
     if (!rawTyped && attachedPaths.length === 0 && attachedNonImageFiles.length === 0) return;
 
     const filesBlock =
@@ -5438,8 +5531,10 @@ export function App() {
         setSessions((prev) => [materialized, ...prev]);
         setEventsBySession((prev) => ({ ...prev, [newId]: [] }));
         setDraftsBySession((prev) => {
-          const carried = prev["draft-empty"];
+          const carried = draftsLatestRef.current["draft-empty"] ?? prev["draft-empty"];
           if (!carried) return prev;
+          draftsLatestRef.current[newId] = carried;
+          delete draftsLatestRef.current["draft-empty"];
           const next = { ...prev, [newId]: carried };
           delete next["draft-empty"];
           return next;
@@ -5555,8 +5650,10 @@ export function App() {
         setSessions((prev) => [materialized, ...prev]);
         setEventsBySession((prev) => ({ ...prev, [newId]: [] }));
         setDraftsBySession((prev) => {
-          const carried = prev["draft-empty"];
+          const carried = draftsLatestRef.current["draft-empty"] ?? prev["draft-empty"];
           if (!carried) return prev;
+          draftsLatestRef.current[newId] = carried;
+          delete draftsLatestRef.current["draft-empty"];
           const next = { ...prev, [newId]: carried };
           delete next["draft-empty"];
           return next;
@@ -8093,7 +8190,10 @@ export function App() {
                           ? "bg-[#8b5cf6]/15 text-[#a78bfa]"
                           : "bg-sky-500/15 text-sky-400",
                       run: () => {
-                        const next = composerTextForSkill(prompt, sk.name);
+                        const next = composerTextForSkill(
+                          draftsLatestRef.current[activeSession.id] ?? "",
+                          sk.name
+                        );
                         setSlashFilter(null);
                         setPrompt(next);
                         setTimeout(() => {
@@ -8420,11 +8520,13 @@ export function App() {
                       </button>
                     </div>
                   ) : (
-                    <textarea
-                      ref={composerTextareaRef}
-                      rows={1}
-                      value={prompt}
-                      onChange={(e) => handlePromptChange(e.target.value)}
+                    <IsolatedComposerTextarea
+                      sessionId={activeSession.id}
+                      initialValue={draftsLatestRef.current[activeSession.id] ?? ""}
+                      programmaticNonce={promptProgrammaticNonce}
+                      textareaRef={composerTextareaRef}
+                      onLiveChange={handleComposerLiveChange}
+                      onCommitDraft={commitDraftToState}
                       onPaste={(e) => {
                         const items = e.clipboardData?.items;
                         if (!items) return;
@@ -8522,7 +8624,6 @@ export function App() {
                               activeSession.model_short
                             } anything... (@ 引用文件 · / 技能 · 拖拽或 ⌘V 粘贴任意文件/截图)`
                       }
-                      className="min-h-[44px] max-h-[200px] w-full resize-none overflow-y-auto bg-transparent text-[13.5px] max-md:text-[16px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                     />
                   )}
 
@@ -8719,7 +8820,7 @@ export function App() {
                       {activeSession.status === "running" ||
                       activeSession.status === "waiting_approval" ? (
                         <div className="flex items-center gap-1.5">
-                          {(prompt.trim().length > 0 || pendingAttachments.length > 0) && (
+                          {(hasComposerText || pendingAttachments.length > 0) && (
                             <>
                               <button
                                 type="button"
@@ -8766,9 +8867,9 @@ export function App() {
                       ) : (
                         <button
                           onClick={() => handleSendPrompt()}
-                          disabled={!prompt.trim() && pendingAttachments.length === 0}
+                          disabled={!hasComposerText && pendingAttachments.length === 0}
                           className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
-                            prompt.trim() || pendingAttachments.length > 0
+                            hasComposerText || pendingAttachments.length > 0
                               ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
                               : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
                           }`}

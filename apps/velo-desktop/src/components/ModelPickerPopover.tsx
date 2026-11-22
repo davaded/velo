@@ -1,6 +1,14 @@
 import React, { useMemo, useState } from "react";
-import { Check, Search, Settings, X } from "lucide-react";
+import { Check, Copy, Search, Settings, Terminal, X } from "lucide-react";
 import type { ModelOption } from "../mockData";
+
+const ENGINE_SETUP_HINTS: Partial<Record<EngineTabKey, { cmd: string; note: string }>> = {
+  claude: { cmd: "claude login", note: "安装 Claude Code CLI 并登录账号" },
+  codex: { cmd: "codex login", note: "安装 OpenAI Codex CLI 并完成登录" },
+  agy: { cmd: "agy auth login", note: "安装 Antigravity CLI (agy) 并登录" },
+  cursor: { cmd: "cursor-agent login", note: "安装 Cursor Agent CLI 并登录" },
+  grok: { cmd: "grok --version", note: "配置 Grok CLI 与 XAI_API_KEY" },
+};
 
 export interface RuntimeAvailability {
   id: string;
@@ -169,6 +177,7 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
   const currentTab = getEngineTabForAgentKind(activeAgentKind);
   const [selectedTab, setSelectedTab] = useState<EngineTabKey>(currentTab);
   const [query, setQuery] = useState<string>("");
+  const [copiedCmd, setCopiedCmd] = useState<boolean>(false);
 
   const countsByTab = useMemo(() => {
     const counts: Record<EngineTabKey, number> = {
@@ -303,6 +312,48 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
               : "当前引擎 · 直接切换"}
           </span>
         </div>
+
+        {/* 3.5 Actionable CLI Login / Install Hint when selected engine is unavailable */}
+        {!trimmedQuery && !tabAvailable(activeTabMeta) && ENGINE_SETUP_HINTS[activeTabMeta.key] && (
+          <div className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.08] px-2.5 py-2 text-[11px]">
+            <div className="min-w-0">
+              <div className="font-medium text-amber-700 dark:text-amber-300">
+                本机未检测到可用 {activeTabMeta.shortLabel} CLI
+              </div>
+              <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-[var(--v-fg-muted)]">
+                <Terminal className="h-3 w-3 shrink-0" />
+                <code className="truncate font-mono text-[var(--v-fg-body)]">
+                  {ENGINE_SETUP_HINTS[activeTabMeta.key]!.cmd}
+                </code>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  const cmd = ENGINE_SETUP_HINTS[activeTabMeta.key]!.cmd;
+                  navigator.clipboard?.writeText(cmd).catch(() => {});
+                  setCopiedCmd(true);
+                  window.setTimeout(() => setCopiedCmd(false), 1600);
+                }}
+                className="flex items-center gap-1 rounded-md border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-2 py-1 text-[10.5px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+              >
+                {copiedCmd ? <Check className="h-3 w-3 text-[#34d399]" /> : <Copy className="h-3 w-3" />}
+                <span>{copiedCmd ? "已复制" : "复制命令"}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onOpenSettings();
+                }}
+                className="rounded-md bg-[var(--v-bg-active)] px-2 py-1 text-[10.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+              >
+                设置检测
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* 4. Scrollable Model List */}
         <div className="max-h-[290px] space-y-0.5 overflow-y-auto pr-0.5">
