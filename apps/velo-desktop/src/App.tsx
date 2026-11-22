@@ -66,6 +66,8 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
   CircleGauge,
   Copy,
   FileCode2,
@@ -676,7 +678,37 @@ export function App() {
     }
     return true;
   });
-  const [collapsedRepos, setCollapsedRepos] = useState<Record<string, boolean>>({});
+  // Persistent per-workspace folder expand/collapse memory keyed by canonical path.
+  // Unrecorded folders default to collapsed (except the active session's folder) so
+  // restarts and newly discovered repos never explode the sidebar open uncontrollably.
+  const [repoFolderState, setRepoFolderState] = useState<Record<string, "open" | "closed">>(() => {
+    try {
+      const saved = safeStorageGet("velo.repoFolderState.v1");
+      if (saved) {
+        const parsed = JSON.parse(saved) as Record<string, unknown>;
+        if (parsed && typeof parsed === "object") {
+          const clean: Record<string, "open" | "closed"> = {};
+          for (const [k, v] of Object.entries(parsed)) {
+            if (v === "open" || v === "closed") clean[k] = v;
+          }
+          return clean;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return {};
+  });
+  useEffect(() => {
+    try {
+      safeStorageSet("velo.repoFolderState.v1", JSON.stringify(repoFolderState));
+    } catch {
+      // ignore
+    }
+  }, [repoFolderState]);
+  const [diffFilesCollapsedBySession, setDiffFilesCollapsedBySession] = useState<
+    Record<string, boolean>
+  >({});
   const [autoCollapseSteps, setAutoCollapseSteps] = useState<boolean>(() => {
     const saved = safeStorageGet("velo.autoCollapseSteps");
     return saved === null ? true : saved !== "false";
@@ -985,13 +1017,31 @@ export function App() {
 
   const streamEndRef = useRef<HTMLDivElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const chatContentRef = useRef<HTMLDivElement | null>(null);
   const isPinnedToBottomRef = useRef<boolean>(true);
+  const programmaticScrollRef = useRef<boolean>(false);
+  const userScrollIntentAtRef = useRef<number>(0);
+  const lastScrollTopRef = useRef<number>(0);
+  const eventsMetaBySessionRef = useRef<
+    Record<string, { newestSeq: number | null; eventCount: number; latestTsMs: number | null }>
+  >({});
   const [showJumpToBottom, setShowJumpToBottom] = useState<boolean>(false);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   // Optimistic queue rows use `q-local-*` until the daemon returns the real id.
   // Clicks that happen in that window are applied once the real id arrives.
   const queuedIntentRef = useRef<Map<string, "drop" | "run">>(new Map());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const snapChatToBottomImmediate = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    programmaticScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
+    requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+    });
+  }, []);
 
   const scrollChatToBottom = useCallback((smooth = false) => {
     if (smooth) {
@@ -1000,7 +1050,12 @@ export function App() {
       requestAnimationFrame(() => {
         const el = chatScrollRef.current;
         if (el) {
+          programmaticScrollRef.current = true;
           el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+          lastScrollTopRef.current = el.scrollHeight;
+          window.setTimeout(() => {
+            programmaticScrollRef.current = false;
+          }, 260);
         } else {
           streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
         }
@@ -1009,12 +1064,27 @@ export function App() {
     }
     if (!isPinnedToBottomRef.current) return;
     requestAnimationFrame(() => {
-      const el = chatScrollRef.current;
-      if (el) {
-        el.scrollTop = el.scrollHeight;
+      if (!isPinnedToBottomRef.current) return;
+      snapChatToBottomImmediate();
+    });
+  }, [snapChatToBottomImmediate]);
+
+  // Auto-keep viewport locked to the very bottom whenever content height or window size
+  // changes while in PinnedBottom mode (fixes focus-resync / markdown / image height jumps).
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    const contentEl = chatContentRef.current;
+    const scrollEl = chatScrollRef.current;
+    if (!contentEl && !scrollEl) return;
+    const ro = new ResizeObserver(() => {
+      if (isPinnedToBottomRef.current) {
+        snapChatToBottomImmediate();
       }
     });
-  }, []);
+    if (contentEl) ro.observe(contentEl);
+    if (scrollEl) ro.observe(scrollEl);
+    return () => ro.disconnect();
+  }, [snapChatToBottomImmediate]);
 
   const activeSession = useMemo<VeloSession>(() => {
     const found =
@@ -1340,11 +1410,9 @@ export function App() {
     setShowJumpToBottom(false);
     refreshSessionDiffAndFiles(activeSession.id);
     requestAnimationFrame(() => {
-      if (chatScrollRef.current) {
-        chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
-      }
+      snapChatToBottomImmediate();
     });
-  }, [activeSession.id, refreshSessionDiffAndFiles]);
+  }, [activeSession.id, refreshSessionDiffAndFiles, snapChatToBottomImmediate]);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSession.id;
@@ -1356,11 +1424,24 @@ export function App() {
     });
   }, [activeSession.id]);
 
-  // Authoritative sync of persisted event history from ~/.velo/events/<session-id>.json
+  // Authoritative sync of persisted event history from SQLite WAL.
+  // Supports lightweight `after_seq` incremental catch-up on window focus so unchanged
+  // sessions perform zero array replacement and never disturb scroll position.
   const syncSessionEventsFromDaemon = useCallback(
-    (sid: string) => {
+    (sid: string, options?: { incremental?: boolean }) => {
       if (!sid || sid.startsWith("sess-") || sid.startsWith("wt-")) return;
-      fetch(`${daemonUrl}/api/sessions/${sid}/events?limit=180`)
+      const meta = eventsMetaBySessionRef.current[sid];
+      const useIncremental =
+        Boolean(options?.incremental) && meta && typeof meta.newestSeq === "number";
+      const qs = new URLSearchParams({ limit: "180" });
+      if (useIncremental && meta && meta.newestSeq !== null) {
+        qs.set("after_seq", String(meta.newestSeq));
+        qs.set("known_count", String(meta.eventCount));
+        if (meta.latestTsMs !== null) {
+          qs.set("known_ts_ms", String(meta.latestTsMs));
+        }
+      }
+      fetch(`${daemonUrl}/api/sessions/${sid}/events?${qs.toString()}`)
         .then((r) => (r.ok ? r.json() : Promise.reject()))
         .then(
           (
@@ -1369,24 +1450,54 @@ export function App() {
               | {
                   events?: Array<Record<string, unknown>>;
                   oldest_seq?: number | null;
+                  newest_seq?: number | null;
+                  latest_ts_ms?: number | null;
+                  event_count?: number;
                   has_more?: boolean;
+                  incremental?: boolean;
+                  unchanged?: boolean;
                 }
           ) => {
+            if (!Array.isArray(payload)) {
+              if (payload?.unchanged) {
+                if (sid === activeSessionIdRef.current && isPinnedToBottomRef.current) {
+                  requestAnimationFrame(() => snapChatToBottomImmediate());
+                }
+                return;
+              }
+              eventsMetaBySessionRef.current[sid] = {
+                newestSeq:
+                  typeof payload?.newest_seq === "number"
+                    ? payload.newest_seq
+                    : meta?.newestSeq ?? null,
+                eventCount:
+                  typeof payload?.event_count === "number"
+                    ? payload.event_count
+                    : meta?.eventCount ?? 0,
+                latestTsMs:
+                  typeof payload?.latest_ts_ms === "number"
+                    ? payload.latest_ts_ms
+                    : meta?.latestTsMs ?? null,
+              };
+              if (!payload?.incremental) {
+                if (typeof payload?.oldest_seq === "number") {
+                  setOldestSeqBySession((prev) => ({ ...prev, [sid]: payload.oldest_seq as number }));
+                }
+                setHasMoreHistoryBySession((prev) => ({
+                  ...prev,
+                  [sid]: Boolean(payload?.has_more),
+                }));
+              }
+            }
             const rawList = Array.isArray(payload)
               ? payload
               : Array.isArray(payload?.events)
               ? payload.events
               : [];
-            if (!Array.isArray(payload)) {
-              if (typeof payload?.oldest_seq === "number") {
-                setOldestSeqBySession((prev) => ({ ...prev, [sid]: payload.oldest_seq as number }));
-              }
-              setHasMoreHistoryBySession((prev) => ({
-                ...prev,
-                [sid]: Boolean(payload?.has_more),
-              }));
-            }
+            const isIncrementalAppend = !Array.isArray(payload) && Boolean(payload?.incremental);
+
             if (rawList.length === 0) {
+              if (isIncrementalAppend) return;
               setEventsBySession((prev) => {
                 const cur = prev[sid] || [];
                 if (cur.some((x) => x.is_streaming_chunk)) return prev;
@@ -1403,8 +1514,21 @@ export function App() {
                 if (isActivelyStreaming) {
                   return prev;
                 }
+                if (isIncrementalAppend && cur.length > 0) {
+                  const tailKeys = new Set(
+                    cur.slice(-12).map((e) => `${e.kind}|${e.timestamp}|${e.content.slice(0, 64)}`)
+                  );
+                  const fresh = reconstructed.filter(
+                    (e) => !tailKeys.has(`${e.kind}|${e.timestamp}|${e.content.slice(0, 64)}`)
+                  );
+                  if (fresh.length === 0) return prev;
+                  return { ...prev, [sid]: [...cur, ...fresh] };
+                }
                 return { ...prev, [sid]: reconstructed };
               });
+              if (sid === activeSessionIdRef.current && isPinnedToBottomRef.current) {
+                requestAnimationFrame(() => snapChatToBottomImmediate());
+              }
             }
           }
         )
@@ -1424,7 +1548,7 @@ export function App() {
           }
         });
     },
-    [daemonUrl, e2eeRelayConfig]
+    [daemonUrl, e2eeRelayConfig, snapChatToBottomImmediate]
   );
 
   const loadOlderEventsForSession = useCallback(
@@ -1501,13 +1625,28 @@ export function App() {
   }, [activeSession.id, syncSessionEventsFromDaemon]);
 
   useEffect(() => {
-    const onFocus = () => {
+    const resyncActiveOnFocus = () => {
       refreshSessions();
-      syncSessionEventsFromDaemon(activeSessionIdRef.current);
+      const sid = activeSessionIdRef.current;
+      if (sid) {
+        syncSessionEventsFromDaemon(sid, { incremental: true });
+      }
+      if (isPinnedToBottomRef.current) {
+        requestAnimationFrame(() => snapChatToBottomImmediate());
+      }
     };
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-  }, [refreshSessions, syncSessionEventsFromDaemon]);
+    const onVisibilityChange = () => {
+      if (!document.hidden) {
+        resyncActiveOnFocus();
+      }
+    };
+    window.addEventListener("focus", resyncActiveOnFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", resyncActiveOnFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [refreshSessions, syncSessionEventsFromDaemon, snapChatToBottomImmediate]);
 
   const fetchPairTicket = useCallback(
     (relayOverride?: string) => {
@@ -1608,6 +1747,176 @@ export function App() {
     }, 2500);
     return () => window.clearInterval(timer);
   }, [activeModal, daemonUrl, fetchPairTicket, fetchServiceStatus]);
+
+  // Coalesce high-frequency streaming text/thinking chunks (~24ms active / 120ms background)
+  // so 60Hz+ token frames never thrash React state or WKWebView layout.
+  const pendingStreamChunksRef = useRef<
+    Map<
+      string,
+      {
+        kind: "thinking" | "assistant";
+        delta: string;
+        replace: boolean;
+        now: string;
+        originMs: number;
+      }
+    >
+  >(new Map());
+  const streamFlushTimerRef = useRef<number | null>(null);
+  const ttftRecordedBySessionRef = useRef<Record<string, boolean>>({});
+
+  const flushPendingStreamChunks = useCallback(
+    (onlySid?: string) => {
+      const pending = pendingStreamChunksRef.current;
+      if (pending.size === 0) return;
+
+      const entries: Array<
+        [
+          string,
+          {
+            kind: "thinking" | "assistant";
+            delta: string;
+            replace: boolean;
+            now: string;
+            originMs: number;
+          }
+        ]
+      > = [];
+
+      if (onlySid) {
+        const item = pending.get(onlySid);
+        if (!item) return;
+        pending.delete(onlySid);
+        entries.push([onlySid, item]);
+      } else {
+        for (const entry of pending.entries()) {
+          entries.push(entry);
+        }
+        pending.clear();
+        if (streamFlushTimerRef.current !== null) {
+          window.clearTimeout(streamFlushTimerRef.current);
+          streamFlushTimerRef.current = null;
+        }
+      }
+
+      const nowMs = Date.now();
+      let touchedActive = false;
+      setEventsBySession((prev) => {
+        let changed = false;
+        const nextMap = { ...prev };
+        for (const [sid, chunk] of entries) {
+          if (sid === activeSessionIdRef.current) touchedActive = true;
+          const list = nextMap[sid] || [];
+          const last = list[list.length - 1];
+          if (chunk.kind === "thinking") {
+            if (last && last.kind === "thinking") {
+              const nextContent = chunk.replace
+                ? chunk.delta || last.content
+                : `${last.content}${chunk.delta}`;
+              nextMap[sid] = [
+                ...list.slice(0, -1),
+                {
+                  ...last,
+                  content: nextContent,
+                  started_at_ms: last.started_at_ms || chunk.originMs,
+                  is_streaming_chunk: true,
+                },
+              ];
+            } else {
+              nextMap[sid] = [
+                ...list,
+                {
+                  id: `th-stream-${nowMs}-${Math.random().toString(36).slice(2, 5)}`,
+                  session_id: sid,
+                  timestamp: chunk.now,
+                  kind: "thinking",
+                  content: chunk.delta,
+                  started_at_ms: chunk.originMs,
+                  is_streaming_chunk: true,
+                },
+              ];
+            }
+            changed = true;
+          } else {
+            if (last && last.kind === "assistant" && last.is_streaming_chunk) {
+              nextMap[sid] = [
+                ...list.slice(0, -1),
+                {
+                  ...last,
+                  content: chunk.replace ? chunk.delta : `${last.content}${chunk.delta}`,
+                },
+              ];
+            } else {
+              const cleanedPrev =
+                last && last.kind === "thinking" && last.is_streaming_chunk
+                  ? [
+                      ...list.slice(0, -1),
+                      {
+                        ...last,
+                        is_streaming_chunk: false,
+                        duration_ms:
+                          last.duration_ms ??
+                          Math.max(500, nowMs - (last.started_at_ms || chunk.originMs)),
+                      },
+                    ]
+                  : list;
+              nextMap[sid] = [
+                ...cleanedPrev,
+                {
+                  id: `as-stream-${nowMs}-${Math.random().toString(36).slice(2, 5)}`,
+                  session_id: sid,
+                  timestamp: chunk.now,
+                  kind: "assistant",
+                  content: chunk.delta,
+                  is_streaming_chunk: true,
+                },
+              ];
+            }
+            changed = true;
+          }
+        }
+        return changed ? nextMap : prev;
+      });
+      if (touchedActive) {
+        scrollChatToBottom(false);
+      }
+    },
+    [scrollChatToBottom]
+  );
+
+  const enqueueStreamChunk = useCallback(
+    (
+      sid: string,
+      kind: "thinking" | "assistant",
+      delta: string,
+      replace: boolean,
+      now: string,
+      originMs: number
+    ) => {
+      const pending = pendingStreamChunksRef.current;
+      const existing = pending.get(sid);
+      if (existing && existing.kind !== kind) {
+        // Phase transition (thinking -> assistant or vice versa): flush previous kind first
+        flushPendingStreamChunks(sid);
+      }
+      const cur = pending.get(sid);
+      if (cur && cur.kind === kind) {
+        cur.delta = replace ? delta : `${cur.delta}${delta}`;
+        cur.replace = cur.replace || replace;
+        cur.now = now;
+      } else {
+        pending.set(sid, { kind, delta, replace, now, originMs });
+      }
+      if (streamFlushTimerRef.current === null) {
+        const delayMs = sid === activeSessionIdRef.current ? 24 : 120;
+        streamFlushTimerRef.current = window.setTimeout(() => {
+          streamFlushTimerRef.current = null;
+          flushPendingStreamChunks();
+        }, delayMs);
+      }
+    },
+    [flushPendingStreamChunks]
+  );
 
   // Shared event dispatcher for both direct Daemon `/ws` and E2EE `velo-relay` (`ChaCha20-Poly1305`)
   const processServerPayload = useCallback(
@@ -1799,7 +2108,14 @@ export function App() {
       const sid = String(evObj.session_id ?? "");
       if (!sid) return;
 
+      // Preserve strict ordering: flush any buffered streaming chunks for this session
+      // before applying lifecycle, tool, final delta, or error events.
+      if (evType !== "thinking_chunk" && evType !== "message_chunk") {
+        flushPendingStreamChunks(sid);
+      }
+
       if (evType === "user_message") {
+        delete ttftRecordedBySessionRef.current[sid];
         const text = String(evObj.text ?? "").trim();
         const imgs = Array.isArray(evObj.images) ? evObj.images.map(String).filter(Boolean) : [];
         if (!text && imgs.length === 0) return;
@@ -1972,14 +2288,16 @@ export function App() {
         return;
       }
 
-      // Record Time-To-First-Token (TTFT) on the earliest reasoning / tool / text packet in the turn
+      // Record Time-To-First-Token (TTFT) once per turn without triggering updater churn on every chunk
       if (
-        evType === "thinking_chunk" ||
-        evType === "thinking_delta" ||
-        evType === "tool_call_requested" ||
-        evType === "message_chunk" ||
-        evType === "message_delta"
+        !ttftRecordedBySessionRef.current[sid] &&
+        (evType === "thinking_chunk" ||
+          evType === "thinking_delta" ||
+          evType === "tool_call_requested" ||
+          evType === "message_chunk" ||
+          evType === "message_delta")
       ) {
+        ttftRecordedBySessionRef.current[sid] = true;
         setTurnTimingBySession((prev) => {
           const cur = prev[sid];
           if (!cur || cur.ttftMs !== undefined) return prev;
@@ -2137,43 +2455,7 @@ export function App() {
         const replace = Boolean(evObj.replace);
         const originMs =
           stepStartMsRef.current[sid] || turnStartMsRef.current[sid] || Date.now();
-        setEventsBySession((prev) => {
-          const list = prev[sid] || [];
-          const last = list[list.length - 1];
-          if (last && last.kind === "thinking") {
-            const nextContent = replace
-              ? delta || last.content
-              : `${last.content}${delta}`;
-            return {
-              ...prev,
-              [sid]: [
-                ...list.slice(0, -1),
-                {
-                  ...last,
-                  content: nextContent,
-                  started_at_ms: last.started_at_ms || originMs,
-                  is_streaming_chunk: true,
-                },
-              ],
-            };
-          }
-          return {
-            ...prev,
-            [sid]: [
-              ...list,
-              {
-                id: `th-stream-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-                session_id: sid,
-                timestamp: now,
-                kind: "thinking",
-                content: delta,
-                started_at_ms: originMs,
-                is_streaming_chunk: true,
-              },
-            ],
-          };
-        });
-        scrollChatToBottom(false);
+        enqueueStreamChunk(sid, "thinking", delta, replace, now, originMs);
         return;
       }
 
@@ -2414,45 +2696,7 @@ export function App() {
         const nowChunkMs = Date.now();
         const originMs =
           stepStartMsRef.current[sid] || turnStartMsRef.current[sid] || nowChunkMs;
-        setEventsBySession((prev) => {
-          const list = prev[sid] || [];
-          const last = list[list.length - 1];
-          if (last && last.kind === "assistant" && last.is_streaming_chunk) {
-            const updatedLast: AgentEvent = {
-              ...last,
-              content: replace ? delta : `${last.content}${delta}`,
-            };
-            return { ...prev, [sid]: [...list.slice(0, -1), updatedLast] };
-          }
-          const cleanedPrev =
-            last && last.kind === "thinking" && last.is_streaming_chunk
-              ? [
-                  ...list.slice(0, -1),
-                  {
-                    ...last,
-                    is_streaming_chunk: false,
-                    duration_ms:
-                      last.duration_ms ??
-                      Math.max(500, nowChunkMs - (last.started_at_ms || originMs)),
-                  },
-                ]
-              : list;
-          return {
-            ...prev,
-            [sid]: [
-              ...cleanedPrev,
-              {
-                id: `as-stream-${nowChunkMs}-${Math.random().toString(36).slice(2, 5)}`,
-                session_id: sid,
-                timestamp: now,
-                kind: "assistant",
-                content: delta,
-                is_streaming_chunk: true,
-              },
-            ],
-          };
-        });
-        scrollChatToBottom(false);
+        enqueueStreamChunk(sid, "assistant", delta, replace, now, originMs);
         return;
       }
 
@@ -2592,6 +2836,8 @@ export function App() {
     },
     [
       daemonUrl,
+      enqueueStreamChunk,
+      flushPendingStreamChunks,
       refreshSessionDiffAndFiles,
       refreshSessions,
       scrollChatToBottom,
@@ -2719,7 +2965,7 @@ export function App() {
           (eventsBySession[s.id]?.length ?? 0) === 0
       );
       if (existingEmpty) {
-        setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+        setRepoFolderState((prev) => ({ ...prev, [canonicalRepoPath(targetRepo.path) || targetRepo.id]: "open" }));
         setActiveId(existingEmpty.id);
         setActiveModal(null);
         setTimeout(() => composerTextareaRef.current?.focus(), 20);
@@ -2751,7 +2997,7 @@ export function App() {
       };
       setSessions((prev) => [freshSession, ...prev]);
       setEventsBySession((prev) => ({ ...prev, [newId]: [] }));
-      setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+      setRepoFolderState((prev) => ({ ...prev, [canonicalRepoPath(targetRepo.path) || targetRepo.id]: "open" }));
       setActiveId(newId);
       setActiveModal(null);
       setTimeout(() => composerTextareaRef.current?.focus(), 20);
@@ -4471,7 +4717,7 @@ export function App() {
               return s;
             });
             setSessions((prev) => [...createdList, ...prev]);
-            setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+            setRepoFolderState((prev) => ({ ...prev, [canonicalRepoPath(targetRepo.path) || targetRepo.id]: "open" }));
             setActiveId(createdList[0].id);
             setNewTaskDesc("");
             setActiveModal(null);
@@ -4501,7 +4747,7 @@ export function App() {
           created.model = chosenModel.id;
           created.model_short = chosenModel.shortLabel;
           setSessions((prev) => [created, ...prev]);
-          setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+          setRepoFolderState((prev) => ({ ...prev, [canonicalRepoPath(targetRepo.path) || targetRepo.id]: "open" }));
           setActiveId(created.id);
           setNewTaskDesc("");
           setActiveModal(null);
@@ -4539,7 +4785,7 @@ export function App() {
           created.updated_at = "now";
         }
         setSessions((prev) => [created, ...prev]);
-        setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+        setRepoFolderState((prev) => ({ ...prev, [canonicalRepoPath(targetRepo.path) || targetRepo.id]: "open" }));
         setActiveId(created.id);
         setNewTaskDesc("");
         setActiveModal(null);
@@ -4575,7 +4821,7 @@ export function App() {
     };
 
     setSessions((prev) => [fallbackCreated, ...prev]);
-    setCollapsedRepos((prev) => ({ ...prev, [targetRepo.id]: false }));
+    setRepoFolderState((prev) => ({ ...prev, [canonicalRepoPath(targetRepo.path) || targetRepo.id]: "open" }));
     setActiveId(newId);
     setActiveModal(null);
   };
@@ -4888,7 +5134,7 @@ export function App() {
     setRepos((prev) =>
       prev.some((r) => canonicalRepoPath(r.path) === cleanPath) ? prev : [...prev, newRepo]
     );
-    setCollapsedRepos((prev) => ({ ...prev, [id]: false }));
+    setRepoFolderState((prev) => ({ ...prev, [cleanPath || id]: "open" }));
 
     try {
       const res = await fetch(`${daemonUrl}/api/workspaces`, {
@@ -5185,12 +5431,44 @@ export function App() {
             </button>
           </div>
 
-          {/* Section Header: Workspaces (Direct Add / Create Folder Entry) */}
+          {/* Section Header: Workspaces (Direct Add / Create Folder + Collapse/Expand All) */}
           <div className="flex items-center justify-between px-3 pb-1.5 pt-1">
             <span className="pl-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--v-fg-muted)]">
               Workspaces
             </span>
             <div className="flex items-center gap-0.5">
+              {repos.length > 0 && (() => {
+                const activeRepoCanon = canonicalRepoPath(activeRepo.path);
+                const anyOpen = repos.some((r) => {
+                  const key = canonicalRepoPath(r.path) || r.id;
+                  const explicit = repoFolderState[key];
+                  return explicit ? explicit === "open" : key === activeRepoCanon;
+                });
+                return (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetState: "open" | "closed" = anyOpen ? "closed" : "open";
+                      setRepoFolderState((prev) => {
+                        const next = { ...prev };
+                        for (const r of repos) {
+                          const key = canonicalRepoPath(r.path) || r.id;
+                          next[key] = targetState;
+                        }
+                        return next;
+                      });
+                    }}
+                    title={anyOpen ? "全部收起文件夹" : "全部展开文件夹"}
+                    className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                  >
+                    {anyOpen ? (
+                      <ChevronsDownUp className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronsUpDown className="h-3.5 w-3.5" />
+                    )}
+                  </button>
+                );
+              })()}
               <button
                 type="button"
                 onClick={() => openAddWorkspaceModal("create")}
@@ -5225,6 +5503,8 @@ export function App() {
             )}
             {repos.map((repo) => {
               const canonRepoPath = canonicalRepoPath(repo.path);
+              const repoKey = canonRepoPath || repo.id;
+              const activeRepoCanon = canonicalRepoPath(activeRepo.path);
               const repoItems = sessions.filter((s) => {
                 if (s.archived) return false;
                 if (s.project_path && s.project_path.trim()) {
@@ -5232,7 +5512,10 @@ export function App() {
                 }
                 return s.repo_id === repo.id;
               });
-              const isCollapsed = !!collapsedRepos[repo.id];
+              const explicitFolderState = repoFolderState[repoKey];
+              const isCollapsed = explicitFolderState
+                ? explicitFolderState === "closed"
+                : repoKey !== activeRepoCanon;
 
               return (
                 <div key={repo.id} className="space-y-0.5">
@@ -5240,9 +5523,9 @@ export function App() {
                   <div className="group flex h-[28px] items-center justify-between rounded-md px-2 text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-primary)]">
                     <button
                       onClick={() =>
-                        setCollapsedRepos((prev) => ({
+                        setRepoFolderState((prev) => ({
                           ...prev,
-                          [repo.id]: !prev[repo.id],
+                          [repoKey]: isCollapsed ? "open" : "closed",
                         }))
                       }
                       className="flex min-w-0 flex-1 items-center gap-2 text-left"
@@ -5256,6 +5539,11 @@ export function App() {
                       <span className="truncate text-[13px] font-medium text-[var(--v-fg-body)] group-hover:text-[var(--v-fg-primary)]">
                         {repo.name}
                       </span>
+                      {isCollapsed && repoItems.length > 0 && (
+                        <span className="ml-1 shrink-0 rounded bg-[var(--v-bg-active)]/70 px-1 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
+                          {repoItems.length}
+                        </span>
+                      )}
                     </button>
 
                     <div className="flex items-center gap-0.5">
@@ -6112,15 +6400,48 @@ export function App() {
                 setChatFindQuery("");
               }}
             />
-            {/* Scrollable Stream (Authentic Paseo Stream Layout) */}
+            {/* Scrollable Stream (Unified Scroll State Machine: never jumps off bottom on focus/resize) */}
             <div
               ref={chatScrollRef}
+              onWheel={() => {
+                userScrollIntentAtRef.current = Date.now();
+              }}
+              onPointerDown={() => {
+                userScrollIntentAtRef.current = Date.now();
+              }}
+              onTouchStart={() => {
+                userScrollIntentAtRef.current = Date.now();
+              }}
               onScroll={(e) => {
                 const el = e.currentTarget;
-                const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
-                isPinnedToBottomRef.current = nearBottom;
-                setShowJumpToBottom(!nearBottom);
+                if (programmaticScrollRef.current) {
+                  lastScrollTopRef.current = el.scrollTop;
+                  return;
+                }
+                const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+                const nearBottom = distanceFromBottom < 80;
+                const scrolledUp = el.scrollTop < lastScrollTopRef.current - 2;
+                const isRecentUserGesture = Date.now() - userScrollIntentAtRef.current < 500;
+                lastScrollTopRef.current = el.scrollTop;
+
+                if (nearBottom) {
+                  isPinnedToBottomRef.current = true;
+                  setShowJumpToBottom(false);
+                } else if (isPinnedToBottomRef.current) {
+                  // Only an intentional user scroll-up breaks PinnedBottom; layout/focus growth snaps right back!
+                  if (isRecentUserGesture && scrolledUp) {
+                    isPinnedToBottomRef.current = false;
+                    setShowJumpToBottom(true);
+                  } else {
+                    snapChatToBottomImmediate();
+                    return;
+                  }
+                } else {
+                  setShowJumpToBottom(true);
+                }
+
                 if (
+                  !isPinnedToBottomRef.current &&
                   el.scrollTop < 32 &&
                   hasMoreHistoryBySession[activeSession.id] &&
                   !loadingOlderBySession[activeSession.id]
@@ -6128,10 +6449,13 @@ export function App() {
                   void loadOlderEventsForSession(activeSession.id);
                 }
               }}
-              className="w-full flex-1 overflow-y-auto overflow-x-hidden px-3.5 py-4 sm:px-6 sm:py-6"
+              className="velo-chat-scroll w-full flex-1 overflow-y-auto overflow-x-hidden px-3.5 py-4 sm:px-6 sm:py-6"
               data-testid="agent-chat-scroll"
             >
-              <div className="mx-auto flex w-full min-w-0 max-w-[680px] flex-col gap-1.5">
+              <div
+                ref={chatContentRef}
+                className="mx-auto flex w-full min-w-0 max-w-[680px] flex-col gap-1.5"
+              >
                 {hasMoreHistoryBySession[activeSession.id] && (
                   <div className="mb-2 flex justify-center">
                     <button
@@ -6426,7 +6750,7 @@ export function App() {
                           <div
                             key={turn.key}
                             data-turn-key={turn.key}
-                            className="flex flex-col gap-1.5 pb-3"
+                            className={`flex flex-col gap-1.5 pb-3 ${!isLatestTurn ? "velo-turn-offscreen" : ""}`}
                           >
                             {/* 1. User Message (Right-aligned Paseo Bubble + Hover Trailing Actions) */}
                             {turn.userEv &&
@@ -7724,26 +8048,59 @@ export function App() {
                 </div>
               ) : (
                 <div className="flex flex-1 flex-col overflow-hidden">
-                  <div className="flex flex-wrap gap-1 border-b border-[var(--v-border-subtle)] p-2.5">
-                    {activeDiffFiles.map((file) => {
-                      const active = file.path === currentDiffFile.path;
-                      return (
-                        <button
-                          key={file.path}
-                          onClick={() => setSelectedDiffPath(file.path)}
-                          className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11px] transition-colors ${
-                            active
-                              ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                              : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-secondary)]"
-                          }`}
-                        >
-                          <span>{file.path.split("/").pop()}</span>
-                          <span className="text-[#34d399]">+{file.additions}</span>
-                          <span className="text-[#f87171]">−{file.deletions}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
+                  {(() => {
+                    const explicitDiffCollapsed = diffFilesCollapsedBySession[activeSession.id];
+                    const isDiffListCollapsed =
+                      explicitDiffCollapsed !== undefined
+                        ? explicitDiffCollapsed
+                        : activeDiffFiles.length > 5;
+                    const visibleDiffFiles = isDiffListCollapsed
+                      ? activeDiffFiles.slice(0, 5)
+                      : activeDiffFiles;
+                    return (
+                      <div className="border-b border-[var(--v-border-subtle)] p-2.5">
+                        {activeDiffFiles.length > 5 && (
+                          <div className="mb-1.5 flex items-center justify-between px-0.5 text-[10.5px] text-[var(--v-fg-muted)]">
+                            <span>变更文件 ({activeDiffFiles.length})</span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setDiffFilesCollapsedBySession((prev) => ({
+                                  ...prev,
+                                  [activeSession.id]: !isDiffListCollapsed,
+                                }))
+                              }
+                              className="rounded px-1.5 py-0.5 text-[10.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                            >
+                              {isDiffListCollapsed
+                                ? `展开全部 (+${activeDiffFiles.length - 5})`
+                                : "收起列表"}
+                            </button>
+                          </div>
+                        )}
+                        <div className="flex flex-wrap gap-1">
+                          {visibleDiffFiles.map((file) => {
+                            const active = file.path === currentDiffFile.path;
+                            return (
+                              <button
+                                key={file.path}
+                                onClick={() => setSelectedDiffPath(file.path)}
+                                className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11px] transition-colors ${
+                                  active
+                                    ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                    : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-secondary)]"
+                                }`}
+                              >
+                                <span>{file.path.split("/").pop()}</span>
+                                <span className="text-[#34d399]">+{file.additions}</span>
+                                <span className="text-[#f87171]">−{file.deletions}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   <div className="flex items-center justify-between border-b border-[var(--v-border-subtle)] px-3.5 py-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
                     <span className="truncate">{currentDiffFile.path}</span>

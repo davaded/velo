@@ -20,7 +20,14 @@ pub struct EventsPageDto {
     pub events: Vec<AgentEvent>,
     pub oldest_seq: Option<i64>,
     pub newest_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_ts_ms: Option<i64>,
+    pub event_count: usize,
     pub has_more: bool,
+    #[serde(default)]
+    pub incremental: bool,
+    #[serde(default)]
+    pub unchanged: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -579,6 +586,14 @@ impl VeloSqliteStore {
         }
         rows_desc.reverse();
 
+        let (event_count, latest_ts_ms): (usize, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(ts_ms) FROM session_events WHERE session_id = ?1",
+                params![&sid_s],
+                |r| Ok((r.get::<_, i64>(0).unwrap_or(0).max(0) as usize, r.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap_or((0, None));
+
         let oldest_seq = rows_desc.first().map(|(seq, _)| *seq);
         let newest_seq = rows_desc.last().map(|(seq, _)| *seq);
         let events: Vec<AgentEvent> = rows_desc.into_iter().map(|(_, ev)| ev).collect();
@@ -588,8 +603,120 @@ impl VeloSqliteStore {
             events: crate::enrich_history_turn_metrics(&events),
             oldest_seq,
             newest_seq,
+            latest_ts_ms,
+            event_count,
             has_more,
+            incremental: false,
+            unchanged: false,
         })
+    }
+
+    /// Lightweight incremental catch-up query for focus/foreground resyncs.
+    /// Returns `unchanged = true` with zero event deserialization when nothing changed,
+    /// `incremental = true` with only newly appended tail rows when safe, or gracefully
+    /// falls back to a full latest page if history was rewritten/rewound or an in-place
+    /// tail row was mutated.
+    pub fn query_events_incremental(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        known_count: Option<usize>,
+        known_ts_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<EventsPageDto> {
+        let sid_s = session_id.to_string();
+        let capped = limit.clamp(10, 500);
+        let (event_count, max_seq, latest_ts_ms, after_row_ts_ms) = {
+            let conn = self.conn.lock().unwrap();
+            let (cnt, m_seq, m_ts): (usize, Option<i64>, Option<i64>) = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(seq), MAX(ts_ms) FROM session_events WHERE session_id = ?1",
+                    params![&sid_s],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0).unwrap_or(0).max(0) as usize,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap_or((0, None, None));
+
+            let after_ts: Option<i64> = conn
+                .query_row(
+                    "SELECT ts_ms FROM session_events WHERE session_id = ?1 AND seq = ?2",
+                    params![&sid_s, after_seq],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            (cnt, m_seq, m_ts, after_ts)
+        };
+
+        // Fast-path 1: mathematically identical (zero events changed, zero rows added/deleted)
+        if known_count == Some(event_count)
+            && max_seq == Some(after_seq)
+            && known_ts_ms.is_some()
+            && latest_ts_ms == known_ts_ms
+        {
+            return Ok(EventsPageDto {
+                session_id,
+                events: Vec::new(),
+                oldest_seq: None,
+                newest_seq: max_seq,
+                latest_ts_ms,
+                event_count,
+                has_more: false,
+                incremental: true,
+                unchanged: true,
+            });
+        }
+
+        // Fast-path 2: strictly append-only tail growth since `after_seq`
+        let rewound_or_shrunk = known_count.is_some_and(|kc| event_count < kc);
+        let tail_mutated_in_place = known_ts_ms
+            .zip(after_row_ts_ms)
+            .is_some_and(|(kt, at)| at > kt);
+
+        if !rewound_or_shrunk
+            && !tail_mutated_in_place
+            && max_seq.is_some_and(|m| m > after_seq)
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT seq, json_blob FROM session_events
+                 WHERE session_id = ?1 AND seq > ?2
+                 ORDER BY seq ASC LIMIT ?3",
+            )?;
+            let mapped = stmt.query_map(params![&sid_s, after_seq, (capped + 1) as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut rows_asc: Vec<(i64, AgentEvent)> = Vec::new();
+            for item in mapped.flatten() {
+                if let Ok(ev) = serde_json::from_str::<AgentEvent>(&item.1) {
+                    rows_asc.push((item.0, ev));
+                }
+            }
+            if rows_asc.len() <= capped {
+                let oldest_seq = rows_asc.first().map(|(seq, _)| *seq);
+                let newest_seq = rows_asc.last().map(|(seq, _)| *seq).or(max_seq);
+                let events: Vec<AgentEvent> = rows_asc.into_iter().map(|(_, ev)| ev).collect();
+                return Ok(EventsPageDto {
+                    session_id,
+                    events: crate::enrich_history_turn_metrics(&events),
+                    oldest_seq,
+                    newest_seq,
+                    latest_ts_ms,
+                    event_count,
+                    has_more: false,
+                    incremental: true,
+                    unchanged: false,
+                });
+            }
+        }
+
+        // Fallback: full latest page guarantees 100% consistency after rewinds/in-place updates
+        self.query_events_page(session_id, None, limit)
     }
 
     pub fn search_global(&self, query: &str, limit: usize) -> Result<Vec<SearchHitDto>> {

@@ -4996,6 +4996,9 @@ async fn terminal_restart_handler(
 #[derive(Debug, Default, serde::Deserialize)]
 struct EventsQueryParams {
     before_seq: Option<i64>,
+    after_seq: Option<i64>,
+    known_count: Option<usize>,
+    known_ts_ms: Option<i64>,
     limit: Option<usize>,
 }
 
@@ -5033,6 +5036,25 @@ async fn get_session_events_handler(
     Query(params): Query<EventsQueryParams>,
 ) -> impl IntoResponse {
     state.flush_open_assistant_text(Some(id)).await;
+    if let Some(after_seq) = params.after_seq {
+        let lim = params.limit.unwrap_or(180);
+        match state.db.query_events_incremental(
+            id,
+            after_seq,
+            params.known_count,
+            params.known_ts_ms,
+            lim,
+        ) {
+            Ok(page) => return Json(json!(page)).into_response(),
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
     if params.before_seq.is_some() || params.limit.is_some() {
         let lim = params.limit.unwrap_or(180);
         match state.db.query_events_page(id, params.before_seq, lim) {
@@ -9279,6 +9301,81 @@ composer-2.5 - Composer 2.5
             10_000,
         );
         assert!((cost - 0.39).abs() < 0.0001, "expected $0.39, got {}", cost);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn test_incremental_events_sync_fast_paths() -> anyhow::Result<()> {
+        let tmp = std::env::temp_dir().join(format!("velo-inc-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp)?;
+        let db = storage::VeloSqliteStore::open(&tmp.join("velo.db"))?;
+        let sid = Uuid::new_v4();
+        let now = Utc::now();
+
+        for i in 0..5 {
+            db.append_event(
+                sid,
+                &AgentEvent::MessageDelta {
+                    session_id: sid,
+                    text: format!("msg-{}", i),
+                    timestamp: now + chrono::Duration::seconds(i),
+                },
+            )?;
+        }
+
+        let initial = db.query_events_page(sid, None, 50)?;
+        assert_eq!(initial.events.len(), 5);
+        assert_eq!(initial.event_count, 5);
+        let newest = initial.newest_seq.unwrap();
+
+        // 1. Unchanged fast-path
+        let unchanged = db.query_events_incremental(
+            sid,
+            newest,
+            Some(initial.event_count),
+            initial.latest_ts_ms,
+            50,
+        )?;
+        assert!(unchanged.unchanged);
+        assert!(unchanged.incremental);
+        assert!(unchanged.events.is_empty());
+
+        // 2. Incremental tail append fast-path
+        db.append_event(
+            sid,
+            &AgentEvent::MessageDelta {
+                session_id: sid,
+                text: "msg-5".to_string(),
+                timestamp: now + chrono::Duration::seconds(10),
+            },
+        )?;
+        let delta = db.query_events_incremental(
+            sid,
+            newest,
+            Some(initial.event_count),
+            initial.latest_ts_ms,
+            50,
+        )?;
+        assert!(!delta.unchanged);
+        assert!(delta.incremental);
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.event_count, 6);
+
+        // 3. Rewind/shrink gracefully falls back to full page
+        let tail_seq = delta.newest_seq.unwrap();
+        db.delete_event_seq(sid, tail_seq)?;
+        let after_rewind = db.query_events_incremental(
+            sid,
+            tail_seq,
+            Some(delta.event_count),
+            delta.latest_ts_ms,
+            50,
+        )?;
+        assert!(!after_rewind.unchanged);
+        assert!(!after_rewind.incremental);
+        assert_eq!(after_rewind.events.len(), 5);
 
         let _ = std::fs::remove_dir_all(&tmp);
         Ok(())

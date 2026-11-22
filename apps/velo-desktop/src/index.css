@@ -191,6 +191,17 @@ body,
   color: #111113;
 }
 
+/* Prevent browser scroll-anchor jumps when history updates or refocuses */
+.velo-chat-scroll {
+  overflow-anchor: none;
+}
+
+/* Skip layout/paint for offscreen completed conversation turns (huge boost on long threads) */
+.velo-turn-offscreen {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 180px;
+}
+
 ::-webkit-scrollbar {
   width: 5px;
   height: 5px;

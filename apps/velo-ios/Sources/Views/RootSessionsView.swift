@@ -15,7 +15,8 @@ public struct RootSessionsView: View {
     @State private var analyticsInitialTab: VeloAnalyticsHubSheet.HubTab = .analytics
     @State private var prefillRepoForNewSession: String?
     @State private var selectedEngineFilter: VeloEngineCategory?
-    @State private var collapsedProjects: Set<String> = []
+    /// Persistent per-workspace folder state ("open" | "closed") keyed by canonical path.
+    @State private var repoFolderState: [String: String] = RootSessionsView.loadFolderState()
     @State private var navigationPath: [String] = []
     @State private var renamingSessionId: String?
     @State private var renameDraftTitle: String = ""
@@ -70,6 +71,32 @@ public struct RootSessionsView: View {
         }
     }
 
+    private static let folderStateDefaultsKey = "velo.repoFolderState.v1"
+
+    private static func loadFolderState() -> [String: String] {
+        (UserDefaults.standard.dictionary(forKey: folderStateDefaultsKey) as? [String: String]) ?? [:]
+    }
+
+    private func saveFolderState(_ state: [String: String]) {
+        UserDefaults.standard.set(state, forKey: Self.folderStateDefaultsKey)
+    }
+
+    private var defaultExpandedRepoRoot: String? {
+        if let activeId = store.activeSessionId,
+           let active = store.sessions.first(where: { $0.id == activeId })
+        {
+            return VeloFormatting.canonicalWorkspacePath(active.repoRoot)
+        }
+        return groupedByProject.first?.repoRoot
+    }
+
+    private func isFolderCollapsed(_ repoRoot: String) -> Bool {
+        if let explicit = repoFolderState[repoRoot] {
+            return explicit == "closed"
+        }
+        return repoRoot != defaultExpandedRepoRoot
+    }
+
     private var runningCount: Int {
         store.sessions.filter { $0.status == .running || $0.status == .waitingApproval }.count
     }
@@ -111,6 +138,36 @@ public struct RootSessionsView: View {
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 48)
                             } else {
+                                HStack {
+                                    Text("WORKSPACES")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .tracking(0.6)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    let anyOpen = groupedByProject.contains { !isFolderCollapsed($0.repoRoot) }
+                                    Button {
+                                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                            var next = repoFolderState
+                                            let target = anyOpen ? "closed" : "open"
+                                            for g in groupedByProject {
+                                                next[g.repoRoot] = target
+                                            }
+                                            repoFolderState = next
+                                            saveFolderState(next)
+                                        }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: anyOpen ? "rectangle.compress.vertical" : "rectangle.expand.vertical")
+                                                .font(.system(size: 11, weight: .medium))
+                                            Text(anyOpen ? "全部收起" : "全部展开")
+                                                .font(.system(size: 11.5, weight: .medium))
+                                        }
+                                        .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(.horizontal, 2)
+
                                 ForEach(groupedByProject, id: \.repoRoot) { group in
                                     projectSectionView(group: group)
                                 }
@@ -663,18 +720,17 @@ public struct RootSessionsView: View {
     private func projectSectionView(
         group: (repoRoot: String, projectName: String, sessions: [VeloSessionItem])
     ) -> some View {
-        let isCollapsed = collapsedProjects.contains(group.repoRoot)
+        let isCollapsed = isFolderCollapsed(group.repoRoot)
         let shortPath = VeloFormatting.shortenHomePath(group.repoRoot)
 
         return VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 8) {
                 Button {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                        if isCollapsed {
-                            collapsedProjects.remove(group.repoRoot)
-                        } else {
-                            collapsedProjects.insert(group.repoRoot)
-                        }
+                        var next = repoFolderState
+                        next[group.repoRoot] = isCollapsed ? "open" : "closed"
+                        repoFolderState = next
+                        saveFolderState(next)
                     }
                 } label: {
                     HStack(spacing: 7) {

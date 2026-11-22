@@ -687,7 +687,7 @@ export const BeautifulThinkingBlock: React.FC<{
   startedAtMs?: number;
   durationMs?: number;
   defaultExpanded?: boolean;
-}> = ({
+}> = React.memo(({
   text,
   isStreaming = false,
   startedAtMs,
@@ -761,7 +761,7 @@ export const BeautifulThinkingBlock: React.FC<{
       )}
     </PaseoExpandableBadge>
   );
-};
+});
 
 /**
  * ============================================================================
@@ -1001,7 +1001,7 @@ export const BeautifulToolCallCard: React.FC<{
   isError?: boolean;
   isActive?: boolean;
   onOpenDiffTab?: () => void;
-}> = ({ toolName, input, output, isError = false, isActive = false, onOpenDiffTab }) => {
+}> = React.memo(({ toolName, input, output, isError = false, isActive = false, onOpenDiffTab }) => {
   const [expanded, setExpanded] = useState(false);
   const pres = useMemo(
     () => resolvePaseoToolPresentation(toolName, input, output),
@@ -1153,7 +1153,13 @@ export const BeautifulToolCallCard: React.FC<{
       )}
     </PaseoExpandableBadge>
   );
-};
+}, (prev, next) =>
+  prev.toolName === next.toolName &&
+  prev.input === next.input &&
+  prev.output === next.output &&
+  prev.isError === next.isError &&
+  prev.isActive === next.isActive
+);
 
 /**
  * ============================================================================
@@ -1880,7 +1886,7 @@ export const PaseoMarkdown: React.FC<{
   isStreaming?: boolean;
   className?: string;
   resolveImageUrl?: (src: string) => string;
-}> = ({ content, isStreaming = false, className = "", resolveImageUrl }) => {
+}> = React.memo(({ content, isStreaming = false, className = "", resolveImageUrl }) => {
   const blocks = useMemo(() => parseMarkdownBlocks(content), [content]);
 
   const renderBlock = (block: MdBlock, idx: number) => {
@@ -2015,7 +2021,11 @@ export const PaseoMarkdown: React.FC<{
       )}
     </div>
   );
-};
+}, (prev, next) =>
+  prev.content === next.content &&
+  prev.isStreaming === next.isStreaming &&
+  prev.className === next.className
+);
 
 /**
  * Beautiful UI (beautifului.dev) — Human-in-the-Loop Approval Card

@@ -30,6 +30,16 @@ public final class VeloStore: ObservableObject {
     @Published public var automations: [VeloAutomationItem] = []
     @Published public var lastActionBanner: String?
     @Published public var oldestSeqBySession: [String: Int] = [:]
+    private var eventsMetaBySession: [String: (newestSeq: Int, eventCount: Int, latestTsMs: Int?)] = [:]
+    private struct PendingStreamChunk {
+        var isThinking: Bool
+        var delta: String
+        var replace: Bool
+        var nowLabel: String
+        var origin: Date
+    }
+    private var pendingStreamChunks: [String: PendingStreamChunk] = [:]
+    private var streamFlushTask: Task<Void, Never>?
     @Published public var hasMoreHistoryBySession: [String: Bool] = [:]
     @Published public var externalCliSessions: [VeloExternalCliSessionItem] = []
     @Published public var hiddenCliSessionsCount: Int = 0
@@ -539,7 +549,7 @@ public final class VeloStore: ObservableObject {
                     }
                     self.scheduleCacheSave()
                     if let sid = self.activeSessionId {
-                        await loadEventsForSession(sid)
+                        await loadEventsForSession(sid, incremental: true)
                     }
                     await self.flushOfflineOutboxIfConnected()
                 }
@@ -663,26 +673,48 @@ public final class VeloStore: ObservableObject {
         }
     }
 
-    public func loadEventsForSession(_ sessionId: String) async {
+    public func loadEventsForSession(_ sessionId: String, incremental: Bool = false) async {
         markSessionRead(sessionId)
+        let meta = eventsMetaBySession[sessionId]
+        let hasCachedEvents = !(eventsBySession[sessionId]?.isEmpty ?? true)
+        let useIncremental = incremental && meta != nil && hasCachedEvents
+
         switch connectionConfig {
         case .direct(let baseURL):
-            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/events?limit=160") else { return }
+            var qs = "limit=160"
+            if useIncremental, let m = meta {
+                qs += "&after_seq=\(m.newestSeq)&known_count=\(m.eventCount)"
+                if let ts = m.latestTsMs {
+                    qs += "&known_ts_ms=\(ts)"
+                }
+            }
+            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/events?\(qs)") else { return }
             guard let (data, _) = try? await URLSession.shared.data(from: url),
                   let parsedJson = try? JSONSerialization.jsonObject(with: data)
             else { return }
 
             let rawList: [[String: Any]]
+            var isIncrementalAppend = false
             if let arr = parsedJson as? [[String: Any]] {
                 rawList = arr
-            } else if let pageObj = parsedJson as? [String: Any],
-                      let evs = pageObj["events"] as? [[String: Any]]
-            {
-                rawList = evs
-                if let oSeq = VeloSessionItem.intValue(pageObj["oldest_seq"]) {
-                    oldestSeqBySession[sessionId] = oSeq
+            } else if let pageObj = parsedJson as? [String: Any] {
+                if (pageObj["unchanged"] as? Bool) == true {
+                    return
                 }
-                hasMoreHistoryBySession[sessionId] = (pageObj["has_more"] as? Bool) ?? false
+                guard let evs = pageObj["events"] as? [[String: Any]] else { return }
+                rawList = evs
+                isIncrementalAppend = (pageObj["incremental"] as? Bool) ?? false
+                if let nSeq = VeloSessionItem.intValue(pageObj["newest_seq"]) {
+                    let cnt = VeloSessionItem.intValue(pageObj["event_count"]) ?? (meta?.eventCount ?? rawList.count)
+                    let ts = VeloSessionItem.intValue(pageObj["latest_ts_ms"]) ?? meta?.latestTsMs
+                    eventsMetaBySession[sessionId] = (newestSeq: nSeq, eventCount: cnt, latestTsMs: ts)
+                }
+                if !isIncrementalAppend {
+                    if let oSeq = VeloSessionItem.intValue(pageObj["oldest_seq"]) {
+                        oldestSeqBySession[sessionId] = oSeq
+                    }
+                    hasMoreHistoryBySession[sessionId] = (pageObj["has_more"] as? Bool) ?? false
+                }
             } else {
                 return
             }
@@ -694,7 +726,19 @@ public final class VeloStore: ObservableObject {
                 rawList: rawList,
                 fallbackProvider: fallbackProv
             )
-            if !items.isEmpty || self.eventsBySession[sessionId] == nil {
+            if isIncrementalAppend {
+                guard !items.isEmpty else { return }
+                if !Self.hasStreamingTimelineItem(self.eventsBySession[sessionId] ?? []) {
+                    var existing = self.eventsBySession[sessionId] ?? []
+                    let tailKeys = Set(existing.suffix(12).map { "\($0.timestamp)|\($0.content.prefix(64))" })
+                    let fresh = items.filter { !tailKeys.contains("\($0.timestamp)|\($0.content.prefix(64))") }
+                    if !fresh.isEmpty {
+                        existing.append(contentsOf: fresh)
+                        self.eventsBySession[sessionId] = existing
+                        self.scheduleCacheSave()
+                    }
+                }
+            } else if !items.isEmpty || self.eventsBySession[sessionId] == nil {
                 if !Self.hasStreamingTimelineItem(self.eventsBySession[sessionId] ?? []) {
                     self.eventsBySession[sessionId] = items
                     self.scheduleCacheSave()
@@ -706,10 +750,122 @@ public final class VeloStore: ObservableObject {
                 self.turnStartedAtBySession[sessionId] = activeStart
             }
         case .e2eeRelay:
-            oldestSeqBySession.removeValue(forKey: sessionId)
-            sendEncryptedCommand(["cmd": "get_events_page", "session_id": sessionId, "limit": 140])
+            if useIncremental, let m = meta {
+                var cmd: [String: Any] = [
+                    "cmd": "get_events_page",
+                    "session_id": sessionId,
+                    "after_seq": m.newestSeq,
+                    "known_count": m.eventCount,
+                    "limit": 140,
+                ]
+                if let ts = m.latestTsMs {
+                    cmd["known_ts_ms"] = ts
+                }
+                sendEncryptedCommand(cmd)
+            } else {
+                oldestSeqBySession.removeValue(forKey: sessionId)
+                sendEncryptedCommand(["cmd": "get_events_page", "session_id": sessionId, "limit": 140])
+            }
         case .none:
             break
+        }
+    }
+
+    private func enqueueStreamChunk(
+        sessionId: String,
+        isThinking: Bool,
+        delta: String,
+        replace: Bool,
+        nowLabel: String,
+        origin: Date
+    ) {
+        if let existing = pendingStreamChunks[sessionId], existing.isThinking != isThinking {
+            flushPendingStreamChunks(onlySessionId: sessionId)
+        }
+        if var cur = pendingStreamChunks[sessionId], cur.isThinking == isThinking {
+            cur.delta = replace ? delta : (cur.delta + delta)
+            cur.replace = cur.replace || replace
+            cur.nowLabel = nowLabel
+            pendingStreamChunks[sessionId] = cur
+        } else {
+            pendingStreamChunks[sessionId] = PendingStreamChunk(
+                isThinking: isThinking,
+                delta: delta,
+                replace: replace,
+                nowLabel: nowLabel,
+                origin: origin
+            )
+        }
+        if streamFlushTask == nil {
+            let delayNs: UInt64 = (sessionId == activeSessionId) ? 28_000_000 : 110_000_000
+            streamFlushTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: delayNs)
+                guard let self else { return }
+                self.streamFlushTask = nil
+                self.flushPendingStreamChunks(onlySessionId: nil)
+            }
+        }
+    }
+
+    private func flushPendingStreamChunks(onlySessionId: String?) {
+        guard !pendingStreamChunks.isEmpty else { return }
+        let items: [(String, PendingStreamChunk)]
+        if let sid = onlySessionId {
+            guard let chunk = pendingStreamChunks.removeValue(forKey: sid) else { return }
+            items = [(sid, chunk)]
+        } else {
+            items = Array(pendingStreamChunks)
+            pendingStreamChunks.removeAll()
+            streamFlushTask?.cancel()
+            streamFlushTask = nil
+        }
+
+        let now = Date()
+        for (sid, chunk) in items {
+            var list = eventsBySession[sid] ?? []
+            if chunk.isThinking {
+                if let last = list.last, case .thinking(let startedAt, let dur, _) = last.kind {
+                    var updated = last
+                    updated.content = chunk.replace
+                        ? (chunk.delta.isEmpty ? last.content : chunk.delta)
+                        : (last.content + chunk.delta)
+                    updated.kind = .thinking(startedAt: startedAt ?? chunk.origin, durationMs: dur, isStreaming: true)
+                    list[list.count - 1] = updated
+                } else {
+                    list.append(
+                        TimelineEventItem(
+                            id: "th-\(UUID().uuidString.prefix(8))",
+                            sessionId: sid,
+                            timestamp: chunk.nowLabel,
+                            content: chunk.delta,
+                            kind: .thinking(startedAt: chunk.origin, durationMs: nil, isStreaming: true)
+                        )
+                    )
+                }
+            } else {
+                if let last = list.last, case .assistant(true) = last.kind {
+                    var updated = last
+                    updated.content = chunk.replace ? chunk.delta : (last.content + chunk.delta)
+                    list[list.count - 1] = updated
+                } else {
+                    if let lastIdx = list.indices.last,
+                       case .thinking(let startedAt, let dur, true) = list[lastIdx].kind
+                    {
+                        let finalDur = dur ?? max(500, Int(now.timeIntervalSince(startedAt ?? chunk.origin) * 1000))
+                        list[lastIdx].kind = .thinking(startedAt: startedAt, durationMs: finalDur, isStreaming: false)
+                    }
+                    list.append(
+                        TimelineEventItem(
+                            id: "as-stream-\(UUID().uuidString.prefix(8))",
+                            sessionId: sid,
+                            timestamp: chunk.nowLabel,
+                            content: chunk.delta,
+                            kind: .assistant(isStreaming: true)
+                        )
+                    )
+                }
+            }
+            eventsBySession[sid] = list
         }
     }
 
@@ -3143,15 +3299,45 @@ public final class VeloStore: ObservableObject {
                 }
                 return
             case "events_page":
-                if let sid = raw["session_id"] as? String,
-                   let rawEvs = raw["events"] as? [[String: Any]]
-                {
-                    mergeOlderEventsPage(
-                        sessionId: sid,
-                        rawEvents: rawEvs,
-                        oldestSeq: VeloSessionItem.intValue(raw["oldest_seq"]),
-                        hasMore: (raw["has_more"] as? Bool) ?? false
-                    )
+                if let sid = raw["session_id"] as? String {
+                    if (raw["unchanged"] as? Bool) == true {
+                        return
+                    }
+                    let isIncremental = (raw["incremental"] as? Bool) ?? false
+                    if let nSeq = VeloSessionItem.intValue(raw["newest_seq"]) {
+                        let prevMeta = eventsMetaBySession[sid]
+                        let cnt = VeloSessionItem.intValue(raw["event_count"]) ?? prevMeta?.eventCount ?? 0
+                        let ts = VeloSessionItem.intValue(raw["latest_ts_ms"]) ?? prevMeta?.latestTsMs
+                        eventsMetaBySession[sid] = (newestSeq: nSeq, eventCount: cnt, latestTsMs: ts)
+                    }
+                    if let rawEvs = raw["events"] as? [[String: Any]] {
+                        if isIncremental {
+                            let sessionItem = sessions.first(where: { $0.id == sid })
+                            let prov = sessionItem?.agentKind ?? "claude"
+                            let (parsed, _) = Self.reconstructEventsWithActiveTurn(
+                                sessionId: sid,
+                                rawList: rawEvs,
+                                fallbackProvider: prov
+                            )
+                            if !parsed.isEmpty && !Self.hasStreamingTimelineItem(eventsBySession[sid] ?? []) {
+                                var existing = eventsBySession[sid] ?? []
+                                let tailKeys = Set(existing.suffix(12).map { "\($0.timestamp)|\($0.content.prefix(64))" })
+                                let fresh = parsed.filter { !tailKeys.contains("\($0.timestamp)|\($0.content.prefix(64))") }
+                                if !fresh.isEmpty {
+                                    existing.append(contentsOf: fresh)
+                                    eventsBySession[sid] = existing
+                                    scheduleCacheSave()
+                                }
+                            }
+                        } else {
+                            mergeOlderEventsPage(
+                                sessionId: sid,
+                                rawEvents: rawEvs,
+                                oldestSeq: VeloSessionItem.intValue(raw["oldest_seq"]),
+                                hasMore: (raw["has_more"] as? Bool) ?? false
+                            )
+                        }
+                    }
                 }
                 return
             case "cli_sessions_snapshot":
@@ -3249,6 +3435,10 @@ public final class VeloStore: ObservableObject {
         guard let evType = evObj["type"] as? String,
               let sid = evObj["session_id"] as? String, !sid.isEmpty
         else { return }
+
+        if evType != "thinking_chunk" && evType != "message_chunk" {
+            flushPendingStreamChunks(onlySessionId: sid)
+        }
 
         let now = Date()
         let serverDate = Self.parseServerDate(evObj["timestamp"]) ?? now
@@ -3407,24 +3597,14 @@ public final class VeloStore: ObservableObject {
             let delta = (evObj["delta"] as? String) ?? ""
             let replace = (evObj["replace"] as? Bool) ?? false
             let origin = stepStartedAtBySession[sid] ?? turnStartedAtBySession[sid] ?? now
-            var list = eventsBySession[sid] ?? []
-            if let last = list.last, case .thinking(let startedAt, let dur, _) = last.kind {
-                var updated = last
-                updated.content = replace ? (delta.isEmpty ? last.content : delta) : (last.content + delta)
-                updated.kind = .thinking(startedAt: startedAt ?? origin, durationMs: dur, isStreaming: true)
-                list[list.count - 1] = updated
-            } else {
-                list.append(
-                    TimelineEventItem(
-                        id: "th-\(UUID().uuidString.prefix(8))",
-                        sessionId: sid,
-                        timestamp: nowLabel,
-                        content: delta,
-                        kind: .thinking(startedAt: origin, durationMs: nil, isStreaming: true)
-                    )
-                )
-            }
-            eventsBySession[sid] = list
+            enqueueStreamChunk(
+                sessionId: sid,
+                isThinking: true,
+                delta: delta,
+                replace: replace,
+                nowLabel: nowLabel,
+                origin: origin
+            )
 
         case "thinking_delta":
             let text = ((evObj["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3620,30 +3800,14 @@ public final class VeloStore: ObservableObject {
             let replace = (evObj["replace"] as? Bool) ?? false
             guard !delta.isEmpty else { return }
             let origin = stepStartedAtBySession[sid] ?? turnStartedAtBySession[sid] ?? serverDate
-
-            var list = eventsBySession[sid] ?? []
-            if let last = list.last, case .assistant(true) = last.kind {
-                var updated = last
-                updated.content = replace ? delta : (last.content + delta)
-                list[list.count - 1] = updated
-            } else {
-                if let lastIdx = list.indices.last,
-                   case .thinking(let startedAt, let dur, true) = list[lastIdx].kind
-                {
-                    let finalDur = dur ?? max(500, Int(now.timeIntervalSince(startedAt ?? origin) * 1000))
-                    list[lastIdx].kind = .thinking(startedAt: startedAt, durationMs: finalDur, isStreaming: false)
-                }
-                list.append(
-                    TimelineEventItem(
-                        id: "as-stream-\(UUID().uuidString.prefix(8))",
-                        sessionId: sid,
-                        timestamp: nowLabel,
-                        content: delta,
-                        kind: .assistant(isStreaming: true)
-                    )
-                )
-            }
-            eventsBySession[sid] = list
+            enqueueStreamChunk(
+                sessionId: sid,
+                isThinking: false,
+                delta: delta,
+                replace: replace,
+                nowLabel: nowLabel,
+                origin: origin
+            )
 
         case "message_delta":
             let text = (evObj["text"] as? String) ?? ""

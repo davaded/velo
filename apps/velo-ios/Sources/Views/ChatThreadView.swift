@@ -13,6 +13,7 @@ public struct ChatThreadView: View {
     var onSwitchedSession: ((String) -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
     @State private var draftPrompt: String = ""
     @State private var selectedModelId: String = "claude-fable-5-2"
     @State private var selectedEffort: String = "medium"
@@ -31,6 +32,7 @@ public struct ChatThreadView: View {
     @State private var isTranscribingVoice: Bool = false
     @State private var isLoadingOlderHistory: Bool = false
     @State private var didInitialBottomScroll: Bool = false
+    @State private var isPinnedToBottom: Bool = true
     @State private var lastTailEventId: String? = nil
     @FocusState private var composerFocused: Bool
 
@@ -390,18 +392,82 @@ public struct ChatThreadView: View {
                     Color.clear
                         .frame(height: 6)
                         .id("BOTTOM_ANCHOR")
+                        .onAppear {
+                            isPinnedToBottom = true
+                        }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
                 .padding(.bottom, 12)
             }
+            .defaultScrollAnchor(.bottom)
             .scrollDismissesKeyboard(.interactively)
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 12)
+                    .onChanged { value in
+                        // Dragging finger downward scrolls toward earlier history -> unpin bottom
+                        if value.translation.height > 18 {
+                            isPinnedToBottom = false
+                        }
+                    }
+            )
+            .overlay(alignment: .bottomTrailing) {
+                if !isPinnedToBottom && !turns.isEmpty {
+                    Button {
+                        isPinnedToBottom = true
+                        withAnimation(.easeOut(duration: 0.22)) {
+                            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 11, weight: .bold))
+                            Text("最新")
+                                .font(.system(size: 11.5, weight: .semibold))
+                        }
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(
+                            Capsule()
+                                .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.9)
+                        )
+                        .shadow(color: Color.black.opacity(0.16), radius: 6, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 14)
+                    .padding(.bottom, 10)
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                }
+            }
             .onChange(of: store.eventsBySession[sessionId]?.last?.id) { _, newTailId in
                 handleTailEventChanged(newTailId: newTailId, proxy: proxy)
+            }
+            .onChange(of: store.eventsBySession[sessionId]?.last?.content.count ?? 0) { _, _ in
+                if isPinnedToBottom {
+                    proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                }
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase == .active {
+                    let wasPinned = isPinnedToBottom
+                    Task {
+                        await store.loadEventsForSession(sessionId, incremental: true)
+                        if wasPinned {
+                            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                            try? await Task.sleep(nanoseconds: 120_000_000)
+                            if isPinnedToBottom {
+                                proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                            }
+                        }
+                    }
+                }
             }
             .onChange(of: jumpTargetTurnId) { _, targetId in
                 guard let targetId else { return }
                 jumpTargetTurnId = nil
+                isPinnedToBottom = false
                 withAnimation(.easeInOut(duration: 0.25)) {
                     proxy.scrollTo(targetId, anchor: .top)
                 }
@@ -446,7 +512,7 @@ public struct ChatThreadView: View {
         }
         .frame(maxWidth: .infinity)
         .onAppear {
-            guard didInitialBottomScroll, !isLoadingOlderHistory, !turns.isEmpty else { return }
+            guard didInitialBottomScroll, !isPinnedToBottom, !isLoadingOlderHistory, !turns.isEmpty else { return }
             isLoadingOlderHistory = true
             Task {
                 await store.loadOlderEventsPage(for: sessionId)
@@ -485,6 +551,7 @@ public struct ChatThreadView: View {
     private func handleTailEventChanged(newTailId: String?, proxy: ScrollViewProxy) {
         guard let newTailId, newTailId != lastTailEventId else { return }
         lastTailEventId = newTailId
+        guard isPinnedToBottom else { return }
         guard let lastEv = store.eventsBySession[sessionId]?.last else { return }
         let shouldScroll: Bool = {
             if !store.autoCollapseSteps { return true }
@@ -504,14 +571,19 @@ public struct ChatThreadView: View {
 
     private func syncAndScrollInitial(sid: String, proxy: ScrollViewProxy) {
         didInitialBottomScroll = false
+        isPinnedToBottom = true
         if let s = store.sessions.first(where: { $0.id == sid }) {
             selectedModelId = s.model
             selectedEffort = s.effort
         }
         Task {
-            await store.loadEventsForSession(sid)
+            await store.loadEventsForSession(sid, incremental: true)
             proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            try? await Task.sleep(nanoseconds: 140_000_000)
+            if isPinnedToBottom {
+                proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+            }
+            try? await Task.sleep(nanoseconds: 210_000_000)
             didInitialBottomScroll = true
         }
     }

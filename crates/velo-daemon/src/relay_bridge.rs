@@ -1806,13 +1806,32 @@ async fn run_supervised_e2ee_bridge(
                                             let before_seq = cmd_val
                                                 .get("before_seq")
                                                 .and_then(|v| v.as_i64());
+                                            let after_seq = cmd_val
+                                                .get("after_seq")
+                                                .and_then(|v| v.as_i64());
+                                            let known_count = cmd_val
+                                                .get("known_count")
+                                                .and_then(|v| v.as_u64())
+                                                .map(|v| v as usize);
+                                            let known_ts_ms = cmd_val
+                                                .get("known_ts_ms")
+                                                .and_then(|v| v.as_i64());
                                             let limit = cmd_val
                                                 .get("limit")
                                                 .and_then(|v| v.as_u64())
                                                 .unwrap_or(140) as usize;
-                                            if let Ok(mut page) =
+                                            let page_res = if let Some(a_seq) = after_seq {
+                                                state.db.query_events_incremental(
+                                                    sid,
+                                                    a_seq,
+                                                    known_count,
+                                                    known_ts_ms,
+                                                    limit,
+                                                )
+                                            } else {
                                                 state.db.query_events_page(sid, before_seq, limit)
-                                            {
+                                            };
+                                            if let Ok(mut page) = page_res {
                                                 page.events = page
                                                     .events
                                                     .iter()
@@ -1824,7 +1843,11 @@ async fn run_supervised_e2ee_bridge(
                                                     "events": page.events,
                                                     "oldest_seq": page.oldest_seq,
                                                     "newest_seq": page.newest_seq,
+                                                    "latest_ts_ms": page.latest_ts_ms,
+                                                    "event_count": page.event_count,
                                                     "has_more": page.has_more,
+                                                    "incremental": page.incremental,
+                                                    "unchanged": page.unchanged,
                                                 });
                                                 if let Some(frame_txt) = send_sealed_with_key(
                                                     &resp,
