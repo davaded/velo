@@ -44,7 +44,7 @@ import {
 } from "./components/ForkBranchModal";
 import { ChatOutlineRail, OutlineTurnSummary } from "./components/ChatOutlineRail";
 import { SidebarQuotaBar } from "./components/SidebarQuotaBar";
-import { RemoteHostsModal } from "./components/RemoteHostsModal";
+import { RemoteHostDto, RemoteHostsModal } from "./components/RemoteHostsModal";
 import {
   ExtensionsAndCheckpointsModal,
   SkillEntryDto,
@@ -629,7 +629,7 @@ try {
 }
 
 export function App() {
-  const [daemonUrl] = useState<string>(() => {
+  const [localDaemonUrl] = useState<string>(() => {
     const sp = new URLSearchParams(window.location.search);
     const explicitDaemon = sp.get("daemon");
     if (explicitDaemon && explicitDaemon.startsWith("http")) {
@@ -644,6 +644,37 @@ export function App() {
     }
     return "http://127.0.0.1:6767";
   });
+
+  const [daemonUrl, setDaemonUrl] = useState<string>(() => {
+    const saved = safeStorageGet("velo.activeDaemonUrl.v1");
+    if (saved && (saved.startsWith("http://") || saved.startsWith("https://"))) {
+      return saved.replace(/\/$/, "");
+    }
+    return localDaemonUrl;
+  });
+  const [federatedHosts, setFederatedHosts] = useState<RemoteHostDto[]>([]);
+  const [monitorMenuOpen, setMonitorMenuOpen] = useState<boolean>(false);
+  const desktopClientIdRef = useRef<string>(
+    `desktop-${Math.random().toString(36).slice(2, 10)}`
+  );
+
+  const handleSwitchControlPlane = useCallback(
+    (targetUrl: string) => {
+      const clean = targetUrl.replace(/\/+$/, "");
+      if (!clean || clean === daemonUrl) return;
+      if (clean === localDaemonUrl) {
+        safeStorageSet("velo.activeDaemonUrl.v1", "");
+      } else {
+        safeStorageSet("velo.activeDaemonUrl.v1", clean);
+      }
+      eventsMetaBySessionRef.current = {};
+      setEventsBySession({});
+      setSessions([]);
+      setActiveId("");
+      setDaemonUrl(clean);
+    },
+    [daemonUrl, localDaemonUrl]
+  );
 
   const [isMacDesktop] = useState<boolean>(() => {
     const w = window as unknown as Record<string, unknown>;
@@ -1677,6 +1708,56 @@ export function App() {
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [refreshSessions, syncSessionEventsFromDaemon, snapChatToBottomImmediate]);
+
+  // Phase 3: Report desktop presence to daemon so push notifications stay silent while
+  // the user is actively viewing the same session on Mac.
+  useEffect(() => {
+    const reportPresence = (focused: boolean) => {
+      const sid = activeSessionIdRef.current;
+      const validUuid =
+        sid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid)
+          ? sid
+          : null;
+      fetch(`${daemonUrl}/api/presence`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_id: desktopClientIdRef.current,
+          platform: "desktop",
+          focused,
+          active_session_id: validUuid,
+        }),
+      }).catch(() => {});
+    };
+    reportPresence(document.hasFocus() && !document.hidden);
+    const onFocus = () => reportPresence(true);
+    const onBlur = () => reportPresence(false);
+    const onVis = () => reportPresence(!document.hidden && document.hasFocus());
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onVis);
+    const hb = window.setInterval(() => {
+      if (!document.hidden && document.hasFocus()) {
+        reportPresence(true);
+      }
+    }, 12_000);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onVis);
+      window.clearInterval(hb);
+    };
+  }, [daemonUrl, activeSession.id]);
+
+  // Phase 4: Load federated multi-host registry from local daemon so sidebar host switcher stays live
+  useEffect(() => {
+    fetch(`${localDaemonUrl}/api/hosts`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (Array.isArray(d?.hosts)) setFederatedHosts(d.hosts as RemoteHostDto[]);
+      })
+      .catch(() => {});
+  }, [localDaemonUrl]);
 
   const fetchPairTicket = useCallback(
     (relayOverride?: string) => {
@@ -5621,6 +5702,51 @@ export function App() {
             </button>
           </div>
 
+          {/* Phase 4: Compact Federated Multi-Host Switcher Strip (only visible when >1 Daemon host is configured) */}
+          {(() => {
+            const daemonNodes = federatedHosts.filter(
+              (h) => h.is_local || h.node_kind === "daemon"
+            );
+            if (daemonNodes.length <= 1) return null;
+            return (
+              <div className="mx-2.5 mb-2 flex items-center gap-1 overflow-x-auto rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)]/70 p-1">
+                {daemonNodes.map((h) => {
+                  const targetUrl = (h.is_local ? localDaemonUrl : h.daemon_url) || "";
+                  const active =
+                    targetUrl.replace(/\/+$/, "") === daemonUrl.replace(/\/+$/, "");
+                  const online = h.status === "online";
+                  return (
+                    <button
+                      key={h.id}
+                      type="button"
+                      onClick={() => targetUrl && handleSwitchControlPlane(targetUrl)}
+                      title={`${h.label} (${targetUrl || "offline"})`}
+                      className={`inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
+                        active
+                          ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                          : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                      }`}
+                    >
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${
+                          online ? "bg-[#34d399]" : "bg-[var(--v-fg-faint)]"
+                        }`}
+                      />
+                      <span className="max-w-[96px] truncate">
+                        {h.label.replace(/\s*\(本机\)\s*/, "")}
+                      </span>
+                      {(h.running_count || 0) > 0 && (
+                        <span className="font-mono text-[9.5px] text-[#34d399]">
+                          {h.running_count}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            );
+          })()}
+
           {/* Section Header: Workspaces (Direct Add / Create Folder + Collapse/Expand All) */}
           <div className="flex items-center justify-between px-3 pb-1.5 pt-1">
             <span className="pl-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--v-fg-muted)]">
@@ -6171,6 +6297,102 @@ export function App() {
 
           {/* Right Header Controls: non-wrapping shrink-0 strip + container-responsive `···` overflow menu */}
           <div className="relative flex shrink-0 items-center gap-1 whitespace-nowrap">
+            {/* Phase 3: Global P0-P3 Arbitrated Task Monitor Pill */}
+            {(() => {
+              const activeTasks = sessions
+                .filter(
+                  (s) =>
+                    !s.archived &&
+                    (s.status === "waiting_approval" || s.status === "running")
+                )
+                .sort((a, b) => {
+                  const pa = a.status === "waiting_approval" ? 0 : a.id === activeSession.id ? 1 : 2;
+                  const pb = b.status === "waiting_approval" ? 0 : b.id === activeSession.id ? 1 : 2;
+                  return pa - pb;
+                });
+              if (activeTasks.length === 0) return null;
+              const waitingCount = activeTasks.filter(
+                (s) => s.status === "waiting_approval"
+              ).length;
+              const runningCount = activeTasks.length - waitingCount;
+              const hasWaiting = waitingCount > 0;
+              return (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setMonitorMenuOpen((v) => !v)}
+                    title="全局运行任务监控（P0 待审批优先 · 点击直达）"
+                    className={`inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-medium transition-colors cursor-pointer ${
+                      hasWaiting
+                        ? "border-[#f59e0b]/40 bg-[#f59e0b]/12 text-[#d97706] dark:text-[#fbbf24] hover:bg-[#f59e0b]/20"
+                        : "border-[#34d399]/35 bg-[#34d399]/10 text-[#059669] dark:text-[#34d399] hover:bg-[#34d399]/18"
+                    }`}
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full animate-pulse ${
+                        hasWaiting ? "bg-[#f59e0b]" : "bg-[#34d399]"
+                      }`}
+                    />
+                    <span>
+                      {hasWaiting
+                        ? `${waitingCount} 待批准${runningCount > 0 ? ` · ${runningCount} 运行` : ""}`
+                        : `${runningCount} 运行中`}
+                    </span>
+                  </button>
+                  {monitorMenuOpen && (
+                    <>
+                      <div
+                        className="fixed inset-0 z-30"
+                        onClick={() => setMonitorMenuOpen(false)}
+                      />
+                      <div className="absolute right-0 top-8 z-40 w-[280px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                        <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
+                          <span>全局任务监控 · P0-P2 优先级</span>
+                          <span className="font-mono">{activeTasks.length} 项</span>
+                        </div>
+                        <div className="mt-0.5 max-h-[240px] space-y-0.5 overflow-y-auto">
+                          {activeTasks.map((task) => {
+                            const isWait = task.status === "waiting_approval";
+                            const isCur = task.id === activeSession.id;
+                            return (
+                              <button
+                                key={task.id}
+                                type="button"
+                                onClick={() => {
+                                  setActiveId(task.id);
+                                  setMonitorMenuOpen(false);
+                                }}
+                                className={`flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors cursor-pointer ${
+                                  isCur
+                                    ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                    : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
+                                }`}
+                              >
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <span
+                                    className={`shrink-0 rounded px-1 py-0.5 font-mono text-[9.5px] font-semibold ${
+                                      isWait
+                                        ? "bg-[#f59e0b]/20 text-[#fbbf24]"
+                                        : "bg-[#34d399]/15 text-[#34d399]"
+                                    }`}
+                                  >
+                                    {isWait ? "P0" : isCur ? "P1" : "P2"}
+                                  </span>
+                                  <span className="truncate">{task.title}</span>
+                                </div>
+                                <span className="shrink-0 font-mono text-[10px] text-[var(--v-fg-muted)]">
+                                  {isWait ? "待批准" : "执行中"}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              );
+            })()}
             <button
               type="button"
               onClick={() => {
@@ -9664,6 +9886,9 @@ export function App() {
       <RemoteHostsModal
         open={hostsModalOpen}
         daemonUrl={daemonUrl}
+        localDaemonUrl={localDaemonUrl}
+        onSwitchControlPlane={(targetUrl) => handleSwitchControlPlane(targetUrl)}
+        onHostsUpdated={(list) => setFederatedHosts(list)}
         onDispatchedSession={(rawSess) => {
           const created = normalizeToVeloSession(rawSess, 0);
           setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)]);

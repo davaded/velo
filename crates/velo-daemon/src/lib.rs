@@ -1020,6 +1020,15 @@ pub struct WarmAgentEntry {
     pub approval_mode: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClientPresence {
+    pub client_id: String,
+    pub platform: String,
+    pub focused: bool,
+    pub active_session_id: Option<Uuid>,
+    pub updated_at: std::time::Instant,
+}
+
 pub struct DaemonInner {
     pub sessions: HashMap<Uuid, SessionInfo>,
     pub event_history: HashMap<Uuid, Vec<AgentEvent>>,
@@ -1037,6 +1046,9 @@ pub struct DaemonInner {
     pub push_config: push::PushConfig,
     pub quota_cache: quota::PersistedQuotaCache,
     pub remote_hosts: Vec<hosts::RemoteHostNode>,
+    pub host_identity: hosts::HostIdentity,
+    pub client_presences: HashMap<String, ClientPresence>,
+    pub monitor_version: u64,
 }
 
 #[derive(Clone)]
@@ -1073,6 +1085,8 @@ impl DaemonState {
         let push_config_file = velo_home.join("push_config.json");
         let quota_cache_file = velo_home.join("quotas.json");
         let hosts_file = velo_home.join("hosts.json");
+        let host_identity_file = velo_home.join("host_identity.json");
+        let host_identity = hosts::load_or_create_host_identity(&host_identity_file);
         tokio::fs::create_dir_all(&events_dir).await?;
         tokio::fs::create_dir_all(&attachments_dir).await?;
 
@@ -1164,6 +1178,9 @@ impl DaemonState {
                 push_config: push_cfg,
                 quota_cache,
                 remote_hosts,
+                host_identity,
+                client_presences: HashMap::new(),
+                monitor_version: 1,
             })),
             db,
             agent_event_tx,
@@ -1874,6 +1891,7 @@ impl DaemonState {
                                             wh.handle.stop();
                                         }
                                     }
+                                    g.monitor_version = g.monitor_version.saturating_add(1);
                                     if matches!(
                                         status,
                                         SessionStatus::Completed | SessionStatus::Failed
@@ -1881,7 +1899,18 @@ impl DaemonState {
                                     {
                                         next_queued_job = Some(session.queued_prompts.remove(0));
                                     }
-                                    if p_cfg.enabled && next_queued_job.is_none() {
+                                    let user_actively_viewing = g
+                                        .client_presences
+                                        .values()
+                                        .any(|p| {
+                                            p.focused
+                                                && p.active_session_id == Some(session_id)
+                                                && p.updated_at.elapsed().as_secs() <= 18
+                                        });
+                                    if p_cfg.enabled
+                                        && next_queued_job.is_none()
+                                        && !user_actively_viewing
+                                    {
                                         match status {
                                             SessionStatus::Completed => {
                                                 push_notification_job = Some((
@@ -1904,7 +1933,16 @@ impl DaemonState {
                                     }
                                 }
                                 AgentEvent::PermissionRequested { description, .. } => {
-                                    if p_cfg.enabled {
+                                    g.monitor_version = g.monitor_version.saturating_add(1);
+                                    let user_actively_viewing = g
+                                        .client_presences
+                                        .values()
+                                        .any(|p| {
+                                            p.focused
+                                                && p.active_session_id == Some(session_id)
+                                                && p.updated_at.elapsed().as_secs() <= 18
+                                        });
+                                    if p_cfg.enabled && !user_actively_viewing {
                                         push_notification_job = Some((
                                             p_cfg,
                                             push::PushTriggerKind::PermissionRequired,
@@ -1914,7 +1952,16 @@ impl DaemonState {
                                     }
                                 }
                                 AgentEvent::UserQuestionRequested { question, .. } => {
-                                    if p_cfg.enabled {
+                                    g.monitor_version = g.monitor_version.saturating_add(1);
+                                    let user_actively_viewing = g
+                                        .client_presences
+                                        .values()
+                                        .any(|p| {
+                                            p.focused
+                                                && p.active_session_id == Some(session_id)
+                                                && p.updated_at.elapsed().as_secs() <= 18
+                                        });
+                                    if p_cfg.enabled && !user_actively_viewing {
                                         push_notification_job = Some((
                                             p_cfg,
                                             push::PushTriggerKind::QuestionRequired,
@@ -2844,6 +2891,9 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/search", get(global_search_handler))
         .route("/api/pricing", get(pricing_catalog_handler))
         .route("/api/workspaces/files", get(list_workspace_files_handler))
+        .route("/api/host/info", get(host_info_handler))
+        .route("/api/presence", post(update_presence_handler))
+        .route("/api/monitor/summary", get(monitor_summary_handler))
         .route("/api/analytics/usage", get(usage_analytics_handler))
         .route("/api/analytics/quotas", get(quotas_analytics_handler))
         .route(
@@ -6561,18 +6611,229 @@ impl DaemonState {
         json!({ "ok": true, "providers": cards })
     }
 
-    pub async fn list_hosts_dto(&self) -> Value {
-        let remote = {
+    pub async fn host_info_dto(&self) -> Value {
+        let (ident, running_count, waiting_count, sessions_count) = {
             let guard = self.inner.read().await;
-            guard.remote_hosts.clone()
+            let mut running = 0usize;
+            let mut waiting = 0usize;
+            for s in guard.sessions.values() {
+                match s.status {
+                    SessionStatus::Running | SessionStatus::Starting => running += 1,
+                    SessionStatus::WaitingForPermission => waiting += 1,
+                    _ => {}
+                }
+            }
+            (
+                guard.host_identity.clone(),
+                running,
+                waiting,
+                guard.sessions.len(),
+            )
         };
-        let mut all = vec![hosts::local_host_summary_json()];
+        let mut available_providers: Vec<&str> = Vec::new();
+        for (name, bin) in [
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("antigravity", "agy"),
+            ("cursor", "cursor-agent"),
+            ("grok", "grok"),
+        ] {
+            if velo_agent::resolve_cli_binary(bin).is_some() {
+                available_providers.push(name);
+            }
+        }
+        json!({
+            "ok": true,
+            "host_id": ident.host_id,
+            "label": ident.label,
+            "os_info": ident.os_info,
+            "arch": ident.arch,
+            "version": env!("CARGO_PKG_VERSION"),
+            "available_providers": available_providers,
+            "running_count": running_count,
+            "waiting_count": waiting_count,
+            "sessions_count": sessions_count,
+        })
+    }
+
+    pub async fn update_client_presence(
+        &self,
+        client_id: String,
+        platform: String,
+        focused: bool,
+        active_session_id: Option<Uuid>,
+    ) {
+        let mut guard = self.inner.write().await;
+        // Prune stale clients (> 60s)
+        guard
+            .client_presences
+            .retain(|_, p| p.updated_at.elapsed().as_secs() <= 60);
+        guard.client_presences.insert(
+            client_id.clone(),
+            ClientPresence {
+                client_id,
+                platform,
+                focused,
+                active_session_id,
+                updated_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Authoritative P0-P3 arbitrated monitoring snapshot for Mac global monitor pill & iOS Dynamic Island.
+    pub async fn monitor_summary_dto(&self, preferred_session_id: Option<Uuid>) -> Value {
+        let guard = self.inner.read().await;
+        let ident = guard.host_identity.clone();
+        let state_version = guard.monitor_version;
+
+        struct Candidate {
+            priority_rank: u8, // 0 = P0 waiting, 1 = P1 preferred running, 2 = P2 other running, 3 = P3 recent error/done
+            priority_label: &'static str,
+            phase: &'static str,
+            session_id: Uuid,
+            title: String,
+            provider: String,
+            model: String,
+            queued_count: usize,
+            updated_at: chrono::DateTime<Utc>,
+        }
+
+        let mut running_count = 0usize;
+        let mut waiting_count = 0usize;
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let now = Utc::now();
+
+        for s in guard.sessions.values() {
+            if s.archived {
+                continue;
+            }
+            match s.status {
+                SessionStatus::WaitingForPermission => {
+                    waiting_count += 1;
+                    candidates.push(Candidate {
+                        priority_rank: 0,
+                        priority_label: "P0",
+                        phase: "waiting_approval",
+                        session_id: s.id,
+                        title: s.name.clone(),
+                        provider: format!("{:?}", s.provider).to_lowercase(),
+                        model: s.model.clone().unwrap_or_default(),
+                        queued_count: s.queued_prompts.len(),
+                        updated_at: s.updated_at,
+                    });
+                }
+                SessionStatus::Running | SessionStatus::Starting => {
+                    running_count += 1;
+                    let is_pref = preferred_session_id == Some(s.id);
+                    candidates.push(Candidate {
+                        priority_rank: if is_pref { 1 } else { 2 },
+                        priority_label: if is_pref { "P1" } else { "P2" },
+                        phase: "running",
+                        session_id: s.id,
+                        title: s.name.clone(),
+                        provider: format!("{:?}", s.provider).to_lowercase(),
+                        model: s.model.clone().unwrap_or_default(),
+                        queued_count: s.queued_prompts.len(),
+                        updated_at: s.updated_at,
+                    });
+                }
+                SessionStatus::Failed => {
+                    if (now - s.updated_at).num_seconds() <= 30 {
+                        candidates.push(Candidate {
+                            priority_rank: 3,
+                            priority_label: "P3",
+                            phase: "failed",
+                            session_id: s.id,
+                            title: s.name.clone(),
+                            provider: format!("{:?}", s.provider).to_lowercase(),
+                            model: s.model.clone().unwrap_or_default(),
+                            queued_count: s.queued_prompts.len(),
+                            updated_at: s.updated_at,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            a.priority_rank
+                .cmp(&b.priority_rank)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+
+        let tasks_json: Vec<Value> = candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "priority": c.priority_label,
+                    "phase": c.phase,
+                    "session_id": c.session_id,
+                    "title": c.title,
+                    "provider": c.provider,
+                    "model": c.model,
+                    "queued_count": c.queued_count,
+                    "host_id": ident.host_id,
+                    "host_label": ident.label,
+                })
+            })
+            .collect();
+
+        let primary = tasks_json.first().cloned();
+        let active_clients = guard
+            .client_presences
+            .values()
+            .filter(|p| p.updated_at.elapsed().as_secs() <= 18)
+            .count();
+
+        json!({
+            "ok": true,
+            "state_version": state_version,
+            "host_id": ident.host_id,
+            "host_label": ident.label,
+            "running_count": running_count,
+            "waiting_count": waiting_count,
+            "active_clients": active_clients,
+            "primary_focus": primary,
+            "active_tasks": tasks_json,
+        })
+    }
+
+    pub async fn list_hosts_dto(&self) -> Value {
+        let (ident, remote, running_count, waiting_count) = {
+            let guard = self.inner.read().await;
+            let mut running = 0usize;
+            let mut waiting = 0usize;
+            for s in guard.sessions.values() {
+                match s.status {
+                    SessionStatus::Running | SessionStatus::Starting => running += 1,
+                    SessionStatus::WaitingForPermission => waiting += 1,
+                    _ => {}
+                }
+            }
+            (
+                guard.host_identity.clone(),
+                guard.remote_hosts.clone(),
+                running,
+                waiting,
+            )
+        };
+        let mut all = vec![hosts::local_host_summary_json(
+            &ident,
+            running_count,
+            waiting_count,
+        )];
         for h in remote {
             if let Ok(v) = serde_json::to_value(h) {
                 all.push(v);
             }
         }
-        json!({ "ok": true, "hosts": all })
+        json!({
+            "ok": true,
+            "local_host_id": ident.host_id,
+            "local_label": ident.label,
+            "hosts": all,
+        })
     }
 
     pub async fn add_remote_host_core(
@@ -6586,10 +6847,38 @@ impl DaemonState {
             anyhow::bail!("SSH target cannot be empty");
         }
         let created = hosts::create_host_node(label, ssh_target, default_cwd, prefer_hush);
-        let probed = hosts::probe_ssh_host(created).await;
+        let probed = hosts::probe_host_node(created).await;
         {
             let mut guard = self.inner.write().await;
-            guard.remote_hosts.retain(|h| h.ssh_target != probed.ssh_target);
+            guard.remote_hosts.retain(|h| {
+                !(h.node_kind == "ssh" && h.ssh_target == probed.ssh_target)
+            });
+            guard.remote_hosts.push(probed.clone());
+            hosts::save_remote_hosts(&self.hosts_file, &guard.remote_hosts);
+        }
+        Ok(probed)
+    }
+
+    pub async fn add_daemon_host_core(
+        &self,
+        label: &str,
+        daemon_url: &str,
+        pairing_uri: Option<&str>,
+    ) -> Result<hosts::RemoteHostNode> {
+        if daemon_url.trim().is_empty()
+            && pairing_uri.map(str::trim).unwrap_or("").is_empty()
+        {
+            anyhow::bail!("Daemon URL or Pairing URI is required");
+        }
+        let created = hosts::create_daemon_host_node(label, daemon_url, pairing_uri);
+        let probed = hosts::probe_host_node(created).await;
+        {
+            let mut guard = self.inner.write().await;
+            guard.remote_hosts.retain(|h| {
+                !(h.node_kind == "daemon"
+                    && h.daemon_url.is_some()
+                    && h.daemon_url == probed.daemon_url)
+            });
             guard.remote_hosts.push(probed.clone());
             hosts::save_remote_hosts(&self.hosts_file, &guard.remote_hosts);
         }
@@ -6612,7 +6901,7 @@ impl DaemonState {
             let guard = self.inner.read().await;
             guard.remote_hosts.iter().find(|h| h.id == host_id).cloned()
         }?;
-        let updated = hosts::probe_ssh_host(existing).await;
+        let updated = hosts::probe_host_node(existing).await;
         {
             let mut guard = self.inner.write().await;
             if let Some(slot) = guard.remote_hosts.iter_mut().find(|h| h.id == host_id) {
@@ -7039,6 +7328,51 @@ async fn quotas_analytics_handler(
     Json(state.get_quotas_dto_opts(force).await)
 }
 
+async fn host_info_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    Json(state.host_info_dto().await)
+}
+
+#[derive(serde::Deserialize)]
+struct UpdatePresenceRequest {
+    client_id: String,
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    focused: bool,
+    active_session_id: Option<Uuid>,
+}
+
+async fn update_presence_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<UpdatePresenceRequest>,
+) -> impl IntoResponse {
+    state
+        .update_client_presence(
+            req.client_id,
+            if req.platform.trim().is_empty() {
+                "desktop".to_string()
+            } else {
+                req.platform
+            },
+            req.focused,
+            req.active_session_id,
+        )
+        .await;
+    Json(json!({ "ok": true }))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct MonitorSummaryQuery {
+    preferred_session_id: Option<Uuid>,
+}
+
+async fn monitor_summary_handler(
+    State(state): State<DaemonState>,
+    Query(q): Query<MonitorSummaryQuery>,
+) -> impl IntoResponse {
+    Json(state.monitor_summary_dto(q.preferred_session_id).await)
+}
+
 async fn list_hosts_handler(State(state): State<DaemonState>) -> impl IntoResponse {
     Json(state.list_hosts_dto().await)
 }
@@ -7046,7 +7380,14 @@ async fn list_hosts_handler(State(state): State<DaemonState>) -> impl IntoRespon
 #[derive(serde::Deserialize)]
 struct AddHostRequest {
     label: Option<String>,
+    #[serde(default)]
+    node_kind: Option<String>,
+    #[serde(default)]
     ssh_target: String,
+    #[serde(default)]
+    daemon_url: Option<String>,
+    #[serde(default)]
+    pairing_uri: Option<String>,
     default_cwd: Option<String>,
     #[serde(default = "default_prefer_hush")]
     prefer_hush: bool,
@@ -7060,15 +7401,36 @@ async fn add_host_handler(
     State(state): State<DaemonState>,
     Json(req): Json<AddHostRequest>,
 ) -> impl IntoResponse {
-    match state
-        .add_remote_host_core(
-            req.label.as_deref().unwrap_or(""),
-            &req.ssh_target,
-            req.default_cwd.as_deref(),
-            req.prefer_hush,
-        )
-        .await
-    {
+    let is_daemon = req.node_kind.as_deref() == Some("daemon")
+        || req
+            .daemon_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+        || req
+            .pairing_uri
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
+
+    let res = if is_daemon {
+        state
+            .add_daemon_host_core(
+                req.label.as_deref().unwrap_or(""),
+                req.daemon_url.as_deref().unwrap_or(""),
+                req.pairing_uri.as_deref(),
+            )
+            .await
+    } else {
+        state
+            .add_remote_host_core(
+                req.label.as_deref().unwrap_or(""),
+                &req.ssh_target,
+                req.default_cwd.as_deref(),
+                req.prefer_hush,
+            )
+            .await
+    };
+
+    match res {
         Ok(node) => (StatusCode::CREATED, Json(json!({ "ok": true, "host": node }))).into_response(),
         Err(err) => (
             StatusCode::BAD_REQUEST,
@@ -9291,6 +9653,15 @@ composer-2.5 - Composer 2.5
                 push_config: push::PushConfig::default(),
                 quota_cache: quota::PersistedQuotaCache::default(),
                 remote_hosts: Vec::new(),
+                host_identity: hosts::HostIdentity {
+                    host_id: "test-host".to_string(),
+                    label: "TestMac".to_string(),
+                    os_info: "macos aarch64".to_string(),
+                    arch: "aarch64".to_string(),
+                    created_at: Utc::now(),
+                },
+                client_presences: HashMap::new(),
+                monitor_version: 1,
             })),
             db,
             agent_event_tx,
@@ -9876,6 +10247,15 @@ composer-2.5 - Composer 2.5
                 push_config: push::PushConfig::default(),
                 quota_cache: quota::PersistedQuotaCache::default(),
                 remote_hosts: Vec::new(),
+                host_identity: hosts::HostIdentity {
+                    host_id: "test-host".to_string(),
+                    label: "TestMac".to_string(),
+                    os_info: "macos aarch64".to_string(),
+                    arch: "aarch64".to_string(),
+                    created_at: Utc::now(),
+                },
+                client_presences: HashMap::new(),
+                monitor_version: 1,
             })),
             db,
             agent_event_tx,

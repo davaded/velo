@@ -7,6 +7,9 @@ public struct VeloRemoteHostsSheet: View {
     @Environment(\.colorScheme) private var colorScheme
 
     @State private var showAddSshForm = false
+    @State private var showAddDirectDaemonForm = false
+    @State private var newDaemonName = ""
+    @State private var newDaemonUrl = ""
     @State private var newLabel = ""
     @State private var newTarget = ""
     @State private var newCwd = "~/code"
@@ -71,6 +74,51 @@ public struct VeloRemoteHostsSheet: View {
                         Label("扫码添加另一台 Mac 或云端守护节点", systemImage: "qrcode.viewfinder")
                             .font(.system(size: 13.5, weight: .medium))
                             .foregroundStyle(VeloTheme.accentViolet)
+                    }
+
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showAddDirectDaemonForm.toggle()
+                        }
+                    } label: {
+                        Label(
+                            showAddDirectDaemonForm ? "收起手动接入表单" : "手动添加 LAN / Tailscale 主机地址",
+                            systemImage: "network"
+                        )
+                        .font(.system(size: 13.5, weight: .medium))
+                        .foregroundStyle(VeloTheme.emerald)
+                    }
+
+                    if showAddDirectDaemonForm {
+                        VStack(alignment: .leading, spacing: 8) {
+                            TextField("主机名称（如 Linux-4090 / Office Mac）", text: $newDaemonName)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 13))
+                            TextField("Daemon 地址（如 http://100.64.0.5:6767）", text: $newDaemonUrl)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 13, design: .monospaced))
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            Button {
+                                let url = newDaemonUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !url.isEmpty else { return }
+                                store.addDirectDaemonHost(name: newDaemonName, rawURL: url)
+                                newDaemonName = ""
+                                newDaemonUrl = ""
+                                showAddDirectDaemonForm = false
+                                dismiss()
+                            } label: {
+                                Text("保存并切换到该主机")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 7)
+                                    .background(VeloTheme.accentViolet, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                                    .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(newDaemonUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                        .padding(.vertical, 4)
                     }
                 } header: {
                     Text("已配对控制面节点 (多机秒切)")

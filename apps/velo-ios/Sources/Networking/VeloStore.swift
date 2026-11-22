@@ -322,6 +322,56 @@ public final class VeloStore: ObservableObject {
         saveAndConnect(profile.config, customName: profile.name)
     }
 
+    public func addDirectDaemonHost(name: String, rawURL: String) {
+        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !trimmed.isEmpty else { return }
+        let normalized = (trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://"))
+            ? trimmed
+            : "http://\(trimmed)"
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        saveAndConnect(
+            .direct(baseURL: normalized),
+            customName: cleanName.isEmpty ? normalized : cleanName
+        )
+    }
+
+    /// Phase 3: Reports iOS foreground/background presence to daemon for cross-device anti-disturb coordination.
+    public func reportPresence(focused: Bool, sessionId: String? = nil) {
+        let targetSid = sessionId ?? activeSessionId
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/presence") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            var body: [String: Any] = [
+                "client_id": clientSenderId,
+                "platform": "ios",
+                "focused": focused,
+            ]
+            if let sid = targetSid, UUID(uuidString: sid) != nil {
+                body["active_session_id"] = sid
+            }
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            Task {
+                _ = try? await URLSession.shared.data(for: req)
+            }
+        case .e2eeRelay:
+            var payload: [String: Any] = [
+                "cmd": "presence_heartbeat",
+                "client_id": clientSenderId,
+                "platform": "ios",
+                "focused": focused,
+            ]
+            if let sid = targetSid, UUID(uuidString: sid) != nil {
+                payload["active_session_id"] = sid
+            }
+            sendEncryptedCommand(payload)
+        case .none:
+            break
+        }
+    }
+
     public func removeSavedHost(_ profileId: String) {
         savedHostProfiles.removeAll { $0.id == profileId }
         if let data = try? JSONEncoder().encode(savedHostProfiles) {
@@ -377,6 +427,7 @@ public final class VeloStore: ObservableObject {
     private var lastBackgroundedAt: Date?
 
     public func handleAppDidEnterBackground() {
+        reportPresence(focused: false)
         lastBackgroundedAt = Date()
         let hasLiveWork = sessions.contains(where: { $0.status == .running || $0.status == .waitingApproval })
             || VeloLiveActivityManager.shared.hasActiveLiveActivity
@@ -405,6 +456,7 @@ public final class VeloStore: ObservableObject {
 
     public func ensureConnectedOnForeground() {
         endBackgroundTaskIfNeeded()
+        reportPresence(focused: true)
         let bgElapsed = lastBackgroundedAt.map { Date().timeIntervalSince($0) } ?? 0
         lastBackgroundedAt = nil
         guard connectionConfig != nil else { return }
@@ -675,6 +727,7 @@ public final class VeloStore: ObservableObject {
 
     public func loadEventsForSession(_ sessionId: String, incremental: Bool = false) async {
         markSessionRead(sessionId)
+        reportPresence(focused: true, sessionId: sessionId)
         let meta = eventsMetaBySession[sessionId]
         let hasCachedEvents = !(eventsBySession[sessionId]?.isEmpty ?? true)
         let useIncremental = incremental && meta != nil && hasCachedEvents

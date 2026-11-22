@@ -1991,6 +1991,29 @@ async fn run_supervised_e2ee_bridge(
                                         }
                                     }
                                 }
+                                "presence_heartbeat" => {
+                                    let cid = cmd_val
+                                        .get("client_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("ios-relay")
+                                        .to_string();
+                                    let plat = cmd_val
+                                        .get("platform")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("ios")
+                                        .to_string();
+                                    let focused = cmd_val
+                                        .get("focused")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    let active_sid = cmd_val
+                                        .get("active_session_id")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| Uuid::parse_str(s).ok());
+                                    state
+                                        .update_client_presence(cid, plat, focused, active_sid)
+                                        .await;
+                                }
                                 "list_hosts" => {
                                     let h_dto = state.list_hosts_dto().await;
                                     let resp = json!({

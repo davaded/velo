@@ -18,6 +18,9 @@ public final class VeloLiveActivityManager {
     /// if iOS suspends or kills the app, `context.isStale` flips automatically after 25s!
     private var heartbeatTask: Task<Void, Never>?
     private var latestActiveState: VeloSessionActivityAttributes.ContentState?
+    /// Phase 3: Track parallel active & P0 waiting-approval sessions for multi-task priority arbitration
+    private var waitingApprovalSessionIds: Set<String> = []
+    private var parallelActiveCount: Int = 1
 
     #if canImport(ActivityKit)
     private var currentActivity: Activity<VeloSessionActivityAttributes>?
@@ -146,6 +149,10 @@ public final class VeloLiveActivityManager {
                 .filter { $0.status == .running || $0.status == .waitingApproval }
                 .map(\.id)
         )
+        waitingApprovalSessionIds = Set(
+            sessions.filter { $0.status == .waitingApproval }.map(\.id)
+        )
+        parallelActiveCount = max(1, runningIds.count)
 
         var stillHasRunning = false
         for act in Activity<VeloSessionActivityAttributes>.activities {
@@ -289,9 +296,34 @@ public final class VeloLiveActivityManager {
             return nil
         }()
 
+        // Phase 3 P0 Priority Shield: never allow a lower-priority running session to overwrite
+        // an active P0 waiting-approval Dynamic Island pill!
+        if mappedPhase != .waitingApproval,
+           mappedPhase != .completed,
+           mappedPhase != .failed,
+           let curAct = currentActivity,
+           curAct.activityState == .active,
+           curAct.content.state.phase == .waitingApproval,
+           let curSid = activeSessionId,
+           curSid != sessionId
+        {
+            return
+        }
+
+        let effectiveHeadline: String = {
+            if parallelActiveCount > 1,
+               mappedPhase != .completed,
+               mappedPhase != .failed,
+               !headline.contains("并行")
+            {
+                return "\(headline) · +\(parallelActiveCount - 1) 并行"
+            }
+            return headline
+        }()
+
         let state = VeloSessionActivityAttributes.ContentState(
             phase: mappedPhase,
-            stepHeadline: headline,
+            stepHeadline: effectiveHeadline,
             stepTarget: target,
             startedAt: originDate,
             finishedElapsedSeconds: nil,
