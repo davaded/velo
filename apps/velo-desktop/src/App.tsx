@@ -6338,7 +6338,6 @@ export function App() {
                           const isSelected = w.id === activeSession.id;
                           const hasPending = !!pendingApprovals[w.id] || !!pendingQuestions[w.id];
                           const hasDraft = !isSelected && Boolean(draftsBySession[w.id]?.trim());
-                          const hasDiffStats = w.insertions > 0 || w.deletions > 0;
                           const rowStatus: EngineStatusIndicator =
                             hasPending || w.status === "waiting_approval"
                               ? "waiting"
@@ -6347,10 +6346,6 @@ export function App() {
                               : unreadSessionIds[w.id] && !isSelected
                               ? "unread"
                               : "idle";
-                          const showMetaRow =
-                            hasDiffStats ||
-                            hasDraft ||
-                            rowStatus === "waiting";
 
                           return (
                             <div
@@ -6436,12 +6431,20 @@ export function App() {
                                       {w.title}
                                     </span>
                                   )}
-                                  <div className="flex shrink-0 items-center gap-0.5">
-                                    {w.updated_at && w.updated_at !== "ready" && (
+                                  <div className="flex shrink-0 items-center gap-1">
+                                    {rowStatus === "waiting" ? (
+                                      <span className="rounded bg-[#fbbf24]/15 px-1.5 py-[1px] text-[9.5px] font-medium text-[#d97706] dark:text-[#fbbf24] group-hover:hidden">
+                                        待确认
+                                      </span>
+                                    ) : hasDraft ? (
+                                      <span className="rounded bg-[#f59e0b]/15 px-1.5 py-[1px] text-[9.5px] font-medium text-[#d97706] dark:text-[#fbbf24] group-hover:hidden">
+                                        草稿
+                                      </span>
+                                    ) : w.updated_at && w.updated_at !== "ready" ? (
                                       <span className="font-mono text-[10px] text-[var(--v-fg-faint)] tabular-nums group-hover:hidden">
                                         {w.updated_at}
                                       </span>
-                                    )}
+                                    ) : null}
                                     <button
                                       type="button"
                                       onClick={(e) => {
@@ -6475,38 +6478,6 @@ export function App() {
                                     </button>
                                   </div>
                                 </div>
-
-                                {/* High-Signal Meta Line (Shown ONLY for diff stats, draft, or pending approval; branch is in chat header) */}
-                                {showMetaRow && (
-                                  <div className="mt-0.5 flex items-center justify-between gap-1.5 text-[10px] text-[var(--v-fg-muted)]">
-                                    <div className="flex min-w-0 items-center gap-1.5">
-                                      {rowStatus === "waiting" && (
-                                        <span className="shrink-0 rounded bg-[#fbbf24]/15 px-1 py-[0.5px] font-medium text-[#d97706] dark:text-[#fbbf24]">
-                                          待确认
-                                        </span>
-                                      )}
-                                      {hasDraft && (
-                                        <span className="shrink-0 rounded bg-[#f59e0b]/15 px-1 py-[0.5px] font-medium text-[#d97706] dark:text-[#fbbf24]">
-                                          草稿
-                                        </span>
-                                      )}
-                                    </div>
-                                    {hasDiffStats && (
-                                      <span className="flex shrink-0 items-center gap-1 font-mono text-[10px] tabular-nums">
-                                        {w.insertions > 0 && (
-                                          <span className="text-[#10b981] dark:text-[#34d399]">
-                                            +{w.insertions}
-                                          </span>
-                                        )}
-                                        {w.deletions > 0 && (
-                                          <span className="text-[#ef4444] dark:text-[#f87171]">
-                                            −{w.deletions}
-                                          </span>
-                                        )}
-                                      </span>
-                                    )}
-                                  </div>
-                                )}
                               </div>
                             </div>
                           );
