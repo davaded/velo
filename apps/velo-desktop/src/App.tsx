@@ -6338,11 +6338,6 @@ export function App() {
                           const isSelected = w.id === activeSession.id;
                           const hasPending = !!pendingApprovals[w.id] || !!pendingQuestions[w.id];
                           const hasDraft = !isSelected && Boolean(draftsBySession[w.id]?.trim());
-                          const isFeatureBranch =
-                            Boolean(w.branch_name) &&
-                            w.branch_name !== "main" &&
-                            w.branch_name !== "master" &&
-                            w.branch_name !== repo.default_branch;
                           const hasDiffStats = w.insertions > 0 || w.deletions > 0;
                           const rowStatus: EngineStatusIndicator =
                             hasPending || w.status === "waiting_approval"
@@ -6353,7 +6348,6 @@ export function App() {
                               ? "unread"
                               : "idle";
                           const showMetaRow =
-                            isFeatureBranch ||
                             hasDiffStats ||
                             hasDraft ||
                             rowStatus === "waiting";
@@ -6482,7 +6476,7 @@ export function App() {
                                   </div>
                                 </div>
 
-                                {/* High-Signal Meta Line (Shown ONLY when there is real extra info: feature branch, diff stats, draft, or pending approval) */}
+                                {/* High-Signal Meta Line (Shown ONLY for diff stats, draft, or pending approval; branch is in chat header) */}
                                 {showMetaRow && (
                                   <div className="mt-0.5 flex items-center justify-between gap-1.5 text-[10px] text-[var(--v-fg-muted)]">
                                     <div className="flex min-w-0 items-center gap-1.5">
@@ -6494,12 +6488,6 @@ export function App() {
                                       {hasDraft && (
                                         <span className="shrink-0 rounded bg-[#f59e0b]/15 px-1 py-[0.5px] font-medium text-[#d97706] dark:text-[#fbbf24]">
                                           草稿
-                                        </span>
-                                      )}
-                                      {isFeatureBranch && (
-                                        <span className="inline-flex min-w-0 items-center gap-0.5 truncate font-mono text-[9.5px] text-[var(--v-fg-faint)]">
-                                          <GitBranch className="h-2.5 w-2.5 shrink-0 opacity-70" />
-                                          <span className="truncate">{w.branch_name}</span>
                                         </span>
                                       )}
                                     </div>
