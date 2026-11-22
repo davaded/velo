@@ -44,6 +44,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     private var allowExplicitQuit = false
     private var cachedMenuSessions: [MenuSessionSummary] = []
     private var caffeinateActive = false
+    private var lastMenuBarSignature = ""
 
     // Native macOS Speech.framework + AVAudioEngine live dictation state
     private var audioEngine: AVAudioEngine?
@@ -208,8 +209,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                     {
                         caff = (sObj["caffeinate_active"] as? Bool) ?? (sObj["prevent_idle_sleep"] as? Bool) ?? false
                     }
+                    let sig = "\(runningCount)|\(waitingCount)|\(caff)|" + summaries.map { "\($0.id):\($0.status):\($0.name)" }.joined(separator: ",")
                     DispatchQueue.main.async {
                         guard let self else { return }
+                        if sig == self.lastMenuBarSignature { return }
+                        self.lastMenuBarSignature = sig
                         self.cachedMenuSessions = summaries
                         self.caffeinateActive = caff
                         self.updateStatusBarButton(runningCount: runningCount, waitingCount: waitingCount)

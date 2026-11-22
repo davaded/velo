@@ -133,12 +133,16 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
         return ModelRateCard::flat(3.00, 0.30, 3.75, 15.00);
     }
 
-    // Google Gemini 4 (Neon / Hydrogen) + 3.8 Flash + 3.1/2.5 Pro & Flash
-    if clean.contains("gemini") || clean.contains("neon") || clean.contains("hydrogen") {
+    // Google Gemini 4 (Neon / Hydrogen / Carbon) + 3.8 Flash + 3.1/2.5 Pro & Flash
+    if clean.contains("gemini")
+        || clean.contains("neon")
+        || clean.contains("hydrogen")
+        || clean.contains("carbon")
+    {
         if clean.contains("neon") {
             return ModelRateCard::tiered(3.00, 0.15, 0.0, 15.00, 200_000, 2.0);
         }
-        if clean.contains("hydrogen") {
+        if clean.contains("hydrogen") || clean.contains("carbon") {
             return ModelRateCard::flat(1.50, 0.15, 0.0, 7.50);
         }
         if clean.contains("flash-lite") {
@@ -213,17 +217,17 @@ pub fn compute_cost_usd(
     output_tokens: u64,
 ) -> f64 {
     let rate = lookup_rate_card(provider, model);
-    let tier_mult = match (rate.long_context_threshold, rate.long_context_multiplier) {
-        (Some(thresh), Some(mult)) if input_tokens > thresh && mult > 1.0 => mult,
-        _ => 1.0,
-    };
+    // Note: Agent turns frequently aggregate 10-50 tool steps into a single turn's `input_tokens`
+    // (e.g. 20 steps x 150k = 3M input tokens) where no individual API call exceeded 200k context.
+    // Applying a blanket 2x multiplier on aggregated turn sums falsely doubles multi-step bills,
+    // so compute standard base rates accurately (tier metadata remains surfaced in `/api/pricing`).
     let uncached_in = input_tokens
         .saturating_sub(cache_read_tokens)
         .saturating_sub(cache_write_tokens);
-    let usd = (uncached_in as f64 * rate.input_per_m * tier_mult
-        + cache_read_tokens as f64 * rate.cached_input_per_m * tier_mult
-        + cache_write_tokens as f64 * rate.cache_write_per_m * tier_mult
-        + output_tokens as f64 * rate.output_per_m * tier_mult)
+    let usd = (uncached_in as f64 * rate.input_per_m
+        + cache_read_tokens as f64 * rate.cached_input_per_m
+        + cache_write_tokens as f64 * rate.cache_write_per_m
+        + output_tokens as f64 * rate.output_per_m)
         / 1_000_000.0;
     (usd * 1_000_000.0).round() / 1_000_000.0
 }
@@ -299,9 +303,9 @@ pub fn effective_turn_cost_usd(
     if stored_cost_usd <= 0.0 {
         return computed;
     }
-    // If legacy Codex double-counting inflated `stored_cost_usd` far above what the recorded
-    // tokens can actually cost at the model's rate card, use the token-accurate rate card cost.
-    if computed > 0.0 && stored_cost_usd > computed * 1.65 {
+    // If legacy rate/double-counting inflated `stored_cost_usd` above what the recorded
+    // tokens can actually cost at the calibrated rate card, heal to the token-accurate cost.
+    if computed > 0.0 && stored_cost_usd > computed * 1.35 {
         return computed;
     }
     stored_cost_usd
@@ -644,10 +648,13 @@ mod tests {
         let grok47 = lookup_rate_card(&AgentProvider::Grok, Some("grok-4.7"));
         assert_eq!(grok47.input_per_m, 2.0);
         assert_eq!(grok47.output_per_m, 6.0);
-        // Long context (>200k) doubles Grok 4.7 pricing
-        let grok_long = compute_cost_usd(&AgentProvider::Grok, Some("grok-4.7"), 250_000, 0, 0, 10_000);
-        let grok_std = compute_cost_usd(&AgentProvider::Grok, Some("grok-4.7"), 100_000, 0, 0, 10_000);
-        assert!(grok_long > grok_std * 3.0);
+        // Multi-step aggregated turn input totals must NOT falsely double the bill
+        let grok_multi = compute_cost_usd(&AgentProvider::Grok, Some("grok-4.7"), 250_000, 0, 0, 10_000);
+        assert!((grok_multi - 0.56).abs() < 0.001, "unexpected grok cost: {grok_multi}");
+
+        let carbon = lookup_rate_card(&AgentProvider::Antigravity, Some("gemini-4-carbon"));
+        assert_eq!(carbon.input_per_m, 1.5);
+        assert_eq!(carbon.output_per_m, 7.5);
 
         let opus55 = lookup_rate_card(&AgentProvider::Claude, Some("claude-opus-5-5"));
         assert_eq!(opus55.input_per_m, 4.0);

@@ -478,10 +478,10 @@ public struct ChatThreadView: View {
             .defaultScrollAnchor(.bottom)
             .scrollDismissesKeyboard(.interactively)
             .simultaneousGesture(
-                DragGesture(minimumDistance: 12)
+                DragGesture(minimumDistance: 6)
                     .onChanged { value in
-                        // Dragging finger downward scrolls toward earlier history -> unpin bottom
-                        if value.translation.height > 18 {
+                        // Dragging finger downward scrolls toward earlier history -> immediately unpin bottom
+                        if value.translation.height > 8 {
                             isPinnedToBottom = false
                         }
                     }
@@ -2042,10 +2042,49 @@ private struct TurnBlockView: View {
                     if case .user(let imgs) = userEv.kind { return imgs }
                     return []
                 }()
-                let cleanUserText = userEv.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                let parsedFilesAndBody: (files: [String], body: String) = {
+                    let raw = userEv.content
+                    guard raw.hasPrefix("[Referenced Files]\n") else { return ([], raw) }
+                    let lines = raw.components(separatedBy: "\n")
+                    var files: [String] = []
+                    var idx = 1
+                    while idx < lines.count, lines[idx].hasPrefix("- ") {
+                        let p = String(lines[idx].dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !p.isEmpty { files.append(p) }
+                        idx += 1
+                    }
+                    while idx < lines.count, lines[idx].trimmingCharacters(in: .whitespaces).isEmpty {
+                        idx += 1
+                    }
+                    return (files, lines[idx...].joined(separator: "\n"))
+                }()
+                let cleanUserText = parsedFilesAndBody.body.trimmingCharacters(in: .whitespacesAndNewlines)
                 let shouldShowText = !cleanUserText.isEmpty && !(cleanUserText == "请查看附图" && !userImages.isEmpty)
 
                 VStack(alignment: .trailing, spacing: 7) {
+                    if !parsedFilesAndBody.files.isEmpty {
+                        HStack {
+                            Spacer(minLength: 42)
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    ForEach(Array(parsedFilesAndBody.files.enumerated()), id: \.offset) { _, fp in
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "doc.text.fill")
+                                                .font(.system(size: 10.5))
+                                                .foregroundStyle(VeloTheme.accentVioletSoft)
+                                            Text(URL(fileURLWithPath: fp).lastPathComponent)
+                                                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(1)
+                                        }
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !userImages.isEmpty {
                         HStack {
                             Spacer(minLength: 42)
@@ -2079,7 +2118,7 @@ private struct TurnBlockView: View {
                     if shouldShowText {
                         HStack {
                             Spacer(minLength: 42)
-                            Text(userEv.content)
+                            Text(parsedFilesAndBody.body)
                                 .font(.system(size: 15))
                                 .foregroundStyle(.primary)
                                 .lineSpacing(3)

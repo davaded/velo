@@ -130,6 +130,7 @@ export const ForkBranchModal: React.FC<ForkBranchModalProps> = ({
         onSubmit={handleSubmit}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
+          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
           if (e.key === "Escape") {
             e.preventDefault();
             onClose();

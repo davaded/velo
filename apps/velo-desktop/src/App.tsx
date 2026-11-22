@@ -213,6 +213,24 @@ function formatCompactFileSize(bytes?: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function parseUserMessageWithFiles(raw: string): { files: string[]; body: string } {
+  if (!raw.startsWith("[Referenced Files]\n")) {
+    return { files: [], body: raw };
+  }
+  const lines = raw.split("\n");
+  const files: string[] = [];
+  let idx = 1;
+  while (idx < lines.length && lines[idx].startsWith("- ")) {
+    const p = lines[idx].slice(2).trim();
+    if (p) files.push(p);
+    idx++;
+  }
+  while (idx < lines.length && lines[idx].trim() === "") {
+    idx++;
+  }
+  return { files, body: lines.slice(idx).join("\n") };
+}
+
 const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {};
 
 /** Same projected reply, not a second copy. Matches Paseo's catch-up rule. */
@@ -967,6 +985,8 @@ export function App() {
     }
   }, [draftsBySession]);
   const [slashFilter, setSlashFilter] = useState<string | null>(null);
+  const [slashSelectedIdx, setSlashSelectedIdx] = useState<number>(0);
+  const slashActionRunnersRef = useRef<Array<() => void>>([]);
   const [fileMentionQuery, setFileMentionQuery] = useState<string | null>(null);
   const [fileMentionResults, setFileMentionResults] = useState<WorkspaceFileMentionItem[]>([]);
   const [fileMentionIdx, setFileMentionIdx] = useState<number>(0);
@@ -3274,6 +3294,7 @@ export function App() {
       }
     }
     setSlashFilter(body.toLowerCase());
+    setSlashSelectedIdx(0);
   };
 
   const resolveAttachmentUrl = useCallback(
@@ -6360,6 +6381,10 @@ export function App() {
                                 type="button"
                                 onClick={() => {
                                   setActiveId(task.id);
+                                  const cp = canonicalRepoPath(task.project_path);
+                                  if (cp) {
+                                    setRepoFolderState((prev) => ({ ...prev, [cp]: "open" }));
+                                  }
                                   setMonitorMenuOpen(false);
                                 }}
                                 className={`flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors cursor-pointer ${
@@ -6812,11 +6837,16 @@ export function App() {
                 setChatFindQuery("");
               }}
             />
-            {/* Scrollable Stream (Unified Scroll State Machine: never jumps off bottom on focus/resize) */}
+            {/* Scrollable Stream (Unified Scroll State Machine: zero yank-back on upward scroll, zero jump on focus) */}
             <div
               ref={chatScrollRef}
-              onWheel={() => {
+              onWheel={(e) => {
                 userScrollIntentAtRef.current = Date.now();
+                // Any deliberate upward scroll immediately releases PinnedBottom (never fight macOS trackpad inertia!)
+                if (e.deltaY < -1) {
+                  isPinnedToBottomRef.current = false;
+                  setShowJumpToBottom(true);
+                }
               }}
               onPointerDown={() => {
                 userScrollIntentAtRef.current = Date.now();
@@ -6831,24 +6861,18 @@ export function App() {
                   return;
                 }
                 const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-                const nearBottom = distanceFromBottom < 80;
+                const nearBottom = distanceFromBottom < 64;
                 const scrolledUp = el.scrollTop < lastScrollTopRef.current - 2;
-                const isRecentUserGesture = Date.now() - userScrollIntentAtRef.current < 500;
+                const isRecentUserGesture = Date.now() - userScrollIntentAtRef.current < 1800;
                 lastScrollTopRef.current = el.scrollTop;
 
                 if (nearBottom) {
                   isPinnedToBottomRef.current = true;
                   setShowJumpToBottom(false);
-                } else if (isPinnedToBottomRef.current) {
-                  // Only an intentional user scroll-up breaks PinnedBottom; layout/focus growth snaps right back!
-                  if (isRecentUserGesture && scrolledUp) {
-                    isPinnedToBottomRef.current = false;
-                    setShowJumpToBottom(true);
-                  } else {
-                    snapChatToBottomImmediate();
-                    return;
-                  }
-                } else {
+                } else if (isRecentUserGesture && scrolledUp) {
+                  isPinnedToBottomRef.current = false;
+                  setShowJumpToBottom(true);
+                } else if (!isPinnedToBottomRef.current) {
                   setShowJumpToBottom(true);
                 }
 
@@ -7162,7 +7186,7 @@ export function App() {
                           <div
                             key={turn.key}
                             data-turn-key={turn.key}
-                            className={`flex flex-col gap-1.5 pb-3 ${!isLatestTurn ? "velo-turn-offscreen" : ""}`}
+                            className="flex flex-col gap-1.5 pb-3"
                           >
                             {/* 1. User Message (Right-aligned Paseo Bubble + Hover Trailing Actions) */}
                             {turn.userEv &&
@@ -7179,6 +7203,7 @@ export function App() {
                                           value={editingText}
                                           onChange={(e) => setEditingText(e.target.value)}
                                           onKeyDown={(e) => {
+                                            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                                             if (e.key === "Enter" && !e.shiftKey) {
                                               e.preventDefault();
                                               handleSaveAndResendEdit(ev);
@@ -7249,7 +7274,30 @@ export function App() {
                                           ))}
                                         </div>
                                       )}
-                                      {ev.content}
+                                      {(() => {
+                                        const parsedUser = parseUserMessageWithFiles(ev.content);
+                                        return (
+                                          <>
+                                            {parsedUser.files.length > 0 && (
+                                              <div className="mb-1.5 flex flex-wrap gap-1.5">
+                                                {parsedUser.files.map((fp, fIdx) => (
+                                                  <span
+                                                    key={`${fp}-${fIdx}`}
+                                                    title={fp}
+                                                    className="velo-no-select inline-flex max-w-[240px] items-center gap-1 rounded-md border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)]/80 px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-secondary)]"
+                                                  >
+                                                    <FileText className="h-3 w-3 shrink-0 text-[#a78bfa]" />
+                                                    <span className="truncate">
+                                                      {fp.split("/").pop() || fp}
+                                                    </span>
+                                                  </span>
+                                                ))}
+                                              </div>
+                                            )}
+                                            {parsedUser.body}
+                                          </>
+                                        );
+                                      })()}
                                     </div>
                                     <div
                                       data-testid="user-message-trailing-row"
@@ -7828,29 +7876,43 @@ export function App() {
                   const visibleSkills = matches(realSkillItems).slice(0, 8);
                   const visibleCommands = matches(builtinItems).slice(0, 6);
                   const hiddenSkills = Math.max(0, matches(realSkillItems).length - visibleSkills.length);
+                  const combinedSlash = [...visibleSkills, ...visibleCommands];
+                  slashActionRunnersRef.current = combinedSlash.map((it) => it.run);
+                  const clampedSlashIdx =
+                    combinedSlash.length > 0
+                      ? Math.min(slashSelectedIdx, combinedSlash.length - 1)
+                      : 0;
 
-                  const renderItem = (item: (typeof builtinItems)[number]) => (
-                    <button
-                      key={item.key}
-                      type="button"
-                      onClick={item.run}
-                      className="block w-full overflow-hidden rounded-lg px-3 py-2 text-left transition-colors hover:bg-[var(--v-bg-active)] cursor-pointer"
-                    >
-                      <div className="flex w-full min-w-0 items-center justify-between gap-2">
-                        <div className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12.5px] font-medium leading-snug text-[var(--v-fg-primary)]">
-                          {item.cmd}
+                  const renderItem = (item: (typeof builtinItems)[number], flatIdx: number) => {
+                    const isActive = flatIdx === clampedSlashIdx;
+                    return (
+                      <button
+                        key={item.key}
+                        type="button"
+                        onMouseEnter={() => setSlashSelectedIdx(flatIdx)}
+                        onClick={item.run}
+                        className={`block w-full overflow-hidden rounded-lg px-3 py-2 text-left transition-colors cursor-pointer ${
+                          isActive
+                            ? "bg-[var(--v-bg-active)]"
+                            : "hover:bg-[var(--v-bg-active)]"
+                        }`}
+                      >
+                        <div className="flex w-full min-w-0 items-center justify-between gap-2">
+                          <div className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12.5px] font-medium leading-snug text-[var(--v-fg-primary)]">
+                            {item.cmd}
+                          </div>
+                          <span
+                            className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium leading-none ${item.badgeTone}`}
+                          >
+                            {item.badge}
+                          </span>
                         </div>
-                        <span
-                          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium leading-none ${item.badgeTone}`}
-                        >
-                          {item.badge}
-                        </span>
-                      </div>
-                      <div className="mt-1 w-full min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[11.5px] leading-snug text-[var(--v-fg-muted)]">
-                        {item.desc}
-                      </div>
-                    </button>
-                  );
+                        <div className="mt-1 w-full min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[11.5px] leading-snug text-[var(--v-fg-muted)]">
+                          {item.desc}
+                        </div>
+                      </button>
+                    );
+                  };
 
                   return (
                     <div className="mb-2 max-h-[320px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
@@ -7876,7 +7938,7 @@ export function App() {
                               Skills
                             </div>
                           )}
-                          {visibleSkills.map(renderItem)}
+                          {visibleSkills.map((it, i) => renderItem(it, i))}
                           {hiddenSkills > 0 && (
                             <div className="flex items-center justify-between px-3 pb-1 text-[11px] text-[var(--v-fg-faint)]">
                               <span>还有 {hiddenSkills} 个 Skill，继续输入筛选</span>
@@ -7904,7 +7966,7 @@ export function App() {
                               内置命令
                             </div>
                           )}
-                          {visibleCommands.map(renderItem)}
+                          {visibleCommands.map((it, i) => renderItem(it, visibleSkills.length + i))}
                         </>
                       )}
                     </div>
@@ -8136,6 +8198,35 @@ export function App() {
                         }
                       }}
                       onKeyDown={(e) => {
+                        // Guard macOS Chinese/Japanese IME composition so pressing Enter to commit Pinyin never sends!
+                        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                        if (slashFilter !== null && slashActionRunnersRef.current.length > 0) {
+                          const total = slashActionRunnersRef.current.length;
+                          if (e.key === "ArrowDown") {
+                            e.preventDefault();
+                            setSlashSelectedIdx((i) => (i + 1) % total);
+                            return;
+                          }
+                          if (e.key === "ArrowUp") {
+                            e.preventDefault();
+                            setSlashSelectedIdx((i) => (i - 1 + total) % total);
+                            return;
+                          }
+                          if (e.key === "Enter" || e.key === "Tab") {
+                            e.preventDefault();
+                            const fn =
+                              slashActionRunnersRef.current[
+                                Math.min(slashSelectedIdx, total - 1)
+                              ] || slashActionRunnersRef.current[0];
+                            fn?.();
+                            return;
+                          }
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            setSlashFilter(null);
+                            return;
+                          }
+                        }
                         if (fileMentionQuery !== null) {
                           if (e.key === "ArrowDown" && fileMentionResults.length > 0) {
                             e.preventDefault();
