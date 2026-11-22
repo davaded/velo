@@ -237,11 +237,11 @@ export const EngineBrandGlyph: React.FC<{
 };
 
 /**
- * Scheme A (Linear / Raycast / LobeHub):
- * - Unselected: quiet low-contrast monochrome mark inside clean container (zero rainbow clutter)
- * - Hover: gently brightens
- * - Selected: illuminates into full official brand color inside a subtle 13% brand-tinted micro-squircle
- * - Live status (running / waiting / unread) is completely decoupled via outer spinner ring or crisp corner dot
+ * Bare, refined engine mark for sidebar thread rows:
+ * - Zero heavy box/border around the icon (matches the calm matte monochrome sidebar & composer pill).
+ * - Unselected: quiet low-contrast monochrome glyph; gently brightens on hover.
+ * - Selected: cleanly illuminates in official brand color.
+ * - Live status (running / waiting / unread) is decoupled via clean spinner or subtle corner dot.
  */
 export const EngineSessionBadge: React.FC<{
   engine?: string | null;
@@ -250,55 +250,40 @@ export const EngineSessionBadge: React.FC<{
   title?: string;
 }> = ({ engine, selected = false, status = "idle", title }) => {
   const meta = resolveEngineBrandMeta(engine);
-  const illuminated = selected || status === "running" || status === "waiting";
 
   return (
     <div
       title={title || meta.label}
-      className={`relative flex h-[20px] w-[20px] shrink-0 items-center justify-center rounded-[6px] transition-all duration-150 ${
-        illuminated
-          ? ""
-          : "text-[var(--v-fg-muted)] opacity-60 group-hover:opacity-90"
-      }`}
-      style={
+      className={`relative flex h-4 w-4 shrink-0 items-center justify-center transition-colors duration-150 ${
         selected
-          ? {
-              backgroundColor: meta.tintBg,
-              boxShadow: `inset 0 0 0 1px ${meta.tintRing}`,
-            }
-          : status === "running" || status === "waiting"
-          ? {
-              backgroundColor: "var(--v-bg-active)",
-            }
-          : undefined
-      }
+          ? ""
+          : "text-[var(--v-fg-muted)] opacity-55 group-hover:text-[var(--v-fg-secondary)] group-hover:opacity-90"
+      }`}
     >
-      {/* Decoupled Running Indicator: crisp animated arc hugging the squircle */}
-      {status === "running" && (
+      {status === "running" ? (
         <span
-          className="pointer-events-none absolute -inset-[1.5px] rounded-[7px] border-[1.5px] border-[#34d399]/25 border-t-[#34d399] animate-spin"
-          style={{ animationDuration: "1.1s" }}
+          className="h-3.5 w-3.5 rounded-full border-[1.5px] border-[#34d399]/25 border-t-[#34d399] animate-spin"
+          style={{ animationDuration: "1s" }}
           aria-label="正在执行"
+        />
+      ) : (
+        <EngineBrandGlyph
+          engine={engine}
+          size={13}
+          colored={selected}
+          className={selected ? "" : "text-current"}
         />
       )}
 
-      <EngineBrandGlyph
-        engine={engine}
-        size={12.5}
-        colored={selected}
-        className={selected ? "" : "text-current"}
-      />
-
-      {/* Decoupled Corner Status Badge (Waiting Approval / Unread) */}
       {status === "waiting" && (
         <span
-          className="absolute -bottom-[2px] -right-[2px] h-[7px] w-[7px] rounded-full bg-[#fbbf24] ring-[1.5px] ring-[var(--v-bg-sidebar)] animate-pulse"
+          className="absolute -bottom-[1px] -right-[1px] h-[6px] w-[6px] rounded-full bg-[#fbbf24] ring-[1.5px] ring-[var(--v-bg-sidebar)] animate-pulse"
           aria-label="等待审批"
         />
       )}
       {status === "unread" && (
         <span
-          className="absolute -bottom-[2px] -right-[2px] h-[6.5px] w-[6.5px] rounded-full bg-[#38bdf8] ring-[1.5px] ring-[var(--v-bg-sidebar)] shadow-[0_0_5px_rgba(56,189,248,0.75)]"
+          className="absolute -bottom-[1px] -right-[1px] h-[5.5px] w-[5.5px] rounded-full bg-[#38bdf8] ring-[1.5px] ring-[var(--v-bg-sidebar)]"
           aria-label="未读新进展"
         />
       )}

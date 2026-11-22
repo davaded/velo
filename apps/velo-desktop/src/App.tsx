@@ -6278,7 +6278,7 @@ export function App() {
                         {repo.name}
                       </span>
                       {repoItems.length > 0 && (
-                        <span className="ml-0.5 inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--v-bg-active)]/60 px-1.5 py-[0.5px] font-mono text-[9.5px] text-[var(--v-fg-muted)] tabular-nums">
+                        <span className="ml-0.5 inline-flex shrink-0 items-center gap-1 font-mono text-[10px] text-[var(--v-fg-faint)] tabular-nums">
                           {isCollapsed && folderHasWaiting ? (
                             <span className="h-1.5 w-1.5 rounded-full bg-[#fbbf24]" />
                           ) : isCollapsed && folderHasRunning ? (
@@ -6353,7 +6353,6 @@ export function App() {
                               ? "unread"
                               : "idle";
                           const showMetaRow =
-                            isSelected ||
                             isFeatureBranch ||
                             hasDiffStats ||
                             hasDraft ||
@@ -6385,29 +6384,27 @@ export function App() {
                                     }
                                   : undefined
                               }
-                              className={`group relative flex w-full cursor-pointer items-start gap-2 rounded-[9px] px-2 py-1.5 text-left transition-all duration-150 ${
+                              className={`group relative flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors duration-150 ${
                                 isSelected
                                   ? "text-[var(--v-fg-primary)]"
                                   : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]/75 hover:text-[var(--v-fg-primary)]"
                               }`}
                             >
-                              {/* Scheme A Engine Brand Squircle (Monochrome idle -> Brand-illuminated on select; status decoupled) */}
-                              <div className="mt-[0.5px]">
-                                <EngineSessionBadge
-                                  engine={w.agent_kind}
-                                  selected={isSelected}
-                                  status={rowStatus}
-                                  title={`${w.model_short || w.agent_kind}${
-                                    rowStatus === "running"
-                                      ? " · 正在执行"
-                                      : rowStatus === "waiting"
-                                      ? " · 等待审批"
-                                      : rowStatus === "unread"
-                                      ? " · 有未读新进展"
-                                      : ""
-                                  }`}
-                                />
-                              </div>
+                              {/* Bare Refined Engine Brand Glyph (Monochrome idle -> Brand-illuminated on select; status decoupled) */}
+                              <EngineSessionBadge
+                                engine={w.agent_kind}
+                                selected={isSelected}
+                                status={rowStatus}
+                                title={`${w.model_short || w.agent_kind}${
+                                  rowStatus === "running"
+                                    ? " · 正在执行"
+                                    : rowStatus === "waiting"
+                                    ? " · 等待审批"
+                                    : rowStatus === "unread"
+                                    ? " · 有未读新进展"
+                                    : ""
+                                }`}
+                              />
 
                               {/* Thread Content Column */}
                               <div className="min-w-0 flex-1">
@@ -6437,7 +6434,7 @@ export function App() {
                                         setRenamingTitle(w.title);
                                       }}
                                       title={`${w.title} · ${w.model_short || w.agent_kind}`}
-                                      className={`truncate text-[12.5px] leading-[1.4] ${
+                                      className={`truncate text-[12.5px] leading-[1.35] ${
                                         isSelected
                                           ? "font-medium text-[var(--v-fg-primary)]"
                                           : "font-normal"
@@ -6447,9 +6444,11 @@ export function App() {
                                     </span>
                                   )}
                                   <div className="flex shrink-0 items-center gap-0.5">
-                                    <span className="font-mono text-[10px] text-[var(--v-fg-faint)] tabular-nums group-hover:hidden">
-                                      {w.updated_at}
-                                    </span>
+                                    {w.updated_at && w.updated_at !== "ready" && (
+                                      <span className="font-mono text-[10px] text-[var(--v-fg-faint)] tabular-nums group-hover:hidden">
+                                        {w.updated_at}
+                                      </span>
+                                    )}
                                     <button
                                       type="button"
                                       onClick={(e) => {
@@ -6484,7 +6483,7 @@ export function App() {
                                   </div>
                                 </div>
 
-                                {/* High-Signal Meta Line (Selected row shows quiet model tag; unselected only shows branch/diff/draft/approval) */}
+                                {/* High-Signal Meta Line (Shown ONLY when there is real extra info: feature branch, diff stats, draft, or pending approval) */}
                                 {showMetaRow && (
                                   <div className="mt-0.5 flex items-center justify-between gap-1.5 text-[10px] text-[var(--v-fg-muted)]">
                                     <div className="flex min-w-0 items-center gap-1.5">
@@ -6496,11 +6495,6 @@ export function App() {
                                       {hasDraft && (
                                         <span className="shrink-0 rounded bg-[#f59e0b]/15 px-1 py-[0.5px] font-medium text-[#d97706] dark:text-[#fbbf24]">
                                           草稿
-                                        </span>
-                                      )}
-                                      {isSelected && (w.model_short || w.agent_kind) && (
-                                        <span className="truncate font-mono text-[9.5px] text-[var(--v-fg-muted)]">
-                                          {w.model_short || w.agent_kind}
                                         </span>
                                       )}
                                       {isFeatureBranch && (

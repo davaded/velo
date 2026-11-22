@@ -38,104 +38,55 @@ function formatResetCountdown(sec?: number | null): string {
 
 function providerMeta(provider: string, fallback: string): {
   shortName: string;
-  stroke: string;
-  softBg: string;
-  badgeText: string;
+  compactTag: string;
+  barColor: string;
 } {
   switch (provider) {
     case "antigravity":
       return {
         shortName: "Antigravity",
-        stroke: "#60a5fa",
-        softBg: "rgba(96, 165, 250, 0.12)",
-        badgeText: "#60a5fa",
+        compactTag: "AGY",
+        barColor: "#5B93FA",
       };
     case "cursor":
       return {
         shortName: "Cursor",
-        stroke: "#a78bfa",
-        softBg: "rgba(167, 139, 250, 0.12)",
-        badgeText: "#a78bfa",
+        compactTag: "Cursor",
+        barColor: "#A78BFA",
       };
     case "claude":
       return {
         shortName: "Claude",
-        stroke: "#e08759",
-        softBg: "rgba(224, 135, 89, 0.12)",
-        badgeText: "#e08759",
+        compactTag: "Claude",
+        barColor: "#D97757",
       };
     case "codex":
       return {
         shortName: "Codex",
-        stroke: "#34d399",
-        softBg: "rgba(52, 211, 153, 0.12)",
-        badgeText: "#34d399",
+        compactTag: "Codex",
+        barColor: "#10A37F",
       };
     default:
       return {
         shortName: fallback,
-        stroke: "#34d399",
-        softBg: "rgba(52, 211, 153, 0.12)",
-        badgeText: "#34d399",
+        compactTag: fallback,
+        barColor: "#34d399",
       };
   }
 }
 
-function statusStrokeColor(status: string, defaultStroke: string): string {
+function resolveBarColor(status: string, defaultColor: string): string {
   if (status === "exhausted") return "#f87171";
   if (status === "warning") return "#fbbf24";
-  return defaultStroke;
+  return defaultColor;
 }
 
-/** Precision SVG Radial Ring Gauge (macOS / Raycast / Linear style) */
-const RadialRing: React.FC<{
-  percent: number;
-  size: number;
-  strokeWidth: number;
-  color: string;
-  showCenterText?: boolean;
-}> = ({ percent, size, strokeWidth, color, showCenterText = false }) => {
-  const clamped = Math.max(0, Math.min(100, percent));
-  const r = (size - strokeWidth) / 2;
-  const c = 2 * Math.PI * r;
-  const offset = c * (1 - clamped / 100);
-
-  return (
-    <div
-      className="relative inline-flex shrink-0 items-center justify-center"
-      style={{ width: size, height: size }}
-    >
-      <svg width={size} height={size} className="-rotate-90">
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={r}
-          fill="none"
-          stroke="var(--v-bg-active)"
-          strokeWidth={strokeWidth}
-        />
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={r}
-          fill="none"
-          stroke={color}
-          strokeWidth={strokeWidth}
-          strokeDasharray={c}
-          strokeDashoffset={offset}
-          strokeLinecap="round"
-          style={{ transition: "stroke-dashoffset 400ms cubic-bezier(0.22, 1, 0.36, 1)" }}
-        />
-      </svg>
-      {showCenterText && (
-        <span className="absolute font-mono text-[8.5px] font-semibold tracking-tight text-[var(--v-fg-primary)] tabular-nums">
-          {Math.round(clamped)}
-        </span>
-      )}
-    </div>
-  );
-};
-
+/**
+ * Seamless Matte Sidebar Quota Section:
+ * - Zero heavy nested boxes or cramped 2-column widgets
+ * - Shares the exact horizontal padding, typography, bare brand glyphs, and hairline borders of the sidebar
+ * - Hovering any provider row reveals a clean floating glass breakdown of all rate-limit windows
+ */
 export const SidebarQuotaBar: React.FC<{
   daemonUrl: string;
   onOpenAnalytics: () => void;
@@ -187,7 +138,7 @@ export const SidebarQuotaBar: React.FC<{
     return () => clearInterval(id);
   }, [daemonUrl]);
 
-  // Strictly show quota tiles ONLY for real subscription/rate-limit windows
+  // Strictly show quota rows ONLY for real subscription/rate-limit windows
   const subscriptionCards = cards.filter(
     (c) => c.mode === "subscription" && c.windows.length > 0
   );
@@ -200,30 +151,30 @@ export const SidebarQuotaBar: React.FC<{
 
   return (
     <div
-      className="relative mx-2 mb-1.5 pt-1"
+      className="relative shrink-0 border-t border-[var(--v-border-subtle)]/80 px-2.5 py-2"
       onMouseLeave={() => setHoveredProvider(null)}
     >
-      {/* Floating Glass Detail Popover on Tile Hover (shows ALL windows, e.g. Gemini 5h/7d + Claude/GPT 5h/7d or Cursor $75/$400) */}
+      {/* Floating Detail Popover on Row Hover (All Windows & Exact Reset Countdowns) */}
       {hoveredCard && (
-        <div className="pointer-events-none absolute bottom-full left-0 right-0 z-30 mb-1.5 rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)]/95 p-2.5 shadow-xl backdrop-blur-md">
-          <div className="mb-1.5 flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--v-fg-primary)]">
-              <EngineBrandGlyph engine={hoveredCard.provider} size={12.5} colored />
+        <div className="pointer-events-none absolute bottom-full left-2 right-2 z-30 mb-1.5 rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)]/95 p-2.5 shadow-xl backdrop-blur-md">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--v-fg-primary)]">
+              <EngineBrandGlyph engine={hoveredCard.provider} size={12} colored />
               <span>{hoveredCard.label}</span>
             </span>
-            <span className="rounded bg-[var(--v-bg-active)] px-1.5 py-0.5 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
+            <span className="font-mono text-[9.5px] text-[var(--v-fg-muted)]">
               {hoveredCard.plan_badge}
             </span>
           </div>
-          <div className="space-y-1.5">
+          <div className="space-y-2">
             {hoveredCard.windows.map((w) => {
               const meta = providerMeta(hoveredCard.provider, hoveredCard.label);
-              const color = statusStrokeColor(w.status, meta.stroke);
+              const color = resolveBarColor(w.status, meta.barColor);
               const pct = Math.max(0, Math.min(100, w.remaining_percent));
               const resetTxt = formatResetCountdown(w.reset_in_seconds);
               return (
-                <div key={w.id} className="space-y-0.5">
-                  <div className="flex items-center justify-between gap-1.5 text-[10px]">
+                <div key={w.id} className="space-y-1">
+                  <div className="flex items-center justify-between gap-2 text-[10px]">
                     <span className="truncate text-[var(--v-fg-secondary)]">{w.label}</span>
                     <span className="shrink-0 font-mono text-[10px] text-[var(--v-fg-primary)] tabular-nums">
                       {w.detail_text ? `${w.detail_text} · ` : ""}
@@ -233,10 +184,10 @@ export const SidebarQuotaBar: React.FC<{
                       ) : null}
                     </span>
                   </div>
-                  <div className="h-[3px] w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
+                  <div className="h-[2.5px] w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
                     <div
                       style={{ width: `${Math.max(3, pct)}%`, backgroundColor: color }}
-                      className="h-full rounded-full"
+                      className="h-full rounded-full opacity-85"
                     />
                   </div>
                 </div>
@@ -246,30 +197,49 @@ export const SidebarQuotaBar: React.FC<{
         </div>
       )}
 
-      {/* Subtle Section Header */}
-      <div className="mb-1 flex items-center justify-between px-1">
+      {/* Header Line (Matches Workspaces Header Style) */}
+      <div className="flex items-center justify-between px-1">
         <button
           type="button"
           onClick={onOpenAnalytics}
-          title="点击查看完整配额与花费账单"
-          className="text-[10.5px] font-semibold tracking-wide text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-primary)] cursor-pointer"
+          title="查看完整配额与账单"
+          className="flex min-w-0 items-center gap-2 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-primary)] cursor-pointer"
         >
-          订阅配额
+          <span>配额</span>
+          {collapsed && (
+            <span className="flex items-center gap-2 font-mono text-[10px] font-normal normal-case tracking-normal text-[var(--v-fg-secondary)] tabular-nums">
+              {subscriptionCards.map((card) => {
+                const wPrimary = card.windows.find((w) => w.id === "5h") || card.windows[0];
+                if (!wPrimary) return null;
+                return (
+                  <span
+                    key={card.provider}
+                    onMouseEnter={() => setHoveredProvider(card.provider)}
+                    className="inline-flex items-center gap-1"
+                  >
+                    <EngineBrandGlyph engine={card.provider} size={10.5} colored />
+                    <span>{Math.round(wPrimary.remaining_percent)}%</span>
+                  </span>
+                );
+              })}
+            </span>
+          )}
         </button>
-        <div className="flex items-center gap-0.5">
+
+        <div className="flex shrink-0 items-center gap-0.5">
           <button
             type="button"
             onClick={() => void fetchQuotas(true)}
             title="刷新实时配额"
-            className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-faint)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--v-fg-faint)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
           >
             <RefreshCw className={`h-2.5 w-2.5 ${refreshing ? "animate-spin" : ""}`} />
           </button>
           <button
             type="button"
             onClick={toggleCollapsed}
-            title={collapsed ? "展开配额卡片" : "收起为精简环状条"}
-            className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-faint)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            title={collapsed ? "展开配额明细" : "收起配额"}
+            className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--v-fg-faint)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
           >
             {collapsed ? (
               <ChevronUp className="h-3 w-3" />
@@ -280,73 +250,25 @@ export const SidebarQuotaBar: React.FC<{
         </div>
       </div>
 
-      {/* Collapsed Mode: Single Ultra-Slim Mini-Ring Telemetry Strip */}
-      {collapsed ? (
-        <div className="flex items-center gap-1.5 overflow-x-auto rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)]/80 px-2 py-1.5">
-          {subscriptionCards.map((card) => {
-            const meta = providerMeta(card.provider, card.label);
-            const wPrimary = card.windows.find((w) => w.id === "5h") || card.windows[0];
-            if (!wPrimary) return null;
-            const remPct = Math.max(0, Math.min(100, wPrimary.remaining_percent));
-            const stroke = statusStrokeColor(wPrimary.status, meta.stroke);
-            return (
-              <button
-                key={card.provider}
-                type="button"
-                onClick={onOpenAnalytics}
-                onMouseEnter={() => setHoveredProvider(card.provider)}
-                className="flex flex-1 items-center justify-center gap-1.5 rounded-md px-1 py-0.5 transition-colors hover:bg-[var(--v-bg-hover)] cursor-pointer"
-              >
-                <RadialRing percent={remPct} size={14} strokeWidth={2} color={stroke} />
-                <span className="truncate text-[10.5px] font-medium text-[var(--v-fg-body)]">
-                  {meta.shortName === "Antigravity" ? "AGY" : meta.shortName}
-                </span>
-                <span className="font-mono text-[10px] font-semibold text-[var(--v-fg-primary)] tabular-nums">
-                  {Math.round(remPct)}%
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      ) : (
-        /* Expanded Mode: Modern 2-Column Bento Micro-Tiles with SVG Radial Rings */
-        <div
-          className={`grid gap-1.5 ${
-            subscriptionCards.length >= 2 ? "grid-cols-2" : "grid-cols-1"
-          }`}
-        >
+      {/* Expanded Mode: Airy Full-Width Hairline Telemetry Rows */}
+      {!collapsed && (
+        <div className="mt-1.5 space-y-1">
           {subscriptionCards.map((card) => {
             const meta = providerMeta(card.provider, card.label);
             const wPrimary = card.windows.find((w) => w.id === "5h") || card.windows[0];
             const w7d = card.windows.find((w) => w.id === "7d");
-            const wAlt5h = card.windows.find((w) => w.id === "g1-5h");
             if (!wPrimary) return null;
 
             const remPct = Math.max(0, Math.min(100, wPrimary.remaining_percent));
-            const stroke = statusStrokeColor(wPrimary.status, meta.stroke);
-            const resetTxt = formatResetCountdown(wPrimary.reset_in_seconds);
+            const barColor = resolveBarColor(wPrimary.status, meta.barColor);
             const isHovered = hoveredProvider === card.provider;
 
-            // Compact high-signal secondary line:
-            // - For Cursor: show real dollar usage e.g. "$75.5/$400"
-            // - For Antigravity / Claude: show 7d & reset countdown
-            const compactDetail = wPrimary.detail_text
-              ? wPrimary.detail_text.replace(/\s*\/\s*/, "/")
+            // Clean, never-truncated right metric
+            const metricText = wPrimary.detail_text
+              ? `${wPrimary.detail_text.replace(/\s*\/\s*/, "/")} · ${Math.round(remPct)}%`
               : w7d
-              ? `7d ${Math.round(w7d.remaining_percent)}%`
-              : resetTxt
-              ? `${resetTxt} 重置`
-              : card.plan_badge;
-
-            const footerMeta = wPrimary.detail_text
-              ? resetTxt
-                ? `${resetTxt} 重置`
-                : "月度额度"
-              : wAlt5h
-              ? `C/G ${Math.round(wAlt5h.remaining_percent)}%`
-              : resetTxt
-              ? `${resetTxt} 重置`
-              : "5h 窗口";
+              ? `${Math.round(remPct)}% · 7d ${Math.round(w7d.remaining_percent)}%`
+              : `${Math.round(remPct)}%`;
 
             return (
               <button
@@ -354,38 +276,37 @@ export const SidebarQuotaBar: React.FC<{
                 type="button"
                 onClick={onOpenAnalytics}
                 onMouseEnter={() => setHoveredProvider(card.provider)}
-                className={`group flex flex-col justify-between rounded-xl border p-2 text-left transition-all duration-150 cursor-pointer ${
-                  isHovered
-                    ? "border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] shadow-xs"
-                    : "border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)]/75 hover:border-[var(--v-border-strong)]"
-                }`}
+                className="group block w-full rounded-lg px-1.5 py-1.5 text-left transition-colors hover:bg-[var(--v-bg-hover)]/75 cursor-pointer"
               >
-                <div className="flex items-center gap-2">
-                  <RadialRing
-                    percent={remPct}
-                    size={28}
-                    strokeWidth={2.75}
-                    color={stroke}
-                    showCenterText
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-[11px] font-semibold leading-tight text-[var(--v-fg-primary)]">
+                <div className="flex items-center justify-between gap-2 text-[11.5px] leading-none">
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    <EngineBrandGlyph
+                      engine={card.provider}
+                      size={11.5}
+                      colored={isHovered}
+                      className={
+                        isHovered
+                          ? "shrink-0"
+                          : "shrink-0 text-[var(--v-fg-muted)] opacity-75 transition-opacity group-hover:opacity-100"
+                      }
+                    />
+                    <span className="truncate font-medium text-[var(--v-fg-body)]">
                       {meta.shortName}
-                    </div>
-                    <div className="mt-0.5 truncate font-mono text-[9.5px] leading-tight text-[var(--v-fg-muted)] tabular-nums">
-                      {compactDetail}
-                    </div>
-                  </div>
+                    </span>
+                  </span>
+                  <span className="shrink-0 font-mono text-[10.5px] text-[var(--v-fg-secondary)] tabular-nums">
+                    {metricText}
+                  </span>
                 </div>
 
-                {/* Micro Footer Bar: Reset countdown or secondary pool + crisp brand glyph */}
-                <div className="mt-1.5 flex items-center justify-between border-t border-[var(--v-border-subtle)]/70 pt-1 text-[9.5px] text-[var(--v-fg-muted)]">
-                  <span className="truncate font-mono tabular-nums">{footerMeta}</span>
-                  <EngineBrandGlyph
-                    engine={card.provider}
-                    size={11}
-                    colored
-                    className="shrink-0 opacity-90"
+                {/* Hairline 2.5px Track */}
+                <div className="mt-1.5 h-[2.5px] w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
+                  <div
+                    style={{
+                      width: `${Math.max(4, remPct)}%`,
+                      backgroundColor: barColor,
+                    }}
+                    className="h-full rounded-full opacity-80 transition-all duration-300 group-hover:opacity-100"
                   />
                 </div>
               </button>
