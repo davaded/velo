@@ -256,6 +256,8 @@ pub async fn spawn_codex_app_server(
         let mut bound_thread_id: Option<String> = None;
         let mut turn_rpc_seq: i64 = 4;
         let mut is_idle_warm = false;
+        let mut last_thread_total: Option<(u64, u64, u64)> = None;
+        let mut last_step_snapshot: Option<(u64, u64, u64)> = None;
 
         loop {
             tokio::select! {
@@ -774,39 +776,76 @@ pub async fn spawn_codex_app_server(
                             }
                         }
                         "thread/tokenUsage/updated" => {
+                            let parse_usage_triple = |u: &Value| -> (u64, u64, u64) {
+                                let inp = u.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let cache = u
+                                    .get("cachedInputTokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let out =
+                                    u.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                (inp, cache, out)
+                            };
+                            let total_opt = msg
+                                .pointer("/params/tokenUsage/total")
+                                .map(parse_usage_triple);
+                            let last_opt = msg
+                                .pointer("/params/tokenUsage/last")
+                                .map(parse_usage_triple);
+
                             if !saw_turn_activity {
-                                // Ignore stale `thread/resume` echo of the previous turn's usage before this turn starts
+                                // Capture baseline thread totals from `thread/resume` echo so the upcoming turn emits exact deltas
+                                if let Some(tot) = total_opt {
+                                    last_thread_total = Some(tot);
+                                }
+                                if let Some(lst) = last_opt {
+                                    last_step_snapshot = Some(lst);
+                                }
                                 continue;
                             }
+
                             let ctx_win = msg
                                 .pointer("/params/tokenUsage/modelContextWindow")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(200_000);
-                            if let Some(usage) = msg
-                                .pointer("/params/tokenUsage/last")
-                                .or_else(|| msg.pointer("/params/tokenUsage/total"))
+
+                            let delta_triple: Option<(u64, u64, u64)> = if let Some(tot) = total_opt
                             {
-                                let input_tokens = usage
-                                    .get("inputTokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let cache_read_tokens = usage
-                                    .get("cachedInputTokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let output_tokens = usage
-                                    .get("outputTokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let total_tokens = usage
-                                    .get("totalTokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(input_tokens.saturating_add(output_tokens));
+                                let prev = last_thread_total;
+                                last_thread_total = Some(tot);
+                                if let Some(p) = prev {
+                                    let d_in = tot.0.saturating_sub(p.0);
+                                    let d_cache = tot.1.saturating_sub(p.1);
+                                    let d_out = tot.2.saturating_sub(p.2);
+                                    if d_in == 0 && d_cache == 0 && d_out == 0 {
+                                        None
+                                    } else {
+                                        Some((d_in, d_cache, d_out))
+                                    }
+                                } else if let Some(lst) = last_opt {
+                                    last_step_snapshot = Some(lst);
+                                    if lst.0 == 0 && lst.2 == 0 { None } else { Some(lst) }
+                                } else if tot.0 == 0 && tot.2 == 0 {
+                                    None
+                                } else {
+                                    Some(tot)
+                                }
+                            } else if let Some(lst) = last_opt {
+                                if last_step_snapshot == Some(lst) || (lst.0 == 0 && lst.2 == 0) {
+                                    None
+                                } else {
+                                    last_step_snapshot = Some(lst);
+                                    Some(lst)
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some((input_tokens, cache_read_tokens, output_tokens)) =
+                                delta_triple
+                            {
+                                let total_tokens = input_tokens.saturating_add(output_tokens);
                                 if total_tokens > 0 {
-                                    let uncached_in = input_tokens.saturating_sub(cache_read_tokens);
-                                    let cost_usd = (uncached_in as f64 * 0.000_0025)
-                                        + (cache_read_tokens as f64 * 0.000_00025)
-                                        + (output_tokens as f64 * 0.000_01);
                                     let _ = event_tx.send(AgentEvent::UsageUpdated {
                                         session_id,
                                         input_tokens,
@@ -815,7 +854,8 @@ pub async fn spawn_codex_app_server(
                                         cache_read_tokens,
                                         cache_write_tokens: 0,
                                         context_window: ctx_win,
-                                        cost_usd,
+                                        // Delegate cost computation to velo-daemon's model-aware pricing engine
+                                        cost_usd: 0.0,
                                         output_tps: 0.0,
                                         is_turn_total: false,
                                         timestamp: Utc::now(),

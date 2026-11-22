@@ -434,7 +434,8 @@ public struct ExecutionTraceGroupView: View {
                                     inlineDiffNew: item.inlineDiffNew,
                                     subagentRole: item.subagentRole,
                                     subagentPrompt: item.subagentPrompt,
-                                    nested: true
+                                    nested: true,
+                                    isTurnRunning: isTurnRunning
                                 )
                             default:
                                 EmptyView()
@@ -451,15 +452,18 @@ public struct ExecutionTraceGroupView: View {
 
 public struct ToolCallGroupRowView: View {
     public let items: [TimelineEventItem]
+    public let isTurnRunning: Bool
     @Environment(\.colorScheme) private var colorScheme
     @State private var expanded: Bool = false
 
-    public init(items: [TimelineEventItem]) {
+    public init(items: [TimelineEventItem], isTurnRunning: Bool = false) {
         self.items = items
+        self.isTurnRunning = isTurnRunning
     }
 
     public var body: some View {
         let meta = VeloFormatting.summarizeToolBatch(items)
+        let activelyRunning = isTurnRunning && meta.isRunning
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
@@ -468,7 +472,7 @@ public struct ToolCallGroupRowView: View {
                 }
             } label: {
                 HStack(spacing: 7) {
-                    if meta.isRunning {
+                    if activelyRunning {
                         OrbitalStatusIcon(phase: .working)
                             .frame(width: 16)
                     } else {
@@ -478,7 +482,7 @@ public struct ToolCallGroupRowView: View {
                             .frame(width: 16)
                     }
 
-                    if let activeVerb = meta.activeVerb {
+                    if activelyRunning, let activeVerb = meta.activeVerb {
                         ShimmerTextView(
                             "\(activeVerb)… (\(items.count) 步)",
                             font: .system(size: 13, weight: .medium)
@@ -555,6 +559,7 @@ public struct ToolCallRowView: View {
     public var subagentRole: String? = nil
     public var subagentPrompt: String? = nil
     public var nested: Bool = false
+    public var isTurnRunning: Bool = false
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var expanded: Bool = false
@@ -570,7 +575,8 @@ public struct ToolCallRowView: View {
         inlineDiffNew: String? = nil,
         subagentRole: String? = nil,
         subagentPrompt: String? = nil,
-        nested: Bool = false
+        nested: Bool = false,
+        isTurnRunning: Bool = false
     ) {
         self.toolName = toolName
         self.displayName = displayName
@@ -583,9 +589,10 @@ public struct ToolCallRowView: View {
         self.subagentRole = subagentRole
         self.subagentPrompt = subagentPrompt
         self.nested = nested
+        self.isTurnRunning = isTurnRunning
     }
 
-    private var isRunning: Bool { output == nil }
+    private var isRunning: Bool { isTurnRunning && output == nil }
 
     private var hasInlineDiff: Bool {
         (inlineDiffOld?.isEmpty == false) || (inlineDiffNew?.isEmpty == false)

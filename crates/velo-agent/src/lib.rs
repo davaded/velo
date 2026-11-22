@@ -2129,10 +2129,6 @@ pub fn parse_agent_stdout_line(
                                 .unwrap_or(0);
                             let total_tokens = input_tokens.saturating_add(output_tokens);
                             if total_tokens > 0 {
-                                let uncached_in = input_tokens.saturating_sub(cache_read);
-                                let cost_usd = (uncached_in as f64 * 0.000_0025)
-                                    + (cache_read as f64 * 0.000_00025)
-                                    + (output_tokens as f64 * 0.000_01);
                                 events.push(AgentEvent::UsageUpdated {
                                     session_id,
                                     input_tokens,
@@ -2141,7 +2137,8 @@ pub fn parse_agent_stdout_line(
                                     cache_read_tokens: cache_read,
                                     cache_write_tokens: 0,
                                     context_window: 0,
-                                    cost_usd,
+                                    // Let velo-daemon pricing engine calculate exact cost for the active model
+                                    cost_usd: 0.0,
                                     output_tps: 0.0,
                                     is_turn_total: true,
                                     timestamp: Utc::now(),

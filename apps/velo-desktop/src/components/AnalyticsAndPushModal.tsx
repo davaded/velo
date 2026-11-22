@@ -319,12 +319,14 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                   {/* KPI Cards */}
                   <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                     <div className="rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/50 p-3.5">
-                      <div className="text-[11px] text-[var(--v-fg-muted)]">累计折算账单</div>
+                      <div className="text-[11px] text-[var(--v-fg-muted)]" title="按各模型公开 API 单价折算，订阅制套餐不会额外扣费">
+                        API 等效折算
+                      </div>
                       <div className="mt-1 font-mono text-[20px] font-semibold text-[var(--v-fg-primary)] tabular-nums">
                         {fmtUsd(analytics.total_cost_usd)}
                       </div>
                       <div className="mt-0.5 text-[11px] text-[#34d399]">
-                        今日 {fmtUsd(analytics.today_cost_usd)}
+                        今日 {fmtUsd(analytics.today_cost_usd)} · 订阅不扣费
                       </div>
                     </div>
                     <div className="rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/50 p-3.5">

@@ -22,6 +22,8 @@ public struct RootSessionsView: View {
     @State private var relocatingFolderOldPath: String?
     @State private var relocatingSessionId: String?
     @State private var relocateDraftPath: String = ""
+    @State private var pendingDeleteSessionId: String?
+    @State private var pendingDeleteSessionTitle: String = ""
 
     public init(store: VeloStore) {
         self.store = store
@@ -326,6 +328,25 @@ public struct RootSessionsView: View {
                 }
             } message: {
                 Text("将同步更新 Mac 守护进程的目录映射关系")
+            }
+            .alert(
+                "删除会话？",
+                isPresented: Binding(
+                    get: { pendingDeleteSessionId != nil },
+                    set: { if !$0 { pendingDeleteSessionId = nil } }
+                )
+            ) {
+                Button("取消", role: .cancel) {
+                    pendingDeleteSessionId = nil
+                }
+                Button("永久删除", role: .destructive) {
+                    if let sid = pendingDeleteSessionId {
+                        pendingDeleteSessionId = nil
+                        Task { await store.deleteSession(sid) }
+                    }
+                }
+            } message: {
+                Text("将永久删除「\(pendingDeleteSessionTitle)」，对话记录会一起清掉。此操作无法撤销。")
             }
             .onChange(of: store.latestCreatedOrHandoffSessionId) { _, newSid in
                 guard let newSid, !newSid.isEmpty else { return }
@@ -788,7 +809,8 @@ public struct RootSessionsView: View {
                                 }
 
                                 Button(role: .destructive) {
-                                    Task { await store.deleteSession(session.id) }
+                                    pendingDeleteSessionTitle = session.title
+                                    pendingDeleteSessionId = session.id
                                 } label: {
                                     Label("永久删除会话", systemImage: "trash")
                                 }

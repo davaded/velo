@@ -444,6 +444,20 @@ fn is_editable_velo_skill_md_path(canon: &Path) -> bool {
         && dot_velo.file_name().and_then(|n| n.to_str()) == Some(".velo")
 }
 
+/// Prompt sent to the engine for one turn. The chat transcript keeps `visible`.
+pub fn skill_turn_prompt(visible: &str, skill_path: Option<&str>) -> String {
+    let Some(path) = skill_path.map(str::trim).filter(|s| !s.is_empty()) else {
+        return visible.to_string();
+    };
+    let Ok(raw) = read_skill_markdown(path) else {
+        return visible.to_string();
+    };
+    let body: String = raw.chars().take(24_000).collect();
+    format!(
+        "Follow the skill below for this turn. Apply its steps to the user task. Do not repeat the skill text back unless the user asks.\n\n{body}\n\n---\nUser task:\n{visible}\n"
+    )
+}
+
 /// Safely reads the full markdown source of any discovered `SKILL.md` file.
 pub fn read_skill_markdown(raw_path: &str) -> anyhow::Result<String> {
     let trimmed = raw_path.trim();
@@ -633,6 +647,12 @@ mod tests {
 
         let content = read_skill_markdown(&saved.path).expect("read saved skill");
         assert!(content.contains("@ObservedObject"));
+
+        let expanded = skill_turn_prompt("/SwiftUI Audit check views", Some(&saved.path));
+        assert!(expanded.contains("@ObservedObject"));
+        assert!(expanded.contains("User task:\n/SwiftUI Audit check views"));
+        assert_eq!(skill_turn_prompt("hello", None), "hello");
+        assert_eq!(skill_turn_prompt("hello", Some("/etc/hosts")), "hello");
 
         // Path traversal / arbitrary file read must be rejected
         assert!(read_skill_markdown("/etc/hosts").is_err());

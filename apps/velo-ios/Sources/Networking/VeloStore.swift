@@ -79,6 +79,27 @@ public final class VeloStore: ObservableObject {
     private static let unreadIdsKey = "velo.ios.unreadIds.v1"
     private static let autoCollapseKey = "velo.ios.autoCollapseSteps"
     private static let offlineOutboxKey = "velo.ios.offlineOutbox.v1"
+    private static let draftPromptsKey = "velo.ios.draftPrompts.v1"
+
+    public var draftPromptsBySession: [String: String] = [:]
+
+    public func draftPrompt(for sessionId: String) -> String {
+        draftPromptsBySession[sessionId] ?? ""
+    }
+
+    public func setDraftPrompt(_ text: String, for sessionId: String) {
+        guard !sessionId.isEmpty else { return }
+        let current = draftPromptsBySession[sessionId] ?? ""
+        if current == text { return }
+        if text.isEmpty {
+            draftPromptsBySession.removeValue(forKey: sessionId)
+        } else {
+            draftPromptsBySession[sessionId] = text
+        }
+        if let data = try? JSONEncoder().encode(draftPromptsBySession) {
+            UserDefaults.standard.set(data, forKey: Self.draftPromptsKey)
+        }
+    }
 
     public init() {
         if let storedCollapse = UserDefaults.standard.object(forKey: Self.autoCollapseKey) as? Bool {
@@ -96,6 +117,11 @@ public final class VeloStore: ObservableObject {
            let decodedOutbox = try? JSONDecoder().decode([VeloOfflineQueuedPrompt].self, from: outboxData)
         {
             self.offlineOutbox = decodedOutbox
+        }
+        if let draftsData = UserDefaults.standard.data(forKey: Self.draftPromptsKey),
+           let decodedDrafts = try? JSONDecoder().decode([String: String].self, from: draftsData)
+        {
+            self.draftPromptsBySession = decodedDrafts
         }
 
         // Frame-0 local disk cache hydration so sessions, folders, and message contents
@@ -669,8 +695,10 @@ public final class VeloStore: ObservableObject {
                 fallbackProvider: fallbackProv
             )
             if !items.isEmpty || self.eventsBySession[sessionId] == nil {
-                self.eventsBySession[sessionId] = items
-                self.scheduleCacheSave()
+                if !Self.hasStreamingTimelineItem(self.eventsBySession[sessionId] ?? []) {
+                    self.eventsBySession[sessionId] = items
+                    self.scheduleCacheSave()
+                }
             }
             if sessionItem?.status == .running || sessionItem?.status == .waitingApproval,
                let activeStart
@@ -703,6 +731,27 @@ public final class VeloStore: ObservableObject {
     }
 
 
+    private func matchedSkillPath(for text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return nil }
+        let body = String(trimmed.dropFirst())
+        let lower = body.lowercased()
+        let ranked = installedSkills.sorted { a, b in
+            let aName = a.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let bName = b.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if aName.count != bName.count { return aName.count > bName.count }
+            return a.scope == "project" && b.scope != "project"
+        }
+        for sk in ranked {
+            let key = sk.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !key.isEmpty else { continue }
+            if lower == key || lower.hasPrefix(key + " ") {
+                return sk.path
+            }
+        }
+        return nil
+    }
+
     public func sendPrompt(
         sessionId: String,
         text: String,
@@ -716,6 +765,7 @@ public final class VeloStore: ObservableObject {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty || !images.isEmpty else { return }
         let effectivePrompt = clean.isEmpty ? "请查看附图" : clean
+        let skillPath = matchedSkillPath(for: effectivePrompt)
 
         // Offline Prompt Outbox: when disconnected (e.g., subway / plane / Mac sleeping),
         // persist locally and flush automatically once the daemon reconnects.
@@ -767,17 +817,42 @@ public final class VeloStore: ObservableObject {
                     var req = URLRequest(url: url)
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                    var queueBody: [String: Any] = [
                         "input": effectivePrompt,
                         "model": model,
                         "effort": effort,
                         "images": images,
                         "mode": "queue",
-                    ])
-                    _ = try? await URLSession.shared.data(for: req)
+                    ]
+                    if let skillPath {
+                        queueBody["skill_path"] = skillPath
+                    }
+                    req.httpBody = try? JSONSerialization.data(withJSONObject: queueBody)
+                    let localId = curQ.last?.id
+                    if let (data, resp) = try? await URLSession.shared.data(for: req),
+                       let http = resp as? HTTPURLResponse, http.statusCode < 400,
+                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let item = obj["item"] as? [String: Any],
+                       let realId = item["id"] as? String,
+                       let localId,
+                       let idx2 = sessions.firstIndex(where: { $0.id == sessionId }) {
+                        let stillQueued = sessions[idx2].activeQueuedPrompts.contains { $0.id == localId }
+                        if stillQueued {
+                            sessions[idx2].queuedPrompts = sessions[idx2].activeQueuedPrompts.map { q in
+                                q.id == localId
+                                    ? VeloQueuedPromptItem(id: realId, input: q.input, images: q.images)
+                                    : q
+                            }
+                        } else if let encoded = realId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+                                  let dropURL = URL(string: "\(baseURL)/api/sessions/\(sessionId)/queue/\(encoded)") {
+                            var drop = URLRequest(url: dropURL)
+                            drop.httpMethod = "DELETE"
+                            _ = try? await URLSession.shared.data(for: drop)
+                        }
+                    }
                 }
             case .e2eeRelay:
-                sendEncryptedCommand([
+                var queuePayload: [String: Any] = [
                     "cmd": "send_input",
                     "session_id": sessionId,
                     "input": effectivePrompt,
@@ -785,7 +860,11 @@ public final class VeloStore: ObservableObject {
                     "effort": effort,
                     "images": images,
                     "mode": "queue",
-                ])
+                ]
+                if let skillPath {
+                    queuePayload["skill_path"] = skillPath
+                }
+                sendEncryptedCommand(queuePayload)
             case .none:
                 break
             }
@@ -875,6 +954,9 @@ public final class VeloStore: ObservableObject {
             if let executionMode {
                 body["mode"] = executionMode
             }
+            if let skillPath {
+                body["skill_path"] = skillPath
+            }
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             do {
                 let (data, resp) = try await URLSession.shared.data(for: req)
@@ -907,6 +989,9 @@ public final class VeloStore: ObservableObject {
             if let executionMode {
                 payload["mode"] = executionMode
             }
+            if let skillPath {
+                payload["skill_path"] = skillPath
+            }
             sendEncryptedCommand(payload)
         case .none:
             appendLocalErrorEvent(sessionId: sessionId, rawError: "当前未连接主机")
@@ -915,25 +1000,111 @@ public final class VeloStore: ObservableObject {
     }
 
     public func removeQueuedPrompt(sessionId: String, queueId: String) async {
+        let input = sessions
+            .first(where: { $0.id == sessionId })?
+            .activeQueuedPrompts
+            .first(where: { $0.id == queueId })?
+            .input
         if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[idx].queuedPrompts = sessions[idx].activeQueuedPrompts.filter { $0.id != queueId }
         }
         switch connectionConfig {
         case .direct(let baseURL):
             let encoded = queueId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? queueId
-            guard let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/queue/\(encoded)") else { return }
+            var components = URLComponents(string: "\(baseURL)/api/sessions/\(sessionId)/queue/\(encoded)")
+            if queueId.hasPrefix("q-local-"), let input, !input.isEmpty {
+                components?.queryItems = [URLQueryItem(name: "input", value: input)]
+            }
+            guard let url = components?.url else { return }
             var req = URLRequest(url: url)
             req.httpMethod = "DELETE"
             _ = try? await URLSession.shared.data(for: req)
         case .e2eeRelay:
-            sendEncryptedCommand([
+            var payload: [String: Any] = [
                 "cmd": "remove_queued_prompt",
                 "session_id": sessionId,
                 "queue_id": queueId,
-            ])
+            ]
+            if let input, !input.isEmpty {
+                payload["input"] = input
+            }
+            sendEncryptedCommand(payload)
         case .none:
             break
         }
+    }
+
+    /// Interrupt the active turn and run this queued prompt immediately.
+    public func runQueuedPromptNow(sessionId: String, queueId: String) async {
+        guard let item = sessions
+            .first(where: { $0.id == sessionId })?
+            .activeQueuedPrompts
+            .first(where: { $0.id == queueId })
+        else { return }
+
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[idx].queuedPrompts = sessions[idx].activeQueuedPrompts.filter { $0.id != queueId }
+        }
+
+        if !queueId.hasPrefix("q-local-") {
+            switch connectionConfig {
+            case .direct(let baseURL):
+                let encoded = queueId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? queueId
+                if let url = URL(string: "\(baseURL)/api/sessions/\(sessionId)/queue/\(encoded)/run") {
+                    var req = URLRequest(url: url)
+                    req.httpMethod = "POST"
+                    if let (_, resp) = try? await URLSession.shared.data(for: req),
+                       let http = resp as? HTTPURLResponse, http.statusCode < 400 {
+                        await loadEventsForSession(sessionId)
+                        return
+                    }
+                }
+            case .e2eeRelay:
+                sendEncryptedCommand([
+                    "cmd": "run_queued_prompt",
+                    "session_id": sessionId,
+                    "queue_id": queueId,
+                ])
+                return
+            case .none:
+                break
+            }
+        }
+
+        if queueId.hasPrefix("q-local-") {
+            switch connectionConfig {
+            case .direct(let baseURL):
+                let encoded = queueId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? queueId
+                var components = URLComponents(string: "\(baseURL)/api/sessions/\(sessionId)/queue/\(encoded)")
+                components?.queryItems = [URLQueryItem(name: "input", value: item.input)]
+                if let url = components?.url {
+                    var req = URLRequest(url: url)
+                    req.httpMethod = "DELETE"
+                    _ = try? await URLSession.shared.data(for: req)
+                }
+            case .e2eeRelay:
+                sendEncryptedCommand([
+                    "cmd": "remove_queued_prompt",
+                    "session_id": sessionId,
+                    "queue_id": queueId,
+                    "input": item.input,
+                ])
+            case .none:
+                break
+            }
+        } else {
+            await removeQueuedPrompt(sessionId: sessionId, queueId: queueId)
+        }
+        let model = sessions.first(where: { $0.id == sessionId })?.model ?? ""
+        let effort = sessions.first(where: { $0.id == sessionId })?.effort ?? "medium"
+        await sendPrompt(
+            sessionId: sessionId,
+            text: item.input,
+            model: model,
+            effort: effort,
+            images: item.images,
+            executionMode: "steer"
+        )
     }
 
     // MARK: - Offline Outbox, Turn Checkpoints & Local MCP/Skills Extensions (v0.6.0)
@@ -1318,7 +1489,12 @@ public final class VeloStore: ObservableObject {
     }
 
 
-    public func forkSession(_ sessionId: String, upToUserTurn: Int? = nil) async -> String? {
+    public func forkSession(
+        _ sessionId: String,
+        upToUserTurn: Int? = nil,
+        upToUserText: String? = nil,
+        userTurnsFromEnd: Int? = nil
+    ) async -> String? {
         triggerHaptic(.medium)
         switch connectionConfig {
         case .direct(let baseURL):
@@ -1328,6 +1504,8 @@ public final class VeloStore: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             var body: [String: Any] = [:]
             if let t = upToUserTurn { body["up_to_user_turn"] = t }
+            if let txt = upToUserText, !txt.isEmpty { body["up_to_user_text"] = txt }
+            if let fromEnd = userTurnsFromEnd { body["user_turns_from_end"] = fromEnd }
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             guard let (data, _) = try? await URLSession.shared.data(for: req),
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -1343,6 +1521,8 @@ public final class VeloStore: ObservableObject {
         case .e2eeRelay:
             var payload: [String: Any] = ["cmd": "fork_session", "session_id": sessionId]
             if let t = upToUserTurn { payload["up_to_user_turn"] = t }
+            if let txt = upToUserText, !txt.isEmpty { payload["up_to_user_text"] = txt }
+            if let fromEnd = userTurnsFromEnd { payload["user_turns_from_end"] = fromEnd }
             sendEncryptedCommand(payload)
             return nil
         case .none:
@@ -1741,8 +1921,10 @@ public final class VeloStore: ObservableObject {
         )
         if isInitialPage {
             if !parsed.isEmpty || eventsBySession[sessionId] == nil {
-                eventsBySession[sessionId] = parsed
-                scheduleCacheSave()
+                if !Self.hasStreamingTimelineItem(eventsBySession[sessionId] ?? []) {
+                    eventsBySession[sessionId] = parsed
+                    scheduleCacheSave()
+                }
             }
             if sessionItem?.status == .running || sessionItem?.status == .waitingApproval,
                let activeStart
@@ -2450,6 +2632,7 @@ public final class VeloStore: ObservableObject {
                 } else {
                     eventsBySession[created.id] = []
                 }
+                Task { await loadEventsForSession(created.id) }
                 scheduleCacheSave()
                 return created.id
             }
@@ -2885,8 +3068,10 @@ public final class VeloStore: ObservableObject {
                 fallbackProvider: fallbackProv
             )
             if !items.isEmpty || eventsBySession[sid] == nil {
-                eventsBySession[sid] = items
-                scheduleCacheSave()
+                if !Self.hasStreamingTimelineItem(eventsBySession[sid] ?? []) {
+                    eventsBySession[sid] = items
+                    scheduleCacheSave()
+                }
             }
             if sessionItem?.status == .running || sessionItem?.status == .waitingApproval,
                let activeStart
@@ -3469,39 +3654,69 @@ public final class VeloStore: ObservableObject {
             stepStartedAtBySession[sid] = now
 
             var list = eventsBySession[sid] ?? []
-            var targetIdx: Int?
-            for idx in list.indices.reversed() {
-                switch list[idx].kind {
-                case .user, .toolCall:
-                    idx == -1 ? () : ()
-                    break
-                case .assistant:
-                    targetIdx = idx
-                default:
-                    continue
-                }
-                if targetIdx != nil { break }
-                if case .user = list[idx].kind { break }
-                if case .toolCall = list[idx].kind { break }
+            let turnStart = list.lastIndex(where: {
+                if case .user = $0.kind { return true }
+                return false
+            }).map { $0 + 1 } ?? 0
+            if let streamingIdx = list.indices.reversed().first(where: { idx in
+                idx >= turnStart && {
+                    if case .assistant(true) = list[idx].kind { return true }
+                    return false
+                }()
+            }) {
+                list[streamingIdx].content = text
+                list[streamingIdx].kind = .assistant(isStreaming: false)
+                eventsBySession[sid] = list
+                scheduleCacheSave()
+                return
             }
-
-            if let targetIdx {
-                let existing = list[targetIdx]
-                if case .assistant(let wasStreaming) = existing.kind {
-                    let nextContent: String = {
-                        if wasStreaming { return text }
-                        if existing.content.trimmingCharacters(in: .whitespacesAndNewlines) == text.trimmingCharacters(in: .whitespacesAndNewlines) {
-                            return existing.content
-                        }
-                        if text.hasPrefix(existing.content) { return text }
-                        return "\(existing.content)\n\n\(text)"
-                    }()
-                    list[targetIdx].content = nextContent
-                    list[targetIdx].kind = .assistant(isStreaming: false)
-                    eventsBySession[sid] = list
-                    scheduleCacheSave()
+            if let matchIdx = list.indices.reversed().first(where: { idx in
+                guard idx >= turnStart, case .assistant = list[idx].kind else { return false }
+                return Self.foldAssistantProjection(previous: list[idx].content, incoming: text) != "distinct"
+            }) {
+                let fold = Self.foldAssistantProjection(previous: list[matchIdx].content, incoming: text)
+                if fold == "previous" {
                     return
                 }
+                let toolAfter = list.dropFirst(matchIdx + 1).contains { item in
+                    if case .toolCall = item.kind { return true }
+                    return false
+                }
+                if toolAfter {
+                    list.remove(at: matchIdx)
+                    list.append(
+                        TimelineEventItem(
+                            id: "as-\(UUID().uuidString.prefix(8))",
+                            sessionId: sid,
+                            timestamp: nowLabel,
+                            content: text,
+                            kind: .assistant(isStreaming: false)
+                        )
+                    )
+                } else {
+                    list[matchIdx].content = text
+                    list[matchIdx].kind = .assistant(isStreaming: false)
+                }
+                eventsBySession[sid] = list
+                scheduleCacheSave()
+                return
+            }
+            var targetIdx: Int?
+            for idx in list.indices.reversed() {
+                if idx < turnStart { break }
+                if case .toolCall = list[idx].kind { break }
+                if case .assistant = list[idx].kind {
+                    targetIdx = idx
+                    break
+                }
+            }
+            if let targetIdx, case .assistant = list[targetIdx].kind {
+                let existing = list[targetIdx].content
+                list[targetIdx].content = "\(existing)\n\n\(text)".trimmingCharacters(in: .whitespacesAndNewlines)
+                list[targetIdx].kind = .assistant(isStreaming: false)
+                eventsBySession[sid] = list
+                scheduleCacheSave()
+                return
             }
 
             if let lastIdx = list.indices.last,
@@ -3684,6 +3899,35 @@ public final class VeloStore: ObservableObject {
         if let idx = sessions.firstIndex(where: { $0.id == sid }) {
             sessions[idx].status = status
             sessions[idx].updatedAtLabel = "now"
+        }
+    }
+
+    /// Same projected reply, not a second copy. "incoming" replaces the earlier
+    /// sentence, "previous" means the saved text already covers this one.
+    private static func foldAssistantProjection(previous: String, incoming: String) -> String {
+        let prev = previous.trimmingCharacters(in: .whitespacesAndNewlines)
+        let next = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        if prev.isEmpty || next.isEmpty || prev.hasPrefix("⚠️") || next.hasPrefix("⚠️") {
+            return "distinct"
+        }
+        if prev == next { return "previous" }
+        if next.hasPrefix(prev), prev.count >= 24 { return "incoming" }
+        if prev.hasPrefix(next), next.count >= 24 { return "previous" }
+        if prev.count >= 40, next.contains(prev) { return "incoming" }
+        if next.count >= 40, prev.contains(next) { return "previous" }
+        return "distinct"
+    }
+
+    private static func hasStreamingTimelineItem(_ items: [TimelineEventItem]) -> Bool {
+        items.contains { item in
+            switch item.kind {
+            case .assistant(let isStreaming):
+                return isStreaming
+            case .thinking(_, _, let isStreaming):
+                return isStreaming
+            default:
+                return false
+            }
         }
     }
 
@@ -3893,6 +4137,28 @@ public final class VeloStore: ObservableObject {
                       !text.hasPrefix("[stderr]")
                 else { continue }
                 if tsMs > 0 { lastStepMs = tsMs }
+                var folded = false
+                let turnFloor = activeUserIdx ?? -1
+                if let matchIdx = out.indices.reversed().first(where: { idx in
+                    guard idx > turnFloor, case .assistant = out[idx].kind else { return false }
+                    return Self.foldAssistantProjection(previous: out[idx].content, incoming: text) != "distinct"
+                }) {
+                    let fold = Self.foldAssistantProjection(previous: out[matchIdx].content, incoming: text)
+                    folded = true
+                    if fold == "incoming" {
+                        let toolAfter = out.dropFirst(matchIdx + 1).contains { item in
+                            if case .toolCall = item.kind { return true }
+                            return false
+                        }
+                        if toolAfter {
+                            out.remove(at: matchIdx)
+                            folded = false
+                        } else {
+                            out[matchIdx].content = text
+                        }
+                    }
+                }
+                if folded { continue }
                 out.append(
                     TimelineEventItem(
                         id: "as-hist-\(i)",

@@ -5,7 +5,7 @@ public struct VeloExtensionsAndCheckpointsSheet: View {
     let sessionId: String?
     let workspacePath: String?
     let initialTab: Int
-    var onInjectSkillPrompt: (String) -> Void
+    var onInjectSkillPrompt: (VeloSkillItem) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
@@ -36,7 +36,7 @@ public struct VeloExtensionsAndCheckpointsSheet: View {
         sessionId: String?,
         workspacePath: String? = nil,
         initialTab: Int = 0,
-        onInjectSkillPrompt: @escaping (String) -> Void
+        onInjectSkillPrompt: @escaping (VeloSkillItem) -> Void
     ) {
         self.store = store
         self.sessionId = sessionId
@@ -621,12 +621,13 @@ public struct VeloExtensionsAndCheckpointsSheet: View {
     private func skillRow(_ sk: VeloSkillItem) -> some View {
         let color = badgeColor(for: sk.engine)
         return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 6) {
-                Text(sk.name)
-                    .font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
+            Text(sk.name)
+                .font(.system(size: 13.5, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
 
+            HStack(spacing: 6) {
                 if sk.scope == "project" {
                     Text("项目")
                         .font(.system(size: 9.5, weight: .bold))
@@ -642,9 +643,17 @@ public struct VeloExtensionsAndCheckpointsSheet: View {
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(color.opacity(0.14), in: Capsule())
+            }
 
-                Spacer(minLength: 4)
+            if !sk.description.isEmpty {
+                Text(sk.description)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
+            HStack(spacing: 6) {
                 Button {
                     openSkillPreview(sk)
                 } label: {
@@ -671,7 +680,7 @@ public struct VeloExtensionsAndCheckpointsSheet: View {
 
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    onInjectSkillPrompt(sk.crossEnginePrompt)
+                    onInjectSkillPrompt(sk)
                     dismiss()
                 } label: {
                     HStack(spacing: 3.5) {
@@ -686,21 +695,6 @@ public struct VeloExtensionsAndCheckpointsSheet: View {
                     .background(VeloTheme.accentViolet.opacity(0.14), in: Capsule())
                 }
                 .buttonStyle(.plain)
-            }
-
-            if !sk.description.isEmpty {
-                Text(sk.description)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-
-            if !sk.path.isEmpty {
-                Text(sk.path)
-                    .font(.system(size: 10.5, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
             }
         }
         .padding(12)
@@ -771,7 +765,7 @@ public struct VeloExtensionsAndCheckpointsSheet: View {
                     }
                     Button("跨引擎调用") {
                         previewSkill = nil
-                        onInjectSkillPrompt(sk.crossEnginePrompt)
+                        onInjectSkillPrompt(sk)
                         dismiss()
                     }
                     .fontWeight(.semibold)

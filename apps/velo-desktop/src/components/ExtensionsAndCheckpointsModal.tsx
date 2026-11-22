@@ -49,8 +49,52 @@ export interface SkillEntryDto {
   editable?: boolean;
 }
 
-export function buildCrossEngineSkillPrompt(sk: Pick<SkillEntryDto, "name" | "path">): string {
-  return `请先读取并严格遵循技能 \`${sk.name}\`（路径：\`${sk.path}\`）中的规范与步骤，协助完成以下任务：\n`;
+/** Composer text after picking a skill: `/Name` plus any task already typed. */
+export function composerTextForSkill(current: string, name: string): string {
+  const trimmed = current.trim();
+  const skill = name.trim();
+  let task = "";
+  if (trimmed.startsWith("/")) {
+    const body = trimmed.slice(1);
+    const lower = body.toLowerCase();
+    const key = skill.toLowerCase();
+    if (lower === key) {
+      task = "";
+    } else if (key && lower.startsWith(`${key} `)) {
+      task = body.slice(skill.length).trim();
+    } else {
+      const space = body.search(/\s/);
+      task = space === -1 ? "" : body.slice(space + 1).trim();
+    }
+  } else {
+    task = trimmed;
+  }
+  return task ? `/${skill} ${task}` : `/${skill} `;
+}
+
+/** Longest skill name that prefixes the composer text. Project scope wins on a tie. */
+export function matchSkillInvocation(
+  text: string,
+  skills: Array<Pick<SkillEntryDto, "name" | "path" | "scope">>
+): { path: string } | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) return null;
+  const body = trimmed.slice(1);
+  const lower = body.toLowerCase();
+  const ranked = skills
+    .filter((sk) => sk.name.trim() && sk.path)
+    .sort((a, b) => {
+      const byLen = b.name.trim().length - a.name.trim().length;
+      if (byLen !== 0) return byLen;
+      return (a.scope === "project" ? 0 : 1) - (b.scope === "project" ? 0 : 1);
+    });
+  for (const sk of ranked) {
+    const key = sk.name.trim().toLowerCase();
+    if (lower === key || lower.startsWith(`${key} `)) {
+      return { path: sk.path };
+    }
+  }
+  return null;
 }
 
 interface Props {
@@ -60,7 +104,7 @@ interface Props {
   sessionId: string | null;
   sessionTitle: string;
   workspacePath?: string;
-  onUseSkillPrompt: (text: string) => void;
+  onUseSkill: (skill: SkillEntryDto) => void;
   onRunSlashCommand?: (cmd: string) => void;
   onSkillsUpdated?: (skills: SkillEntryDto[]) => void;
   onRewound: () => void;
@@ -91,7 +135,7 @@ export const ExtensionsAndCheckpointsModal: React.FC<Props> = ({
   sessionId,
   sessionTitle,
   workspacePath,
-  onUseSkillPrompt,
+  onUseSkill,
   onRunSlashCommand,
   onSkillsUpdated,
   onRewound,
@@ -679,7 +723,7 @@ export const ExtensionsAndCheckpointsModal: React.FC<Props> = ({
                       <button
                         type="button"
                         onClick={() => {
-                          onUseSkillPrompt(buildCrossEngineSkillPrompt(previewSkill));
+                          onUseSkill(previewSkill);
                           onClose();
                         }}
                         className="inline-flex items-center gap-1 rounded-lg bg-[#8b5cf6] px-2.5 py-1 text-[11.5px] font-semibold text-white hover:opacity-90 cursor-pointer"
@@ -746,7 +790,7 @@ export const ExtensionsAndCheckpointsModal: React.FC<Props> = ({
                     <span>跨引擎可用 Skills ({filteredSkills.length})</span>
                   </div>
                   <span className="text-[11px] text-[var(--v-fg-muted)]">
-                    点击「调用」自动附带 SKILL.md 路径，任意引擎通用
+                    调用后在输入框写任务，发送时附上技能全文
                   </span>
                 </div>
                 {filteredSkills.length === 0 ? (
@@ -761,9 +805,9 @@ export const ExtensionsAndCheckpointsModal: React.FC<Props> = ({
                       return (
                         <div
                           key={sk.id}
-                          className="flex items-center justify-between gap-3 rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)]/70 px-3.5 py-2.5"
+                          className="rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)]/70 px-3.5 py-2.5"
                         >
-                          <div className="min-w-0 flex-1">
+                          <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-1.5">
                               {sk.scope === "project" && (
                                 <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[#34d399]/18 px-2 py-0.5 text-[10px] font-semibold text-[#34d399]">
@@ -776,18 +820,18 @@ export const ExtensionsAndCheckpointsModal: React.FC<Props> = ({
                               >
                                 {badge.label}
                               </span>
-                              <span className="truncate font-mono text-[12.5px] font-semibold text-[var(--v-fg-primary)]">
+                              <span className="min-w-0 font-mono text-[12.5px] font-semibold text-[var(--v-fg-primary)]">
                                 {sk.name}
                               </span>
                             </div>
                             {sk.description && (
-                              <p className="mt-1 line-clamp-2 text-[11.5px] text-[var(--v-fg-muted)]">
+                              <p className="mt-1 line-clamp-2 text-[11.5px] leading-relaxed text-[var(--v-fg-muted)]">
                                 {sk.description}
                               </p>
                             )}
                           </div>
 
-                          <div className="flex shrink-0 items-center gap-1">
+                          <div className="mt-2 flex items-center gap-1 border-t border-[var(--v-border-subtle)] pt-2">
                             <button
                               type="button"
                               onClick={() => void handleOpenPreview(sk)}
@@ -829,7 +873,7 @@ export const ExtensionsAndCheckpointsModal: React.FC<Props> = ({
                             <button
                               type="button"
                               onClick={() => {
-                                onUseSkillPrompt(buildCrossEngineSkillPrompt(sk));
+                                onUseSkill(sk);
                                 onClose();
                               }}
                               className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[var(--v-bg-active)] px-2.5 py-1.5 text-[11.5px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
@@ -907,12 +951,12 @@ export const ExtensionsAndCheckpointsModal: React.FC<Props> = ({
                           onClose();
                           onRunSlashCommand(s.cmd);
                         }}
-                        className="flex items-center justify-between gap-2 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)]/50 px-3 py-2 text-left hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                        className="flex flex-col items-start gap-0.5 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-canvas)]/50 px-3 py-2 text-left hover:bg-[var(--v-bg-hover)] cursor-pointer"
                       >
                         <span className="font-mono text-[12px] font-semibold text-[var(--v-fg-primary)]">
                           {s.cmd}
                         </span>
-                        <span className="truncate text-[11px] text-[var(--v-fg-muted)]">
+                        <span className="line-clamp-2 text-[11px] leading-relaxed text-[var(--v-fg-muted)]">
                           {s.desc}
                         </span>
                       </button>

@@ -392,6 +392,7 @@ export interface VeloSession {
   worktree_path: string;
   project_path: string;
   approval_mode: ApprovalMode;
+  parent_session_id?: string | null;
   preview_url?: string | null;
   queued_prompts?: QueuedPromptDto[];
   archived?: boolean;
@@ -649,6 +650,7 @@ export function normalizeToVeloSession(raw: unknown, idx = 0): VeloSession {
     worktree_path: worktreePath,
     project_path: projectPath,
     approval_mode: approvalMode,
+    parent_session_id: typeof r.parent_session_id === "string" ? r.parent_session_id : null,
     preview_url: typeof r.preview_url === "string" ? r.preview_url : null,
     queued_prompts: Array.isArray(r.queued_prompts)
       ? (r.queued_prompts as QueuedPromptDto[])

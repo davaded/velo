@@ -43,7 +43,8 @@ import { RemoteHostsModal } from "./components/RemoteHostsModal";
 import {
   ExtensionsAndCheckpointsModal,
   SkillEntryDto,
-  buildCrossEngineSkillPrompt,
+  composerTextForSkill,
+  matchSkillInvocation,
 } from "./components/ExtensionsAndCheckpointsModal";
 import {
   ENGINE_TABS,
@@ -85,6 +86,7 @@ import {
   Mic,
   Monitor,
   Moon,
+  MoreHorizontal,
   PanelLeft,
   Plus,
   RefreshCw,
@@ -184,6 +186,22 @@ interface PendingAttachmentItem {
 }
 
 const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {};
+
+/** Same projected reply, not a second copy. Matches Paseo's catch-up rule. */
+function foldAssistantProjection(
+  previous: string,
+  incoming: string
+): "incoming" | "previous" | "distinct" {
+  const prev = previous.trim();
+  const next = incoming.trim();
+  if (!prev || !next || prev.startsWith("⚠️") || next.startsWith("⚠️")) return "distinct";
+  if (prev === next) return "previous";
+  if (next.startsWith(prev) && prev.length >= 24) return "incoming";
+  if (prev.startsWith(next) && next.length >= 24) return "previous";
+  if (prev.length >= 40 && next.includes(prev)) return "incoming";
+  if (next.length >= 40 && prev.includes(next)) return "previous";
+  return "distinct";
+}
 
 function reconstructEventsFromHistory(
   sid: string,
@@ -360,6 +378,24 @@ function reconstructEventsFromHistory(
       if (tsMs > 0) {
         lastStepMs = tsMs;
       }
+      let folded = false;
+      for (let j = reconstructed.length - 1; j > activeHistUserIdx; j--) {
+        const item = reconstructed[j];
+        if (item.kind !== "assistant") continue;
+        const fold = foldAssistantProjection(item.content, text);
+        if (fold === "distinct") continue;
+        folded = true;
+        if (fold === "previous") break;
+        const toolAfter = reconstructed.slice(j + 1).some((entry) => entry.kind === "tool_call");
+        if (toolAfter) {
+          reconstructed.splice(j, 1);
+          folded = false;
+        } else {
+          item.content = text;
+        }
+        break;
+      }
+      if (folded) continue;
       reconstructed.push({
         id: `as-hist-${i}`,
         session_id: sid,
@@ -768,6 +804,7 @@ export function App() {
 
   // Open in External IDE Menu State
   const [openInMenuOpen, setOpenInMenuOpen] = useState<boolean>(false);
+  const [headerMoreMenuOpen, setHeaderMoreMenuOpen] = useState<boolean>(false);
 
   // Phase 3 Dispatch Mode (Single / Committee Race / TDD Loop)
   const [dispatchMode, setDispatchMode] = useState<"single" | "committee" | "loop">("single");
@@ -813,11 +850,35 @@ export function App() {
   );
   const [pendingQuestions, setPendingQuestions] = useState<Record<string, PendingQuestionItem>>({});
 
-  // Clean Composer State (Natural language + slash skills + multimodal image attachments + voice STT)
-  const [prompt, setPrompt] = useState<string>("");
+  // Per-Session Composer State (each thread keeps its own unsent text draft + image attachments)
+  const [draftsBySession, setDraftsBySession] = useState<Record<string, string>>(() => {
+    try {
+      const raw = safeStorageGet("velo.drafts.v1");
+      const parsed = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  });
+  const [attachmentsBySession, setAttachmentsBySession] = useState<
+    Record<string, PendingAttachmentItem[]>
+  >({});
+  useEffect(() => {
+    try {
+      const compact: Record<string, string> = {};
+      for (const [k, v] of Object.entries(draftsBySession)) {
+        if (v && v.length <= 24_000) compact[k] = v;
+      }
+      const serialized = JSON.stringify(compact);
+      if (serialized.length <= 200_000) {
+        safeStorageSet("velo.drafts.v1", serialized);
+      }
+    } catch {
+      // ignore
+    }
+  }, [draftsBySession]);
   const [slashFilter, setSlashFilter] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachmentItem[]>([]);
   const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
   const [composerDragOver, setComposerDragOver] = useState<boolean>(false);
   const [isDictating, setIsDictating] = useState<boolean>(false);
@@ -872,6 +933,10 @@ export function App() {
     newPath: string;
   } | null>(null);
   const [showArchivedDrawer, setShowArchivedDrawer] = useState<boolean>(false);
+  const [sessionPendingDelete, setSessionPendingDelete] = useState<{
+    id: string;
+    title: string;
+  } | null>(null);
   const [chatFindOpen, setChatFindOpen] = useState<boolean>(false);
   const [chatFindQuery, setChatFindQuery] = useState<string>("");
   const [unreadSessionIds, setUnreadSessionIds] = useState<Record<string, boolean>>(() => {
@@ -923,6 +988,9 @@ export function App() {
   const isPinnedToBottomRef = useRef<boolean>(true);
   const [showJumpToBottom, setShowJumpToBottom] = useState<boolean>(false);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Optimistic queue rows use `q-local-*` until the daemon returns the real id.
+  // Clicks that happen in that window are applied once the real id arrives.
+  const queuedIntentRef = useRef<Map<string, "drop" | "run">>(new Map());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const scrollChatToBottom = useCallback((smooth = false) => {
@@ -978,6 +1046,62 @@ export function App() {
       updated_at: "ready",
     };
   }, [sessions, activeId, repos]);
+
+  const activeSessionIdRef = useRef<string>(activeSession.id);
+  activeSessionIdRef.current = activeSession.id;
+
+  const prompt = draftsBySession[activeSession.id] ?? "";
+  const pendingAttachments = useMemo(
+    () => attachmentsBySession[activeSession.id] ?? [],
+    [attachmentsBySession, activeSession.id]
+  );
+
+  const setPrompt = useCallback(
+    (updater: string | ((prev: string) => string), targetSid?: string) => {
+      const sid = targetSid || activeSessionIdRef.current || "draft-empty";
+      setDraftsBySession((prev) => {
+        const cur = prev[sid] ?? "";
+        const nextVal = typeof updater === "function" ? updater(cur) : updater;
+        if (nextVal === cur) return prev;
+        const next = { ...prev };
+        if (!nextVal) {
+          delete next[sid];
+        } else {
+          next[sid] = nextVal;
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  const setPendingAttachments = useCallback(
+    (
+      updater:
+        | PendingAttachmentItem[]
+        | ((prev: PendingAttachmentItem[]) => PendingAttachmentItem[]),
+      targetSid?: string
+    ) => {
+      const sid = targetSid || activeSessionIdRef.current || "draft-empty";
+      setAttachmentsBySession((prev) => {
+        const cur = prev[sid] ?? [];
+        const nextVal = typeof updater === "function" ? updater(cur) : updater;
+        const next = { ...prev };
+        if (nextVal.length === 0) {
+          delete next[sid];
+        } else {
+          next[sid] = nextVal;
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  // Close slash menu when switching between threads so another thread's `/` state never carries over
+  useEffect(() => {
+    setSlashFilter(null);
+  }, [activeSession.id]);
 
   const activeRepo = useMemo(
     () =>
@@ -1222,7 +1346,6 @@ export function App() {
     });
   }, [activeSession.id, refreshSessionDiffAndFiles]);
 
-  const activeSessionIdRef = useRef<string>(activeSession.id);
   useEffect(() => {
     activeSessionIdRef.current = activeSession.id;
     setUnreadSessionIds((prev) => {
@@ -1263,13 +1386,21 @@ export function App() {
                 [sid]: Boolean(payload?.has_more),
               }));
             }
-            if (rawList.length === 0) return;
+            if (rawList.length === 0) {
+              setEventsBySession((prev) => {
+                const cur = prev[sid] || [];
+                if (cur.some((x) => x.is_streaming_chunk)) return prev;
+                if (cur.length === 0) return prev;
+                return { ...prev, [sid]: [] };
+              });
+              return;
+            }
             const reconstructed = reconstructEventsFromHistory(sid, rawList);
             if (reconstructed.length > 0) {
               setEventsBySession((prev) => {
                 const cur = prev[sid] || [];
                 const isActivelyStreaming = cur.some((x) => x.is_streaming_chunk);
-                if (isActivelyStreaming && cur.length > reconstructed.length) {
+                if (isActivelyStreaming) {
                   return prev;
                 }
                 return { ...prev, [sid]: reconstructed };
@@ -1580,6 +1711,25 @@ export function App() {
         raw.session
       ) {
         const created = normalizeToVeloSession(raw.session, 0);
+        const cp = canonicalRepoPath(created.project_path);
+        if (cp) {
+          created.project_path = cp;
+          created.repo_id = repoIdFromPath(cp);
+          setRepos((prevRepos) => {
+            if (prevRepos.some((r) => canonicalRepoPath(r.path) === cp)) return prevRepos;
+            const folder = cp.split("/").filter(Boolean).pop() || "workspace";
+            return [
+              ...prevRepos,
+              {
+                id: repoIdFromPath(cp),
+                code: folder.slice(0, 2).toUpperCase(),
+                name: folder,
+                path: cp,
+                default_branch: created.branch_name || "main",
+              },
+            ];
+          });
+        }
         setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)]);
         setActiveId(created.id);
         syncSessionEventsFromDaemon(created.id);
@@ -2315,10 +2465,58 @@ export function App() {
         stepStartMsRef.current[sid] = nowMsgMs;
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
-          // Search current post-tool / post-user segment for a streaming assistant block
-          let targetIdx = -1;
+          let turnStart = 0;
           for (let i = list.length - 1; i >= 0; i--) {
-            if (list[i].kind === "user" || list[i].kind === "tool_call") break;
+            if (list[i].kind === "user") {
+              turnStart = i + 1;
+              break;
+            }
+          }
+          const streamingIdx = (() => {
+            for (let i = list.length - 1; i >= turnStart; i--) {
+              if (list[i].kind === "assistant" && list[i].is_streaming_chunk) return i;
+            }
+            return -1;
+          })();
+          if (streamingIdx !== -1) {
+            const next = [...list];
+            next[streamingIdx] = {
+              ...next[streamingIdx],
+              content: text,
+              is_streaming_chunk: false,
+            };
+            return { ...prev, [sid]: next };
+          }
+          for (let i = list.length - 1; i >= turnStart; i--) {
+            if (list[i].kind !== "assistant") continue;
+            const fold = foldAssistantProjection(list[i].content, text);
+            if (fold === "distinct") continue;
+            if (fold === "previous") return prev;
+            const toolAfter = list.slice(i + 1).some((entry) => entry.kind === "tool_call");
+            if (toolAfter) {
+              const without = list.filter((_, idx) => idx !== i);
+              return {
+                ...prev,
+                [sid]: [
+                  ...without,
+                  {
+                    id: `as-${nowMsgMs}-${Math.random().toString(36).slice(2, 5)}`,
+                    session_id: sid,
+                    timestamp: now,
+                    kind: "assistant" as const,
+                    content: text,
+                    is_streaming_chunk: false,
+                  },
+                ],
+              };
+            }
+            const next = [...list];
+            next[i] = { ...next[i], content: text, is_streaming_chunk: false };
+            return { ...prev, [sid]: next };
+          }
+          let targetIdx = -1;
+          for (let i = list.length - 1; i >= turnStart; i--) {
+            if (list[i].kind === "tool_call") break;
             if (list[i].kind === "assistant") {
               targetIdx = i;
               break;
@@ -2326,17 +2524,10 @@ export function App() {
           }
           if (targetIdx !== -1) {
             const existing = list[targetIdx];
-            const nextContent = existing.is_streaming_chunk
-              ? text
-              : existing.content.trim() === text.trim()
-              ? existing.content
-              : text.startsWith(existing.content)
-              ? text
-              : `${existing.content}\n\n${text}`.trim();
             const next = [...list];
             next[targetIdx] = {
               ...existing,
-              content: nextContent,
+              content: `${existing.content}\n\n${text}`.trim(),
               is_streaming_chunk: false,
             };
             return { ...prev, [sid]: next };
@@ -2639,11 +2830,24 @@ export function App() {
   // Composer input handler with `/` slash skills (Agent explores worktree files autonomously)
   const handlePromptChange = (val: string) => {
     setPrompt(val);
-    if (val.startsWith("/")) {
-      setSlashFilter(val.slice(1).toLowerCase());
+    if (!val.startsWith("/")) {
+      setSlashFilter(null);
       return;
     }
-    setSlashFilter(null);
+    const body = val.slice(1);
+    // Once a skill or slash command is followed by whitespace (user is now typing the task body),
+    // close the slash popover unless the typed text is still a prefix of a multi-word skill name.
+    if (/\s/.test(body)) {
+      const lower = body.toLowerCase();
+      const stillCompletingMultiWordSkill =
+        !matchSkillInvocation(val, localSkills) &&
+        localSkills.some((sk) => sk.name.trim().toLowerCase().startsWith(lower));
+      if (!stillCompletingMultiWordSkill) {
+        setSlashFilter(null);
+        return;
+      }
+    }
+    setSlashFilter(body.toLowerCase());
   };
 
   const resolveAttachmentUrl = useCallback(
@@ -2668,6 +2872,7 @@ export function App() {
     async (fileList: FileList | File[]) => {
       const files = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
       if (files.length === 0) return;
+      const originSid = activeSessionIdRef.current;
       setUploadingAttachment(true);
       try {
         for (const file of files) {
@@ -2692,14 +2897,17 @@ export function App() {
               path: string;
               url: string;
             };
-            setPendingAttachments((prev) => [
-              ...prev,
-              {
-                filename: data.filename,
-                path: data.path,
-                url: `${daemonUrl}${data.url}`,
-              },
-            ]);
+            setPendingAttachments(
+              (prev) => [
+                ...prev,
+                {
+                  filename: data.filename,
+                  path: data.path,
+                  url: `${daemonUrl}${data.url}`,
+                },
+              ],
+              originSid
+            );
           }
         }
       } catch {
@@ -2708,12 +2916,16 @@ export function App() {
         setUploadingAttachment(false);
       }
     },
-    [daemonUrl]
+    [daemonUrl, setPendingAttachments]
   );
 
   const handleRemoveQueuedPrompt = useCallback(
     async (queueId: string) => {
       const sid = activeSession.id;
+      const item = (activeSession.queued_prompts || []).find((q) => q.id === queueId);
+      if (queueId.startsWith("q-local-")) {
+        queuedIntentRef.current.set(queueId, "drop");
+      }
       setSessions((prev) =>
         prev.map((s) =>
           s.id === sid
@@ -2721,19 +2933,25 @@ export function App() {
             : s
         )
       );
+      const query =
+        queueId.startsWith("q-local-") && item?.input
+          ? `?input=${encodeURIComponent(item.input)}`
+          : "";
       try {
-        await fetch(`${daemonUrl}/api/sessions/${sid}/queue/${encodeURIComponent(queueId)}`, {
-          method: "DELETE",
-        });
+        await fetch(
+          `${daemonUrl}/api/sessions/${sid}/queue/${encodeURIComponent(queueId)}${query}`,
+          { method: "DELETE" }
+        );
       } catch {
         sendE2eeCommand({
           cmd: "remove_queued_prompt",
           session_id: sid,
           queue_id: queueId,
+          input: item?.input,
         });
       }
     },
-    [activeSession.id, daemonUrl]
+    [activeSession.id, activeSession.queued_prompts, daemonUrl]
   );
 
   // Register global hooks for macOS Menu Bar Status Item (`VeloApp.swift`)
@@ -2766,7 +2984,8 @@ export function App() {
     overridePriorEvents?: AgentEvent[],
     truncateToUserTurn?: number,
     overrideImages?: string[],
-    executionMode?: "queue" | "steer"
+    executionMode?: "queue" | "steer",
+    preserveComposer?: boolean
   ) => {
     const attachedPaths =
       overrideImages !== undefined ? overrideImages : pendingAttachments.map((a) => a.path);
@@ -2775,11 +2994,14 @@ export function App() {
 
     const rawText = rawTyped || "Please inspect the attached image(s).";
     const text = rawText;
+    const skillPath = matchSkillInvocation(text, localSkills)?.path;
 
-    setPrompt("");
-    setSlashFilter(null);
-    if (overrideImages === undefined) {
-      setPendingAttachments([]);
+    if (!preserveComposer) {
+      setPrompt("");
+      setSlashFilter(null);
+      if (overrideImages === undefined) {
+        setPendingAttachments([]);
+      }
     }
 
     if (rawText.toLowerCase() === "/automations") {
@@ -2803,7 +3025,10 @@ export function App() {
     }
 
     // Server-side Queue Mode: enqueue follow-up prompt without disturbing the running turn UI
-    if (executionMode === "queue" && activeSession.status === "running") {
+    if (
+      executionMode === "queue" &&
+      (activeSession.status === "running" || activeSession.status === "waiting_approval")
+    ) {
       const optimisticQueueItem = {
         id: `q-local-${Date.now()}`,
         input: text,
@@ -2828,9 +3053,40 @@ export function App() {
             effort: activeSession.effort || "medium",
             images: attachedPaths,
             mode: "queue",
+            skill_path: skillPath ?? null,
           }),
         });
         if (qRes.ok) {
+          const queuedBody = (await qRes.json().catch(() => null)) as {
+            item?: { id?: string };
+          } | null;
+          const realId = queuedBody?.item?.id;
+          const intent = queuedIntentRef.current.get(optimisticQueueItem.id);
+          if (intent) {
+            queuedIntentRef.current.delete(optimisticQueueItem.id);
+            if (realId) {
+              await fetch(
+                `${daemonUrl}/api/sessions/${activeSession.id}/queue/${encodeURIComponent(realId)}`,
+                { method: "DELETE" }
+              ).catch(() => {});
+            }
+            refreshSessions();
+            return;
+          }
+          if (realId) {
+            setSessions((prev) =>
+              prev.map((s) =>
+                s.id === activeSession.id
+                  ? {
+                      ...s,
+                      queued_prompts: (s.queued_prompts || []).map((q) =>
+                        q.id === optimisticQueueItem.id ? { ...q, id: realId } : q
+                      ),
+                    }
+                  : s
+              )
+            );
+          }
           refreshSessions();
           return;
         }
@@ -2845,6 +3101,7 @@ export function App() {
         effort: activeSession.effort || "medium",
         images: attachedPaths,
         mode: "queue",
+        skill_path: skillPath,
       });
       return;
     }
@@ -3108,6 +3365,7 @@ export function App() {
           reset_thread: truncateToUserTurn !== undefined,
           images: attachedPaths,
           mode: executionMode ?? null,
+          skill_path: skillPath ?? null,
         }),
       });
 
@@ -3226,6 +3484,7 @@ export function App() {
           model: activeSession.model,
           effort: activeSession.effort || "medium",
           approval_mode: activeSession.approval_mode,
+          skill_path: skillPath,
         })
       ) {
         return;
@@ -3253,6 +3512,46 @@ export function App() {
     setTimeout(() => {
       streamEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, 50);
+  };
+
+  const handleRunQueuedNow = async (queueId: string) => {
+    const sid = activeSession.id;
+    const item = (activeSession.queued_prompts || []).find((q) => q.id === queueId);
+    if (!item || !sid) return;
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === sid
+          ? { ...s, queued_prompts: (s.queued_prompts || []).filter((q) => q.id !== queueId) }
+          : s
+      )
+    );
+    if (queueId.startsWith("q-local-")) {
+      queuedIntentRef.current.set(queueId, "run");
+      await handleSendPrompt(item.input, undefined, undefined, item.images || [], "steer", true);
+      return;
+    }
+    try {
+      const res = await fetch(
+        `${daemonUrl}/api/sessions/${sid}/queue/${encodeURIComponent(queueId)}/run`,
+        { method: "POST" }
+      );
+      if (res.ok) {
+        refreshSessions();
+        syncSessionEventsFromDaemon(sid);
+        return;
+      }
+    } catch {
+      sendE2eeCommand({
+        cmd: "run_queued_prompt",
+        session_id: sid,
+        queue_id: queueId,
+      });
+      return;
+    }
+    await fetch(`${daemonUrl}/api/sessions/${sid}/queue/${encodeURIComponent(queueId)}`, {
+      method: "DELETE",
+    }).catch(() => {});
+    await handleSendPrompt(item.input, undefined, undefined, item.images || [], "steer", true);
   };
 
   // Stop currently running agent turn via POST /api/sessions/{id}/stop (or E2EE Relay)
@@ -3416,22 +3715,53 @@ export function App() {
   };
 
   // Fork current conversation at any turn (`POST /api/sessions/{id}/fork`)
-  const handleForkSession = async (upToUserTurn?: number) => {
+  const handleForkSession = async (
+    upToUserTurn?: number,
+    upToUserText?: string,
+    userTurnsFromEnd?: number
+  ) => {
     const sid = activeSession.id;
     if (!sid || sid === "draft-empty") return;
+    const ensureRepoRegistered = (forked: VeloSession) => {
+      const cp = canonicalRepoPath(forked.project_path);
+      if (!cp) return;
+      forked.project_path = cp;
+      forked.repo_id = repoIdFromPath(cp);
+      setRepos((prevRepos) => {
+        if (prevRepos.some((r) => canonicalRepoPath(r.path) === cp)) return prevRepos;
+        const folder = cp.split("/").filter(Boolean).pop() || "workspace";
+        return [
+          ...prevRepos,
+          {
+            id: repoIdFromPath(cp),
+            code: folder.slice(0, 2).toUpperCase(),
+            name: folder,
+            path: cp,
+            default_branch: forked.branch_name || "main",
+          },
+        ];
+      });
+    };
     try {
       const res = await fetch(`${daemonUrl}/api/sessions/${sid}/fork`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ up_to_user_turn: upToUserTurn }),
+        body: JSON.stringify({
+          up_to_user_turn: upToUserTurn,
+          up_to_user_text: upToUserText,
+          user_turns_from_end: userTurnsFromEnd,
+        }),
       });
       if (res.ok) {
         const d = (await res.json()) as { ok?: boolean; session?: Record<string, unknown> };
         if (d.ok && d.session) {
           const forked = normalizeToVeloSession(d.session, 0);
+          ensureRepoRegistered(forked);
           setSessions((prev) => [forked, ...prev.filter((s) => s.id !== forked.id)]);
           setActiveId(forked.id);
           syncSessionEventsFromDaemon(forked.id);
+          refreshSessions();
+          setTimeout(() => composerTextareaRef.current?.focus(), 60);
           return;
         }
       }
@@ -3439,12 +3769,16 @@ export function App() {
         cmd: "fork_session",
         session_id: sid,
         up_to_user_turn: upToUserTurn,
+        up_to_user_text: upToUserText,
+        user_turns_from_end: userTurnsFromEnd,
       });
     } catch {
       sendE2eeCommand({
         cmd: "fork_session",
         session_id: sid,
         up_to_user_turn: upToUserTurn,
+        up_to_user_text: upToUserText,
+        user_turns_from_end: userTurnsFromEnd,
       });
     }
   };
@@ -3470,8 +3804,20 @@ export function App() {
   );
 
   // Delete / archive a thread from sidebar, daemon state, events history & isolated Git worktree
-  const handleDeleteSession = async (sessionId: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleDeleteSession = async (sessionId: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setDraftsBySession((prev) => {
+      if (!(sessionId in prev)) return prev;
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
+    setAttachmentsBySession((prev) => {
+      if (!(sessionId in prev)) return prev;
+      const next = { ...prev };
+      delete next[sessionId];
+      return next;
+    });
     setSessions((prev) => {
       const remaining = prev.filter((s) => s.id !== sessionId);
       if (remaining.length === 0) {
@@ -3905,6 +4251,8 @@ export function App() {
       webkit?: { messageHandlers?: { veloVoice?: { postMessage: (msg: string) => void } } };
     };
 
+    const voiceOriginSid = activeSessionIdRef.current;
+
     if (nw.__VELO_NATIVE_VOICE__ && nw.webkit?.messageHandlers?.veloVoice) {
       nw.__veloOnNativeVoiceLevels = (levels: number[]) => {
         if (Array.isArray(levels) && levels.length > 0) {
@@ -3917,8 +4265,10 @@ export function App() {
         setVoiceLevels(Array(24).fill(0.16));
         const clean = (text || "").trim();
         if (clean && !discardRecordingRef.current) {
-          setPrompt((prev) => (prev ? `${prev} ${clean}` : clean));
-          setTimeout(() => composerTextareaRef.current?.focus(), 20);
+          setPrompt((prev) => (prev ? `${prev} ${clean}` : clean), voiceOriginSid);
+          if (activeSessionIdRef.current === voiceOriginSid) {
+            setTimeout(() => composerTextareaRef.current?.focus(), 20);
+          }
         }
       };
       nw.__veloOnNativeVoiceFallback = () => {
@@ -3975,7 +4325,10 @@ export function App() {
             }
           }
           if (finalChunk.trim()) {
-            setPrompt((prev) => (prev ? `${prev} ${finalChunk.trim()}` : finalChunk.trim()));
+            setPrompt(
+              (prev) => (prev ? `${prev} ${finalChunk.trim()}` : finalChunk.trim()),
+              voiceOriginSid
+            );
           }
         };
         rec.onerror = () => {
@@ -4030,8 +4383,13 @@ export function App() {
             if (res.ok) {
               const d = (await res.json()) as { ok?: boolean; text?: string };
               if (d.ok && d.text?.trim()) {
-                setPrompt((prev) => (prev ? `${prev} ${d.text!.trim()}` : d.text!.trim()));
-                setTimeout(() => composerTextareaRef.current?.focus(), 20);
+                setPrompt(
+                  (prev) => (prev ? `${prev} ${d.text!.trim()}` : d.text!.trim()),
+                  voiceOriginSid
+                );
+                if (activeSessionIdRef.current === voiceOriginSid) {
+                  setTimeout(() => composerTextareaRef.current?.focus(), 20);
+                }
               }
             }
           } finally {
@@ -4333,6 +4691,20 @@ export function App() {
         };
         setSessions((prev) => [materialized, ...prev]);
         setEventsBySession((prev) => ({ ...prev, [newId]: [] }));
+        setDraftsBySession((prev) => {
+          const carried = prev["draft-empty"];
+          if (!carried) return prev;
+          const next = { ...prev, [newId]: carried };
+          delete next["draft-empty"];
+          return next;
+        });
+        setAttachmentsBySession((prev) => {
+          const carried = prev["draft-empty"];
+          if (!carried || carried.length === 0) return prev;
+          const next = { ...prev, [newId]: carried };
+          delete next["draft-empty"];
+          return next;
+        });
         setActiveId(newId);
         return;
       }
@@ -4382,7 +4754,9 @@ export function App() {
           if (res.ok) {
             const rawNew = await res.json();
             const created = normalizeToVeloSession(rawNew, 0);
-            created.repo_id = activeSession.repo_id;
+            const cp = canonicalRepoPath(created.project_path || activeSession.project_path);
+            created.project_path = cp;
+            created.repo_id = repoIdFromPath(cp);
             created.agent_kind = m.agentKind;
             created.model = m.id;
             created.model_short = m.shortLabel;
@@ -4392,6 +4766,8 @@ export function App() {
               ...prev.filter((s) => s.id !== created.id),
             ]);
             setActiveId(created.id);
+            syncSessionEventsFromDaemon(created.id);
+            refreshSessions();
             setTimeout(() => composerTextareaRef.current?.focus(), 30);
             return;
           }
@@ -4426,6 +4802,20 @@ export function App() {
         };
         setSessions((prev) => [materialized, ...prev]);
         setEventsBySession((prev) => ({ ...prev, [newId]: [] }));
+        setDraftsBySession((prev) => {
+          const carried = prev["draft-empty"];
+          if (!carried) return prev;
+          const next = { ...prev, [newId]: carried };
+          delete next["draft-empty"];
+          return next;
+        });
+        setAttachmentsBySession((prev) => {
+          const carried = prev["draft-empty"];
+          if (!carried || carried.length === 0) return prev;
+          const next = { ...prev, [newId]: carried };
+          delete next["draft-empty"];
+          return next;
+        });
         setActiveId(newId);
         setTimeout(() => composerTextareaRef.current?.focus(), 20);
         return;
@@ -4835,11 +5225,13 @@ export function App() {
             )}
             {repos.map((repo) => {
               const canonRepoPath = canonicalRepoPath(repo.path);
-              const repoItems = sessions.filter(
-                (s) =>
-                  !s.archived &&
-                  (canonicalRepoPath(s.project_path) === canonRepoPath || s.repo_id === repo.id)
-              );
+              const repoItems = sessions.filter((s) => {
+                if (s.archived) return false;
+                if (s.project_path && s.project_path.trim()) {
+                  return canonicalRepoPath(s.project_path) === canonRepoPath;
+                }
+                return s.repo_id === repo.id;
+              });
               const isCollapsed = !!collapsedRepos[repo.id];
 
               return (
@@ -5008,18 +5400,36 @@ export function App() {
                                   >
                                     <Archive className="h-2.5 w-2.5" />
                                   </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setSessionPendingDelete({ id: w.id, title: w.title });
+                                    }}
+                                    title="删除会话"
+                                    className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171] group-hover:flex"
+                                  >
+                                    <Trash2 className="h-2.5 w-2.5" />
+                                  </button>
                                 </div>
                               </div>
 
-                              {/* Subtle Meta Line: Branch + Diff Stats */}
+                              {/* Subtle Meta Line: Branch + Draft Badge + Diff Stats */}
                               <div className="mt-0.5 flex items-center justify-between gap-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
                                 <span className="truncate">{w.branch_name}</span>
-                                {(w.insertions > 0 || w.deletions > 0) && (
-                                  <span className="flex shrink-0 items-center gap-1 text-[10.5px]">
-                                    <span className="text-[#34d399]/80">+{w.insertions}</span>
-                                    <span className="text-[#f87171]/80">−{w.deletions}</span>
-                                  </span>
-                                )}
+                                <span className="flex shrink-0 items-center gap-1.5 text-[10.5px]">
+                                  {!isSelected && Boolean(draftsBySession[w.id]?.trim()) && (
+                                    <span className="rounded bg-[#f59e0b]/15 px-1 py-0.2 font-sans text-[9.5px] font-medium text-[#fbbf24]">
+                                      草稿
+                                    </span>
+                                  )}
+                                  {(w.insertions > 0 || w.deletions > 0) && (
+                                    <span className="flex items-center gap-1">
+                                      <span className="text-[#34d399]/80">+{w.insertions}</span>
+                                      <span className="text-[#f87171]/80">−{w.deletions}</span>
+                                    </span>
+                                  )}
+                                </span>
                               </div>
                             </div>
                           </div>
@@ -5076,7 +5486,10 @@ export function App() {
                             </button>
                             <button
                               type="button"
-                              onClick={(e) => handleDeleteSession(arch.id, e)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSessionPendingDelete({ id: arch.id, title: arch.title });
+                              }}
                               title="永久清理会话与 Worktree"
                               className="rounded p-0.5 text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171]"
                             >
@@ -5194,26 +5607,46 @@ export function App() {
           2. MAIN WORKSPACE AREA (Clean Header + Natural Conversation + Docked Composer)
          ===================================================================== */}
       <div className="flex flex-1 flex-col overflow-hidden bg-[var(--v-bg-canvas)]">
-        {/* Clean Minimal Workspace Header (42px) */}
+        {/* Clean Minimal Workspace Header (42px, container-query responsive so narrow windows never squish or wrap) */}
         <header
           data-tauri-drag-region
-          className={`flex h-[42px] shrink-0 items-center justify-between border-b border-[var(--v-border-subtle)] pr-4 ${
-            isMacDesktop && !sidebarOpen ? "pl-[78px]" : "pl-4"
+          className={`@container flex h-[42px] shrink-0 items-center justify-between gap-2 border-b border-[var(--v-border-subtle)] pr-3 ${
+            isMacDesktop && !sidebarOpen ? "pl-[78px]" : "pl-3.5"
           }`}
         >
-          <div className="flex items-center gap-2.5 min-w-0">
+          <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
             {!sidebarOpen && (
               <button
                 onClick={() => setSidebarOpen(true)}
                 title="Show sidebar (⌘B)"
-                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
               >
                 <PanelLeft className="h-4 w-4" />
               </button>
             )}
-            <span className="truncate text-[13px] font-medium text-[var(--v-fg-primary)]">
+            <span
+              title={activeSession.title}
+              className="min-w-0 truncate text-[13px] font-medium text-[var(--v-fg-primary)]"
+            >
               {activeSession.title}
             </span>
+            {(() => {
+              const parentSess = activeSession.parent_session_id
+                ? sessions.find((s) => s.id === activeSession.parent_session_id)
+                : undefined;
+              if (!parentSess) return null;
+              return (
+                <button
+                  type="button"
+                  onClick={() => setActiveId(parentSess.id)}
+                  title={`点击返回源会话：${parentSess.title}`}
+                  className="hidden @[640px]:inline-flex max-w-[140px] shrink-0 items-center gap-1 overflow-hidden whitespace-nowrap rounded-md bg-[#a78bfa]/12 px-1.5 py-0.5 text-[10.5px] font-medium text-[#a78bfa] transition-colors hover:bg-[#a78bfa]/22 cursor-pointer"
+                >
+                  <GitFork className="h-2.5 w-2.5 shrink-0" />
+                  <span className="min-w-0 truncate">{parentSess.title}</span>
+                </button>
+              );
+            })()}
             <button
               type="button"
               onClick={() =>
@@ -5228,13 +5661,13 @@ export function App() {
                 })
               }
               title={`当前归属路径: ${activeSession.worktree_path}（点击可修改归属目录）`}
-              className="hidden sm:inline-flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              className="hidden @[740px]:inline-flex max-w-[190px] shrink-0 items-center gap-1 overflow-hidden whitespace-nowrap rounded-md bg-[var(--v-bg-hover)] px-2 py-0.5 font-mono text-[11px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
-              <Folder className="h-3 w-3 text-[var(--v-fg-muted)]" />
-              <span>{activeRepo.name}</span>
-              <span className="text-[var(--v-fg-faint)]">/</span>
-              <GitBranch className="h-3 w-3 text-[var(--v-fg-muted)]" />
-              <span>{activeSession.branch_name}</span>
+              <Folder className="h-3 w-3 shrink-0 text-[var(--v-fg-muted)]" />
+              <span className="min-w-0 truncate">{activeRepo.name}</span>
+              <span className="shrink-0 text-[var(--v-fg-faint)]">/</span>
+              <GitBranch className="h-3 w-3 shrink-0 text-[var(--v-fg-muted)]" />
+              <span className="min-w-0 truncate">{activeSession.branch_name}</span>
             </button>
             {(() => {
               const isRunning =
@@ -5250,7 +5683,7 @@ export function App() {
               return (
                 <span
                   title="模型输出生成速率 (Tokens / Sec)"
-                  className="inline-flex items-center gap-1 rounded-md bg-[#8b5cf6]/12 px-2 py-0.5 font-mono text-[11px] font-medium text-[#a78bfa] tabular-nums"
+                  className="hidden @[560px]:inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-[#8b5cf6]/12 px-2 py-0.5 font-mono text-[11px] font-medium text-[#a78bfa] tabular-nums"
                 >
                   <span>⚡ {displayTps.toFixed(1)} tok/s</span>
                 </span>
@@ -5258,8 +5691,8 @@ export function App() {
             })()}
           </div>
 
-          {/* Right Header Controls: Auto-Collapse Toggle, E2EE Badge, Open in IDE, Diff, PR, Preview & xterm Terminal */}
-          <div className="relative flex items-center gap-1.5">
+          {/* Right Header Controls: non-wrapping shrink-0 strip + container-responsive `···` overflow menu */}
+          <div className="relative flex shrink-0 items-center gap-1 whitespace-nowrap">
             <button
               type="button"
               onClick={() => {
@@ -5267,10 +5700,10 @@ export function App() {
                 setAnalyticsModalOpen(true);
               }}
               title="跨工作区全文搜索历史会话 · 用量账单 · 远程锁屏盲推送"
-              className="flex h-7 items-center gap-1 rounded-md px-2 text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              className="hidden @[580px]:inline-flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2 text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
-              <CircleGauge className="h-3.5 w-3.5" />
-              <span className="hidden md:inline">账单/搜索</span>
+              <CircleGauge className="h-3.5 w-3.5 shrink-0" />
+              <span className="hidden @[1040px]:inline">账单/搜索</span>
             </button>
 
             <button
@@ -5281,65 +5714,77 @@ export function App() {
                   ? "当前：连续思考与 MCP/工具执行默认折叠收起（点击切换为默认展开）"
                   : "当前：执行过程默认展开（点击切换为默认折叠收起）"
               }
-              className={`hidden sm:inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] transition-colors cursor-pointer ${
+              className={`hidden @[780px]:inline-flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2 text-[11px] transition-colors cursor-pointer ${
                 autoCollapseSteps
                   ? "bg-[var(--v-bg-hover)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
                   : "bg-[#8b5cf6]/15 text-[#a78bfa] hover:bg-[#8b5cf6]/25"
               }`}
             >
-              <Layers className="h-3 w-3" />
-              <span>{autoCollapseSteps ? "过程默认收起" : "过程默认展开"}</span>
+              <Layers className="h-3 w-3 shrink-0" />
+              <span className="hidden @[1120px]:inline">
+                {autoCollapseSteps ? "过程默认收起" : "过程默认展开"}
+              </span>
             </button>
 
             {e2eeConnected && (
               <span
                 title="End-to-End Encrypted Relay Active (X25519 + ChaCha20-Poly1305)"
-                className="inline-flex items-center gap-1 rounded-md bg-[#34d399]/15 px-2 py-1 font-mono text-[10.5px] font-medium text-[#34d399]"
+                className="hidden @[640px]:inline-flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-[#34d399]/15 px-2 font-mono text-[10.5px] font-medium text-[#34d399]"
               >
-                <Lock className="h-3 w-3" />
-                <span className="hidden sm:inline">E2EE ChaCha20</span>
+                <Lock className="h-3 w-3 shrink-0" />
+                <span className="hidden @[1180px]:inline">E2EE</span>
               </span>
             )}
 
             {mobileMode && !e2eeRelayConfig && (
               <button
                 onClick={() => setMobileMode(false)}
-                className="rounded-md bg-[#34d399]/15 px-2 py-1 font-mono text-[11px] font-medium text-[#34d399]"
+                className="shrink-0 whitespace-nowrap rounded-md bg-[#34d399]/15 px-2 py-1 font-mono text-[11px] font-medium text-[#34d399]"
               >
-                Mobile Preview · Exit
+                Exit Preview
               </button>
             )}
 
-            <div className="relative hidden sm:block">
+            <div className="relative hidden @[840px]:block shrink-0">
               <button
-                onClick={() => setOpenInMenuOpen((o) => !o)}
+                onClick={() => {
+                  setHeaderMoreMenuOpen(false);
+                  setOpenInMenuOpen((o) => !o);
+                }}
                 title="Open isolated worktree in external IDE or Finder"
-                className="flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)]"
+                className="flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-[var(--v-bg-hover)] px-2 text-[11.5px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
               >
                 <span>Open in</span>
-                <ChevronDown className="h-3 w-3 text-[var(--v-fg-muted)]" />
+                <ChevronDown className="h-3 w-3 shrink-0 text-[var(--v-fg-muted)]" />
               </button>
 
               {openInMenuOpen && (
-                <div className="absolute right-0 top-8 z-40 w-[168px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1 shadow-2xl">
-                  {(
-                    [
-                      { id: "cursor", label: "Cursor" },
-                      { id: "vscode", label: "VS Code" },
-                      { id: "zed", label: "Zed" },
-                      { id: "finder", label: "Reveal in Finder" },
-                      { id: "terminal", label: "macOS Terminal" },
-                    ] as const
-                  ).map((item) => (
-                    <button
-                      key={item.id}
-                      onClick={() => handleOpenInEditor(item.id)}
-                      className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
-                    >
-                      <span>{item.label}</span>
-                    </button>
-                  ))}
-                </div>
+                <>
+                  <div
+                    className="fixed inset-0 z-30"
+                    onClick={() => setOpenInMenuOpen(false)}
+                    aria-hidden="true"
+                  />
+                  <div className="absolute right-0 top-8 z-40 w-[168px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1 shadow-2xl">
+                    {(
+                      [
+                        { id: "cursor", label: "Cursor" },
+                        { id: "vscode", label: "VS Code" },
+                        { id: "zed", label: "Zed" },
+                        { id: "finder", label: "Reveal in Finder" },
+                        { id: "terminal", label: "macOS Terminal" },
+                      ] as const
+                    ).map((item) => (
+                      <button
+                        key={item.id}
+                        onClick={() => handleOpenInEditor(item.id)}
+                        className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                      >
+                        <span>{item.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </>
               )}
             </div>
 
@@ -5352,7 +5797,7 @@ export function App() {
                 }
               }}
               title="Worktree Changes & Inline Code Review"
-              className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-mono text-[11.5px] transition-colors ${
+              className={`flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2 font-mono text-[11.5px] transition-colors cursor-pointer ${
                 drawerOpen && drawerTab === "diff"
                   ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                   : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -5371,7 +5816,7 @@ export function App() {
                 }
               }}
               title="GitHub Pull Request Lifecycle & CI Checks"
-              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+              className={`hidden @[720px]:flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors cursor-pointer ${
                 drawerOpen && drawerTab === "pr"
                   ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                   : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -5389,7 +5834,7 @@ export function App() {
                 }
               }}
               title="Live Browser Preview & Agent DOM Inspection"
-              className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+              className={`relative hidden @[720px]:flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors cursor-pointer ${
                 drawerOpen && drawerTab === "browser"
                   ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                   : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -5410,7 +5855,7 @@ export function App() {
                 }
               }}
               title="Toggle Full-Color xterm.js Terminal (⌘J)"
-              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+              className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors cursor-pointer ${
                 drawerOpen && drawerTab === "terminal"
                   ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                   : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -5423,7 +5868,7 @@ export function App() {
               type="button"
               onClick={() => setChatFindOpen((v) => !v)}
               title="在当前会话中搜索提问轮次 (⌘F)"
-              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors cursor-pointer ${
+              className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors cursor-pointer ${
                 chatFindOpen
                   ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                   : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -5440,7 +5885,7 @@ export function App() {
                     setExtCpModalOpen(true);
                   }}
                   title="每轮自动检查点 · 一键回滚代码 (Rewind)"
-                  className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                  className="hidden @[720px]:flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                 >
                   <History className="h-3.5 w-3.5" />
                 </button>
@@ -5448,7 +5893,7 @@ export function App() {
                   type="button"
                   onClick={() => void handleForkSession()}
                   title="从当前会话一键分叉探索新思路 (Fork)"
-                  className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                  className="hidden @[720px]:flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                 >
                   <GitFork className="h-3.5 w-3.5" />
                 </button>
@@ -5461,18 +5906,154 @@ export function App() {
                 setExtCpModalOpen(true);
               }}
               title="查看本机 MCP 服务器与 Skills"
-              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              className="hidden @[520px]:flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
               <Blocks className="h-3.5 w-3.5" />
             </button>
+
+            {/* Compact overflow menu on narrower headers (< 840px) so every tool stays 1-click reachable without wrapping */}
+            <div className="relative @[840px]:hidden shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenInMenuOpen(false);
+                  setHeaderMoreMenuOpen((o) => !o);
+                }}
+                title="更多工具"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              >
+                <MoreHorizontal className="h-4 w-4" />
+              </button>
+              {headerMoreMenuOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-30"
+                    onClick={() => setHeaderMoreMenuOpen(false)}
+                    aria-hidden="true"
+                  />
+                  <div className="absolute right-0 top-8 z-40 w-[200px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1 shadow-2xl">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMoreMenuOpen(false);
+                        setAnalyticsInitialTab("analytics");
+                        setAnalyticsModalOpen(true);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                    >
+                      <CircleGauge className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                      <span>账单与全局搜索</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMoreMenuOpen(false);
+                        setAutoCollapseSteps((v) => !v);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                    >
+                      <Layers className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                      <span>{autoCollapseSteps ? "切换为过程默认展开" : "切换为过程默认收起"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMoreMenuOpen(false);
+                        setExtCpInitialTab("extensions");
+                        setExtCpModalOpen(true);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                    >
+                      <Blocks className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                      <span>Skills &amp; MCP</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMoreMenuOpen(false);
+                        setDrawerTab("pr");
+                        setDrawerOpen(true);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                    >
+                      <GitPullRequest className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                      <span>Pull Requests</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMoreMenuOpen(false);
+                        setDrawerTab("browser");
+                        setDrawerOpen(true);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                    >
+                      <Globe className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                      <span>浏览器预览</span>
+                    </button>
+                    {activeEvents.length > 0 && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setHeaderMoreMenuOpen(false);
+                            setExtCpInitialTab("checkpoints");
+                            setExtCpModalOpen(true);
+                          }}
+                          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                        >
+                          <History className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                          <span>检查点回滚 (Rewind)</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setHeaderMoreMenuOpen(false);
+                            void handleForkSession();
+                          }}
+                          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                        >
+                          <GitFork className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                          <span>分叉会话 (Fork)</span>
+                        </button>
+                      </>
+                    )}
+                    <div className="my-1 border-t border-[var(--v-border-subtle)]" />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMoreMenuOpen(false);
+                        handleOpenInEditor("cursor");
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                    >
+                      <Folder className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                      <span>在 Cursor 中打开</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHeaderMoreMenuOpen(false);
+                        handleOpenInEditor("finder");
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
+                    >
+                      <Folder className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                      <span>在 Finder 中显示</span>
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+
             {!mobileMode && (
               <button
                 onClick={() => setActiveModal("qr")}
                 title="手机扫码连接 (Mobile Remote)"
-                className="flex h-7 items-center gap-1 rounded-md px-2 text-[11.5px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                className="flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2 text-[11.5px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
               >
-                <Smartphone className="h-3.5 w-3.5" />
-                <span className="hidden lg:inline">手机端</span>
+                <Smartphone className="h-3.5 w-3.5 shrink-0" />
+                <span className="hidden @[1000px]:inline">手机端</span>
               </button>
             )}
           </div>
@@ -5907,14 +6488,16 @@ export function App() {
                                   >
                                     <div
                                       onClick={() => {
+                                        const selected = window.getSelection()?.toString() ?? "";
+                                        if (selected.length > 0) return;
                                         if (!isSessionRunning) {
                                           handleStartEditMessage(ev);
                                         }
                                       }}
                                       title={!isSessionRunning ? "点击可编辑并重新发送" : undefined}
-                                      className={`min-w-0 max-w-[82%] overflow-hidden whitespace-pre-wrap break-words [overflow-wrap:anywhere] rounded-2xl rounded-tr-[4px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-[1.48] text-[var(--v-fg-primary)] transition-colors ${
+                                      className={`velo-selectable min-w-0 max-w-[82%] overflow-hidden whitespace-pre-wrap break-words rounded-2xl rounded-tr-[4px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-[1.48] text-[var(--v-fg-primary)] transition-colors ${
                                         !isSessionRunning
-                                          ? "cursor-pointer hover:brightness-105"
+                                          ? "hover:brightness-105"
                                           : ""
                                       }`}
                                     >
@@ -6037,6 +6620,9 @@ export function App() {
                                     <PaseoExecutionTraceGroup
                                       key={`trace-${ev.id}-${autoCollapseSteps ? "c" : "e"}`}
                                       steps={traceSteps}
+                                      isTurnRunning={Boolean(
+                                        isTurnRunning && endIdx === turn.items.length - 1
+                                      )}
                                       defaultExpanded={!autoCollapseSteps}
                                       onOpenDiffForFile={openDiffForFile}
                                     />
@@ -6075,6 +6661,7 @@ export function App() {
                                     input={toolInput}
                                     output={toolOutput}
                                     isError={ev.tool_is_error}
+                                    isActive={Boolean(isTurnRunning && isLastTurnItem)}
                                     onOpenDiffTab={() => openDiffForFile(ev.tool_args)}
                                   />
                                 );
@@ -6189,6 +6776,7 @@ export function App() {
                                     isStreaming={Boolean(
                                       ev.is_streaming_chunk && isTurnRunning && isLastTurnItem
                                     )}
+                                    resolveImageUrl={resolveAttachmentUrl}
                                   />
 
                                   {isLatestTurn &&
@@ -6302,7 +6890,21 @@ export function App() {
                               }
                               onFork={
                                 turn.userEv && !isSessionRunning
-                                  ? () => void handleForkSession(turnIdx + 1)
+                                  ? () => {
+                                      const userTurnsOnly = turns.filter((t) => t.userEv !== null);
+                                      const userOrdinal = turns
+                                        .slice(0, turnIdx + 1)
+                                        .filter((t) => t.userEv !== null).length;
+                                      const turnsFromEnd = Math.max(
+                                        0,
+                                        userTurnsOnly.length - userOrdinal
+                                      );
+                                      void handleForkSession(
+                                        Math.max(1, userOrdinal),
+                                        turn.userEv!.content,
+                                        turnsFromEnd
+                                      );
+                                    }
                                   : undefined
                               }
                             />
@@ -6464,27 +7066,59 @@ export function App() {
                           ? "bg-[#8b5cf6]/15 text-[#a78bfa]"
                           : "bg-sky-500/15 text-sky-400",
                       run: () => {
+                        const next = composerTextForSkill(prompt, sk.name);
                         setSlashFilter(null);
-                        setPrompt(buildCrossEngineSkillPrompt(sk));
-                        setTimeout(() => composerTextareaRef.current?.focus(), 20);
+                        setPrompt(next);
+                        setTimeout(() => {
+                          const el = composerTextareaRef.current;
+                          if (!el) return;
+                          el.focus();
+                          el.setSelectionRange(next.length, next.length);
+                        }, 20);
                       },
                     };
                   });
 
-                  const allItems = [...builtinItems, ...realSkillItems];
-                  const matched = allItems.filter(
-                    (item) =>
-                      !q ||
-                      item.cmd.toLowerCase().includes(q) ||
-                      item.desc.toLowerCase().includes(q) ||
-                      item.badge.toLowerCase().includes(q)
+                  const matches = (
+                    items: typeof builtinItems
+                  ) =>
+                    items.filter(
+                      (item) =>
+                        !q ||
+                        item.cmd.toLowerCase().includes(q) ||
+                        item.desc.toLowerCase().includes(q) ||
+                        item.badge.toLowerCase().includes(q)
+                    );
+                  const visibleSkills = matches(realSkillItems).slice(0, 8);
+                  const visibleCommands = matches(builtinItems).slice(0, 6);
+                  const hiddenSkills = Math.max(0, matches(realSkillItems).length - visibleSkills.length);
+
+                  const renderItem = (item: (typeof builtinItems)[number]) => (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={item.run}
+                      className="block w-full overflow-hidden rounded-lg px-3 py-2 text-left transition-colors hover:bg-[var(--v-bg-active)] cursor-pointer"
+                    >
+                      <div className="flex w-full min-w-0 items-center justify-between gap-2">
+                        <div className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12.5px] font-medium leading-snug text-[var(--v-fg-primary)]">
+                          {item.cmd}
+                        </div>
+                        <span
+                          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium leading-none ${item.badgeTone}`}
+                        >
+                          {item.badge}
+                        </span>
+                      </div>
+                      <div className="mt-1 w-full min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[11.5px] leading-snug text-[var(--v-fg-muted)]">
+                        {item.desc}
+                      </div>
+                    </button>
                   );
-                  const visible = matched.slice(0, 14);
-                  const hiddenCount = Math.max(0, matched.length - visible.length);
 
                   return (
-                    <div className="mb-2 max-h-[280px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
-                      {visible.length === 0 ? (
+                    <div className="mb-2 max-h-[320px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
+                      {visibleSkills.length === 0 && visibleCommands.length === 0 ? (
                         <div className="flex items-center justify-between px-3 py-2 text-[12px] text-[var(--v-fg-muted)]">
                           <span>没有匹配的指令或本地 Skill</span>
                           <button
@@ -6501,31 +7135,15 @@ export function App() {
                         </div>
                       ) : (
                         <>
-                          {visible.map((item) => (
-                            <button
-                              key={item.key}
-                              type="button"
-                              onClick={item.run}
-                              className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-1.5 text-left text-[12.5px] hover:bg-[var(--v-bg-active)] cursor-pointer"
-                            >
-                              <div className="flex min-w-0 items-center gap-2">
-                                <span className="shrink-0 font-mono font-medium text-[var(--v-fg-primary)]">
-                                  {item.cmd}
-                                </span>
-                                <span
-                                  className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${item.badgeTone}`}
-                                >
-                                  {item.badge}
-                                </span>
-                              </div>
-                              <span className="min-w-0 truncate text-[12px] text-[var(--v-fg-muted)]">
-                                {item.desc}
-                              </span>
-                            </button>
-                          ))}
-                          {hiddenCount > 0 && (
-                            <div className="flex items-center justify-between border-t border-[var(--v-border-subtle)] px-3 pt-1.5 pb-0.5 text-[11px] text-[var(--v-fg-faint)]">
-                              <span>还有 {hiddenCount} 个本地 Skill，继续输入关键词筛选</span>
+                          {visibleSkills.length > 0 && (
+                            <div className="px-2 pb-1 pt-1 text-[10.5px] font-medium tracking-wide text-[var(--v-fg-faint)]">
+                              Skills
+                            </div>
+                          )}
+                          {visibleSkills.map(renderItem)}
+                          {hiddenSkills > 0 && (
+                            <div className="flex items-center justify-between px-3 pb-1 text-[11px] text-[var(--v-fg-faint)]">
+                              <span>还有 {hiddenSkills} 个 Skill，继续输入筛选</span>
                               <button
                                 type="button"
                                 onClick={() => {
@@ -6535,10 +7153,22 @@ export function App() {
                                 }}
                                 className="text-[#a78bfa] hover:underline cursor-pointer"
                               >
-                                查看全部 →
+                                查看全部
                               </button>
                             </div>
                           )}
+                          {visibleCommands.length > 0 && (
+                            <div
+                              className={`px-2 pb-1 pt-1.5 text-[10.5px] font-medium tracking-wide text-[var(--v-fg-faint)] ${
+                                visibleSkills.length > 0
+                                  ? "mt-1 border-t border-[var(--v-border-subtle)]"
+                                  : ""
+                              }`}
+                            >
+                              内置命令
+                            </div>
+                          )}
+                          {visibleCommands.map(renderItem)}
                         </>
                       )}
                     </div>
@@ -6617,6 +7247,7 @@ export function App() {
                   <QueuedPromptsBar
                     items={activeSession.queued_prompts || []}
                     onRemove={(qid) => void handleRemoveQueuedPrompt(qid)}
+                    onRunNow={(qid) => void handleRunQueuedNow(qid)}
                   />
 
                   {isDictating ? (
@@ -6678,7 +7309,10 @@ export function App() {
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && !e.shiftKey) {
                           e.preventDefault();
-                          if (activeSession.status === "running") {
+                          if (
+                            activeSession.status === "running" ||
+                            activeSession.status === "waiting_approval"
+                          ) {
                             void handleSendPrompt(
                               undefined,
                               undefined,
@@ -6691,10 +7325,15 @@ export function App() {
                           }
                         }
                       }}
-                      placeholder={`Ask ${
-                        modelCatalog.find((m) => m.id === activeSession.model)?.label ||
-                        activeSession.model_short
-                      } anything... (/ for commands, ⌘V paste screenshot, or click mic to dictate)`}
+                      placeholder={
+                        activeSession.status === "running" ||
+                        activeSession.status === "waiting_approval"
+                          ? "正在执行中… 输入新指令按 Enter 排队，按 ⌘Enter 直接插队执行"
+                          : `Ask ${
+                              modelCatalog.find((m) => m.id === activeSession.model)?.label ||
+                              activeSession.model_short
+                            } anything... (/ for commands, ⌘V paste screenshot, or click mic to dictate)`
+                      }
                       className="w-full resize-none bg-transparent text-[13.5px] max-md:text-[16px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                     />
                   )}
@@ -6889,7 +7528,8 @@ export function App() {
                         maxTokens={activeSession.tokens_limit || 200000}
                         costUsd={activeSession.cost_usd || 0}
                       />
-                      {activeSession.status === "running" ? (
+                      {activeSession.status === "running" ||
+                      activeSession.status === "waiting_approval" ? (
                         <div className="flex items-center gap-1.5">
                           {(prompt.trim().length > 0 || pendingAttachments.length > 0) && (
                             <>
@@ -6904,7 +7544,7 @@ export function App() {
                                     "queue"
                                   )
                                 }
-                                title="加入队列：当前轮完成后立即自动执行 (Enter)"
+                                title="加入队列：当前轮完成后自动执行 (Enter)"
                                 className="flex h-7 items-center gap-1 rounded-full bg-[#a78bfa]/18 px-2.5 text-[11.5px] font-medium text-[#a78bfa] transition-colors hover:bg-[#a78bfa]/28 cursor-pointer"
                               >
                                 <span>排队</span>
@@ -6920,10 +7560,10 @@ export function App() {
                                     "steer"
                                   )
                                 }
-                                title="打断并纠偏：立即中断当前执行并带上此条指令重跑 (⌘Enter)"
-                                className="flex h-7 items-center gap-1 rounded-full bg-[#fbbf24]/18 px-2.5 text-[11.5px] font-medium text-[#fbbf24] transition-colors hover:bg-[#fbbf24]/28 cursor-pointer"
+                                title="插队执行：立即打断当前执行并马上跑这条指令 (⌘Enter)"
+                                className="flex h-7 items-center gap-1 rounded-full bg-[#fbbf24]/20 px-2.5 text-[11.5px] font-semibold text-[#fbbf24] transition-colors hover:bg-[#fbbf24]/30 cursor-pointer"
                               >
-                                <span>纠偏</span>
+                                <span>插队执行</span>
                               </button>
                             </>
                           )}
@@ -8374,9 +9014,17 @@ export function App() {
         sessionId={activeSession?.id ?? null}
         sessionTitle={activeSession?.title ?? "当前会话"}
         workspacePath={activeSession?.project_path || activeRepo?.path}
-        onUseSkillPrompt={(txt) => {
-          setPrompt(txt);
-          setTimeout(() => composerTextareaRef.current?.focus(), 60);
+        onUseSkill={(sk) => {
+          setPrompt((cur) => {
+            const next = composerTextForSkill(cur, sk.name);
+            setTimeout(() => {
+              const el = composerTextareaRef.current;
+              if (!el) return;
+              el.focus();
+              el.setSelectionRange(next.length, next.length);
+            }, 60);
+            return next;
+          });
         }}
         onRunSlashCommand={(cmd) => {
           void handleSendPrompt(cmd);
@@ -8391,6 +9039,58 @@ export function App() {
         }}
         onClose={() => setExtCpModalOpen(false)}
       />
+
+      {sessionPendingDelete && (
+        <div
+          onClick={() => setSessionPendingDelete(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs"
+        >
+          <div
+            role="alertdialog"
+            aria-labelledby="delete-session-title"
+            aria-describedby="delete-session-body"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[420px] rounded-2xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-5 shadow-2xl"
+          >
+            <div className="mb-2 flex items-center gap-2">
+              <Trash2 className="h-4 w-4 text-[#f87171]" />
+              <span
+                id="delete-session-title"
+                className="text-[14px] font-semibold text-[var(--v-fg-primary)]"
+              >
+                删除会话？
+              </span>
+            </div>
+            <p
+              id="delete-session-body"
+              className="text-[13px] leading-relaxed text-[var(--v-fg-secondary)]"
+            >
+              将永久删除「{sessionPendingDelete.title}」，对话记录和对应的 Git worktree
+              会一起清掉。此操作无法撤销。
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setSessionPendingDelete(null)}
+                className="rounded-lg px-3 py-1.5 text-[12.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const targetId = sessionPendingDelete.id;
+                  setSessionPendingDelete(null);
+                  void handleDeleteSession(targetId);
+                }}
+                className="rounded-lg bg-[#f87171] px-3 py-1.5 text-[12.5px] font-medium text-black hover:opacity-90 cursor-pointer"
+              >
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Relocate Folder / Rebind Session Workspace Path Modal */}
       {relocateTarget && (

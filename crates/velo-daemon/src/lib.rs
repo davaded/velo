@@ -564,6 +564,13 @@ pub struct LiveTurnMetrics {
     pub last_live_emit_at: Option<std::time::Instant>,
     pub last_computed_tps: f64,
     pub provider_emitted_usage: bool,
+    /// Assistant prose for the current segment. Step-window resets clear the TPS
+    /// buffer, but this text has to survive so a reload can still show it.
+    pub segment_text: String,
+    /// True while `segment_text` is growing the latest persisted message.
+    pub continuing_last_message: bool,
+    /// `(sqlite seq, text)` for assistant messages already written this turn.
+    pub persisted_messages: Vec<(i64, String)>,
 }
 
 impl LiveTurnMetrics {
@@ -595,6 +602,9 @@ impl LiveTurnMetrics {
             last_live_emit_at: None,
             last_computed_tps: 0.0,
             provider_emitted_usage: false,
+            segment_text: String::new(),
+            continuing_last_message: false,
+            persisted_messages: Vec::new(),
         }
     }
 
@@ -617,6 +627,387 @@ impl LiveTurnMetrics {
     }
 }
 
+fn streamed_message_covers(snapshot: &str, incoming: &str) -> bool {
+    let previous = snapshot.trim();
+    let next = incoming.trim();
+    !previous.is_empty() && !next.is_empty() && (previous == next || next.starts_with(previous))
+}
+
+/// A later reply that repeats an earlier sentence is the same projection.
+/// Prefix growth still updates in place. A summary that quotes a long earlier
+/// sentence is relocated to the end so the process does not keep a second copy.
+fn reply_projection(existing: &str, incoming: &str) -> &'static str {
+    let previous = existing.trim();
+    let next = incoming.trim();
+    if previous.is_empty() || next.is_empty() {
+        return "distinct";
+    }
+    if previous == next {
+        return "covered";
+    }
+    let prev_chars = previous.chars().count();
+    let next_chars = next.chars().count();
+    if next.starts_with(previous) && prev_chars >= 24 {
+        return "extend";
+    }
+    if previous.starts_with(next) && next_chars >= 24 {
+        return "covered";
+    }
+    if prev_chars >= 40 && next.contains(previous) {
+        return "relocate";
+    }
+    if next_chars >= 40 && previous.contains(next) {
+        return "covered";
+    }
+    "distinct"
+}
+
+fn replace_or_push_message_delta(
+    hist: &mut Vec<AgentEvent>,
+    previous: &str,
+    replacement: AgentEvent,
+) {
+    if !previous.is_empty() {
+        if let Some(pos) = hist.iter().rposition(|ev| match ev {
+            AgentEvent::MessageDelta { text, .. } => text == previous,
+            _ => false,
+        }) {
+            hist[pos] = replacement;
+            return;
+        }
+    }
+    if let AgentEvent::MessageDelta { text, .. } = &replacement {
+        if hist.iter().rev().any(|ev| match ev {
+            AgentEvent::MessageDelta { text: existing, .. } => existing == text,
+            _ => false,
+        }) {
+            return;
+        }
+    }
+    hist.push(replacement);
+}
+
+enum SegmentCommit {
+    MarkContinuing,
+    Write {
+        seq: Option<i64>,
+        previous: String,
+        event: AgentEvent,
+        index: Option<usize>,
+    },
+}
+
+struct CommitOutcome {
+    index: Option<usize>,
+    seq: i64,
+    text: String,
+}
+
+struct DeferredHistoryEdit {
+    previous: String,
+    event: AgentEvent,
+    remove_only: bool,
+}
+
+enum AbsorbPlan {
+    Ignore,
+    Replace {
+        seq: i64,
+        previous: String,
+        index: usize,
+        clear_live_segment: bool,
+        event: AgentEvent,
+    },
+    /// The saved reply already contains this text. Do not append another copy.
+    Drop,
+    /// The final summary repeats an earlier sentence. Drop that earlier row and
+    /// append the summary once, after the steps.
+    Relocate {
+        seq: i64,
+        previous: String,
+        index: usize,
+    },
+    QueueFresh { leftover: Option<SegmentCommit> },
+}
+
+fn plan_segment_commit(
+    metrics: &LiveTurnMetrics,
+    session_id: Uuid,
+    force: bool,
+) -> Option<SegmentCommit> {
+    let text = metrics.segment_text.clone();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let extends_last = metrics.continuing_last_message
+        && metrics
+            .persisted_messages
+            .last()
+            .map(|(_, prev)| streamed_message_covers(prev, text.trim()))
+            .unwrap_or(false);
+    if !force {
+        let prev_len = if extends_last {
+            metrics
+                .persisted_messages
+                .last()
+                .map(|(_, prev)| prev.trim().len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if text.trim().len().saturating_sub(prev_len) < 48 {
+            return None;
+        }
+    }
+    if extends_last {
+        let (seq, previous) = metrics.persisted_messages.last().cloned()?;
+        if previous.trim() == text.trim() {
+            return None;
+        }
+        let index = metrics.persisted_messages.len() - 1;
+        return Some(SegmentCommit::Write {
+            seq: Some(seq),
+            previous,
+            event: AgentEvent::MessageDelta {
+                session_id,
+                text,
+                timestamp: Utc::now(),
+            },
+            index: Some(index),
+        });
+    }
+    if metrics
+        .persisted_messages
+        .last()
+        .map(|(_, prev)| prev.trim() == text.trim())
+        .unwrap_or(false)
+    {
+        return Some(SegmentCommit::MarkContinuing);
+    }
+    Some(SegmentCommit::Write {
+        seq: None,
+        previous: String::new(),
+        event: AgentEvent::MessageDelta {
+            session_id,
+            text,
+            timestamp: Utc::now(),
+        },
+        index: None,
+    })
+}
+
+fn execute_segment_commit(
+    db: &storage::VeloSqliteStore,
+    hist: &mut Vec<AgentEvent>,
+    commit: SegmentCommit,
+) -> Option<CommitOutcome> {
+    let SegmentCommit::Write {
+        seq,
+        previous,
+        event,
+        index,
+    } = commit
+    else {
+        return None;
+    };
+    let Some((outcome, edit)) = persist_message_row(db, seq, previous, event, index) else {
+        return None;
+    };
+    replace_or_push_message_delta(hist, &edit.previous, edit.event);
+    Some(outcome)
+}
+
+fn persist_message_row(
+    db: &storage::VeloSqliteStore,
+    seq: Option<i64>,
+    previous: String,
+    event: AgentEvent,
+    index: Option<usize>,
+) -> Option<(CommitOutcome, DeferredHistoryEdit)> {
+    let text = match &event {
+        AgentEvent::MessageDelta { text, .. } => text.clone(),
+        _ => return None,
+    };
+    match db.upsert_event_seq(event.session_id(), seq, &event) {
+        Ok(written) => Some((
+            CommitOutcome {
+                index,
+                seq: written,
+                text,
+            },
+            DeferredHistoryEdit {
+                previous,
+                event,
+                remove_only: false,
+            },
+        )),
+        Err(err) => {
+            warn!("failed to persist streamed assistant text: {err}");
+            None
+        }
+    }
+}
+
+fn note_commit_outcome(metrics: &mut LiveTurnMetrics, outcome: CommitOutcome) {
+    let updates_latest = outcome
+        .index
+        .map(|index| index + 1 == metrics.persisted_messages.len())
+        .unwrap_or(true);
+    if let Some(index) = outcome.index {
+        if let Some(slot) = metrics.persisted_messages.get_mut(index) {
+            *slot = (outcome.seq, outcome.text);
+        }
+    } else {
+        metrics.persisted_messages.push((outcome.seq, outcome.text));
+        if metrics.persisted_messages.len() > 24 {
+            metrics.persisted_messages.remove(0);
+        }
+    }
+    if updates_latest {
+        metrics.continuing_last_message = true;
+    }
+}
+
+fn apply_segment_plan(
+    db: &storage::VeloSqliteStore,
+    metrics: &mut LiveTurnMetrics,
+    hist: &mut Vec<AgentEvent>,
+    plan: SegmentCommit,
+) {
+    match plan {
+        SegmentCommit::MarkContinuing => metrics.continuing_last_message = true,
+        write => {
+            if let Some(outcome) = execute_segment_commit(db, hist, write) {
+                note_commit_outcome(metrics, outcome);
+            }
+        }
+    }
+}
+
+/// Write the in-progress assistant reply as one `MessageDelta`. Chunks themselves
+/// stay ephemeral; this is the copy a session reload can reconstruct.
+fn commit_open_assistant_segment(
+    db: &storage::VeloSqliteStore,
+    metrics: &mut LiveTurnMetrics,
+    hist: &mut Vec<AgentEvent>,
+    session_id: Uuid,
+    force: bool,
+) {
+    if let Some(plan) = plan_segment_commit(metrics, session_id, force) {
+        apply_segment_plan(db, metrics, hist, plan);
+    }
+}
+
+fn plan_message_absorb(metrics: &LiveTurnMetrics, event: &AgentEvent) -> AbsorbPlan {
+    let AgentEvent::MessageDelta { text, .. } = event else {
+        return AbsorbPlan::Ignore;
+    };
+    if text.starts_with("[stderr]") || text.trim().is_empty() {
+        return AbsorbPlan::Ignore;
+    }
+    if let Some(idx) = metrics.persisted_messages.iter().rposition(|(_, prev)| {
+        matches!(reply_projection(prev, text), "covered" | "extend" | "relocate")
+    }) {
+        let (seq, previous) = metrics.persisted_messages[idx].clone();
+        return match reply_projection(&previous, text) {
+            "covered" => AbsorbPlan::Drop,
+            "relocate" => AbsorbPlan::Relocate {
+                seq,
+                previous,
+                index: idx,
+            },
+            _ => AbsorbPlan::Replace {
+                seq,
+                previous,
+                index: idx,
+                clear_live_segment: idx + 1 == metrics.persisted_messages.len(),
+                event: event.clone(),
+            },
+        };
+    }
+    let segment = metrics.segment_text.trim().to_string();
+    if segment.is_empty() || streamed_message_covers(&metrics.segment_text, text) {
+        AbsorbPlan::QueueFresh { leftover: None }
+    } else {
+        AbsorbPlan::QueueFresh {
+            leftover: plan_segment_commit(metrics, event.session_id(), true),
+        }
+    }
+}
+
+/// A provider `MessageDelta` is the durable copy of the streamed segment.
+/// Returns true when that row was updated and the caller must not insert another.
+#[cfg(test)]
+fn absorb_streamed_message_delta(
+    db: &storage::VeloSqliteStore,
+    metrics: &mut LiveTurnMetrics,
+    hist: &mut Vec<AgentEvent>,
+    event: &AgentEvent,
+) -> bool {
+    match plan_message_absorb(metrics, event) {
+        AbsorbPlan::Ignore => false,
+        AbsorbPlan::Replace {
+            seq,
+            previous,
+            index,
+            clear_live_segment,
+            event,
+        } => match db.upsert_event_seq(event.session_id(), Some(seq), &event) {
+            Ok(written_seq) => {
+                let text = match &event {
+                    AgentEvent::MessageDelta { text, .. } => text.clone(),
+                    _ => String::new(),
+                };
+                replace_or_push_message_delta(hist, &previous, event);
+                if let Some(slot) = metrics.persisted_messages.get_mut(index) {
+                    *slot = (written_seq, text);
+                }
+                if clear_live_segment {
+                    metrics.segment_text.clear();
+                    metrics.continuing_last_message = false;
+                }
+                true
+            }
+            Err(err) => {
+                warn!("failed to update streamed assistant text: {err}");
+                false
+            }
+        },
+        AbsorbPlan::Drop => {
+            metrics.segment_text.clear();
+            metrics.continuing_last_message = false;
+            true
+        }
+        AbsorbPlan::Relocate {
+            seq,
+            previous,
+            index,
+        } => {
+            let _ = db.delete_event_seq(event.session_id(), seq);
+            if metrics.persisted_messages.get(index).is_some() {
+                metrics.persisted_messages.remove(index);
+            }
+            if let Some(pos) = hist.iter().rposition(|ev| match ev {
+                AgentEvent::MessageDelta { text, .. } => text == &previous,
+                _ => false,
+            }) {
+                hist.remove(pos);
+            }
+            metrics.segment_text.clear();
+            metrics.continuing_last_message = false;
+            false
+        }
+        AbsorbPlan::QueueFresh { leftover } => {
+            if let Some(plan) = leftover {
+                apply_segment_plan(db, metrics, hist, plan);
+            }
+            metrics.segment_text.clear();
+            metrics.continuing_last_message = false;
+            false
+        }
+    }
+}
+
 fn fallback_workspace_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| velo_worktree::default_general_workspace())
 }
@@ -635,6 +1026,8 @@ pub struct DaemonInner {
     pub live_turns: HashMap<Uuid, LiveTurnMetrics>,
     pub handles: HashMap<Uuid, AgentHandle>,
     pub warm_handles: HashMap<Uuid, WarmAgentEntry>,
+    /// Counts delayed `Stopped`/`Failed` events expected from old handles killed during steer/interruption.
+    pub suppressed_steer_stops: HashMap<Uuid, (u32, std::time::Instant)>,
     pub shells: HashMap<Uuid, InteractiveShellHandle>,
     pub pending_approvals: HashMap<String, oneshot::Sender<String>>,
     pub pending_questions: HashMap<String, oneshot::Sender<Vec<String>>>,
@@ -692,12 +1085,21 @@ impl DaemonState {
         }
         let (mut sessions, event_history) = db.load_all()?;
         for s in sessions.values_mut() {
+            let mut dirty = false;
             if matches!(
                 s.status,
                 SessionStatus::Running | SessionStatus::WaitingForPermission
             ) {
                 s.status = SessionStatus::Stopped;
                 s.pid = None;
+                dirty = true;
+            }
+            if let Some(hist) = event_history.get(&s.id) {
+                if pricing::reconcile_session_usage(s, hist) {
+                    dirty = true;
+                }
+            }
+            if dirty {
                 let _ = db.upsert_session(s);
             }
         }
@@ -752,6 +1154,7 @@ impl DaemonState {
                 live_turns: HashMap::new(),
                 handles: HashMap::new(),
                 warm_handles: HashMap::new(),
+                suppressed_steer_stops: HashMap::new(),
                 shells: HashMap::new(),
                 pending_approvals: HashMap::new(),
                 pending_questions: HashMap::new(),
@@ -807,9 +1210,28 @@ impl DaemonState {
                     Option<String>,
                 )> = None;
                 let mut outbound_events: Vec<AgentEvent> = Vec::with_capacity(2);
+                let mut deferred_history_edit: Option<DeferredHistoryEdit> = None;
 
                 {
                     let mut guard = state.inner.write().await;
+                    if matches!(
+                        event,
+                        AgentEvent::StatusChanged {
+                            status: SessionStatus::Stopped | SessionStatus::Failed,
+                            ..
+                        }
+                    ) {
+                        if let Some((count, ts)) = guard.suppressed_steer_stops.get_mut(&session_id) {
+                            if *count > 0 && now.duration_since(*ts) < std::time::Duration::from_secs(4) {
+                                *count -= 1;
+                                if *count == 0 {
+                                    guard.suppressed_steer_stops.remove(&session_id);
+                                }
+                                continue;
+                            }
+                            guard.suppressed_steer_stops.remove(&session_id);
+                        }
+                    }
                     let (sess_prov, sess_model, base_out, base_cost) = guard
                         .sessions
                         .get(&session_id)
@@ -868,6 +1290,14 @@ impl DaemonState {
                                     metrics.step_stream_message = delta.clone();
                                 } else {
                                     metrics.step_stream_message.push_str(delta);
+                                }
+                                if metrics.segment_text.is_empty() {
+                                    metrics.continuing_last_message = false;
+                                }
+                                if *replace {
+                                    metrics.segment_text = delta.clone();
+                                } else {
+                                    metrics.segment_text.push_str(delta);
                                 }
                             }
                         }
@@ -1029,50 +1459,56 @@ impl DaemonState {
                             }
                         }
 
-                        if *input_tokens > 0 {
-                            metrics.turn_input_tokens = *input_tokens;
-                        }
-                        if *cache_read_tokens > 0 {
-                            metrics.turn_cache_read_tokens = *cache_read_tokens;
-                        }
-                        if *cache_write_tokens > 0 {
-                            metrics.turn_cache_write_tokens = *cache_write_tokens;
-                        }
                         if *context_window > 0 {
                             metrics.turn_context_window = *context_window;
                         }
 
+                        let latest_step_input = if *input_tokens > 0 {
+                            *input_tokens
+                        } else {
+                            metrics.turn_input_tokens
+                        };
+
                         let step_delta_tokens = if *is_turn_total {
+                            if *input_tokens > 0 {
+                                metrics.turn_input_tokens = *input_tokens;
+                            }
+                            if *cache_read_tokens > 0 {
+                                metrics.turn_cache_read_tokens = *cache_read_tokens;
+                            }
+                            if *cache_write_tokens > 0 {
+                                metrics.turn_cache_write_tokens = *cache_write_tokens;
+                            }
                             let delta = output_tokens.saturating_sub(metrics.turn_output_tokens);
                             metrics.turn_output_tokens =
                                 metrics.turn_output_tokens.max(*output_tokens);
-                            if *cost_usd > 0.0 {
-                                metrics.turn_cost_usd = *cost_usd;
-                            } else {
-                                metrics.turn_cost_usd = pricing::compute_cost_usd(
-                                    &sess_prov,
-                                    sess_model.as_deref(),
-                                    metrics.turn_input_tokens,
-                                    metrics.turn_cache_read_tokens,
-                                    metrics.turn_cache_write_tokens,
-                                    metrics.turn_output_tokens,
-                                );
-                            }
+                            metrics.turn_cost_usd = pricing::effective_turn_cost_usd(
+                                &sess_prov,
+                                sess_model.as_deref(),
+                                metrics.turn_input_tokens,
+                                metrics.turn_cache_read_tokens,
+                                metrics.turn_cache_write_tokens,
+                                metrics.turn_output_tokens,
+                                *cost_usd,
+                            );
                             delta
                         } else {
-                            metrics.turn_output_tokens += *output_tokens;
-                            if *cost_usd > 0.0 {
-                                metrics.turn_cost_usd += *cost_usd;
-                            } else {
-                                metrics.turn_cost_usd += pricing::compute_cost_usd(
-                                    &sess_prov,
-                                    sess_model.as_deref(),
-                                    *input_tokens,
-                                    *cache_read_tokens,
-                                    *cache_write_tokens,
-                                    *output_tokens,
-                                );
-                            }
+                            metrics.turn_input_tokens =
+                                metrics.turn_input_tokens.saturating_add(*input_tokens);
+                            metrics.turn_cache_read_tokens =
+                                metrics.turn_cache_read_tokens.saturating_add(*cache_read_tokens);
+                            metrics.turn_cache_write_tokens =
+                                metrics.turn_cache_write_tokens.saturating_add(*cache_write_tokens);
+                            metrics.turn_output_tokens =
+                                metrics.turn_output_tokens.saturating_add(*output_tokens);
+                            metrics.turn_cost_usd = pricing::compute_cost_usd(
+                                &sess_prov,
+                                sess_model.as_deref(),
+                                metrics.turn_input_tokens,
+                                metrics.turn_cache_read_tokens,
+                                metrics.turn_cache_write_tokens,
+                                metrics.turn_output_tokens,
+                            );
                             *output_tokens
                         };
 
@@ -1146,37 +1582,158 @@ impl DaemonState {
                             timestamp: *timestamp,
                         };
 
-                        let base_out_snap = metrics.base_session_output_tokens;
-                        let base_cost_snap = metrics.base_session_cost_usd;
-                        let turn_in_snap = metrics.turn_input_tokens;
                         let turn_out_snap = metrics.turn_output_tokens;
-                        let turn_cache_snap = metrics.turn_cache_read_tokens;
                         let turn_ctx_snap = metrics.turn_context_window;
-                        let turn_cost_snap = metrics.turn_cost_usd;
 
-                        let hist = guard.event_history.entry(session_id).or_default();
+                        let g = &mut *guard;
+                        let hist = g.event_history.entry(session_id).or_default();
                         upsert_turn_usage_event(hist, norm_usage.clone());
                         db_usage_to_upsert = Some(norm_usage.clone());
 
-                        if let Some(session) = guard.sessions.get_mut(&session_id) {
+                        if let Some(session) = g.sessions.get_mut(&session_id) {
                             session.updated_at = Utc::now();
-                            if turn_in_snap > 0 {
-                                session.input_tokens = turn_in_snap;
-                            }
-                            session.output_tokens = base_out_snap.saturating_add(turn_out_snap);
-                            if turn_cache_snap > 0 {
-                                session.cache_read_tokens = turn_cache_snap;
-                            }
+                            let _ = pricing::reconcile_session_usage(session, hist);
                             if turn_ctx_snap > 0 {
                                 session.context_window = turn_ctx_snap;
                             }
-                            session.tokens_used = turn_in_snap.saturating_add(turn_out_snap);
-                            session.cost_usd = base_cost_snap + turn_cost_snap;
+                            session.tokens_used = latest_step_input.saturating_add(turn_out_snap);
                             should_persist_sessions = true;
                         }
 
                         outbound_events.push(norm_usage);
                     } else {
+                        let mut suppress_event_append = false;
+                        let boundary = matches!(
+                            event,
+                            AgentEvent::ToolCallRequested { .. }
+                                | AgentEvent::ToolCallCompleted { .. }
+                        ) || is_terminal_status_event(&event);
+                        if let AgentEvent::MessageDelta { text, .. } = &event {
+                            if !text.starts_with("[stderr]") && !text.trim().is_empty() {
+                                match plan_message_absorb(metrics, &event) {
+                                    AbsorbPlan::Ignore => {}
+                                    AbsorbPlan::Replace {
+                                        seq,
+                                        previous,
+                                        index,
+                                        clear_live_segment,
+                                        event: replacement,
+                                    } => {
+                                        if let Some((outcome, edit)) = persist_message_row(
+                                            &state.db,
+                                            Some(seq),
+                                            previous,
+                                            replacement,
+                                            Some(index),
+                                        ) {
+                                            note_commit_outcome(metrics, outcome);
+                                            if clear_live_segment {
+                                                metrics.segment_text.clear();
+                                                metrics.continuing_last_message = false;
+                                            }
+                                            deferred_history_edit = Some(edit);
+                                            suppress_event_append = true;
+                                        }
+                                    }
+                                    AbsorbPlan::Drop => {
+                                        metrics.segment_text.clear();
+                                        metrics.continuing_last_message = false;
+                                        suppress_event_append = true;
+                                    }
+                                    AbsorbPlan::Relocate {
+                                        seq,
+                                        previous,
+                                        index,
+                                    } => {
+                                        let _ = state.db.delete_event_seq(session_id, seq);
+                                        if metrics.persisted_messages.get(index).is_some() {
+                                            metrics.persisted_messages.remove(index);
+                                        }
+                                        metrics.segment_text.clear();
+                                        metrics.continuing_last_message = false;
+                                        deferred_history_edit = Some(DeferredHistoryEdit {
+                                            previous,
+                                            event: event.clone(),
+                                            remove_only: true,
+                                        });
+                                    }
+                                    AbsorbPlan::QueueFresh { leftover } => {
+                                        let mut segment_saved = leftover.is_none();
+                                        if let Some(plan) = leftover {
+                                            match plan {
+                                                SegmentCommit::MarkContinuing => {
+                                                    metrics.continuing_last_message = true;
+                                                    segment_saved = true;
+                                                }
+                                                SegmentCommit::Write {
+                                                    seq,
+                                                    previous,
+                                                    event: planned,
+                                                    index,
+                                                } => {
+                                                    if let Some((outcome, edit)) =
+                                                        persist_message_row(
+                                                            &state.db,
+                                                            seq,
+                                                            previous,
+                                                            planned,
+                                                            index,
+                                                        )
+                                                    {
+                                                        note_commit_outcome(metrics, outcome);
+                                                        deferred_history_edit = Some(edit);
+                                                        segment_saved = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if segment_saved {
+                                            metrics.segment_text.clear();
+                                            metrics.continuing_last_message = false;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if matches!(event, AgentEvent::MessageChunk { .. }) || boundary {
+                            if let Some(plan) = plan_segment_commit(metrics, session_id, boundary) {
+                                match plan {
+                                    SegmentCommit::MarkContinuing => {
+                                        metrics.continuing_last_message = true;
+                                    }
+                                    SegmentCommit::Write {
+                                        seq,
+                                        previous,
+                                        event: planned,
+                                        index,
+                                    } => {
+                                        if let Some((outcome, edit)) = persist_message_row(
+                                            &state.db,
+                                            seq,
+                                            previous,
+                                            planned,
+                                            index,
+                                        ) {
+                                            note_commit_outcome(metrics, outcome);
+                                            deferred_history_edit = Some(edit);
+                                        }
+                                    }
+                                }
+                            }
+                            if boundary {
+                                let already_saved = deferred_history_edit.is_some()
+                                    || metrics
+                                        .persisted_messages
+                                        .last()
+                                        .map(|(_, prev)| prev.trim() == metrics.segment_text.trim())
+                                        .unwrap_or(false)
+                                    || metrics.segment_text.trim().is_empty();
+                                if already_saved {
+                                    metrics.segment_text.clear();
+                                    metrics.continuing_last_message = false;
+                                }
+                            }
+                        }
+
                         // Synthesize end-of-turn UsageUpdated for providers (AGY / Cursor / Grok) that didn't emit UsageUpdated
                         if is_terminal_status_event(&event) {
                             let rem_stream_tok = metrics.current_step_stream_tokens();
@@ -1221,16 +1778,12 @@ impl DaemonState {
                                     is_turn_total: true,
                                     timestamp: Utc::now(),
                                 };
-                                let base_out_snap = metrics.base_session_output_tokens;
-                                let base_cost_snap = metrics.base_session_cost_usd;
-                                let est_out_snap = metrics.turn_est_tokens;
-                                let hist = guard.event_history.entry(session_id).or_default();
+                                let g = &mut *guard;
+                                let hist = g.event_history.entry(session_id).or_default();
                                 upsert_turn_usage_event(hist, synth_usage.clone());
                                 db_usage_to_upsert = Some(synth_usage.clone());
-                                if let Some(session) = guard.sessions.get_mut(&session_id) {
-                                    session.output_tokens =
-                                        base_out_snap.saturating_add(est_out_snap);
-                                    session.cost_usd = base_cost_snap + synth_cost;
+                                if let Some(session) = g.sessions.get_mut(&session_id) {
+                                    let _ = pricing::reconcile_session_usage(session, hist);
                                 }
                                 outbound_events.push(synth_usage);
                                 should_persist_sessions = true;
@@ -1249,15 +1802,31 @@ impl DaemonState {
                             quota::save_quota_cache(&state.quota_cache_file, &guard.quota_cache);
                         }
 
-                        if !matches!(
-                            event,
-                            AgentEvent::UserMessage { .. }
-                                | AgentEvent::ProviderSessionBound { .. }
-                                | AgentEvent::ThinkingChunk { .. }
-                                | AgentEvent::MessageChunk { .. }
-                                | AgentEvent::TerminalOutput { .. }
-                                | AgentEvent::RateLimitsUpdated { .. }
-                        ) {
+                        if let Some(edit) = deferred_history_edit {
+                            let hist = guard.event_history.entry(session_id).or_default();
+                            if edit.remove_only {
+                                if let Some(pos) = hist.iter().rposition(|ev| match ev {
+                                    AgentEvent::MessageDelta { text, .. } => text == &edit.previous,
+                                    _ => false,
+                                }) {
+                                    hist.remove(pos);
+                                }
+                            } else {
+                                replace_or_push_message_delta(hist, &edit.previous, edit.event);
+                            }
+                        }
+
+                        if !suppress_event_append
+                            && !matches!(
+                                event,
+                                AgentEvent::UserMessage { .. }
+                                    | AgentEvent::ProviderSessionBound { .. }
+                                    | AgentEvent::ThinkingChunk { .. }
+                                    | AgentEvent::MessageChunk { .. }
+                                    | AgentEvent::TerminalOutput { .. }
+                                    | AgentEvent::RateLimitsUpdated { .. }
+                            )
+                        {
                             guard
                                 .event_history
                                 .entry(session_id)
@@ -1282,6 +1851,7 @@ impl DaemonState {
                                     should_refresh_diff = true;
                                     should_persist_sessions = true;
                                     if *status == SessionStatus::Completed {
+                                        g.live_turns.remove(&session_id);
                                         if let Some(active_h) = g.handles.remove(&session_id) {
                                             g.warm_handles.insert(
                                                 session_id,
@@ -1298,6 +1868,7 @@ impl DaemonState {
                                         status,
                                         SessionStatus::Failed | SessionStatus::Stopped
                                     ) {
+                                        g.live_turns.remove(&session_id);
                                         g.handles.remove(&session_id);
                                         if let Some(mut wh) = g.warm_handles.remove(&session_id) {
                                             wh.handle.stop();
@@ -1390,7 +1961,30 @@ impl DaemonState {
                     let _ = state.db.upsert_turn_usage_event(session_id, &u_ev);
                 }
                 if let Some(a_ev) = db_event_to_append {
-                    let _ = state.db.append_event(session_id, &a_ev);
+                    match state.db.append_event(session_id, &a_ev) {
+                        Ok(seq) => {
+                            if let AgentEvent::MessageDelta { text, .. } = &a_ev {
+                                if !text.starts_with("[stderr]") && !text.trim().is_empty() {
+                                    let mut guard = state.inner.write().await;
+                                    if let Some(metrics) = guard.live_turns.get_mut(&session_id) {
+                                        if let Some(idx) = metrics
+                                            .persisted_messages
+                                            .iter()
+                                            .rposition(|(_, prev)| streamed_message_covers(prev, text))
+                                        {
+                                            metrics.persisted_messages[idx] = (seq, text.clone());
+                                        } else {
+                                            metrics.persisted_messages.push((seq, text.clone()));
+                                            if metrics.persisted_messages.len() > 24 {
+                                                metrics.persisted_messages.remove(0);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => warn!("failed to append session event: {err}"),
+                    }
                 }
                 if let Some((cfg, kind, sess, detail)) = push_notification_job {
                     tokio::spawn(async move {
@@ -1444,6 +2038,7 @@ impl DaemonState {
                                     images: queued_item.images,
                                     approval_mode: None,
                                     mode: None,
+                                    skill_path: queued_item.skill_path,
                                 },
                             )
                             .await;
@@ -2297,6 +2892,10 @@ pub fn build_router(state: DaemonState) -> Router {
             post(terminal_restart_handler),
         )
         .route("/api/sessions/{id}/input", post(send_input_handler))
+        .route(
+            "/api/sessions/{id}/queue/{queue_id}/run",
+            post(run_queued_prompt_handler),
+        )
         .route(
             "/api/sessions/{id}/queue/{queue_id}",
             axum::routing::delete(remove_queued_prompt_handler),
@@ -4406,11 +5005,34 @@ struct GlobalSearchQueryParams {
     limit: Option<usize>,
 }
 
+impl DaemonState {
+    /// Persist in-progress assistant prose before a history read, so reopening a
+    /// session still shows the reply that was already streaming.
+    pub(crate) async fn flush_open_assistant_text(&self, only: Option<Uuid>) {
+        let mut guard = self.inner.write().await;
+        let ids: Vec<Uuid> = match only {
+            Some(id) => vec![id],
+            None => guard.live_turns.keys().copied().collect(),
+        };
+        let inner = &mut *guard;
+        let live = &mut inner.live_turns;
+        let history = &mut inner.event_history;
+        for id in ids {
+            let Some(metrics) = live.get_mut(&id) else {
+                continue;
+            };
+            let hist = history.entry(id).or_default();
+            commit_open_assistant_segment(&self.db, metrics, hist, id, true);
+        }
+    }
+}
+
 async fn get_session_events_handler(
     State(state): State<DaemonState>,
     AxumPath(id): AxumPath<Uuid>,
     Query(params): Query<EventsQueryParams>,
 ) -> impl IntoResponse {
+    state.flush_open_assistant_text(Some(id)).await;
     if params.before_seq.is_some() || params.limit.is_some() {
         let lim = params.limit.unwrap_or(180);
         match state.db.query_events_page(id, params.before_seq, lim) {
@@ -4594,6 +5216,38 @@ async fn exec_in_worktree_handler(
     }
 }
 
+fn clone_events_for_new_session(events: &[AgentEvent], new_id: Uuid) -> Vec<AgentEvent> {
+    let mut cloned = events.to_vec();
+    for ev in &mut cloned {
+        match ev {
+            AgentEvent::StatusChanged { session_id, .. }
+            | AgentEvent::UserMessage { session_id, .. }
+            | AgentEvent::ProviderSessionBound { session_id, .. }
+            | AgentEvent::ThinkingChunk { session_id, .. }
+            | AgentEvent::ThinkingDelta { session_id, .. }
+            | AgentEvent::MessageChunk { session_id, .. }
+            | AgentEvent::MessageDelta { session_id, .. }
+            | AgentEvent::UsageUpdated { session_id, .. }
+            | AgentEvent::RateLimitsUpdated { session_id, .. }
+            | AgentEvent::TerminalOutput { session_id, .. }
+            | AgentEvent::ToolCallRequested { session_id, .. }
+            | AgentEvent::ToolCallCompleted { session_id, .. }
+            | AgentEvent::PermissionRequested { session_id, .. }
+            | AgentEvent::PermissionResolved { session_id, .. }
+            | AgentEvent::UserQuestionRequested { session_id, .. }
+            | AgentEvent::UserQuestionAnswered { session_id, .. }
+            | AgentEvent::BrowserCommand { session_id, .. }
+            | AgentEvent::SetupHookOutput { session_id, .. }
+            | AgentEvent::PtyOutput { session_id, .. }
+            | AgentEvent::DiffUpdated { session_id, .. }
+            | AgentEvent::Error { session_id, .. } => {
+                *session_id = new_id;
+            }
+        }
+    }
+    cloned
+}
+
 fn truncate_events_at_user_turn(events: &mut Vec<AgentEvent>, user_turn_idx: usize) {
     let mut seen_users = 0usize;
     let mut cut_index = None;
@@ -4628,7 +5282,7 @@ fn build_conversation_transcript_prefix(
                 }
             }
             AgentEvent::MessageDelta { text, .. } => {
-                if !text.trim().is_empty() {
+                if !text.trim().is_empty() && !text.starts_with("[stderr]") {
                     turns.push(format!("Assistant: {}", text.trim()));
                 }
             }
@@ -4676,7 +5330,7 @@ impl DaemonState {
         req: SessionInputRequest,
     ) -> Result<Value> {
         if req.mode.as_deref() == Some("queue") {
-            let mut enqueued_len: Option<usize> = None;
+            let mut enqueued: Option<(QueuedPromptItem, usize)> = None;
             {
                 let mut guard = self.inner.write().await;
                 let Some(sess) = guard.sessions.get_mut(&id) else {
@@ -4688,25 +5342,28 @@ impl DaemonState {
                         | SessionStatus::Running
                         | SessionStatus::WaitingForPermission
                 ) {
-                    sess.queued_prompts.push(QueuedPromptItem {
+                    let item = QueuedPromptItem {
                         id: format!("q-{}", Uuid::new_v4().simple()),
                         input: req.input.clone(),
                         images: req.images.clone(),
                         model: req.model.clone(),
                         effort: req.effort.clone(),
+                        skill_path: req.skill_path.clone(),
                         created_at: Utc::now(),
-                    });
+                    };
+                    sess.queued_prompts.push(item.clone());
                     sess.updated_at = Utc::now();
-                    enqueued_len = Some(sess.queued_prompts.len());
+                    enqueued = Some((item, sess.queued_prompts.len()));
                 }
             }
-            if let Some(qlen) = enqueued_len {
+            if let Some((item, qlen)) = enqueued {
                 let _ = self.persist_sessions().await;
                 return Ok(json!({
                     "ok": true,
                     "queued": true,
                     "queue_len": qlen,
                     "session_id": id,
+                    "item": item,
                 }));
             }
         }
@@ -4715,6 +5372,12 @@ impl DaemonState {
         let (existing_session, prior_transcript, parent_handoff_context) = {
             let mut guard = self.inner.write().await;
             if let Some(mut old_handle) = guard.handles.remove(&id) {
+                let entry = guard
+                    .suppressed_steer_stops
+                    .entry(id)
+                    .or_insert((0, std::time::Instant::now()));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = std::time::Instant::now();
                 old_handle.stop();
                 stopped_active_handle = true;
             }
@@ -4858,18 +5521,30 @@ impl DaemonState {
         }
         let _ = self.event_tx.send(user_ev);
 
+        let model_input =
+            extensions::skill_turn_prompt(&req.input, req.skill_path.as_deref());
         let effective_prompt = if resume_session_id.is_some() {
-            req.input.clone()
+            model_input.clone()
         } else if let Some(history) = prior_transcript.as_ref() {
+            let files_hint = if !session.diff_stats.modified_files.is_empty() {
+                format!(
+                    "\n[Modified files in workspace ({}): {}]",
+                    session.diff_stats.files_changed,
+                    session.diff_stats.modified_files.iter().take(24).cloned().collect::<Vec<_>>().join(", ")
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{}\n\n---\n[Prior conversation context in this session]\n{}",
-                req.input,
-                truncate_utf8_tail(history, 6000)
+                "{}\n\n---\n[Prior conversation history in this session — continue directly from this exact context]{}\n{}",
+                model_input,
+                files_hint,
+                truncate_utf8_tail(history, 24_000)
             )
         } else if let Some(parent_ctx) = parent_handoff_context {
-            format!("{}\n\n---\n{}", req.input, parent_ctx)
+            format!("{model_input}\n\n---\n{parent_ctx}")
         } else {
-            req.input.clone()
+            model_input.clone()
         };
 
         let effective_approval = req
@@ -4917,7 +5592,7 @@ impl DaemonState {
                     && warm
                         .handle
                         .try_send_warm_turn(
-                            &req.input,
+                            &model_input,
                             &req.images,
                             effective_model.as_deref(),
                             effective_effort.as_deref(),
@@ -5034,21 +5709,35 @@ impl DaemonState {
         id: Uuid,
         req: HandoffSessionRequest,
     ) -> Result<SessionInfo> {
-        let source_session = {
+        self.flush_open_assistant_text(Some(id)).await;
+        let (source_session, source_events) = {
             let guard = self.inner.read().await;
-            guard
+            let src = guard
                 .sessions
                 .get(&id)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Source session not found"))?
+                .ok_or_else(|| anyhow::anyhow!("Source session not found"))?;
+            let evs = guard.event_history.get(&id).cloned().unwrap_or_default();
+            (src, evs)
         };
 
-        let stripped_base = source_session
+        let is_fork_prefixed = source_session.name.starts_with("Fork · ");
+        let without_fork = source_session
             .name
-            .split(" · ")
-            .next()
+            .strip_prefix("Fork · ")
             .unwrap_or(&source_session.name)
             .trim();
+        let stripped_base = without_fork
+            .rsplit_once(" · ")
+            .map(|(head, tail)| {
+                let t = tail.trim();
+                if matches!(t, "Claude" | "Codex" | "AGY" | "Grok" | "Cursor" | "Copilot" | "Qwen" | "OpenCode" | "ACP") {
+                    head.trim()
+                } else {
+                    without_fork
+                }
+            })
+            .unwrap_or(without_fork);
         let base_title = if stripped_base.is_empty() || stripped_base == "New thread" {
             let fallback_line = source_session.prompt.lines().next().unwrap_or("").trim();
             if fallback_line.is_empty() {
@@ -5061,7 +5750,22 @@ impl DaemonState {
         };
 
         let target_badge = clean_provider_badge(&req.target_provider);
-        let handoff_title = format!("{} · {}", base_title, target_badge);
+        let handoff_title = if is_fork_prefixed {
+            format!("Fork · {} · {}", base_title, target_badge)
+        } else {
+            format!("{} · {}", base_title, target_badge)
+        };
+
+        let clean_repo = canonical_workspace_path(if source_session.repo_root.trim().is_empty() {
+            &source_session.worktree_path
+        } else {
+            &source_session.repo_root
+        });
+        let clean_wt = if source_session.worktree_path.trim().is_empty() {
+            clean_repo.clone()
+        } else {
+            canonical_workspace_path(&source_session.worktree_path)
+        };
 
         let new_session_id = Uuid::new_v4();
         let created = self
@@ -5069,9 +5773,9 @@ impl DaemonState {
                 new_session_id,
                 Some(handoff_title),
                 req.target_provider.clone(),
-                String::new(),
-                PathBuf::from(&source_session.repo_root),
-                PathBuf::from(&source_session.worktree_path),
+                source_session.prompt.clone(),
+                PathBuf::from(&clean_repo),
+                PathBuf::from(&clean_wt),
                 source_session.branch.clone(),
                 false,
                 Some(source_session.id),
@@ -5081,6 +5785,28 @@ impl DaemonState {
                 source_session.approval_mode.clone(),
             )
             .await?;
+
+        // Snapshot source conversation events into the handed-off session so context is
+        // immediately visible in the UI and survives even if the source session is later deleted.
+        if !source_events.is_empty() {
+            let mut cloned_events = clone_events_for_new_session(&source_events, new_session_id);
+            cloned_events.retain(|ev| !matches!(ev, AgentEvent::ProviderSessionBound { .. }));
+            {
+                let mut guard = self.inner.write().await;
+                guard
+                    .event_history
+                    .insert(new_session_id, cloned_events.clone());
+                if !guard
+                    .workspaces
+                    .iter()
+                    .any(|w| canonical_workspace_path(w) == clean_repo)
+                {
+                    guard.workspaces.push(clean_repo.clone());
+                }
+            }
+            let _ = self.db.replace_session_events(new_session_id, &cloned_events);
+            let _ = self.persist_workspaces().await;
+        }
 
         if let Some(extra) = req
             .additional_instructions
@@ -5100,6 +5826,7 @@ impl DaemonState {
                         images: Vec::new(),
                         approval_mode: Some(source_session.approval_mode),
                         mode: None,
+                        skill_path: None,
                     },
                 )
                 .await?;
@@ -5113,12 +5840,31 @@ impl DaemonState {
     }
 
     pub async fn remove_queued_prompt_core(&self, id: Uuid, queue_id: &str) -> Value {
+        self.remove_queued_prompt_matching(id, queue_id, None).await
+    }
+
+    /// Drops one queued follow-up. A desktop optimistic id (`q-local-…`) has no server
+    /// counterpart yet, so `input_fallback` removes the first item with that text.
+    pub async fn remove_queued_prompt_matching(
+        &self,
+        id: Uuid,
+        queue_id: &str,
+        input_fallback: Option<&str>,
+    ) -> Value {
         let mut removed = false;
         {
             let mut guard = self.inner.write().await;
             if let Some(s) = guard.sessions.get_mut(&id) {
                 let prev_len = s.queued_prompts.len();
-                s.queued_prompts.retain(|q| q.id != queue_id);
+                if queue_id.starts_with("q-local-") {
+                    if let Some(text) = input_fallback.map(str::trim).filter(|t| !t.is_empty()) {
+                        if let Some(pos) = s.queued_prompts.iter().position(|q| q.input == text) {
+                            s.queued_prompts.remove(pos);
+                        }
+                    }
+                } else {
+                    s.queued_prompts.retain(|q| q.id != queue_id);
+                }
                 removed = s.queued_prompts.len() != prev_len;
                 if removed {
                     s.updated_at = Utc::now();
@@ -5129,6 +5875,39 @@ impl DaemonState {
             let _ = self.persist_sessions().await;
         }
         json!({ "ok": removed, "session_id": id, "queue_id": queue_id })
+    }
+
+    /// Pull one queued prompt out and run it immediately, interrupting the active turn.
+    pub async fn run_queued_prompt_now_core(&self, id: Uuid, queue_id: &str) -> Result<Value> {
+        let item = {
+            let mut guard = self.inner.write().await;
+            let Some(s) = guard.sessions.get_mut(&id) else {
+                anyhow::bail!("Session not found");
+            };
+            let Some(pos) = s.queued_prompts.iter().position(|q| q.id == queue_id) else {
+                anyhow::bail!("Queued prompt not found");
+            };
+            let item = s.queued_prompts.remove(pos);
+            s.updated_at = Utc::now();
+            item
+        };
+        let _ = self.persist_sessions().await;
+        self.dispatch_session_input(
+            id,
+            SessionInputRequest {
+                input: item.input,
+                model: item.model,
+                effort: item.effort,
+                provider: None,
+                reset_thread: false,
+                truncate_to_user_turn: None,
+                images: item.images,
+                approval_mode: None,
+                mode: Some("steer".to_string()),
+                skill_path: item.skill_path,
+            },
+        )
+        .await
     }
 
     pub async fn list_checkpoints_core(&self, session_id: Uuid) -> Vec<checkpoints::TurnCheckpointDto> {
@@ -5383,67 +6162,133 @@ impl DaemonState {
         &self,
         source_id: Uuid,
         up_to_user_turn: Option<usize>,
+        up_to_user_text: Option<String>,
+        user_turns_from_end: Option<usize>,
         custom_title: Option<String>,
     ) -> Result<SessionInfo> {
+        self.flush_open_assistant_text(Some(source_id)).await;
         let (src, mut cloned_events) = {
             let guard = self.inner.read().await;
             let Some(s) = guard.sessions.get(&source_id).cloned() else {
                 anyhow::bail!("Source session not found");
             };
-            let evs = guard
+            let mut evs = guard
                 .event_history
                 .get(&source_id)
                 .cloned()
                 .unwrap_or_default();
+            // If source was a legacy empty handoff whose events live on its parent, recover them
+            if evs.is_empty() {
+                if let Some(pid) = s.parent_session_id {
+                    if let Some(pevs) = guard.event_history.get(&pid) {
+                        evs = pevs.clone();
+                    }
+                }
+            }
             (s, evs)
         };
 
-        if let Some(limit_turn) = up_to_user_turn {
-            // Keep events up through the `limit_turn`-th user turn and its reply
-            truncate_events_at_user_turn(&mut cloned_events, limit_turn.saturating_add(1));
-        }
+        let user_positions: Vec<usize> = cloned_events
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, ev)| matches!(ev, AgentEvent::UserMessage { .. }).then_some(idx))
+            .collect();
 
-        let new_id = Uuid::new_v4();
-        for ev in &mut cloned_events {
-            match ev {
-                AgentEvent::StatusChanged { session_id, .. }
-                | AgentEvent::UserMessage { session_id, .. }
-                | AgentEvent::ProviderSessionBound { session_id, .. }
-                | AgentEvent::ThinkingChunk { session_id, .. }
-                | AgentEvent::ThinkingDelta { session_id, .. }
-                | AgentEvent::MessageChunk { session_id, .. }
-                | AgentEvent::MessageDelta { session_id, .. }
-                | AgentEvent::UsageUpdated { session_id, .. }
-                | AgentEvent::RateLimitsUpdated { session_id, .. }
-                | AgentEvent::TerminalOutput { session_id, .. }
-                | AgentEvent::ToolCallRequested { session_id, .. }
-                | AgentEvent::ToolCallCompleted { session_id, .. }
-                | AgentEvent::PermissionRequested { session_id, .. }
-                | AgentEvent::PermissionResolved { session_id, .. }
-                | AgentEvent::UserQuestionRequested { session_id, .. }
-                | AgentEvent::UserQuestionAnswered { session_id, .. }
-                | AgentEvent::BrowserCommand { session_id, .. }
-                | AgentEvent::SetupHookOutput { session_id, .. }
-                | AgentEvent::PtyOutput { session_id, .. }
-                | AgentEvent::DiffUpdated { session_id, .. }
-                | AgentEvent::Error { session_id, .. } => {
-                    *session_id = new_id;
+        let target_text_trimmed = up_to_user_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+
+        let mut matched_user_pos: Option<usize> = None;
+        // 1. Prefer `user_turns_from_end` (0 = last user turn, 1 = 2nd-to-last, etc.):
+        //    tail-relative index is 100% invariant to `?limit=180` pagination AND disambiguates duplicate prompts like "继续".
+        if let Some(from_end) = user_turns_from_end {
+            if from_end < user_positions.len() {
+                let candidate_pos = user_positions[user_positions.len() - 1 - from_end];
+                let text_ok = match target_text_trimmed {
+                    Some(expected) => matches!(
+                        &cloned_events[candidate_pos],
+                        AgentEvent::UserMessage { text, .. } if text.trim() == expected
+                    ),
+                    None => true,
+                };
+                if text_ok {
+                    matched_user_pos = Some(candidate_pos);
                 }
             }
         }
+        // 2. Fall back to matching `up_to_user_text` from the end backwards
+        if matched_user_pos.is_none() {
+            if let Some(expected) = target_text_trimmed {
+                matched_user_pos = cloned_events.iter().rposition(|ev| match ev {
+                    AgentEvent::UserMessage { text, .. } => text.trim() == expected,
+                    _ => false,
+                });
+            }
+        }
+
+        if let Some(match_pos) = matched_user_pos {
+            if let Some(rel_next) = cloned_events[match_pos + 1..]
+                .iter()
+                .position(|ev| matches!(ev, AgentEvent::UserMessage { .. }))
+            {
+                cloned_events.truncate(match_pos + 1 + rel_next);
+            }
+        } else if let Some(limit_turn) = up_to_user_turn {
+            // `up_to_user_turn` is 1-based count of user turns to keep (e.g. `1` keeps Turn 1 and its reply)
+            truncate_events_at_user_turn(&mut cloned_events, limit_turn.max(1));
+        }
+
+        let new_id = Uuid::new_v4();
+        cloned_events = clone_events_for_new_session(&cloned_events, new_id);
+        // Strip parent CLI thread bindings & transient running status so the forked thread starts cleanly idle
+        cloned_events.retain(|ev| !matches!(ev, AgentEvent::ProviderSessionBound { .. }));
+        while matches!(
+            cloned_events.last(),
+            Some(AgentEvent::StatusChanged {
+                status: SessionStatus::Running
+                    | SessionStatus::Starting
+                    | SessionStatus::WaitingForPermission,
+                ..
+            })
+        ) {
+            cloned_events.pop();
+        }
 
         let now = Utc::now();
+        let base_src_name = src
+            .name
+            .strip_prefix("Fork · ")
+            .unwrap_or(&src.name)
+            .trim();
         let fork_title = custom_title
             .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| format!("Fork · {}", src.name));
+            .unwrap_or_else(|| {
+                if base_src_name.is_empty() {
+                    "Fork · Session".to_string()
+                } else {
+                    format!("Fork · {}", base_src_name)
+                }
+            });
+
+        let clean_repo = canonical_workspace_path(if src.repo_root.trim().is_empty() {
+            &src.worktree_path
+        } else {
+            &src.repo_root
+        });
+        let clean_wt = if src.worktree_path.trim().is_empty() {
+            clean_repo.clone()
+        } else {
+            canonical_workspace_path(&src.worktree_path)
+        };
 
         let forked = SessionInfo {
             id: new_id,
             name: fork_title,
             provider: src.provider.clone(),
             prompt: src.prompt.clone(),
-            repo_root: src.repo_root.clone(),
-            worktree_path: src.worktree_path.clone(),
+            repo_root: clean_repo.clone(),
+            worktree_path: clean_wt,
             branch: src.branch.clone(),
             status: SessionStatus::Completed,
             pid: None,
@@ -5467,12 +6312,25 @@ impl DaemonState {
             archived: false,
         };
 
+        let mut added_workspace = false;
         {
             let mut guard = self.inner.write().await;
+            if !clean_repo.is_empty()
+                && !guard
+                    .workspaces
+                    .iter()
+                    .any(|w| canonical_workspace_path(w) == clean_repo)
+            {
+                guard.workspaces.push(clean_repo);
+                added_workspace = true;
+            }
             guard.sessions.insert(new_id, forked.clone());
             guard.event_history.insert(new_id, cloned_events.clone());
         }
         let _ = self.db.replace_session_events(new_id, &cloned_events);
+        if added_workspace {
+            let _ = self.persist_workspaces().await;
+        }
         let _ = self.persist_sessions().await;
         Ok(forked)
     }
@@ -5727,6 +6585,8 @@ async fn archive_session_handler(
 #[derive(serde::Deserialize)]
 struct ForkSessionRequest {
     up_to_user_turn: Option<usize>,
+    up_to_user_text: Option<String>,
+    user_turns_from_end: Option<usize>,
     title: Option<String>,
 }
 
@@ -5736,7 +6596,13 @@ async fn fork_session_handler(
     Json(req): Json<ForkSessionRequest>,
 ) -> impl IntoResponse {
     match state
-        .fork_session_core(id, req.up_to_user_turn, req.title)
+        .fork_session_core(
+            id,
+            req.up_to_user_turn,
+            req.up_to_user_text,
+            req.user_turns_from_end,
+            req.title,
+        )
         .await
     {
         Ok(sess) => (
@@ -5856,11 +6722,36 @@ async fn dispatch_ssh_host_handler(
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct RemoveQueueQuery {
+    #[serde(default)]
+    input: Option<String>,
+}
+
 async fn remove_queued_prompt_handler(
     State(state): State<DaemonState>,
     AxumPath((id, queue_id)): AxumPath<(Uuid, String)>,
+    Query(query): Query<RemoveQueueQuery>,
 ) -> impl IntoResponse {
-    Json(state.remove_queued_prompt_core(id, &queue_id).await)
+    Json(
+        state
+            .remove_queued_prompt_matching(id, &queue_id, query.input.as_deref())
+            .await,
+    )
+}
+
+async fn run_queued_prompt_handler(
+    State(state): State<DaemonState>,
+    AxumPath((id, queue_id)): AxumPath<(Uuid, String)>,
+) -> impl IntoResponse {
+    match state.run_queued_prompt_now_core(id, &queue_id).await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_checkpoints_handler(
@@ -6475,6 +7366,7 @@ async fn stop_session_handler(
 ) -> impl IntoResponse {
     {
         let mut guard = state.inner.write().await;
+        guard.suppressed_steer_stops.remove(&id);
         if let Some(mut handle) = guard.handles.remove(&id) {
             handle.stop();
         }
@@ -7963,6 +8855,7 @@ composer-2.5 - Composer 2.5
                 live_turns: HashMap::new(),
                 handles: HashMap::new(),
                 warm_handles: HashMap::new(),
+                suppressed_steer_stops: HashMap::new(),
                 shells: HashMap::new(),
                 pending_approvals: HashMap::new(),
                 pending_questions: HashMap::new(),
@@ -8386,6 +9279,256 @@ composer-2.5 - Composer 2.5
             10_000,
         );
         assert!((cost - 0.39).abs() < 0.0001, "expected $0.39, got {}", cost);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn test_streamed_assistant_text_survives_reload() -> anyhow::Result<()> {
+        let tmp = std::env::temp_dir().join(format!("velo-stream-text-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp)?;
+        let db = storage::VeloSqliteStore::open(&tmp.join("velo.db"))?;
+        let sid = Uuid::new_v4();
+        let mut metrics = LiveTurnMetrics::new(0, 0.0);
+        let mut hist = Vec::new();
+
+        metrics.segment_text = "Hi".to_string();
+        commit_open_assistant_segment(&db, &mut metrics, &mut hist, sid, false);
+        assert!(hist.is_empty(), "a short chunk waits until the segment grows or a boundary");
+
+        metrics.segment_text =
+            "The assistant already wrote a long reply before the next tool step.".to_string();
+        commit_open_assistant_segment(&db, &mut metrics, &mut hist, sid, false);
+        assert_eq!(hist.len(), 1);
+        let seq = metrics.persisted_messages[0].0;
+
+        metrics.segment_text.push_str(
+            " It keeps growing past the snapshot threshold so the same row is updated.",
+        );
+        commit_open_assistant_segment(&db, &mut metrics, &mut hist, sid, false);
+        assert_eq!(hist.len(), 1);
+        assert_eq!(metrics.persisted_messages[0].0, seq);
+
+        commit_open_assistant_segment(&db, &mut metrics, &mut hist, sid, true);
+        metrics.segment_text.clear();
+        metrics.continuing_last_message = false;
+
+        let full = format!("{} Tail.", metrics.persisted_messages[0].1);
+        let delta = AgentEvent::MessageDelta {
+            session_id: sid,
+            text: full.clone(),
+            timestamp: Utc::now(),
+        };
+        assert!(absorb_streamed_message_delta(
+            &db, &mut metrics, &mut hist, &delta
+        ));
+        assert_eq!(hist.len(), 1);
+
+        metrics.segment_text =
+            "After the tool, a second paragraph is still part of the same turn.".to_string();
+        metrics.continuing_last_message = false;
+        commit_open_assistant_segment(&db, &mut metrics, &mut hist, sid, true);
+        assert_eq!(hist.len(), 2);
+
+        let page = db.query_events_page(sid, None, 20)?;
+        let texts: Vec<String> = page
+            .events
+            .iter()
+            .filter_map(|ev| match ev {
+                AgentEvent::MessageDelta { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec![full, metrics.persisted_messages[1].1.clone()]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fork_preserves_exact_folder_and_clicked_turn_context() -> anyhow::Result<()> {
+        let tmp = std::env::temp_dir().join(format!("velo-fork-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp)?;
+        let ws_dir = tmp.join("sentry-viewer");
+        std::fs::create_dir_all(&ws_dir)?;
+        let ws_path = canonical_workspace_path(&ws_dir.to_string_lossy());
+
+        let db = storage::VeloSqliteStore::open(&tmp.join("velo.db"))?;
+        let (agent_event_tx, _) = broadcast::channel(64);
+        let (event_tx, _) = broadcast::channel(64);
+        let (snapshot_tx, _) = broadcast::channel(16);
+        let state = DaemonState {
+            inner: Arc::new(RwLock::new(DaemonInner {
+                sessions: HashMap::new(),
+                event_history: HashMap::new(),
+                live_turns: HashMap::new(),
+                handles: HashMap::new(),
+                warm_handles: HashMap::new(),
+                suppressed_steer_stops: HashMap::new(),
+                shells: HashMap::new(),
+                pending_approvals: HashMap::new(),
+                pending_questions: HashMap::new(),
+                automations: Vec::new(),
+                repo_hooks: HashMap::new(),
+                workspaces: Vec::new(),
+                push_config: push::PushConfig::default(),
+                quota_cache: quota::PersistedQuotaCache::default(),
+                remote_hosts: Vec::new(),
+            })),
+            db,
+            agent_event_tx,
+            event_tx,
+            snapshot_tx,
+            worktree_mgr: WorktreeManager::new(tmp.join("worktrees")),
+            state_file: tmp.join("sessions.json"),
+            events_dir: tmp.join("events"),
+            attachments_dir: tmp.join("attachments"),
+            automations_file: tmp.join("automations.json"),
+            hooks_file: tmp.join("repo_hooks.json"),
+            workspaces_file: tmp.join("workspaces.json"),
+            push_config_file: tmp.join("push_config.json"),
+            quota_cache_file: tmp.join("quotas.json"),
+            hosts_file: tmp.join("hosts.json"),
+            daemon_http_base: None,
+        };
+        let src_id = Uuid::new_v4();
+        let now = Utc::now();
+        let src = SessionInfo {
+            id: src_id,
+            name: "先帮我部署到商店吧".to_string(),
+            provider: AgentProvider::Codex,
+            prompt: "Turn 1 prompt".to_string(),
+            repo_root: format!("{}/", ws_path), // trailing slash should be canonicalized
+            worktree_path: ws_path.clone(),
+            branch: "codex/native-video-playback".to_string(),
+            status: SessionStatus::Completed,
+            pid: None,
+            diff_stats: Default::default(),
+            created_at: now,
+            updated_at: now,
+            parent_session_id: None,
+            provider_session_id: Some("codex-parent-thread-123".to_string()),
+            model: Some("gpt-6.1-sol".to_string()),
+            effort: Some("high".to_string()),
+            tokens_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            context_window: 200_000,
+            cost_usd: 0.0,
+            approval_mode: "auto_edit".to_string(),
+            preview_url: None,
+            queued_prompts: Vec::new(),
+            archived: false,
+        };
+        let src_events = vec![
+            AgentEvent::UserMessage {
+                session_id: src_id,
+                text: "Turn 1 prompt".to_string(),
+                images: vec![],
+                timestamp: now,
+            },
+            AgentEvent::MessageDelta {
+                session_id: src_id,
+                text: "Turn 1 answer".to_string(),
+                timestamp: now,
+            },
+            AgentEvent::UserMessage {
+                session_id: src_id,
+                text: "Turn 2 target prompt".to_string(),
+                images: vec![],
+                timestamp: now,
+            },
+            AgentEvent::ProviderSessionBound {
+                session_id: src_id,
+                provider_session_id: "codex-parent-thread-123".to_string(),
+                timestamp: now,
+            },
+            AgentEvent::MessageDelta {
+                session_id: src_id,
+                text: "Turn 2 target answer".to_string(),
+                timestamp: now,
+            },
+            AgentEvent::UserMessage {
+                session_id: src_id,
+                text: "Turn 3 should be excluded".to_string(),
+                images: vec![],
+                timestamp: now,
+            },
+            AgentEvent::MessageDelta {
+                session_id: src_id,
+                text: "Turn 3 excluded answer".to_string(),
+                timestamp: now,
+            },
+        ];
+        {
+            let mut g = state.inner.write().await;
+            g.sessions.insert(src_id, src);
+            g.event_history.insert(src_id, src_events);
+        }
+
+        // Simulate paginated UI clicking Fork on Turn 2 (sending wrong local turnIdx=1 but exact user text + tail offset!)
+        let forked = state
+            .fork_session_core(
+                src_id,
+                Some(1),
+                Some("Turn 2 target prompt".to_string()),
+                Some(1),
+                None,
+            )
+            .await?;
+
+        // 1. Folder is canonicalized and registered in workspaces
+        assert_eq!(forked.repo_root, ws_path);
+        assert_eq!(forked.worktree_path, ws_path);
+        assert!(forked.provider_session_id.is_none());
+
+        // 2. Context stops right after Turn 2's reply, excludes Turn 3, strips ProviderSessionBound, and rewrites session_id
+        let forked_evs = {
+            let g = state.inner.read().await;
+            assert!(g.workspaces.contains(&ws_path));
+            g.event_history.get(&forked.id).cloned().unwrap_or_default()
+        };
+        let user_texts: Vec<String> = forked_evs
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::UserMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["Turn 1 prompt".to_string(), "Turn 2 target prompt".to_string()]
+        );
+        assert!(forked_evs
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageDelta { text, .. } if text == "Turn 2 target answer")));
+        assert!(!forked_evs
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ProviderSessionBound { .. })));
+        assert!(forked_evs.iter().all(|e| e.session_id() == forked.id));
+
+        // 3. Cross-engine handoff of that forked session preserves BOTH the title AND cloned conversation events!
+        let handed = state
+            .handoff_session(
+                forked.id,
+                HandoffSessionRequest {
+                    target_provider: AgentProvider::Antigravity,
+                    model: Some("gemini-4-neon".to_string()),
+                    effort: Some("high".to_string()),
+                    additional_instructions: None,
+                },
+            )
+            .await?;
+        assert_eq!(handed.name, "Fork · 先帮我部署到商店吧 · AGY");
+        assert_eq!(handed.repo_root, ws_path);
+        let handed_evs = {
+            let g = state.inner.read().await;
+            g.event_history.get(&handed.id).cloned().unwrap_or_default()
+        };
+        assert_eq!(handed_evs.len(), forked_evs.len());
+        assert!(handed_evs.iter().all(|e| e.session_id() == handed.id));
 
         let _ = std::fs::remove_dir_all(&tmp);
         Ok(())

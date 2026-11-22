@@ -828,6 +828,7 @@ async fn run_supervised_e2ee_bridge(
                                         let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
                                     }
 
+                                    state.flush_open_assistant_text(None).await;
                                     let guard = state.inner.read().await;
                                     let mut sessions: Vec<SessionInfo> =
                                         guard.sessions.values().cloned().collect();
@@ -878,6 +879,7 @@ async fn run_supervised_e2ee_bridge(
                                         cmd_val.get("session_id").and_then(|v| v.as_str())
                                     {
                                         if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            state.flush_open_assistant_text(Some(sid)).await;
                                             let guard = state.inner.read().await;
                                             let compact_evs = guard
                                                 .event_history
@@ -983,6 +985,10 @@ async fn run_supervised_e2ee_bridge(
                                                 .get("mode")
                                                 .and_then(|v| v.as_str())
                                                 .map(|s| s.to_string());
+                                            let skill_path = cmd_val
+                                                .get("skill_path")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string());
                                             if let Err(err) = state
                                                 .dispatch_session_input(
                                                     sid,
@@ -996,6 +1002,7 @@ async fn run_supervised_e2ee_bridge(
                                                         images,
                                                         approval_mode,
                                                         mode,
+                                                        skill_path,
                                                     },
                                                 )
                                                 .await
@@ -1795,6 +1802,7 @@ async fn run_supervised_e2ee_bridge(
                                         cmd_val.get("session_id").and_then(|v| v.as_str())
                                     {
                                         if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            state.flush_open_assistant_text(Some(sid)).await;
                                             let before_seq = cmd_val
                                                 .get("before_seq")
                                                 .and_then(|v| v.as_i64());
@@ -1898,12 +1906,27 @@ async fn run_supervised_e2ee_bridge(
                                                 .get("up_to_user_turn")
                                                 .and_then(|v| v.as_u64())
                                                 .map(|n| n as usize);
+                                            let up_to_text = cmd_val
+                                                .get("up_to_user_text")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            let from_end = cmd_val
+                                                .get("user_turns_from_end")
+                                                .and_then(|v| v.as_u64())
+                                                .map(|n| n as usize);
                                             let title = cmd_val
                                                 .get("title")
                                                 .and_then(|v| v.as_str())
                                                 .map(str::to_string);
-                                            if let Ok(forked) =
-                                                state.fork_session_core(sid, up_to, title).await
+                                            if let Ok(forked) = state
+                                                .fork_session_core(
+                                                    sid,
+                                                    up_to,
+                                                    up_to_text,
+                                                    from_end,
+                                                    title,
+                                                )
+                                                .await
                                             {
                                                 let ack = json!({
                                                     "type": "session_forked",
@@ -1990,7 +2013,22 @@ async fn run_supervised_e2ee_bridge(
                                         cmd_val.get("queue_id").and_then(|v| v.as_str()),
                                     ) {
                                         if let Ok(sid) = Uuid::parse_str(sid_s) {
-                                            let _ = state.remove_queued_prompt_core(sid, qid).await;
+                                            let input = cmd_val
+                                                .get("input")
+                                                .and_then(|v| v.as_str());
+                                            let _ = state
+                                                .remove_queued_prompt_matching(sid, qid, input)
+                                                .await;
+                                        }
+                                    }
+                                }
+                                "run_queued_prompt" => {
+                                    if let (Some(sid_s), Some(qid)) = (
+                                        cmd_val.get("session_id").and_then(|v| v.as_str()),
+                                        cmd_val.get("queue_id").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(sid) = Uuid::parse_str(sid_s) {
+                                            let _ = state.run_queued_prompt_now_core(sid, qid).await;
                                         }
                                     }
                                 }

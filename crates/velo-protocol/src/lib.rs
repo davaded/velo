@@ -218,6 +218,9 @@ pub struct QueuedPromptItem {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    /// Recognized `SKILL.md` path. The visible `input` stays short; the daemon reads this file for the model.
+    #[serde(default)]
+    pub skill_path: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -456,6 +459,9 @@ pub struct SessionInputRequest {
     /// Execution mode when session is busy: `"queue"` (enqueue for next turn), `"steer"` (interrupt & run immediately), or `None`.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Path of a `SKILL.md` to follow for this turn. Stored user text stays `input`.
+    #[serde(default)]
+    pub skill_path: Option<String>,
 }
 
 /// Client-to-daemon WebSocket command envelope.

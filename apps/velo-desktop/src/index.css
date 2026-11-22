@@ -161,6 +161,36 @@ body,
     color 160ms ease;
 }
 
+/* Chat prose opts back into selection. The app shell stays select-none,
+   including on WKWebView where an ancestor user-select:none otherwise wins. */
+.velo-selectable,
+.velo-selectable * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  cursor: text;
+}
+.velo-selectable button,
+.velo-selectable button *,
+.velo-selectable .velo-no-select,
+.velo-selectable .velo-no-select * {
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  cursor: pointer;
+}
+.velo-selectable a {
+  cursor: pointer;
+}
+
+/* Theme-aware high-contrast text selection (prevents light-mode pale-on-pale clash) */
+::selection {
+  background-color: rgba(139, 92, 246, 0.36);
+  color: #ffffff;
+}
+[data-theme="light"] ::selection {
+  background-color: rgba(124, 58, 237, 0.22);
+  color: #111113;
+}
+
 ::-webkit-scrollbar {
   width: 5px;
   height: 5px;

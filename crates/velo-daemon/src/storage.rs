@@ -419,6 +419,39 @@ impl VeloSqliteStore {
         Ok(())
     }
 
+    pub fn delete_event_seq(&self, session_id: Uuid, seq: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM session_events WHERE seq = ?1 AND session_id = ?2",
+            params![seq, session_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a new event, or replace the provisional streamed message row.
+    pub fn upsert_event_seq(
+        &self,
+        session_id: Uuid,
+        seq: Option<i64>,
+        ev: &AgentEvent,
+    ) -> Result<i64> {
+        if let Some(seq) = seq {
+            let (etype, ts_ms, stext) = extract_event_metadata(ev);
+            let blob = serde_json::to_string(ev)?;
+            let conn = self.conn.lock().unwrap();
+            let updated = conn.execute(
+                "UPDATE session_events
+                 SET event_type = ?1, ts_ms = ?2, search_text = ?3, json_blob = ?4
+                 WHERE seq = ?5 AND session_id = ?6",
+                params![etype, ts_ms, stext, blob, seq, session_id.to_string()],
+            )?;
+            if updated > 0 {
+                return Ok(seq);
+            }
+        }
+        self.append_event(session_id, ev)
+    }
+
     /// O(1) single-row incremental append in WAL mode.
     pub fn append_event(&self, session_id: Uuid, ev: &AgentEvent) -> Result<i64> {
         let (etype, ts_ms, stext) = extract_event_metadata(ev);

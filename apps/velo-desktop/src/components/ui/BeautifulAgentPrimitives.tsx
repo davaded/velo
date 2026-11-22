@@ -999,8 +999,9 @@ export const BeautifulToolCallCard: React.FC<{
   input: unknown;
   output?: string;
   isError?: boolean;
+  isActive?: boolean;
   onOpenDiffTab?: () => void;
-}> = ({ toolName, input, output, isError = false, onOpenDiffTab }) => {
+}> = ({ toolName, input, output, isError = false, isActive = false, onOpenDiffTab }) => {
   const [expanded, setExpanded] = useState(false);
   const pres = useMemo(
     () => resolvePaseoToolPresentation(toolName, input, output),
@@ -1014,7 +1015,7 @@ export const BeautifulToolCallCard: React.FC<{
     () => extractSubagentDelegation(toolName, input),
     [toolName, input]
   );
-  const isRunning = output === undefined;
+  const isRunning = isActive && output === undefined;
 
   const enrichedSecondary = useMemo(() => {
     if (subagentInfo) {
@@ -1236,9 +1237,10 @@ export interface PaseoTraceStepItem {
 
 export const PaseoExecutionTraceGroup: React.FC<{
   steps: PaseoTraceStepItem[];
+  isTurnRunning?: boolean;
   defaultExpanded?: boolean;
   onOpenDiffForFile?: (fileArg?: string) => void;
-}> = ({ steps, defaultExpanded = false, onOpenDiffForFile }) => {
+}> = ({ steps, isTurnRunning = false, defaultExpanded = false, onOpenDiffForFile }) => {
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
   const expanded = userExpanded ?? defaultExpanded;
 
@@ -1256,7 +1258,7 @@ export const PaseoExecutionTraceGroup: React.FC<{
         if (parsed.summary) {
           latestStepHint = parsed.summary;
         }
-        if (st.isStreamingThinking) {
+        if (isTurnRunning && st.isStreamingThinking) {
           isAnyRunning = true;
         }
       } else {
@@ -1267,7 +1269,7 @@ export const PaseoExecutionTraceGroup: React.FC<{
           st.input,
           st.output
         );
-        if (st.output === undefined) {
+        if (isTurnRunning && st.output === undefined) {
           isAnyRunning = true;
           latestStepHint = pres.summary
             ? `${pres.displayName} · ${pres.summary}`
@@ -1300,7 +1302,7 @@ export const PaseoExecutionTraceGroup: React.FC<{
       hasError,
       isAnyRunning,
     };
-  }, [steps]);
+  }, [steps, isTurnRunning]);
 
   return (
     <PaseoExpandableBadge
@@ -1319,7 +1321,7 @@ export const PaseoExecutionTraceGroup: React.FC<{
             <BeautifulThinkingBlock
               key={st.id}
               text={st.text || ""}
-              isStreaming={st.isStreamingThinking}
+              isStreaming={Boolean(isTurnRunning && st.isStreamingThinking)}
               startedAtMs={st.startedAtMs}
               durationMs={st.durationMs}
               defaultExpanded={false}
@@ -1331,6 +1333,7 @@ export const PaseoExecutionTraceGroup: React.FC<{
               input={st.input}
               output={st.output}
               isError={st.isError}
+              isActive={isTurnRunning}
               onOpenDiffTab={() => onOpenDiffForFile?.(st.fileArg)}
             />
           )
@@ -1402,7 +1405,7 @@ const PaseoCodeBlock: React.FC<{
         </button>
       </div>
       <pre
-        className="overflow-x-auto p-3 font-mono-code text-[12.5px] leading-[1.55]"
+        className="overflow-x-auto whitespace-pre p-3 font-mono-code text-[12.5px] leading-[1.55]"
         style={{ color: "var(--fg)" }}
       >
         <code>{code}</code>
@@ -1411,212 +1414,523 @@ const PaseoCodeBlock: React.FC<{
   );
 };
 
-function renderInlineMarkdown(text: string): React.ReactNode[] {
-  // Tokenize inline `code`, **bold**, *italic*, ~~strike~~, and [label](url)
-  const tokenRegex =
-    /(`[^`\n]+`|\*\*[^*\n]+\*\*|~~[^~\n]+~~|\[[^\]]+\]\([^)]+\)|\*[^*\s][^*\n]*\*)/g;
-  const parts = text.split(tokenRegex);
+type MdListItem = {
+  depth: number;
+  text: string;
+  checked?: boolean;
+  ordered?: string;
+};
 
-  return parts.map((part, idx) => {
-    if (!part) return null;
+type MdBlock =
+  | { type: "code"; lang: string; code: string }
+  | { type: "heading"; level: number; text: string }
+  | { type: "hr" }
+  | { type: "blockquote"; text: string }
+  | { type: "list"; items: MdListItem[] }
+  | { type: "table"; headers: string[]; rows: string[][] }
+  | { type: "image"; alt: string; src: string }
+  | { type: "paragraph"; text: string };
 
-    if (part.startsWith("`") && part.endsWith("`") && part.length >= 2) {
-      return (
-        <code
-          key={idx}
-          className="mx-[1px] rounded-[5px] border px-1.5 py-[1px] font-mono-code text-[12px]"
-          style={{
-            backgroundColor: "var(--surface-1)",
-            borderColor: "var(--border-subtle)",
-            color: "var(--fg)",
-          }}
-        >
-          {part.slice(1, -1)}
-        </code>
-      );
+function matchFenceOpen(line: string): { marker: "`" | "~"; lang: string } | null {
+  const match = line.match(/^ {0,3}(```+|~~~+)(.*)$/);
+  if (!match) return null;
+  const lang = match[2].trim().split(/\s+/)[0] || "";
+  return { marker: match[1][0] === "`" ? "`" : "~", lang };
+}
+
+function matchFenceClose(line: string, marker: "`" | "~"): boolean {
+  const trimmed = line.trim();
+  return marker === "`" ? /^```+\s*$/.test(trimmed) : /^~~~+\s*$/.test(trimmed);
+}
+
+function isTableRow(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.includes("|") && trimmed.replace(/\|/g, "").trim().length > 0;
+}
+
+function isTableSeparator(line: string): boolean {
+  const cells = splitTableCells(line);
+  return (
+    cells.length > 0 &&
+    cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s/g, "")))
+  );
+}
+
+function splitTableCells(line: string): string[] {
+  let raw = line.trim();
+  if (raw.startsWith("|")) raw = raw.slice(1);
+  if (raw.endsWith("|") && !raw.endsWith("\\|")) raw = raw.slice(0, -1);
+  const cells: string[] = [];
+  let current = "";
+  let inCode = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === "\\" && raw[i + 1] === "|") {
+      current += "|";
+      i++;
+      continue;
+    }
+    if (ch === "`") inCode = !inCode;
+    if (ch === "|" && !inCode) {
+      cells.push(current.trim().replace(/<br\s*\/?>/gi, "\n"));
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  cells.push(current.trim().replace(/<br\s*\/?>/gi, "\n"));
+  return cells;
+}
+
+function parseListMarker(line: string): MdListItem | null {
+  const match = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+  if (!match) return null;
+  if (/^\s*([-*_])\1{2,}\s*$/.test(line)) return null;
+  const indent = match[1].replace(/\t/g, "  ").length;
+  let text = match[3];
+  let checked: boolean | undefined;
+  const task = text.match(/^\[([ xX])\]\s+(.*)$/);
+  if (task && /^[-*+]$/.test(match[2])) {
+    checked = task[1].toLowerCase() === "x";
+    text = task[2];
+  }
+  const ordered = /^\d/.test(match[2]) ? match[2].replace(/\)$/, ".") : undefined;
+  return { depth: Math.min(6, Math.floor(indent / 2)), text, checked, ordered };
+}
+
+function isStructuralLine(line: string, nextLine?: string): boolean {
+  if (matchFenceOpen(line)) return true;
+  if (/^ {0,3}#{1,6}\s+\S/.test(line)) return true;
+  if (/^ {0,3}>/.test(line)) return true;
+  if (/^ {0,3}([-*_])\1{2,}\s*$/.test(line)) return true;
+  if (parseListMarker(line)) return true;
+  if (nextLine && isTableRow(line) && isTableSeparator(nextLine)) return true;
+  return false;
+}
+
+function parseMarkdownBlocks(content: string): MdBlock[] {
+  const normalized = content.replace(/\r\n/g, "\n").replace(/<br\s*\/?>/gi, "\n");
+  const lines = normalized.split("\n");
+  const blocks: MdBlock[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i++;
+      continue;
     }
 
-    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
-      return (
-        <strong key={idx} className="font-semibold" style={{ color: "var(--fg)" }}>
-          {part.slice(2, -2)}
-        </strong>
-      );
+    const fence = matchFenceOpen(line);
+    if (fence) {
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length && !matchFenceClose(lines[i], fence.marker)) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++;
+      blocks.push({ type: "code", lang: fence.lang, code: codeLines.join("\n") });
+      continue;
     }
 
-    if (part.startsWith("~~") && part.endsWith("~~") && part.length > 4) {
-      return (
-        <del key={idx} style={{ color: "var(--fg-muted)" }}>
-          {part.slice(2, -2)}
-        </del>
-      );
+    if (/^ {0,3}([-*_])\1{2,}\s*$/.test(line)) {
+      blocks.push({ type: "hr" });
+      i++;
+      continue;
     }
 
-    if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
-      return (
-        <em key={idx} className="italic">
-          {part.slice(1, -1)}
-        </em>
-      );
+    const heading = line.match(/^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      blocks.push({ type: "heading", level: heading[1].length, text: heading[2] });
+      i++;
+      continue;
     }
 
-    const linkMatch = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-    if (linkMatch) {
-      return (
-        <a
-          key={idx}
-          href={linkMatch[2]}
-          target="_blank"
-          rel="noreferrer"
-          className="underline underline-offset-2 transition-opacity hover:opacity-80"
-          style={{ color: "var(--accent-bright)" }}
-        >
-          {linkMatch[1]}
-        </a>
-      );
+    if (isTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      const headers = splitTableCells(line);
+      i += 2;
+      const rows: string[][] = [];
+      while (i < lines.length && isTableRow(lines[i]) && !isTableSeparator(lines[i])) {
+        const cells = splitTableCells(lines[i]);
+        while (cells.length < headers.length) cells.push("");
+        rows.push(cells.slice(0, headers.length));
+        i++;
+      }
+      blocks.push({ type: "table", headers, rows });
+      continue;
     }
 
-    return <React.Fragment key={idx}>{part}</React.Fragment>;
-  });
+    if (/^ {0,3}>/.test(line)) {
+      const quote: string[] = [];
+      while (i < lines.length && /^ {0,3}>/.test(lines[i])) {
+        quote.push(lines[i].replace(/^ {0,3}>\s?/, ""));
+        i++;
+      }
+      blocks.push({ type: "blockquote", text: quote.join("\n") });
+      continue;
+    }
+
+    if (parseListMarker(line)) {
+      const items: MdListItem[] = [];
+      while (i < lines.length) {
+        if (!lines[i].trim()) {
+          if (i + 1 < lines.length && parseListMarker(lines[i + 1])) {
+            i++;
+            continue;
+          }
+          break;
+        }
+        const marker = parseListMarker(lines[i]);
+        if (marker) {
+          items.push(marker);
+          i++;
+          continue;
+        }
+        if (/^( {2,}|\t)/.test(lines[i]) && items.length > 0) {
+          items[items.length - 1].text += "\n" + lines[i].trim();
+          i++;
+          continue;
+        }
+        break;
+      }
+      blocks.push({ type: "list", items });
+      continue;
+    }
+
+    const image = line.trim().match(/^!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)$/);
+    if (image) {
+      blocks.push({ type: "image", alt: image[1], src: image[2] });
+      i++;
+      continue;
+    }
+
+    const paragraph: string[] = [];
+    while (i < lines.length && lines[i].trim()) {
+      const next = lines[i + 1];
+      if (paragraph.length > 0 && isStructuralLine(lines[i], next)) break;
+      paragraph.push(lines[i].trimEnd());
+      i++;
+    }
+    if (paragraph.length > 0) {
+      blocks.push({ type: "paragraph", text: paragraph.join("\n") });
+    }
+  }
+
+  return blocks;
+}
+
+function safeHref(url: string): string | null {
+  const trimmed = url.trim();
+  if (
+    trimmed.startsWith("https://") ||
+    trimmed.startsWith("http://") ||
+    trimmed.startsWith("mailto:") ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("#")
+  ) {
+    return trimmed;
+  }
+  return null;
+}
+
+function safeImageSrc(
+  src: string,
+  resolveImageUrl?: (src: string) => string
+): string | null {
+  const trimmed = src.trim();
+  if (!trimmed || /^javascript:/i.test(trimmed)) return null;
+  const resolved = resolveImageUrl ? resolveImageUrl(trimmed) : trimmed;
+  if (
+    resolved.startsWith("https://") ||
+    resolved.startsWith("http://") ||
+    resolved.startsWith("data:image/") ||
+    resolved.startsWith("/")
+  ) {
+    return resolved;
+  }
+  return null;
+}
+
+function parseMarkdownLink(
+  text: string,
+  start: number
+): { label: string; url: string; end: number } | null {
+  if (text[start] !== "[") return null;
+  const labelEnd = text.indexOf("]", start + 1);
+  if (labelEnd < 0 || text[labelEnd + 1] !== "(") return null;
+  const label = text.slice(start + 1, labelEnd);
+  if (label.includes("\n")) return null;
+  const urlEnd = text.indexOf(")", labelEnd + 2);
+  if (urlEnd < 0) return null;
+  let url = text.slice(labelEnd + 2, urlEnd).trim();
+  const titled = url.match(/^(\S+)\s+["'][^"']*["']$/);
+  if (titled) url = titled[1];
+  if (!url || /\s/.test(url)) return null;
+  return { label, url, end: urlEnd + 1 };
+}
+
+function indexOfMarker(text: string, from: number, marker: string): number {
+  for (let i = from; i < text.length; i++) {
+    if (text[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (!text.startsWith(marker, i)) continue;
+    if (marker.length === 1) {
+      const prev = text[i - 1] ?? "";
+      const next = text[i + 1] ?? "";
+      if (prev === marker || next === marker || prev === " ") continue;
+    }
+    return i;
+  }
+  return -1;
+}
+
+function renderInlineMarkdown(
+  text: string,
+  keyBase = "i",
+  resolveImageUrl?: (src: string) => string
+): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let plain = "";
+  let key = 0;
+  const flush = () => {
+    if (!plain) return;
+    out.push(plain);
+    plain = "";
+  };
+  const push = (node: React.ReactNode) => {
+    flush();
+    out.push(<React.Fragment key={`${keyBase}-${key++}`}>{node}</React.Fragment>);
+  };
+
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === "\\" && i + 1 < text.length && /[\\`*_[\]{}()#+\-.!~|<>]/.test(text[i + 1])) {
+      plain += text[i + 1];
+      i += 2;
+      continue;
+    }
+
+    if (text[i] === "`") {
+      let ticks = 0;
+      while (text[i + ticks] === "`") ticks++;
+      const closer = "`".repeat(ticks);
+      const close = text.indexOf(closer, i + ticks);
+      if (close !== -1) {
+        const code = text.slice(i + ticks, close).replace(/^ /, "").replace(/ $/, "");
+        push(
+          <code
+            className="mx-[1px] rounded-[5px] border px-1.5 py-[1px] font-mono-code text-[12px]"
+            style={{
+              backgroundColor: "var(--surface-1)",
+              borderColor: "var(--border-subtle)",
+              color: "var(--fg)",
+            }}
+          >
+            {code}
+          </code>
+        );
+        i = close + ticks;
+        continue;
+      }
+    }
+
+    if (text.startsWith("![", i)) {
+      const image = parseMarkdownLink(text, i + 1);
+      if (image) {
+        const src = safeImageSrc(image.url, resolveImageUrl);
+        if (src) {
+          push(
+            <img
+              src={src}
+              alt={image.label || "image"}
+              className="my-1 max-h-[280px] max-w-full rounded-lg border"
+              style={{ borderColor: "var(--border-subtle)" }}
+            />
+          );
+          i = image.end;
+          continue;
+        }
+      }
+    }
+
+    if (text[i] === "[") {
+      const link = parseMarkdownLink(text, i);
+      const href = link ? safeHref(link.url) : null;
+      if (link && href) {
+        push(
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-2 transition-opacity hover:opacity-80"
+            style={{ color: "var(--accent-bright)" }}
+          >
+            {renderInlineMarkdown(link.label, `${keyBase}-a${key}`, resolveImageUrl)}
+          </a>
+        );
+        i = link.end;
+        continue;
+      }
+    }
+
+    if (
+      (text.startsWith("***", i) || text.startsWith("___", i)) &&
+      text[i + 3] &&
+      text[i + 3] !== " " &&
+      text[i + 3] !== text[i]
+    ) {
+      const marker = text.slice(i, i + 3);
+      const close = indexOfMarker(text, i + 3, marker);
+      if (close !== -1) {
+        push(
+          <strong className="font-semibold" style={{ color: "var(--fg)" }}>
+            <em>
+              {renderInlineMarkdown(text.slice(i + 3, close), `${keyBase}-bi${key}`, resolveImageUrl)}
+            </em>
+          </strong>
+        );
+        i = close + 3;
+        continue;
+      }
+    }
+
+    if (
+      (text.startsWith("**", i) || text.startsWith("__", i)) &&
+      text[i + 2] &&
+      text[i + 2] !== " " &&
+      text[i + 2] !== text[i]
+    ) {
+      const marker = text.slice(i, i + 2);
+      const close = indexOfMarker(text, i + 2, marker);
+      if (close !== -1) {
+        push(
+          <strong className="font-semibold" style={{ color: "var(--fg)" }}>
+            {renderInlineMarkdown(text.slice(i + 2, close), `${keyBase}-b${key}`, resolveImageUrl)}
+          </strong>
+        );
+        i = close + 2;
+        continue;
+      }
+    }
+
+    if (text.startsWith("~~", i) && text[i + 2] && text[i + 2] !== " ") {
+      const close = indexOfMarker(text, i + 2, "~~");
+      if (close !== -1) {
+        push(
+          <del style={{ color: "var(--fg-muted)" }}>
+            {renderInlineMarkdown(text.slice(i + 2, close), `${keyBase}-s${key}`, resolveImageUrl)}
+          </del>
+        );
+        i = close + 2;
+        continue;
+      }
+    }
+
+    const marker = text[i];
+    if ((marker === "*" || marker === "_") && text[i + 1] && text[i + 1] !== marker && text[i + 1] !== " ") {
+      const prev = i > 0 ? text[i - 1] : "";
+      const midWord = marker === "_" && /[\p{L}\p{N}]/u.test(prev);
+      if (!midWord) {
+        const close = indexOfMarker(text, i + 1, marker);
+        if (close !== -1) {
+          push(
+            <em className="italic">
+              {renderInlineMarkdown(text.slice(i + 1, close), `${keyBase}-e${key}`, resolveImageUrl)}
+            </em>
+          );
+          i = close + 1;
+          continue;
+        }
+      }
+    }
+
+    plain += text[i];
+    i++;
+  }
+
+  flush();
+  return out;
+}
+
+function renderInlineLines(
+  text: string,
+  keyBase: string,
+  resolveImageUrl?: (src: string) => string
+): React.ReactNode {
+  const lines = text.split("\n");
+  return lines.map((line, idx) => (
+    <React.Fragment key={`${keyBase}-ln-${idx}`}>
+      {idx > 0 && <br />}
+      {renderInlineMarkdown(line, `${keyBase}-${idx}`, resolveImageUrl)}
+    </React.Fragment>
+  ));
+}
+
+function headingClass(level: number): string {
+  if (level === 1) return "text-[16px] font-semibold mt-3 mb-1.5";
+  if (level === 2) return "text-[14.5px] font-semibold mt-2.5 mb-1";
+  return "text-[13.5px] font-semibold mt-2 mb-0.5";
 }
 
 export const PaseoMarkdown: React.FC<{
   content: string;
   isStreaming?: boolean;
   className?: string;
-}> = ({ content, isStreaming = false, className = "" }) => {
-  const blocks = useMemo(() => {
-    const result: Array<
-      | { type: "code"; lang: string; code: string }
-      | { type: "prose"; text: string }
-    > = [];
+  resolveImageUrl?: (src: string) => string;
+}> = ({ content, isStreaming = false, className = "", resolveImageUrl }) => {
+  const blocks = useMemo(() => parseMarkdownBlocks(content), [content]);
 
-    const fenceRegex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
-    let lastIndex = 0;
-    let match: RegExpExecArray | null;
-
-    while ((match = fenceRegex.exec(content)) !== null) {
-      if (match.index > lastIndex) {
-        result.push({
-          type: "prose",
-          text: content.slice(lastIndex, match.index),
-        });
-      }
-      result.push({
-        type: "code",
-        lang: match[1] || "",
-        code: match[2].replace(/\n$/, ""),
-      });
-      lastIndex = match.index + match[0].length;
-    }
-
-    if (lastIndex < content.length) {
-      const tail = content.slice(lastIndex);
-      // Handle an unclosed fenced code block while tokens are actively streaming
-      const unclosedMatch = tail.match(/([\s\S]*?)```([a-zA-Z0-9_-]*)\n([\s\S]*)$/);
-      if (unclosedMatch) {
-        if (unclosedMatch[1]) {
-          result.push({
-            type: "prose",
-            text: unclosedMatch[1],
-          });
-        }
-        result.push({
-          type: "code",
-          lang: unclosedMatch[2] || "",
-          code: unclosedMatch[3],
-        });
-      } else {
-        result.push({
-          type: "prose",
-          text: tail,
-        });
-      }
-    }
-
-    return result;
-  }, [content]);
-
-  const renderProseSegment = (text: string, blockIdx: number) => {
-    const lines = text.split("\n");
-    const elements: React.ReactNode[] = [];
-    let i = 0;
-
-    while (i < lines.length) {
-      const line = lines[i];
-      const trimmed = line.trim();
-
-      if (!trimmed) {
-        i++;
-        continue;
-      }
-
-      // Horizontal Rule
-      if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
-        elements.push(
-          <hr
-            key={`${blockIdx}-hr-${i}`}
-            className="my-3 border-t"
-            style={{ borderColor: "var(--border-subtle)" }}
-          />
-        );
-        i++;
-        continue;
-      }
-
-      // Headings
-      const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
-      if (headingMatch) {
-        const level = headingMatch[1].length;
-        const sizeClass =
-          level === 1
-            ? "text-[16px] font-semibold mt-3 mb-1.5"
-            : level === 2
-            ? "text-[14.5px] font-semibold mt-2.5 mb-1"
-            : "text-[13.5px] font-semibold mt-2 mb-0.5";
-        elements.push(
-          <div
-            key={`${blockIdx}-h-${i}`}
-            className={sizeClass}
-            style={{ color: "var(--fg)" }}
-          >
-            {renderInlineMarkdown(headingMatch[2])}
+  const renderBlock = (block: MdBlock, idx: number) => {
+    const key = `md-${idx}`;
+    switch (block.type) {
+      case "code":
+        return <PaseoCodeBlock key={key} language={block.lang} code={block.code} />;
+      case "heading":
+        return (
+          <div key={key} className={headingClass(block.level)} style={{ color: "var(--fg)" }}>
+            {renderInlineMarkdown(block.text, key, resolveImageUrl)}
           </div>
         );
-        i++;
-        continue;
-      }
-
-      // Markdown Table
-      if (
-        trimmed.startsWith("|") &&
-        trimmed.endsWith("|") &&
-        i + 1 < lines.length &&
-        /^\s*\|[\s:-]+\|/.test(lines[i + 1])
-      ) {
-        const headerCells = trimmed
-          .slice(1, -1)
-          .split("|")
-          .map((c) => c.trim());
-        i += 2; // skip header + separator
-        const rows: string[][] = [];
-        while (
-          i < lines.length &&
-          lines[i].trim().startsWith("|") &&
-          lines[i].trim().endsWith("|")
-        ) {
-          rows.push(
-            lines[i]
-              .trim()
-              .slice(1, -1)
-              .split("|")
-              .map((c) => c.trim())
-          );
-          i++;
-        }
-        elements.push(
+      case "hr":
+        return (
+          <hr key={key} className="my-3 border-t" style={{ borderColor: "var(--border-subtle)" }} />
+        );
+      case "blockquote":
+        return (
+          <blockquote
+            key={key}
+            className="my-2 border-l-2 pl-3 text-[13px]"
+            style={{ borderColor: "var(--border-accent)", color: "var(--fg-muted)" }}
+          >
+            {renderInlineLines(block.text, key, resolveImageUrl)}
+          </blockquote>
+        );
+      case "list":
+        return (
+          <div key={key} className="my-1.5 space-y-1 text-[13.5px] leading-[1.65]">
+            {block.items.map((item, itemIdx) => (
+              <div
+                key={`${key}-li-${itemIdx}`}
+                className="flex items-start gap-2"
+                style={{ paddingLeft: item.depth * 16 }}
+              >
+                <span className="velo-no-select mt-[1px] w-5 shrink-0 text-right text-[var(--v-fg-muted)]">
+                  {item.checked === true ? "☑" : item.checked === false ? "☐" : item.ordered || "•"}
+                </span>
+                <span className="min-w-0 flex-1">
+                  {renderInlineLines(item.text, `${key}-li-${itemIdx}`, resolveImageUrl)}
+                </span>
+              </div>
+            ))}
+          </div>
+        );
+      case "table":
+        return (
           <div
-            key={`${blockIdx}-tbl-${i}`}
+            key={key}
             className="my-2 overflow-x-auto rounded-[8px] border"
             style={{ borderColor: "var(--border-subtle)" }}
           >
@@ -1629,23 +1943,27 @@ export const PaseoMarkdown: React.FC<{
                     backgroundColor: "var(--surface-1)",
                   }}
                 >
-                  {headerCells.map((hc, cIdx) => (
+                  {block.headers.map((cell, cellIdx) => (
                     <th
-                      key={cIdx}
+                      key={cellIdx}
                       className="px-3 py-1.5 font-semibold"
                       style={{ color: "var(--fg)" }}
                     >
-                      {renderInlineMarkdown(hc)}
+                      {renderInlineLines(cell, `${key}-th-${cellIdx}`, resolveImageUrl)}
                     </th>
                   ))}
                 </tr>
               </thead>
-              <tbody className="divide-y" style={{ borderColor: "var(--border-subtle)" }}>
-                {rows.map((row, rIdx) => (
-                  <tr key={rIdx}>
-                    {row.map((cell, cIdx) => (
-                      <td key={cIdx} className="px-3 py-1.5">
-                        {renderInlineMarkdown(cell)}
+              <tbody>
+                {block.rows.map((row, rowIdx) => (
+                  <tr
+                    key={rowIdx}
+                    className="border-b last:border-b-0"
+                    style={{ borderColor: "var(--border-subtle)" }}
+                  >
+                    {row.map((cell, cellIdx) => (
+                      <td key={cellIdx} className="px-3 py-1.5 align-top">
+                        {renderInlineLines(cell, `${key}-td-${rowIdx}-${cellIdx}`, resolveImageUrl)}
                       </td>
                     ))}
                   </tr>
@@ -1654,104 +1972,44 @@ export const PaseoMarkdown: React.FC<{
             </table>
           </div>
         );
-        continue;
-      }
-
-      // Unordered List
-      if (/^[-*+]\s+/.test(trimmed)) {
-        const items: string[] = [];
-        while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
-          items.push(lines[i].trim().replace(/^[-*+]\s+/, ""));
-          i++;
+      case "image": {
+        const src = safeImageSrc(block.src, resolveImageUrl);
+        if (!src) {
+          return (
+            <p key={key} className="my-1 text-[13.5px] leading-[1.68]">
+              {block.alt || block.src}
+            </p>
+          );
         }
-        elements.push(
-          <ul
-            key={`${blockIdx}-ul-${i}`}
-            className="my-1.5 list-disc space-y-1 pl-5 text-[13.5px] leading-[1.65]"
-          >
-            {items.map((it, idx) => (
-              <li key={idx}>{renderInlineMarkdown(it)}</li>
-            ))}
-          </ul>
+        return (
+          <img
+            key={key}
+            src={src}
+            alt={block.alt || "image"}
+            className="my-2 max-h-[320px] max-w-full rounded-lg border"
+            style={{ borderColor: "var(--border-subtle)" }}
+          />
         );
-        continue;
       }
-
-      // Ordered List
-      if (/^\d+\.\s+/.test(trimmed)) {
-        const items: string[] = [];
-        while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
-          items.push(lines[i].trim().replace(/^\d+\.\s+/, ""));
-          i++;
-        }
-        elements.push(
-          <ol
-            key={`${blockIdx}-ol-${i}`}
-            className="my-1.5 list-decimal space-y-1 pl-5 text-[13.5px] leading-[1.65]"
-          >
-            {items.map((it, idx) => (
-              <li key={idx}>{renderInlineMarkdown(it)}</li>
-            ))}
-          </ol>
+      case "paragraph":
+        return (
+          <p key={key} className="my-1 text-[13.5px] leading-[1.68]">
+            {renderInlineLines(block.text, key, resolveImageUrl)}
+          </p>
         );
-        continue;
-      }
-
-      // Blockquote
-      if (trimmed.startsWith(">")) {
-        const quoteLines: string[] = [];
-        while (i < lines.length && lines[i].trim().startsWith(">")) {
-          quoteLines.push(lines[i].trim().replace(/^>\s?/, ""));
-          i++;
-        }
-        elements.push(
-          <blockquote
-            key={`${blockIdx}-bq-${i}`}
-            className="my-2 border-l-2 pl-3 italic text-[13px]"
-            style={{
-              borderColor: "var(--border-accent)",
-              color: "var(--fg-muted)",
-            }}
-          >
-            {quoteLines.map((ql, idx) => (
-              <div key={idx}>{renderInlineMarkdown(ql)}</div>
-            ))}
-          </blockquote>
-        );
-        continue;
-      }
-
-      // Standard Paragraph
-      elements.push(
-        <p
-          key={`${blockIdx}-p-${i}`}
-          className="my-1 first:mt-0 last:mb-0 text-[13.5px] leading-[1.68]"
-        >
-          {renderInlineMarkdown(line)}
-        </p>
-      );
-      i++;
     }
-
-    return elements;
   };
 
   return (
     <div
-      className={`w-full min-w-0 space-y-1.5 break-words [overflow-wrap:anywhere] text-[13.5px] leading-[1.68] ${className}`}
+      className={`velo-selectable w-full min-w-0 space-y-1 break-words text-[13.5px] leading-[1.68] ${className}`}
       style={{ color: "var(--v-fg-body)" }}
     >
-      {blocks.map((b, idx) =>
-        b.type === "code" ? (
-          <PaseoCodeBlock key={idx} language={b.lang} code={b.code} />
-        ) : (
-          <React.Fragment key={idx}>{renderProseSegment(b.text, idx)}</React.Fragment>
-        )
-      )}
+      {blocks.map(renderBlock)}
       {isStreaming && (
         <span
           aria-hidden="true"
-          className="inline-block h-[14px] w-[6px] translate-y-[2px] rounded-[1px] animate-pulse"
+          className="velo-no-select inline-block h-[14px] w-[6px] translate-y-[2px] rounded-[1px] animate-pulse"
           style={{ backgroundColor: "var(--fg-muted)" }}
         />
       )}

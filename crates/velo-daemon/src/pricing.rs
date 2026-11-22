@@ -46,7 +46,39 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
             output_per_m: 15.00,
         };
     }
-    if clean.contains("mini") || clean.contains("nano") {
+    if clean.contains("gemini") {
+        if clean.contains("flash-lite") {
+            return ModelRateCard {
+                input_per_m: 0.10,
+                cached_input_per_m: 0.01,
+                cache_write_per_m: 0.0,
+                output_per_m: 0.40,
+            };
+        }
+        if clean.contains("flash") {
+            return ModelRateCard {
+                input_per_m: 0.30,
+                cached_input_per_m: 0.03,
+                cache_write_per_m: 0.0,
+                output_per_m: 2.50,
+            };
+        }
+        return ModelRateCard {
+            input_per_m: 1.25,
+            cached_input_per_m: 0.125,
+            cache_write_per_m: 0.0,
+            output_per_m: 10.00,
+        };
+    }
+    if clean.contains("nano") {
+        return ModelRateCard {
+            input_per_m: 0.05,
+            cached_input_per_m: 0.005,
+            cache_write_per_m: 0.0,
+            output_per_m: 0.40,
+        };
+    }
+    if clean.contains("o3-mini") || clean.contains("o4-mini") {
         return ModelRateCard {
             input_per_m: 1.10,
             cached_input_per_m: 0.275,
@@ -54,28 +86,44 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
             output_per_m: 4.40,
         };
     }
-    if clean.contains("gpt-") || clean.contains("codex") || clean.starts_with("o3") || clean.starts_with("o4") {
+    if clean.contains("-mini") || clean.ends_with("mini") {
         return ModelRateCard {
-            input_per_m: 2.50,
-            cached_input_per_m: 0.25,
+            input_per_m: 0.25,
+            cached_input_per_m: 0.025,
+            cache_write_per_m: 0.0,
+            output_per_m: 2.00,
+        };
+    }
+    if clean.contains("o3") || clean.contains("o4") {
+        return ModelRateCard {
+            input_per_m: 2.00,
+            cached_input_per_m: 0.50,
+            cache_write_per_m: 0.0,
+            output_per_m: 8.00,
+        };
+    }
+    if clean.contains("gpt-") || clean.contains("codex") {
+        return ModelRateCard {
+            input_per_m: 1.25,
+            cached_input_per_m: 0.125,
             cache_write_per_m: 0.0,
             output_per_m: 10.00,
+        };
+    }
+    if clean.contains("flash-lite") {
+        return ModelRateCard {
+            input_per_m: 0.10,
+            cached_input_per_m: 0.01,
+            cache_write_per_m: 0.0,
+            output_per_m: 0.40,
         };
     }
     if clean.contains("flash") {
         return ModelRateCard {
             input_per_m: 0.30,
-            cached_input_per_m: 0.075,
+            cached_input_per_m: 0.03,
             cache_write_per_m: 0.0,
             output_per_m: 2.50,
-        };
-    }
-    if clean.contains("gemini") {
-        return ModelRateCard {
-            input_per_m: 1.25,
-            cached_input_per_m: 0.31,
-            cache_write_per_m: 0.0,
-            output_per_m: 10.00,
         };
     }
     if clean.contains("grok") && clean.contains("fast") {
@@ -104,14 +152,14 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
             output_per_m: 15.00,
         },
         AgentProvider::Codex => ModelRateCard {
-            input_per_m: 2.50,
-            cached_input_per_m: 0.25,
+            input_per_m: 1.25,
+            cached_input_per_m: 0.125,
             cache_write_per_m: 0.0,
             output_per_m: 10.00,
         },
         AgentProvider::Antigravity => ModelRateCard {
             input_per_m: 1.25,
-            cached_input_per_m: 0.31,
+            cached_input_per_m: 0.125,
             cache_write_per_m: 0.0,
             output_per_m: 10.00,
         },
@@ -162,6 +210,110 @@ pub fn compute_cost_usd(
         + output_tokens as f64 * rate.output_per_m)
         / 1_000_000.0;
     (usd * 1_000_000.0).round() / 1_000_000.0
+}
+
+/// Authoritative per-turn cost: prefers exact provider-reported `cost_usd` when present and sane,
+/// otherwise computes from the model rate card (automatically healing legacy inflated rows).
+pub fn effective_turn_cost_usd(
+    provider: &AgentProvider,
+    model: Option<&str>,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    output_tokens: u64,
+    stored_cost_usd: f64,
+) -> f64 {
+    let computed = compute_cost_usd(
+        provider,
+        model,
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+    );
+    if stored_cost_usd <= 0.0 {
+        return computed;
+    }
+    // If legacy Codex double-counting inflated `stored_cost_usd` far above what the recorded
+    // tokens can actually cost at the model's rate card, use the token-accurate rate card cost.
+    if computed > 0.0 && stored_cost_usd > computed * 1.65 {
+        return computed;
+    }
+    stored_cost_usd
+}
+
+/// Reconciles `session.cost_usd` and `session.output_tokens` directly from its persisted
+/// `UsageUpdated` turn history so session cards and analytics totals never drift apart.
+pub fn reconcile_session_usage(session: &mut SessionInfo, history: &[AgentEvent]) -> bool {
+    let enriched = crate::enrich_history_turn_metrics(history);
+    let mut sum_out = 0u64;
+    let mut sum_cost = 0.0f64;
+    let mut last_in = 0u64;
+    let mut last_cache = 0u64;
+    let mut last_ctx = 0u64;
+    let mut saw_usage = false;
+
+    for ev in &enriched {
+        if let AgentEvent::UsageUpdated {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            context_window,
+            cost_usd,
+            ..
+        } = ev
+        {
+            saw_usage = true;
+            sum_out = sum_out.saturating_add(*output_tokens);
+            sum_cost += effective_turn_cost_usd(
+                &session.provider,
+                session.model.as_deref(),
+                *input_tokens,
+                *cache_read_tokens,
+                *cache_write_tokens,
+                *output_tokens,
+                *cost_usd,
+            );
+            if *input_tokens > 0 {
+                last_in = *input_tokens;
+            }
+            if *cache_read_tokens > 0 {
+                last_cache = *cache_read_tokens;
+            }
+            if *context_window > 0 {
+                last_ctx = *context_window;
+            }
+        }
+    }
+
+    if !saw_usage {
+        return false;
+    }
+
+    let rounded_cost = (sum_cost * 1_000_000.0).round() / 1_000_000.0;
+    let mut changed = false;
+    if (session.cost_usd - rounded_cost).abs() > 1e-6 {
+        session.cost_usd = rounded_cost;
+        changed = true;
+    }
+    if session.output_tokens != sum_out {
+        session.output_tokens = sum_out;
+        changed = true;
+    }
+    if last_in > 0 && session.input_tokens != last_in {
+        session.input_tokens = last_in;
+        changed = true;
+    }
+    if last_cache > 0 && session.cache_read_tokens != last_cache {
+        session.cache_read_tokens = last_cache;
+        changed = true;
+    }
+    if last_ctx > 0 && session.context_window != last_ctx {
+        session.context_window = last_ctx;
+        changed = true;
+    }
+    changed
 }
 
 fn provider_key(p: &AgentProvider) -> &'static str {
@@ -273,18 +425,15 @@ pub fn build_usage_analytics(
                 {
                     sess_had_usage = true;
                     total_turns += 1;
-                    let eff_cost = if *cost_usd > 0.0 {
-                        *cost_usd
-                    } else {
-                        compute_cost_usd(
-                            &s.provider,
-                            s.model.as_deref(),
-                            *input_tokens,
-                            *cache_read_tokens,
-                            *cache_write_tokens,
-                            *output_tokens,
-                        )
-                    };
+                    let eff_cost = effective_turn_cost_usd(
+                        &s.provider,
+                        s.model.as_deref(),
+                        *input_tokens,
+                        *cache_read_tokens,
+                        *cache_write_tokens,
+                        *output_tokens,
+                        *cost_usd,
+                    );
 
                     total_in += *input_tokens;
                     total_cache += *cache_read_tokens;
@@ -407,4 +556,43 @@ pub fn build_usage_analytics(
         "by_provider": finalize_buckets(by_provider),
         "by_workspace": finalize_buckets(by_workspace),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rate_card_matching_avoids_gemini_mini_collision() {
+        let gem = lookup_rate_card(&AgentProvider::Antigravity, Some("gemini-4-neon"));
+        assert_eq!(gem.input_per_m, 1.25);
+        assert_eq!(gem.cached_input_per_m, 0.125);
+        assert_eq!(gem.output_per_m, 10.0);
+
+        let cur_gem = lookup_rate_card(&AgentProvider::Cursor, Some("cursor:gemini-4-neon"));
+        assert_eq!(cur_gem.output_per_m, 10.0);
+
+        let flash = lookup_rate_card(&AgentProvider::Antigravity, Some("gemini-2.5-flash"));
+        assert_eq!(flash.output_per_m, 2.5);
+
+        let gpt_mini = lookup_rate_card(&AgentProvider::Codex, Some("gpt-5-mini"));
+        assert_eq!(gpt_mini.output_per_m, 2.0);
+
+        let codex = lookup_rate_card(&AgentProvider::Codex, Some("gpt-6.1-sol"));
+        assert_eq!(codex.input_per_m, 1.25);
+        assert_eq!(codex.cached_input_per_m, 0.125);
+        assert_eq!(codex.output_per_m, 10.0);
+
+        // Legacy inflated Codex turn ($2.71 for 127k cached + 25.8k out) heals to ~$0.275
+        let healed = effective_turn_cost_usd(
+            &AgentProvider::Codex,
+            Some("gpt-6.1-sol"),
+            127_139,
+            126_976,
+            0,
+            25_866,
+            2.7140,
+        );
+        assert!(healed > 0.25 && healed < 0.30, "unexpected healed cost: {healed}");
+    }
 }

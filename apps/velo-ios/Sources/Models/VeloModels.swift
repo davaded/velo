@@ -1889,8 +1889,33 @@ public struct VeloSkillItem: Identifiable, Equatable, Sendable {
         )
     }
 
-    public var crossEnginePrompt: String {
-        "请先读取并严格遵循技能 `\(name)`（路径：`\(path)`）中的规范与步骤，协助完成以下任务：\n"
+    /// `/Name` plus any task already in the composer. The skill file is attached on send.
+    public func composerText(keeping current: String) -> String {
+        let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        let skill = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let task: String
+        if trimmed.hasPrefix("/") {
+            let body = String(trimmed.dropFirst())
+            let lower = body.lowercased()
+            let key = skill.lowercased()
+            if lower == key {
+                task = ""
+            } else if !key.isEmpty, lower.hasPrefix(key + " ") {
+                task = String(body.dropFirst(skill.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if let space = body.firstIndex(of: " ") {
+                task = String(body[body.index(after: space)...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                task = ""
+            }
+        } else {
+            task = trimmed
+        }
+        if task.isEmpty {
+            return "/\(skill) "
+        }
+        return "/\(skill) \(task)"
     }
 }
 

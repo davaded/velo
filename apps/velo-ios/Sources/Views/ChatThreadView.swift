@@ -42,6 +42,7 @@ public struct ChatThreadView: View {
         self.store = store
         self.sessionId = sessionId
         self.onSwitchedSession = onSwitchedSession
+        _draftPrompt = State(initialValue: store.draftPrompt(for: sessionId))
     }
 
     private var session: VeloSessionItem? {
@@ -142,8 +143,8 @@ public struct ChatThreadView: View {
                 sessionId: sessionId,
                 workspacePath: session?.repoRoot,
                 initialTab: extensionsCheckpointsTab,
-                onInjectSkillPrompt: { injected in
-                    draftPrompt = draftPrompt.isEmpty ? injected : "\(draftPrompt)\n\(injected)"
+                onInjectSkillPrompt: { sk in
+                    draftPrompt = sk.composerText(keeping: draftPrompt)
                     composerFocused = true
                 }
             )
@@ -214,6 +215,14 @@ public struct ChatThreadView: View {
         }
         .task(id: session?.repoRoot ?? sessionId) {
             await store.fetchExtensions(workspace: session?.repoRoot)
+        }
+        .onChange(of: draftPrompt) { _, newValue in
+            store.setDraftPrompt(newValue, for: sessionId)
+        }
+        .onChange(of: sessionId) { oldSid, newSid in
+            store.setDraftPrompt(draftPrompt, for: oldSid)
+            draftPrompt = store.draftPrompt(for: newSid)
+            pendingImages.removeAll()
         }
     }
 
@@ -535,11 +544,16 @@ public struct ChatThreadView: View {
         userTurnOrdinal: Int
     ) -> (() -> Void)? {
         guard !isSessionRunning, turn.userEvent != nil else { return nil }
+        let totalUserTurns = turns.filter { $0.userEvent != nil }.count
+        let oneBasedOrdinal = max(1, userTurnOrdinal + 1)
+        let turnsFromEnd = max(0, totalUserTurns - oneBasedOrdinal)
         return {
             Task {
                 if let forkedId = await store.forkSession(
                     sessionId,
-                    upToUserTurn: max(1, userTurnOrdinal + 1)
+                    upToUserTurn: oneBasedOrdinal,
+                    upToUserText: turn.userEvent?.content,
+                    userTurnsFromEnd: turnsFromEnd
                 ) {
                     onSwitchedSession?(forkedId)
                 }
@@ -850,10 +864,20 @@ public struct ChatThreadView: View {
     }
 
     private var matchingSlashActions: [SlashQuickAction] {
-        let trimmed = draftPrompt.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("/") else { return [] }
-        let query = trimmed.lowercased()
-        let keyword = String(query.dropFirst())
+        let leadingTrimmed = draftPrompt.drop(while: { $0.isWhitespace })
+        guard leadingTrimmed.hasPrefix("/") else { return [] }
+        let body = String(leadingTrimmed.dropFirst())
+        let lowerBody = body.lowercased()
+        // Dismiss strip once a skill/command is followed by a space (user is typing the task body)
+        if body.contains(where: { $0.isWhitespace }) {
+            let stillMultiWordSkill = store.installedSkills.contains { sk in
+                let name = sk.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return !name.isEmpty && name.hasPrefix(lowerBody) && name != lowerBody.trimmingCharacters(in: .whitespaces)
+            }
+            if !stillMultiWordSkill { return [] }
+        }
+        let query = "/" + lowerBody
+        let keyword = lowerBody
         let builtinCatalog: [SlashQuickAction] = [
             SlashQuickAction(id: "rewind", cmd: "/rewind", title: "回滚检查点", icon: "clock.arrow.circlepath", skillPrompt: nil, isProjectSkill: false),
             SlashQuickAction(id: "mcp", cmd: "/mcp", title: "Skills & MCP", icon: "puzzlepiece.extension", skillPrompt: nil, isProjectSkill: false),
@@ -871,13 +895,13 @@ public struct ChatThreadView: View {
                 cmd: "/\(sk.name)",
                 title: label,
                 icon: isProj ? "folder.badge.gearshape" : "sparkles",
-                skillPrompt: sk.crossEnginePrompt,
+                skillPrompt: sk.composerText(keeping: ""),
                 isProjectSkill: isProj
             )
         }
 
         if query == "/" {
-            return builtinCatalog + Array(skillCatalog.prefix(8))
+            return Array(skillCatalog.prefix(8)) + builtinCatalog
         }
         let matchedBuiltins = builtinCatalog.filter {
             $0.cmd.lowercased().contains(keyword) || $0.title.lowercased().contains(keyword)
@@ -885,7 +909,7 @@ public struct ChatThreadView: View {
         let matchedSkills = skillCatalog.filter { act in
             act.cmd.lowercased().contains(keyword) || act.title.lowercased().contains(keyword)
         }
-        return matchedBuiltins + Array(matchedSkills.prefix(10))
+        return Array(matchedSkills.prefix(10)) + matchedBuiltins
     }
 
     @ViewBuilder
@@ -930,6 +954,14 @@ public struct ChatThreadView: View {
     }
 
     private func executeSlashQuickAction(_ act: SlashQuickAction) {
+        if act.id.hasPrefix("sk:") {
+            let path = String(act.id.dropFirst(3))
+            if let sk = store.installedSkills.first(where: { $0.path == path }) {
+                draftPrompt = sk.composerText(keeping: draftPrompt)
+                composerFocused = true
+                return
+            }
+        }
         if let skillPrompt = act.skillPrompt {
             draftPrompt = skillPrompt
             composerFocused = true
@@ -1011,14 +1043,32 @@ public struct ChatThreadView: View {
                                 .lineLimit(1)
                             Spacer(minLength: 4)
                             Button {
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                Task {
+                                    await store.runQueuedPromptNow(sessionId: sessionId, queueId: q.id)
+                                }
+                            } label: {
+                                Text("立即执行")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(VeloTheme.amber)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(VeloTheme.amber.opacity(0.14), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            Button {
                                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                                 Task {
                                     await store.removeQueuedPrompt(sessionId: sessionId, queueId: q.id)
                                 }
                             } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 2) {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 9, weight: .bold))
+                                    Text("删除")
+                                        .font(.system(size: 11, weight: .medium))
+                                }
+                                .foregroundStyle(VeloTheme.coral)
                             }
                             .buttonStyle(.plain)
                         }
@@ -1819,11 +1869,12 @@ private struct TurnBlockView: View {
 
             // 2. Chronological Agent Segments (Unified Collapsible Execution Trace + Editorial Markdown)
             ForEach(segments) { seg in
+                let isLastSeg = seg.id == segments.last?.id
                 switch seg {
                 case .traceGroup(_, let batch):
                     ExecutionTraceGroupView(
                         items: batch,
-                        isTurnRunning: isTurnRunning,
+                        isTurnRunning: isTurnRunning && isLastSeg,
                         turnStartedAt: turnStartedAt,
                         defaultExpanded: !autoCollapseSteps
                     )
@@ -1849,7 +1900,8 @@ private struct TurnBlockView: View {
                             inlineDiffOld: item.inlineDiffOld,
                             inlineDiffNew: item.inlineDiffNew,
                             subagentRole: item.subagentRole,
-                            subagentPrompt: item.subagentPrompt
+                            subagentPrompt: item.subagentPrompt,
+                            isTurnRunning: isTurnRunning && isLast
                         )
 
                     case .assistant(let isStreaming):
@@ -2169,7 +2221,9 @@ private struct NativeMarkdownView: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 2)
+        .textSelection(.enabled)
     }
 
     // MARK: Block Parser
@@ -2937,7 +2991,22 @@ private struct InlineMarkdownText: View {
             .lineSpacing(lineSpacing)
             .multilineTextAlignment(alignment)
             .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
+            .frame(
+                maxWidth: .infinity,
+                alignment: alignment == .center ? .center : alignment == .trailing ? .trailing : .leading
+            )
+    }
+
+    /// Keep identifiers like `snake_case` literal. Apple's inline markdown parser
+    /// otherwise treats the underscore as emphasis and the line collapses.
+    private static func protectWordUnderscores(_ raw: String) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"(?<=[\p{L}\p{N}])_(?=[\p{L}\p{N}])"#
+        ) else {
+            return raw
+        }
+        let range = NSRange(raw.startIndex..., in: raw)
+        return regex.stringByReplacingMatches(in: raw, range: range, withTemplate: "\\\\_")
     }
 
     private static func buildAttributed(
@@ -2946,8 +3015,9 @@ private struct InlineMarkdownText: View {
         baseWeight: Font.Weight,
         secondary: Bool
     ) -> AttributedString {
+        let source = protectWordUnderscores(raw)
         guard var attributed = try? AttributedString(
-            markdown: raw,
+            markdown: source,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) else {
             var plain = AttributedString(raw)
@@ -2969,7 +3039,7 @@ private struct InlineMarkdownText: View {
                     weight: .medium,
                     design: .monospaced
                 )
-                attributed[range].backgroundColor = VeloTheme.accentViolet.opacity(0.14)
+                attributed[range].foregroundColor = VeloTheme.accentVioletSoft
             } else {
                 let isBold = intents?.contains(.stronglyEmphasized) == true
                 let isItalic = intents?.contains(.emphasized) == true
