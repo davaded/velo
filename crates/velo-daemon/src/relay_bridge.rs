@@ -2895,16 +2895,45 @@ async fn run_supervised_e2ee_bridge(
                                     }
                                 }
                                 "create_automation" => {
-                                    let name = cmd_val
+                                    let natural_input = cmd_val
+                                        .get("natural_input")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty());
+                                    let parsed_nat = natural_input.map(|s| {
+                                        crate::automations::parse_natural_schedule(
+                                            s,
+                                            chrono::Local::now(),
+                                        )
+                                    });
+                                    let mut name = cmd_val
                                         .get("name")
                                         .and_then(|v| v.as_str())
-                                        .unwrap_or("Scheduled Task")
+                                        .unwrap_or("")
                                         .trim()
                                         .to_string();
-                                    let cron_expr = cmd_val
+                                    let mut cron_expr = cmd_val
                                         .get("cron_expr")
                                         .and_then(|v| v.as_str())
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
                                         .map(str::to_string);
+                                    let mut schedule_text = cmd_val
+                                        .get("schedule_text")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string);
+                                    let mut run_at = cmd_val
+                                        .get("run_at")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                        .map(|d| d.with_timezone(&Utc));
+                                    let mut trigger_type = cmd_val
+                                        .get("trigger_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("cron")
+                                        .to_string();
                                     let repo_path = cmd_val
                                         .get("repo_path")
                                         .and_then(|v| v.as_str())
@@ -2914,18 +2943,48 @@ async fn run_supervised_e2ee_bridge(
                                         .get("provider")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("claude");
-                                    let prompt_template = cmd_val
+                                    let mut prompt_template = cmd_val
                                         .get("prompt_template")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
+                                        .trim()
                                         .to_string();
+                                    if let Some(p) = parsed_nat {
+                                        if p.ok {
+                                            if cron_expr.is_none() && run_at.is_none() {
+                                                trigger_type = p.trigger_type;
+                                                cron_expr = p.cron_expr;
+                                                run_at = p.run_at;
+                                            }
+                                            if schedule_text.is_none() && !p.schedule_text.is_empty() {
+                                                schedule_text = Some(p.schedule_text);
+                                            }
+                                            if prompt_template.is_empty() && !p.task_prompt.is_empty() {
+                                                prompt_template = p.task_prompt;
+                                            }
+                                            if name.is_empty() && !p.suggested_name.is_empty() {
+                                                name = p.suggested_name;
+                                            }
+                                        }
+                                    }
+                                    if schedule_text.is_none() {
+                                        if let Some(ref c) = cron_expr {
+                                            schedule_text =
+                                                Some(crate::automations::describe_cron_human(c));
+                                        }
+                                    }
+                                    if name.is_empty() {
+                                        name = "定时任务".to_string();
+                                    }
                                     if !prompt_template.trim().is_empty() {
                                         let rule = crate::automations::AutomationRule {
                                             id: Uuid::new_v4(),
                                             name,
                                             enabled: true,
-                                            trigger_type: "cron".to_string(),
+                                            trigger_type,
                                             cron_expr,
+                                            schedule_text,
+                                            run_at,
                                             webhook_secret: None,
                                             github_events: Vec::new(),
                                             repo_path: crate::canonical_workspace_path(&repo_path),

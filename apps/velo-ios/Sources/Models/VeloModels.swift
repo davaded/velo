@@ -1666,6 +1666,7 @@ public struct VeloAutomationItem: Identifiable, Equatable {
     public let name: String
     public var enabled: Bool
     public let cronExpr: String
+    public let scheduleText: String
     public let repoPath: String
     public let provider: String
     public let promptTemplate: String
@@ -1678,11 +1679,22 @@ public struct VeloAutomationItem: Identifiable, Equatable {
             if let obj = d["provider"] as? [String: Any], let k = obj.keys.first { return k }
             return "claude"
         }()
+        let cron = (d["cron_expr"] as? String) ?? ""
+        let schedRaw = (d["schedule_text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let schedDisplay: String = {
+            if !schedRaw.isEmpty { return schedRaw }
+            let t = (d["trigger_type"] as? String) ?? "cron"
+            if t == "github_webhook" { return "GitHub Webhook" }
+            if t == "generic_webhook" { return "Webhook 触发" }
+            if t == "once" { return "单次定时" }
+            return cron.isEmpty ? "定时任务" : "定时 \(cron)"
+        }()
         return VeloAutomationItem(
             id: id,
             name: (d["name"] as? String) ?? "定时任务",
             enabled: (d["enabled"] as? Bool) ?? true,
-            cronExpr: (d["cron_expr"] as? String) ?? "0 9 * * *",
+            cronExpr: cron,
+            scheduleText: schedDisplay,
             repoPath: (d["repo_path"] as? String) ?? "",
             provider: prov,
             promptTemplate: (d["prompt_template"] as? String) ?? "",

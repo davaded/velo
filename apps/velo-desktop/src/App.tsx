@@ -33,7 +33,7 @@ import {
 import { XtermTerminalDrawer, TerminalChunkPacket } from "./components/XtermTerminalDrawer";
 import { PullRequestDrawer } from "./components/PullRequestDrawer";
 import { BrowserPreviewDrawer } from "./components/BrowserPreviewDrawer";
-import { AutomationsModal } from "./components/AutomationsModal";
+import { AutomationsModal, ParsedScheduleDto } from "./components/AutomationsModal";
 import { AnalyticsAndPushModal } from "./components/AnalyticsAndPushModal";
 import { CliSessionsModal, ExternalCliSessionItem } from "./components/CliSessionsModal";
 import { QueuedPromptsBar } from "./components/QueuedPromptsBar";
@@ -1156,6 +1156,17 @@ export function App() {
 
   // Modals, Repo Worktree Setup Hooks, Custom ACP Runtime, & E2EE Pairing Ticket
   const [activeModal, setActiveModal] = useState<ModalKind>(null);
+  const [enabledAutomationsCount, setEnabledAutomationsCount] = useState<number>(0);
+  const [pendingScheduleDraft, setPendingScheduleDraft] = useState<{
+    rawInput: string;
+    parsed: ParsedScheduleDto;
+    repoPath: string;
+    provider: string;
+    model?: string;
+    saving?: boolean;
+  } | null>(null);
+  const bypassScheduleInterceptRef = useRef<boolean>(false);
+  const [scheduleCreatedToast, setScheduleCreatedToast] = useState<string | null>(null);
   const [pairTicket, setPairTicket] = useState<PairingTicketDto | null>(null);
   const [serviceStatus, setServiceStatus] = useState<{
     label: string;
@@ -1630,6 +1641,15 @@ export function App() {
       .then((data: { hooks?: Record<string, string> }) => {
         if (data.hooks && typeof data.hooks === "object") {
           setRepoHooks(data.hooks);
+        }
+      })
+      .catch(() => {});
+
+    fetch(`${daemonUrl}/api/automations`)
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data: { automations?: Array<{ enabled?: boolean }> }) => {
+        if (Array.isArray(data.automations)) {
+          setEnabledAutomationsCount(data.automations.filter((a) => a.enabled).length);
         }
       })
       .catch(() => {});
@@ -3779,9 +3799,45 @@ export function App() {
       }
     }
 
-    if (rawText.toLowerCase() === "/automations") {
+    const lowerCmd = rawText.trim().toLowerCase();
+    if (lowerCmd === "/automations" || lowerCmd === "/schedule" || lowerCmd === "/定时") {
       setActiveModal("automations");
       return;
+    }
+    const skipSchedule = bypassScheduleInterceptRef.current;
+    bypassScheduleInterceptRef.current = false;
+    const isConversationalSchedule =
+      !skipSchedule &&
+      (lowerCmd.startsWith("/schedule ") ||
+        rawText.trim().startsWith("/定时 ") ||
+        /^(?:帮我定时|请定时|设个定时|创建定时任务|定时[：:])/.test(rawText.trim()));
+    if (isConversationalSchedule && overridePriorEvents === undefined) {
+      try {
+        const res = await fetch(`${daemonUrl}/api/automations/parse`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: rawText.trim() }),
+        });
+        if (res.ok) {
+          const parsed = (await res.json()) as ParsedScheduleDto;
+          if (parsed.ok) {
+            setPendingScheduleDraft({
+              rawInput: rawText.trim(),
+              parsed,
+              repoPath: activeSession.project_path || activeRepo.path,
+              provider: activeSession.agent_kind || "claude",
+              model: activeSession.model,
+            });
+            return;
+          }
+        }
+      } catch {
+        // fall through to opening modal if explicit /schedule command failed
+      }
+      if (lowerCmd.startsWith("/schedule ") || rawText.trim().startsWith("/定时 ")) {
+        setActiveModal("automations");
+        return;
+      }
     }
     if (rawText.toLowerCase() === "/pr") {
       setDrawerTab("pr");
@@ -6010,10 +6066,17 @@ export function App() {
             </button>
             <button
               onClick={() => setActiveModal("automations")}
-              className="flex h-[30px] w-full items-center gap-2.5 rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              className="flex h-[30px] w-full items-center justify-between rounded-md px-2.5 text-[13px] text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
-              <CalendarClock className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
-              <span>Cron &amp; Webhooks</span>
+              <span className="flex items-center gap-2.5">
+                <CalendarClock className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+                <span>定时任务</span>
+              </span>
+              {enabledAutomationsCount > 0 && (
+                <span className="rounded bg-[#34d399]/15 px-1.5 py-0.5 font-mono text-[10px] font-medium text-[#10b981] dark:text-[#34d399]">
+                  {enabledAutomationsCount}
+                </span>
+              )}
             </button>
             <button
               onClick={() => {
@@ -6187,11 +6250,20 @@ export function App() {
                       <span className="truncate text-[13px] font-medium text-[var(--v-fg-body)] group-hover:text-[var(--v-fg-primary)]">
                         {repo.name}
                       </span>
-                      {isCollapsed && repoItems.length > 0 && (
-                        <span className="ml-1 shrink-0 rounded bg-[var(--v-bg-active)]/70 px-1 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
-                          {repoItems.length}
-                        </span>
-                      )}
+                      {isCollapsed && repoItems.length > 0 && (() => {
+                        const hasWaiting = repoItems.some((s) => s.status === "waiting_approval");
+                        const hasRunning = repoItems.some((s) => s.status === "running");
+                        return (
+                          <span className="ml-1 inline-flex shrink-0 items-center gap-1 rounded bg-[var(--v-bg-active)]/70 px-1 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
+                            {hasWaiting ? (
+                              <span className="h-1.5 w-1.5 rounded-full bg-[#fbbf24]" />
+                            ) : hasRunning ? (
+                              <span className="h-1.5 w-1.5 rounded-full bg-[#34d399] animate-pulse" />
+                            ) : null}
+                            {repoItems.length}
+                          </span>
+                        );
+                      })()}
                     </button>
 
                     <div className="flex items-center gap-0.5">
@@ -6451,50 +6523,29 @@ export function App() {
           }}
         />
 
-        {/* Bottom Icon-Only Footer (Paseo / Codex SidebarFooter) */}
+        {/* Bottom Compact Footer (Zero Duplication: Live Status / Usage on left, Theme & Settings on right) */}
         <div className="flex h-[40px] shrink-0 items-center justify-between border-t border-[var(--v-border-subtle)] px-2.5 text-[var(--v-fg-muted)]">
           <div className="flex items-center gap-1">
             <button
-              onClick={() => openAddWorkspaceModal("existing")}
-              title="添加或新建工作区文件夹"
-              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              onClick={() => setActiveModal("qr")}
+              title={`手机扫码连接 (${connected || e2eeConnected ? "守护进程在线" : "正在重连"})`}
+              className="flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
-              <FolderPlus className="h-4 w-4" />
-            </button>
-            <button
-              onClick={() => setHostsModalOpen(true)}
-              title="远端 SSH 主机与多节点管理"
-              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
-            >
-              <Server className="h-4 w-4" />
-            </button>
-            <button
-              onClick={() => setActiveModal("automations")}
-              title="Velo Hub: Cron Schedules & GitHub Webhooks"
-              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-            >
-              <CalendarClock className="h-4 w-4" />
+              <span
+                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{ background: connected || e2eeConnected ? "#34d399" : "#fbbf24" }}
+              />
+              <Smartphone className="h-3.5 w-3.5" />
             </button>
             <button
               onClick={() => {
                 setAnalyticsInitialTab("analytics");
                 setAnalyticsModalOpen(true);
               }}
-              title={`Usage: ${tokenPercent}% context window`}
+              title={`用量与费用分析 (当前上下文 ${tokenPercent}%)`}
               className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
               <CircleGauge className="h-4 w-4" />
-            </button>
-            <button
-              onClick={() => setActiveModal("qr")}
-              title={`手机扫码连接 (${connected ? "守护进程在线" : "离线"})`}
-              className="relative flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-            >
-              <Smartphone className="h-4 w-4" />
-              <span
-                className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full"
-                style={{ background: connected || e2eeConnected ? "#34d399" : "#fbbf24" }}
-              />
             </button>
           </div>
 
@@ -8090,6 +8141,124 @@ export function App() {
                   />
                 )}
 
+                {/* Inline Conversational Schedule Confirmation Card (`/schedule` or natural language) */}
+                {pendingScheduleDraft && (
+                  <div className="mb-2.5 rounded-xl border border-[#a78bfa]/35 bg-[var(--v-bg-surface)] px-3.5 py-3 shadow-lg">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-[#a78bfa]/18 text-[#a78bfa]">
+                          <CalendarClock className="h-3.5 w-3.5" />
+                        </span>
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2 text-[12.5px] font-semibold text-[var(--v-fg-primary)]">
+                            <span>确认创建定时任务</span>
+                            <span className="rounded-md bg-[#34d399]/16 px-2 py-0.5 text-[11px] font-medium text-[#10b981] dark:text-[#34d399]">
+                              {pendingScheduleDraft.parsed.schedule_text}
+                            </span>
+                            {pendingScheduleDraft.parsed.next_run_label && (
+                              <span className="text-[11px] font-normal text-[var(--v-fg-muted)]">
+                                下次：{pendingScheduleDraft.parsed.next_run_label}
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-1 text-[12px] text-[var(--v-fg-secondary)]">
+                            {pendingScheduleDraft.parsed.task_prompt || pendingScheduleDraft.rawInput}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setPendingScheduleDraft(null)}
+                        className="rounded-md p-1 text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                    <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 border-t border-[var(--v-border-subtle)] pt-2">
+                      <span className="text-[11px] text-[var(--v-fg-muted)]">
+                        工作区：{activeRepo.name} · 引擎：{pendingScheduleDraft.provider}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const txt = pendingScheduleDraft.rawInput;
+                            setPendingScheduleDraft(null);
+                            bypassScheduleInterceptRef.current = true;
+                            void handleSendPrompt(txt);
+                          }}
+                          className="rounded-md border border-[var(--v-border-subtle)] px-2.5 py-1 text-[11px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                        >
+                          仅作为普通对话发送
+                        </button>
+                        <button
+                          type="button"
+                          disabled={pendingScheduleDraft.saving}
+                          onClick={async () => {
+                            const draft = pendingScheduleDraft;
+                            setPendingScheduleDraft({ ...draft, saving: true });
+                            try {
+                              const res = await fetch(`${daemonUrl}/api/automations`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                  name: draft.parsed.suggested_name || "定时任务",
+                                  enabled: true,
+                                  trigger_type: draft.parsed.trigger_type,
+                                  cron_expr: draft.parsed.cron_expr || null,
+                                  run_at: draft.parsed.run_at || null,
+                                  schedule_text: draft.parsed.schedule_text,
+                                  natural_input: draft.rawInput,
+                                  repo_path: draft.repoPath,
+                                  branch_prefix: "auto/hub",
+                                  provider: draft.provider,
+                                  model: draft.model,
+                                  prompt_template:
+                                    draft.parsed.task_prompt || draft.rawInput,
+                                }),
+                              });
+                              if (res.ok) {
+                                setEnabledAutomationsCount((c) => c + 1);
+                                setPendingScheduleDraft(null);
+                                setScheduleCreatedToast(
+                                  `已创建定时任务：${draft.parsed.schedule_text} · ${
+                                    draft.parsed.suggested_name || "已启用"
+                                  }`
+                                );
+                                window.setTimeout(() => setScheduleCreatedToast(null), 4000);
+                              } else {
+                                setPendingScheduleDraft({ ...draft, saving: false });
+                              }
+                            } catch {
+                              setPendingScheduleDraft({ ...draft, saving: false });
+                            }
+                          }}
+                          className="inline-flex items-center gap-1 rounded-md bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90 disabled:opacity-40 cursor-pointer"
+                        >
+                          <Check className="h-3 w-3" />
+                          <span>{pendingScheduleDraft.saving ? "创建中…" : "确认启用"}</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {scheduleCreatedToast && (
+                  <div className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-[#34d399]/30 bg-[#34d399]/10 px-3 py-1.5 text-[11.5px] text-[#10b981] dark:text-[#34d399]">
+                    <span className="truncate">{scheduleCreatedToast}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setScheduleCreatedToast(null);
+                        setActiveModal("automations");
+                      }}
+                      className="shrink-0 underline hover:opacity-80 cursor-pointer"
+                    >
+                      查看全部
+                    </button>
+                  </div>
+                )}
+
                 {/* Slash Command Popover (Built-in Velo Workflow Actions + Prompt Skills + Real Local/Project Skills) */}
                 {slashFilter !== null && (() => {
                   const q = slashFilter.trim().toLowerCase();
@@ -8149,6 +8318,23 @@ export function App() {
                         setPrompt("");
                         setSlashFilter(null);
                         setCliImportOpen(true);
+                      },
+                    },
+                    {
+                      key: "builtin:/schedule",
+                      cmd: "/schedule",
+                      desc: "白话文设定定时任务（如：/schedule 每天早上9点跑单测）",
+                      badge: "定时",
+                      badgeTone: "bg-[#a78bfa]/15 text-[#a78bfa]",
+                      run: () => {
+                        setSlashFilter(null);
+                        setPrompt("/schedule ");
+                        setTimeout(() => {
+                          const el = composerTextareaRef.current;
+                          if (!el) return;
+                          el.focus();
+                          el.setSelectionRange(10, 10);
+                        }, 20);
                       },
                     },
                     {
@@ -9330,11 +9516,14 @@ export function App() {
         <AutomationsModal
           daemonUrl={daemonUrl}
           defaultRepoPath={activeRepo.path}
+          defaultProvider={activeSession.agent_kind}
+          repos={repos}
           onClose={() => setActiveModal(null)}
           onJumpToSession={(sid) => {
             refreshSessions();
             setActiveId(sid);
           }}
+          onCountChange={setEnabledAutomationsCount}
         />
       )}
 

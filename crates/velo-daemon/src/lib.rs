@@ -2473,32 +2473,58 @@ impl DaemonState {
             let mut last_minute_key = String::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                let now = Utc::now();
-                let key = now.format("%Y-%m-%d %H:%M").to_string();
+                let now_local = chrono::Local::now();
+                let now_utc = now_local.with_timezone(&Utc);
+                let key = now_local.format("%Y-%m-%d %H:%M").to_string();
                 if key == last_minute_key {
                     continue;
                 }
                 last_minute_key = key;
 
-                let due_ids: Vec<Uuid> = {
+                let due_ids: Vec<(Uuid, bool)> = {
                     let guard = state.inner.read().await;
                     guard
                         .automations
                         .iter()
-                        .filter(|r| {
-                            r.enabled
-                                && r.trigger_type == "cron"
+                        .filter_map(|r| {
+                            if !r.enabled {
+                                return None;
+                            }
+                            if r.trigger_type == "once" {
+                                if let Some(target) = r.run_at {
+                                    if now_utc >= target {
+                                        return Some((r.id, true));
+                                    }
+                                }
+                                return None;
+                            }
+                            if r.trigger_type == "cron"
                                 && r.cron_expr
                                     .as_deref()
-                                    .map(|c| automations::matches_cron_minute(c, &now))
+                                    .map(|c| automations::matches_cron_minute(c, &now_local))
                                     .unwrap_or(false)
+                            {
+                                return Some((r.id, false));
+                            }
+                            None
                         })
-                        .map(|r| r.id)
                         .collect()
                 };
 
-                for rule_id in due_ids {
-                    let _ = state.trigger_automation_rule(rule_id, "cron", &json!({})).await;
+                for (rule_id, is_once) in due_ids {
+                    if is_once {
+                        {
+                            let mut guard = state.inner.write().await;
+                            if let Some(r) = guard.automations.iter_mut().find(|r| r.id == rule_id)
+                            {
+                                r.enabled = false;
+                            }
+                        }
+                        let _ = state.persist_automations().await;
+                    }
+                    let _ = state
+                        .trigger_automation_rule(rule_id, if is_once { "once" } else { "cron" }, &json!({}))
+                        .await;
                 }
             }
         });
@@ -3002,6 +3028,10 @@ pub fn build_router(state: DaemonState) -> Router {
         .route(
             "/api/automations",
             get(list_automations_handler).post(create_automation_handler),
+        )
+        .route(
+            "/api/automations/parse",
+            post(parse_automation_schedule_handler),
         )
         .route(
             "/api/automations/{id}",
@@ -8817,21 +8847,107 @@ async fn transcribe_audio_handler(
     (StatusCode::OK, Json(res)).into_response()
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ParseSchedulePayload {
+    text: String,
+}
+
+async fn parse_automation_schedule_handler(
+    Json(req): Json<ParseSchedulePayload>,
+) -> impl IntoResponse {
+    let parsed = automations::parse_natural_schedule(&req.text, chrono::Local::now());
+    Json(parsed)
+}
+
 async fn list_automations_handler(State(state): State<DaemonState>) -> impl IntoResponse {
     let guard = state.inner.read().await;
-    Json(json!({ "automations": guard.automations }))
+    let enriched: Vec<automations::AutomationRule> = guard
+        .automations
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            if r.schedule_text
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                if r.trigger_type == "cron" {
+                    if let Some(expr) = r.cron_expr.as_deref() {
+                        r.schedule_text = Some(automations::describe_cron_human(expr));
+                    }
+                } else if r.trigger_type == "once" {
+                    if let Some(ts) = r.run_at {
+                        let local_ts = ts.with_timezone(&chrono::Local);
+                        r.schedule_text = Some(format!("{} · 单次", local_ts.format("%m/%d %H:%M")));
+                    }
+                }
+            }
+            r
+        })
+        .collect();
+    Json(json!({ "automations": enriched }))
 }
 
 async fn create_automation_handler(
     State(state): State<DaemonState>,
     Json(req): Json<automations::CreateAutomationRequest>,
 ) -> impl IntoResponse {
+    let parsed_natural = req
+        .natural_input
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| automations::parse_natural_schedule(s, chrono::Local::now()));
+
+    let mut trigger_type = req.trigger_type;
+    let mut cron_expr = req.cron_expr.filter(|s| !s.trim().is_empty());
+    let mut run_at = req.run_at;
+    let mut schedule_text = req.schedule_text.filter(|s| !s.trim().is_empty());
+    let mut prompt_template = req.prompt_template.trim().to_string();
+    let mut name = req.name.trim().to_string();
+
+    if let Some(p) = parsed_natural {
+        if p.ok {
+            if cron_expr.is_none() && run_at.is_none() {
+                trigger_type = p.trigger_type;
+                cron_expr = p.cron_expr;
+                run_at = p.run_at;
+            }
+            if schedule_text.is_none() && !p.schedule_text.is_empty() {
+                schedule_text = Some(p.schedule_text);
+            }
+            if prompt_template.is_empty() && !p.task_prompt.is_empty() {
+                prompt_template = p.task_prompt;
+            }
+            if name.is_empty() && !p.suggested_name.is_empty() {
+                name = p.suggested_name;
+            }
+        }
+    }
+
+    if schedule_text.is_none() {
+        if trigger_type == "cron" {
+            if let Some(ref c) = cron_expr {
+                schedule_text = Some(automations::describe_cron_human(c));
+            }
+        } else if trigger_type == "once" {
+            if let Some(ts) = run_at {
+                let local_ts = ts.with_timezone(&chrono::Local);
+                schedule_text = Some(format!("{} · 单次", local_ts.format("%m/%d %H:%M")));
+            }
+        }
+    }
+    if name.is_empty() {
+        name = "定时任务".to_string();
+    }
+
     let rule = automations::AutomationRule {
         id: Uuid::new_v4(),
-        name: req.name.trim().to_string(),
+        name,
         enabled: req.enabled,
-        trigger_type: req.trigger_type,
-        cron_expr: req.cron_expr,
+        trigger_type,
+        cron_expr,
+        schedule_text,
+        run_at,
         webhook_secret: req.webhook_secret,
         github_events: req.github_events,
         repo_path: req.repo_path,
@@ -8841,7 +8957,7 @@ async fn create_automation_handler(
             .unwrap_or_else(|| "auto/hub".to_string()),
         provider: req.provider,
         model: req.model,
-        prompt_template: req.prompt_template,
+        prompt_template,
         created_at: Utc::now(),
         last_run_at: None,
         last_session_id: None,
@@ -8870,7 +8986,16 @@ async fn update_automation_handler(
                 r.enabled = en;
             }
             if let Some(c) = req.cron_expr {
-                r.cron_expr = if c.trim().is_empty() { None } else { Some(c) };
+                r.cron_expr = if c.trim().is_empty() { None } else { Some(c.clone()) };
+                if req.schedule_text.is_none() && !c.trim().is_empty() {
+                    r.schedule_text = Some(automations::describe_cron_human(&c));
+                }
+            }
+            if let Some(st) = req.schedule_text {
+                r.schedule_text = if st.trim().is_empty() { None } else { Some(st) };
+            }
+            if let Some(ra) = req.run_at {
+                r.run_at = Some(ra);
             }
             if let Some(pt) = req.prompt_template.filter(|s| !s.trim().is_empty()) {
                 r.prompt_template = pt;

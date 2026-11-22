@@ -516,9 +516,9 @@ export const SLASH_SKILLS: SlashSkillItem[] = [
     desc: "清理已合并的孤立 Git Worktree 目录与锁文件",
   },
   {
-    cmd: "/automations",
-    label: "Velo Hub Automations",
-    desc: "管理 Cron 定时任务与 GitHub / 通用 Webhook 自动工作流",
+    cmd: "/schedule",
+    label: "白话定时任务",
+    desc: "直接用白话定时，例如：/schedule 每天早上9点跑一遍单测",
   },
   {
     cmd: "/pr",

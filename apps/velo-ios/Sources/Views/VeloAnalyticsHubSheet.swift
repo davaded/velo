@@ -21,9 +21,7 @@ public struct VeloAnalyticsHubSheet: View {
     @State private var searchQuery: String = ""
     @State private var pushDraft: VeloPushConfig = VeloPushConfig()
     @State private var pushLoaded: Bool = false
-    @State private var newAutoName: String = ""
-    @State private var newAutoCron: String = "0 9 * * *"
-    @State private var newAutoPrompt: String = ""
+    @State private var newAutoNatural: String = ""
     @State private var showCreateAuto: Bool = false
 
     public init(
@@ -501,51 +499,66 @@ public struct VeloAnalyticsHubSheet: View {
 
         if showCreateAuto {
             VStack(alignment: .leading, spacing: 10) {
-                TextField("规则名称（例如：每日早间单测巡检）", text: $newAutoName)
-                    .font(.system(size: 13.5))
-                    .padding(10)
-                    .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                TextField("Cron 表达式（UTC，例如 0 1 * * *）", text: $newAutoCron)
-                    .font(.system(size: 13, design: .monospaced))
-                    .textInputAutocapitalization(.never)
-                    .padding(10)
-                    .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                TextField("执行 Prompt 指令…", text: $newAutoPrompt, axis: .vertical)
+                Text("直接用白话定时间和任务（本机时区）")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                TextField("例如：每天早上9点跑一遍单测并修复报错", text: $newAutoNatural, axis: .vertical)
                     .lineLimit(2...4)
                     .font(.system(size: 13.5))
                     .padding(10)
                     .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(["每天早上9点 ", "每个工作日18:30 ", "每周五下午6点 ", "每2小时 ", "30分钟后 "], id: \.self) { chip in
+                            Button {
+                                if newAutoNatural.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    newAutoNatural = chip
+                                } else {
+                                    newAutoNatural = chip + newAutoNatural.trimmingCharacters(in: .whitespacesAndNewlines)
+                                }
+                            } label: {
+                                Text(chip.trimmingCharacters(in: .whitespaces))
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 5)
+                                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
                 Button {
                     let repo = store.workspaces.first ?? store.sessions.first?.repoRoot ?? "~/workspace"
+                    let input = newAutoNatural
                     Task {
-                        await store.createAutomation(
-                            name: newAutoName.isEmpty ? "定时巡检" : newAutoName,
-                            cronExpr: newAutoCron,
+                        await store.createNaturalAutomation(
+                            naturalInput: input,
                             repoPath: repo,
-                            provider: "claude",
-                            promptTemplate: newAutoPrompt
+                            provider: "claude"
                         )
-                        newAutoName = ""
-                        newAutoPrompt = ""
+                        newAutoNatural = ""
                         showCreateAuto = false
                     }
                 } label: {
-                    Text("创建并启用")
+                    Text("确认启用")
                         .font(.system(size: 13.5, weight: .semibold))
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                         .background(VeloTheme.accentViolet, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
-                .disabled(newAutoPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(newAutoNatural.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(12)
             .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
         }
 
         if store.automations.isEmpty && !showCreateAuto {
-            Text("暂无定时任务，可点击右上角「新建定时任务」配置自动巡检或定时日报")
+            Text("暂无定时任务，点击右上角「新建定时任务」，用白话写一句即可按时执行")
                 .font(.system(size: 12.5))
                 .foregroundStyle(.secondary)
                 .padding(.vertical, 24)
@@ -567,9 +580,14 @@ public struct VeloAnalyticsHubSheet: View {
                         )
                         .labelsHidden()
                     }
-                    Text("\(item.provider.uppercased()) · `\(item.cronExpr)` · 已运行 \(item.runCount) 次")
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Label(item.scheduleText, systemImage: "clock")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(VeloTheme.emerald)
+                        Text("· \(item.provider.uppercased()) · 已运行 \(item.runCount) 次")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
                     Text(item.promptTemplate)
                         .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)

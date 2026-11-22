@@ -2478,6 +2478,39 @@ public final class VeloStore: ObservableObject {
     }
 
 
+    public func createNaturalAutomation(
+        naturalInput: String,
+        repoPath: String,
+        provider: String
+    ) async {
+        let trimmed = naturalInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/automations") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "enabled": true,
+                "natural_input": trimmed,
+                "repo_path": repoPath,
+                "provider": provider,
+            ])
+            _ = try? await URLSession.shared.data(for: req)
+            await fetchAutomations()
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "create_automation",
+                "natural_input": trimmed,
+                "repo_path": repoPath,
+                "provider": provider,
+            ])
+        case .none:
+            break
+        }
+    }
+
     public func createAutomation(
         name: String,
         cronExpr: String,
