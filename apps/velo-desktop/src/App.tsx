@@ -6321,14 +6321,14 @@ export function App() {
                     </div>
                   </div>
 
-                  {/* Thread Rows Connected by Ultra-Subtle Tree Guide (Scheme A: Linear / Raycast / LobeHub) */}
+                  {/* Thread Rows (Clean native indentation, zero vertical guide line) */}
                   {!isCollapsed && (
-                    <div className="ml-[12px] space-y-0.5 border-l border-[var(--v-border-subtle)]/65 pl-2">
+                    <div className="space-y-0.5 pl-3">
                       {repoItems.length === 0 ? (
                         <button
                           type="button"
                           onClick={() => handleQuickNewThread(repo)}
-                          className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[11.5px] text-[var(--v-fg-faint)] transition-colors hover:bg-[var(--v-bg-hover)]/70 hover:text-[var(--v-fg-secondary)] cursor-pointer"
+                          className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[var(--v-fg-faint)] transition-colors hover:bg-[var(--v-bg-hover)]/70 hover:text-[var(--v-fg-secondary)] cursor-pointer"
                         >
                           <Plus className="h-3 w-3" />
                           <span>新建会话</span>
@@ -6379,14 +6379,13 @@ export function App() {
                                 isSelected
                                   ? {
                                       backgroundColor: "var(--v-row-selected-bg)",
-                                      boxShadow:
-                                        "0 0 0 1px var(--v-row-selected-ring), var(--v-row-selected-shadow)",
+                                      color: "var(--v-row-selected-fg)",
                                     }
                                   : undefined
                               }
-                              className={`group relative flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors duration-150 ${
+                              className={`group relative flex w-full cursor-pointer items-center gap-2 rounded-[8px] px-2.5 py-[6px] text-left transition-colors duration-150 ${
                                 isSelected
-                                  ? "text-[var(--v-fg-primary)]"
+                                  ? ""
                                   : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]/75 hover:text-[var(--v-fg-primary)]"
                               }`}
                             >

@@ -19,9 +19,8 @@
   --v-border-subtle: #1f1f23;
   --v-border-strong: #27272e;
 
-  --v-row-selected-bg: rgba(255, 255, 255, 0.065);
-  --v-row-selected-ring: rgba(255, 255, 255, 0.045);
-  --v-row-selected-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  --v-row-selected-bg: rgba(255, 255, 255, 0.105);
+  --v-row-selected-fg: #ffffff;
 
   --v-btn-bg: #f4f4f5;
   --v-btn-fg: #09090b;
@@ -82,9 +81,8 @@
   --v-border-subtle: #e4e4e7;
   --v-border-strong: #d4d4d8;
 
-  --v-row-selected-bg: #ffffff;
-  --v-row-selected-ring: rgba(0, 0, 0, 0.075);
-  --v-row-selected-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 1px rgba(0, 0, 0, 0.03);
+  --v-row-selected-bg: rgba(0, 0, 0, 0.075);
+  --v-row-selected-fg: #09090b;
 
   --v-btn-bg: #18181b;
   --v-btn-fg: #ffffff;
