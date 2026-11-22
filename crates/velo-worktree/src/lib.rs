@@ -428,12 +428,163 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Canonical Git empty-tree hash used as diff base for freshly initialized repos with no HEAD commit yet.
+    const EMPTY_TREE_SHA: &'static str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    const MAX_UNTRACKED_FILES: usize = 80;
+    const MAX_UNTRACKED_FILE_BYTES: u64 = 256 * 1024;
+    const MAX_UNTRACKED_DIFF_LINES: usize = 1200;
+
+    /// Returns true if `path` is inside a Git work tree.
+    async fn is_git_repo(path: &Path) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .await
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+            .unwrap_or(false)
+    }
+
+    /// Resolves the best Git diff base ref:
+    /// 1. Fresh `git init` repo with no `HEAD` yet -> `EMPTY_TREE_SHA`.
+    /// 2. Working tree has uncommitted tracked/untracked changes -> `"HEAD"`.
+    /// 3. Working tree is clean on a non-default feature/worktree branch -> `merge-base(<default>, HEAD)`
+    ///    so committed changes on a worktree branch stay visible in `+X -Y` and the Diff drawer.
+    async fn resolve_diff_base(worktree_path: &Path, has_dirty_working_tree: bool) -> String {
+        let head_ok = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !head_ok {
+            return Self::EMPTY_TREE_SHA.to_string();
+        }
+        if has_dirty_working_tree {
+            return "HEAD".to_string();
+        }
+
+        // Clean working tree: if on a feature/worktree branch ahead of main/master, diff against merge-base
+        let cur_branch = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+
+        if !cur_branch.is_empty()
+            && cur_branch != "main"
+            && cur_branch != "master"
+            && cur_branch != "HEAD"
+        {
+            let head_sha = Command::new("git")
+                .arg("-C")
+                .arg(worktree_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+
+            for candidate in ["main", "master", "origin/main", "origin/master"] {
+                if let Ok(mb) = Command::new("git")
+                    .arg("-C")
+                    .arg(worktree_path)
+                    .args(["merge-base", candidate, "HEAD"])
+                    .output()
+                    .await
+                {
+                    if mb.status.success() {
+                        let base_sha = String::from_utf8_lossy(&mb.stdout).trim().to_string();
+                        if !base_sha.is_empty() && base_sha != head_sha {
+                            return base_sha;
+                        }
+                    }
+                }
+            }
+        }
+
+        "HEAD".to_string()
+    }
+
+    /// Skips sensitive/OS noise files (`.env*` secrets auto-synced into worktrees, `.DS_Store`) from untracked diffs.
+    fn is_ignored_untracked_noise(rel_path: &str) -> bool {
+        let base = rel_path.rsplit('/').next().unwrap_or(rel_path);
+        if base == ".DS_Store" || base == "Thumbs.db" {
+            return true;
+        }
+        if base == ".env" || base.starts_with(".env.") {
+            let lower = base.to_lowercase();
+            let is_template = lower.ends_with(".example")
+                || lower.ends_with(".sample")
+                || lower.ends_with(".template");
+            return !is_template;
+        }
+        false
+    }
+
+    /// Lists non-ignored untracked files (`git ls-files --others --exclude-standard`), capped for safety.
+    async fn list_untracked_files(worktree_path: &Path) -> Vec<String> {
+        let out = match Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !Self::is_ignored_untracked_noise(l))
+            .take(Self::MAX_UNTRACKED_FILES)
+            .collect()
+    }
+
+    /// Reads an untracked text file safely (skips directories, binaries containing NUL, and files >256KB).
+    async fn read_untracked_text_lines(worktree_path: &Path, rel_path: &str) -> Option<Vec<String>> {
+        let full_path = worktree_path.join(rel_path);
+        let meta = tokio::fs::metadata(&full_path).await.ok()?;
+        if !meta.is_file() || meta.len() > Self::MAX_UNTRACKED_FILE_BYTES {
+            return None;
+        }
+        let bytes = tokio::fs::read(&full_path).await.ok()?;
+        // Skip binary files (NUL byte check in first 8KB)
+        let probe_len = bytes.len().min(8192);
+        if bytes[..probe_len].contains(&0) {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        Some(text.lines().map(|l| l.to_string()).collect())
+    }
+
     /// Computes live diff stats (modified files, insertions, deletions) inside a worktree.
+    /// Accurately includes:
+    /// - Tracked unstaged & staged edits (`git diff <base> --numstat`)
+    /// - Untracked new text files (respecting `.gitignore`)
+    /// - Fresh `git init` repos before their first commit (`EMPTY_TREE_SHA`)
+    /// - Committed feature/worktree branch diffs against `merge-base(main, HEAD)` when working tree is clean
     pub async fn compute_diff_stats(worktree_path: &Path) -> Result<GitDiffStats> {
+        if !Self::is_git_repo(worktree_path).await {
+            return Ok(GitDiffStats::default());
+        }
+
         let status_out = Command::new("git")
             .arg("-C")
             .arg(worktree_path)
-            .args(["status", "--porcelain"])
+            .args(["status", "--porcelain", "-uall"])
             .output()
             .await?;
 
@@ -442,30 +593,59 @@ impl WorktreeManager {
         }
 
         let status_str = String::from_utf8_lossy(&status_out.stdout);
-        let mut modified_files = Vec::new();
+        let mut modified_files: Vec<String> = Vec::new();
         for line in status_str.lines() {
             if line.len() > 3 {
-                modified_files.push(line[3..].trim().to_string());
+                let raw = line[3..].trim();
+                // Handle renames (`old -> new`) cleanly
+                let path = raw
+                    .rsplit_once(" -> ")
+                    .map(|(_, new_p)| new_p)
+                    .unwrap_or(raw)
+                    .trim_matches('"')
+                    .to_string();
+                if !path.is_empty() && !modified_files.contains(&path) {
+                    modified_files.push(path);
+                }
             }
         }
+
+        let has_dirty = !modified_files.is_empty();
+        let base_ref = Self::resolve_diff_base(worktree_path, has_dirty).await;
+
+        let mut insertions = 0usize;
+        let mut deletions = 0usize;
 
         let numstat_out = Command::new("git")
             .arg("-C")
             .arg(worktree_path)
-            .args(["diff", "HEAD", "--numstat"])
+            .args(["diff", &base_ref, "--numstat"])
             .output()
             .await?;
 
-        let mut insertions = 0usize;
-        let mut deletions = 0usize;
         if numstat_out.status.success() {
             let numstat_str = String::from_utf8_lossy(&numstat_out.stdout);
             for line in numstat_str.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    insertions += parts[0].parse::<usize>().unwrap_or(0);
-                    deletions += parts[1].parse::<usize>().unwrap_or(0);
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() >= 3 {
+                    insertions += parts[0].trim().parse::<usize>().unwrap_or(0);
+                    deletions += parts[1].trim().parse::<usize>().unwrap_or(0);
+                    let fpath = parts[2].trim().to_string();
+                    if !fpath.is_empty() && !modified_files.contains(&fpath) {
+                        modified_files.push(fpath);
+                    }
                 }
+            }
+        }
+
+        // Count untracked non-ignored new text files so freshly written files never show `+0 -0`
+        let untracked = Self::list_untracked_files(worktree_path).await;
+        for rel in untracked {
+            if !modified_files.contains(&rel) {
+                modified_files.push(rel.clone());
+            }
+            if let Some(lines) = Self::read_untracked_text_lines(worktree_path, &rel).await {
+                insertions += lines.len();
             }
         }
 
@@ -477,17 +657,66 @@ impl WorktreeManager {
         })
     }
 
-    /// Returns the full unified git diff for a session's worktree.
+    /// Returns the full unified git diff for a session's worktree, including:
+    /// - Tracked unstaged & staged changes (or committed worktree branch diff vs `merge-base`)
+    /// - Synthetic `new file mode 100644` unified diffs for untracked text files (respecting `.gitignore`)
     pub async fn get_unified_diff(worktree_path: &Path) -> Result<String> {
+        if !Self::is_git_repo(worktree_path).await {
+            return Ok(String::new());
+        }
+
+        let status_dirty = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["status", "--porcelain"])
+            .output()
+            .await
+            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .unwrap_or(false);
+
+        let base_ref = Self::resolve_diff_base(worktree_path, status_dirty).await;
+
         let output = Command::new("git")
             .arg("-C")
             .arg(worktree_path)
-            .args(["diff", "HEAD"])
+            .args(["diff", &base_ref])
             .output()
             .await
-            .context("Failed to run git diff HEAD")?;
+            .context("Failed to run git diff")?;
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+
+        // Append standard unified diff blocks for untracked new text files
+        let untracked = Self::list_untracked_files(worktree_path).await;
+        for rel in untracked {
+            let Some(lines) = Self::read_untracked_text_lines(worktree_path, &rel).await else {
+                continue;
+            };
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            let total = lines.len();
+            let shown = total.min(Self::MAX_UNTRACKED_DIFF_LINES);
+            combined.push_str(&format!(
+                "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n"
+            ));
+            if shown > 0 {
+                combined.push_str(&format!("@@ -0,0 +1,{shown} @@\n"));
+                for line in lines.iter().take(shown) {
+                    combined.push('+');
+                    combined.push_str(line);
+                    combined.push('\n');
+                }
+                if total > shown {
+                    combined.push_str(&format!(
+                        "+// ... ({} more lines omitted from preview)\n",
+                        total - shown
+                    ));
+                }
+            }
+        }
+
+        Ok(combined)
     }
 
     /// Removes an isolated worktree cleanly.
@@ -640,6 +869,85 @@ mod tests {
         assert_eq!(marker.trim(), "bootstrapped:feat/hook-test");
 
         mgr.remove_worktree(&prov.repo_root, &prov.worktree_path).await?;
+        let _ = tokio::fs::remove_dir_all(&temp_base).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_untracked_no_head_and_committed_worktree_diff() -> Result<()> {
+        let temp_base = std::env::temp_dir().join(format!("velo-diff-test-{}", Uuid::new_v4()));
+        let repo_dir = temp_base.join("fresh-repo");
+        tokio::fs::create_dir_all(repo_dir.join("server")).await?;
+
+        // 1. Fresh `git init` with NO HEAD commit yet + untracked nested file
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        Command::new("git")
+            .args(["config", "user.email", "test@velo.dev"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        Command::new("git")
+            .args(["config", "user.name", "Velo Test"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+
+        tokio::fs::write(
+            repo_dir.join("server/index.ts"),
+            "export const hello = 'world';\nconsole.log(hello);\n",
+        )
+        .await?;
+
+        let stats_no_head = WorktreeManager::compute_diff_stats(&repo_dir).await?;
+        assert_eq!(stats_no_head.files_changed, 1);
+        assert_eq!(stats_no_head.insertions, 2);
+        assert_eq!(stats_no_head.deletions, 0);
+
+        let diff_no_head = WorktreeManager::get_unified_diff(&repo_dir).await?;
+        assert!(diff_no_head.contains("diff --git a/server/index.ts b/server/index.ts"));
+        assert!(diff_no_head.contains("new file mode 100644"));
+        assert!(diff_no_head.contains("+export const hello = 'world';"));
+
+        // 2. Make initial commit on main, create a feature branch, commit changes -> clean working tree
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        Command::new("git")
+            .args(["checkout", "-b", "feat/demo"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        tokio::fs::write(repo_dir.join("notes.txt"), "line1\nline2\nline3\n").await?;
+        Command::new("git")
+            .args(["add", "notes.txt"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+        Command::new("git")
+            .args(["commit", "-m", "add notes"])
+            .current_dir(&repo_dir)
+            .output()
+            .await?;
+
+        // Even after commit (clean working tree), feature branch shows committed diff vs main!
+        let stats_committed = WorktreeManager::compute_diff_stats(&repo_dir).await?;
+        assert_eq!(stats_committed.files_changed, 1);
+        assert_eq!(stats_committed.insertions, 3);
+        let diff_committed = WorktreeManager::get_unified_diff(&repo_dir).await?;
+        assert!(diff_committed.contains("diff --git a/notes.txt b/notes.txt"));
+        assert!(diff_committed.contains("+line3"));
+
         let _ = tokio::fs::remove_dir_all(&temp_base).await;
         Ok(())
     }
