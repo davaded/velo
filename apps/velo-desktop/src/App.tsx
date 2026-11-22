@@ -30,6 +30,11 @@ import {
   PaseoTurnTelemetry,
   resolvePaseoToolPresentation,
 } from "./components/ui/BeautifulAgentPrimitives";
+import {
+  EngineBrandGlyph,
+  EngineSessionBadge,
+  EngineStatusIndicator,
+} from "./components/ui/EngineBrandIcon";
 import { XtermTerminalDrawer, TerminalChunkPacket } from "./components/XtermTerminalDrawer";
 import { PullRequestDrawer } from "./components/PullRequestDrawer";
 import { BrowserPreviewDrawer } from "./components/BrowserPreviewDrawer";
@@ -6238,11 +6243,11 @@ export function App() {
                 <div key={repo.id} className="space-y-1">
                   {/* Workspace Folder Header Row */}
                   <div
-                    className={`group flex h-[30px] items-center justify-between rounded-lg px-1.5 transition-colors ${
+                    className={`group flex h-[28px] items-center justify-between rounded-lg px-1.5 transition-colors ${
                       isActiveWorkspace
-                        ? "text-[var(--v-fg-primary)]"
+                        ? "text-[var(--v-fg-body)]"
                         : "text-[var(--v-fg-secondary)]"
-                    } hover:bg-[var(--v-bg-hover)]/80`}
+                    } hover:bg-[var(--v-bg-hover)]/70`}
                   >
                     <button
                       onClick={() =>
@@ -6259,27 +6264,21 @@ export function App() {
                         <ChevronDown className="h-3 w-3 shrink-0 text-[var(--v-fg-faint)] transition-transform group-hover:text-[var(--v-fg-muted)]" />
                       )}
                       {isCollapsed ? (
-                        <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)]" />
+                        <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)] opacity-80" />
                       ) : (
-                        <FolderOpen
-                          className={`h-3.5 w-3.5 shrink-0 ${
-                            isActiveWorkspace
-                              ? "text-[var(--v-fg-primary)]"
-                              : "text-[var(--v-fg-muted)]"
-                          }`}
-                        />
+                        <FolderOpen className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)]" />
                       )}
                       <span
-                        className={`truncate text-[12.5px] tracking-[-0.01em] ${
+                        className={`truncate text-[12px] tracking-[-0.01em] ${
                           isActiveWorkspace
-                            ? "font-semibold text-[var(--v-fg-primary)]"
-                            : "font-medium text-[var(--v-fg-body)]"
+                            ? "font-medium text-[var(--v-fg-body)]"
+                            : "font-medium text-[var(--v-fg-secondary)] group-hover:text-[var(--v-fg-body)]"
                         }`}
                       >
                         {repo.name}
                       </span>
                       {repoItems.length > 0 && (
-                        <span className="ml-0.5 inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--v-bg-active)]/75 px-1.5 py-[1px] font-mono text-[9.5px] text-[var(--v-fg-muted)] tabular-nums">
+                        <span className="ml-0.5 inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--v-bg-active)]/60 px-1.5 py-[0.5px] font-mono text-[9.5px] text-[var(--v-fg-muted)] tabular-nums">
                           {isCollapsed && folderHasWaiting ? (
                             <span className="h-1.5 w-1.5 rounded-full bg-[#fbbf24]" />
                           ) : isCollapsed && folderHasRunning ? (
@@ -6322,9 +6321,9 @@ export function App() {
                     </div>
                   </div>
 
-                  {/* Thread Rows Connected by Crisp Subtle Tree Rail */}
+                  {/* Thread Rows Connected by Ultra-Subtle Tree Guide (Scheme A: Linear / Raycast / LobeHub) */}
                   {!isCollapsed && (
-                    <div className="ml-[13px] space-y-0.5 border-l border-[var(--v-border-subtle)] pl-2">
+                    <div className="ml-[12px] space-y-0.5 border-l border-[var(--v-border-subtle)]/65 pl-2">
                       {repoItems.length === 0 ? (
                         <button
                           type="button"
@@ -6345,23 +6344,20 @@ export function App() {
                             w.branch_name !== "master" &&
                             w.branch_name !== repo.default_branch;
                           const hasDiffStats = w.insertions > 0 || w.deletions > 0;
+                          const rowStatus: EngineStatusIndicator =
+                            hasPending || w.status === "waiting_approval"
+                              ? "waiting"
+                              : w.status === "running"
+                              ? "running"
+                              : unreadSessionIds[w.id] && !isSelected
+                              ? "unread"
+                              : "idle";
                           const showMetaRow =
+                            isSelected ||
                             isFeatureBranch ||
                             hasDiffStats ||
                             hasDraft ||
-                            hasPending ||
-                            w.status === "waiting_approval";
-
-                          const engineDotColor =
-                            w.agent_kind === "claude"
-                              ? "#e08759"
-                              : w.agent_kind === "codex"
-                              ? "#34d399"
-                              : w.agent_kind === "agy"
-                              ? "#60a5fa"
-                              : w.agent_kind === "cursor"
-                              ? "#a78bfa"
-                              : "#a1a1aa";
+                            rowStatus === "waiting";
 
                           return (
                             <div
@@ -6380,47 +6376,37 @@ export function App() {
                                   setActiveId(w.id);
                                 }
                               }}
-                              className={`group relative flex w-full cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 text-left transition-all duration-150 ${
+                              style={
                                 isSelected
-                                  ? "bg-[var(--v-bg-surface)] text-[var(--v-fg-primary)] shadow-2xs ring-1 ring-[var(--v-border-strong)]/70"
-                                  : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]/80 hover:text-[var(--v-fg-primary)]"
+                                  ? {
+                                      backgroundColor: "var(--v-row-selected-bg)",
+                                      boxShadow:
+                                        "0 0 0 1px var(--v-row-selected-ring), var(--v-row-selected-shadow)",
+                                    }
+                                  : undefined
+                              }
+                              className={`group relative flex w-full cursor-pointer items-start gap-2 rounded-[9px] px-2 py-1.5 text-left transition-all duration-150 ${
+                                isSelected
+                                  ? "text-[var(--v-fg-primary)]"
+                                  : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]/75 hover:text-[var(--v-fg-primary)]"
                               }`}
                             >
-                              {/* Subtle Left Active Pill Bar */}
-                              {isSelected && (
-                                <span
-                                  className="absolute bottom-1.5 left-0 top-1.5 w-[2.5px] rounded-full"
-                                  style={{ backgroundColor: engineDotColor }}
+                              {/* Scheme A Engine Brand Squircle (Monochrome idle -> Brand-illuminated on select; status decoupled) */}
+                              <div className="mt-[0.5px]">
+                                <EngineSessionBadge
+                                  engine={w.agent_kind}
+                                  selected={isSelected}
+                                  status={rowStatus}
+                                  title={`${w.model_short || w.agent_kind}${
+                                    rowStatus === "running"
+                                      ? " · 正在执行"
+                                      : rowStatus === "waiting"
+                                      ? " · 等待审批"
+                                      : rowStatus === "unread"
+                                      ? " · 有未读新进展"
+                                      : ""
+                                  }`}
                                 />
-                              )}
-
-                              {/* Crisp Leading Status / Engine Indicator */}
-                              <div className="mt-[4.5px] flex h-3 w-3 shrink-0 items-center justify-center">
-                                {hasPending || w.status === "waiting_approval" ? (
-                                  <span
-                                    className="h-2 w-2 rounded-full bg-[#fbbf24] ring-2 ring-[#fbbf24]/30 animate-pulse"
-                                    title="等待你的审批或确认"
-                                  />
-                                ) : w.status === "running" ? (
-                                  <span
-                                    className="h-2.5 w-2.5 rounded-full border-[1.5px] border-[#34d399] border-t-transparent animate-spin"
-                                    title="正在执行"
-                                  />
-                                ) : unreadSessionIds[w.id] && !isSelected ? (
-                                  <span
-                                    className="h-2 w-2 rounded-full bg-[#38bdf8] shadow-[0_0_6px_rgba(56,189,248,0.65)]"
-                                    title="后台任务已完成 · 未读新进展"
-                                  />
-                                ) : (
-                                  <span
-                                    className="h-[5px] w-[5px] rounded-full transition-opacity"
-                                    style={{
-                                      backgroundColor: engineDotColor,
-                                      opacity: isSelected ? 0.95 : 0.45,
-                                    }}
-                                    title={w.model_short || w.agent_kind}
-                                  />
-                                )}
                               </div>
 
                               {/* Thread Content Column */}
@@ -6451,7 +6437,7 @@ export function App() {
                                         setRenamingTitle(w.title);
                                       }}
                                       title={`${w.title} · ${w.model_short || w.agent_kind}`}
-                                      className={`truncate text-[12.5px] leading-[1.35] ${
+                                      className={`truncate text-[12.5px] leading-[1.4] ${
                                         isSelected
                                           ? "font-medium text-[var(--v-fg-primary)]"
                                           : "font-normal"
@@ -6498,11 +6484,11 @@ export function App() {
                                   </div>
                                 </div>
 
-                                {/* High-Signal Meta Line (Shown ONLY when there is real info: non-default branch, diff, draft, or pending approval) */}
+                                {/* High-Signal Meta Line (Selected row shows quiet model tag; unselected only shows branch/diff/draft/approval) */}
                                 {showMetaRow && (
                                   <div className="mt-0.5 flex items-center justify-between gap-1.5 text-[10px] text-[var(--v-fg-muted)]">
                                     <div className="flex min-w-0 items-center gap-1.5">
-                                      {(hasPending || w.status === "waiting_approval") && (
+                                      {rowStatus === "waiting" && (
                                         <span className="shrink-0 rounded bg-[#fbbf24]/15 px-1 py-[0.5px] font-medium text-[#d97706] dark:text-[#fbbf24]">
                                           待确认
                                         </span>
@@ -6512,8 +6498,13 @@ export function App() {
                                           草稿
                                         </span>
                                       )}
+                                      {isSelected && (w.model_short || w.agent_kind) && (
+                                        <span className="truncate font-mono text-[9.5px] text-[var(--v-fg-muted)]">
+                                          {w.model_short || w.agent_kind}
+                                        </span>
+                                      )}
                                       {isFeatureBranch && (
-                                        <span className="inline-flex min-w-0 items-center gap-0.5 truncate font-mono text-[10px] text-[var(--v-fg-muted)]">
+                                        <span className="inline-flex min-w-0 items-center gap-0.5 truncate font-mono text-[9.5px] text-[var(--v-fg-faint)]">
                                           <GitBranch className="h-2.5 w-2.5 shrink-0 opacity-70" />
                                           <span className="truncate">{w.branch_name}</span>
                                         </span>
@@ -9006,9 +8997,11 @@ export function App() {
                             title="切换引擎或模型（支持搜索与按厂商分类筛选）"
                             className="flex items-center gap-1.5 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] transition-colors hover:bg-[var(--v-bg-hover)] cursor-pointer"
                           >
-                            <span
-                              className="h-1.5 w-1.5 rounded-full"
-                              style={{ backgroundColor: engTab?.dotColor || "#34d399" }}
+                            <EngineBrandGlyph
+                              engine={activeSession.agent_kind}
+                              size={12.5}
+                              colored
+                              className="shrink-0"
                             />
                             {engTab && (
                               <span className="font-mono text-[10px] text-[var(--v-fg-muted)]">

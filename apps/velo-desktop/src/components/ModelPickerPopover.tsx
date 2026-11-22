@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { Check, Copy, Search, Settings, Terminal, X } from "lucide-react";
 import type { ModelOption } from "../mockData";
+import { EngineBrandGlyph } from "./ui/EngineBrandIcon";
 
 const ENGINE_SETUP_HINTS: Partial<Record<EngineTabKey, { cmd: string; note: string }>> = {
   claude: { cmd: "claude login", note: "安装 Claude Code CLI 并登录账号" },
@@ -272,12 +273,11 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                       : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-body)]"
                   }`}
                 >
-                  <span
-                    className="h-1.5 w-1.5 shrink-0 rounded-full"
-                    style={{
-                      backgroundColor: avail ? tab.dotColor : "var(--v-fg-faint)",
-                      opacity: avail ? 1 : 0.45,
-                    }}
+                  <EngineBrandGlyph
+                    engine={tab.key}
+                    size={12}
+                    colored={isSelected && avail}
+                    className={`shrink-0 ${avail ? "" : "opacity-40"}`}
                   />
                   <span>{tab.shortLabel}</span>
                   <span className="font-mono text-[9.5px] opacity-60">{count}</span>

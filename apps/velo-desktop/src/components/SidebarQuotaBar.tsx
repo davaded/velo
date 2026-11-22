@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { ChevronDown, ChevronUp, RefreshCw } from "lucide-react";
+import { EngineBrandGlyph } from "./ui/EngineBrandIcon";
 
 export interface QuotaWindowItem {
   id: string;
@@ -206,8 +207,9 @@ export const SidebarQuotaBar: React.FC<{
       {hoveredCard && (
         <div className="pointer-events-none absolute bottom-full left-0 right-0 z-30 mb-1.5 rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)]/95 p-2.5 shadow-xl backdrop-blur-md">
           <div className="mb-1.5 flex items-center justify-between gap-2">
-            <span className="text-[11px] font-semibold text-[var(--v-fg-primary)]">
-              {hoveredCard.label}
+            <span className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--v-fg-primary)]">
+              <EngineBrandGlyph engine={hoveredCard.provider} size={12.5} colored />
+              <span>{hoveredCard.label}</span>
             </span>
             <span className="rounded bg-[var(--v-bg-active)] px-1.5 py-0.5 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
               {hoveredCard.plan_badge}
@@ -376,12 +378,14 @@ export const SidebarQuotaBar: React.FC<{
                   </div>
                 </div>
 
-                {/* Micro Footer Bar: Reset countdown or secondary pool */}
+                {/* Micro Footer Bar: Reset countdown or secondary pool + crisp brand glyph */}
                 <div className="mt-1.5 flex items-center justify-between border-t border-[var(--v-border-subtle)]/70 pt-1 text-[9.5px] text-[var(--v-fg-muted)]">
                   <span className="truncate font-mono tabular-nums">{footerMeta}</span>
-                  <span
-                    className="h-1.5 w-1.5 shrink-0 rounded-full"
-                    style={{ backgroundColor: stroke }}
+                  <EngineBrandGlyph
+                    engine={card.provider}
+                    size={11}
+                    colored
+                    className="shrink-0 opacity-90"
                   />
                 </div>
               </button>
