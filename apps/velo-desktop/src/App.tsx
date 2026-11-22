@@ -79,6 +79,7 @@ import {
   FileCode2,
   FileText,
   Folder,
+  FolderOpen,
   FolderPlus,
   GitBranch,
   GitCommitHorizontal,
@@ -6143,11 +6144,12 @@ export function App() {
           })()}
 
           {/* Section Header: Workspaces (Direct Add / Create Folder + Collapse/Expand All) */}
-          <div className="flex items-center justify-between px-3 pb-1.5 pt-1">
-            <span className="pl-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--v-fg-muted)]">
-              Workspaces
-            </span>
-            <div className="flex items-center gap-0.5">
+          <div className="mx-2.5 border-t border-[var(--v-border-subtle)]/80 pb-1.5 pt-2.5">
+            <div className="flex items-center justify-between px-0.5">
+              <span className="pl-1 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-[var(--v-fg-muted)]">
+                Workspaces
+              </span>
+              <div className="flex items-center gap-0.5">
               {repos.length > 0 && (() => {
                 const activeRepoCanon = canonicalRepoPath(activeRepo.path);
                 const anyOpen = repos.some((r) => {
@@ -6197,16 +6199,17 @@ export function App() {
               >
                 <Plus className="h-3.5 w-3.5" />
               </button>
+              </div>
             </div>
           </div>
 
-          {/* Scrollable Project -> Thread Hierarchy (Borderless, Clean Rows) */}
-          <div className="flex-1 space-y-3 overflow-y-auto px-2 py-1">
+          {/* Scrollable Project -> Thread Hierarchy (Refined macOS / Linear Tree Aesthetics) */}
+          <div className="flex-1 space-y-2.5 overflow-y-auto px-2 py-1">
             {repos.length === 0 && (
               <button
                 type="button"
                 onClick={() => openAddWorkspaceModal("create")}
-                className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-[var(--v-border-strong)] px-3 py-3 text-[12px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-dashed border-[var(--v-border-strong)] px-3 py-4 text-[12px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
               >
                 <FolderPlus className="h-3.5 w-3.5" />
                 <span>添加或新建工作区文件夹</span>
@@ -6216,6 +6219,7 @@ export function App() {
               const canonRepoPath = canonicalRepoPath(repo.path);
               const repoKey = canonRepoPath || repo.id;
               const activeRepoCanon = canonicalRepoPath(activeRepo.path);
+              const isActiveWorkspace = repoKey === activeRepoCanon;
               const repoItems = sessions.filter((s) => {
                 if (s.archived) return false;
                 if (s.project_path && s.project_path.trim()) {
@@ -6227,11 +6231,19 @@ export function App() {
               const isCollapsed = explicitFolderState
                 ? explicitFolderState === "closed"
                 : repoKey !== activeRepoCanon;
+              const folderHasWaiting = repoItems.some((s) => s.status === "waiting_approval");
+              const folderHasRunning = repoItems.some((s) => s.status === "running");
 
               return (
-                <div key={repo.id} className="space-y-0.5">
-                  {/* Project Row */}
-                  <div className="group flex h-[28px] items-center justify-between rounded-md px-2 text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-primary)]">
+                <div key={repo.id} className="space-y-1">
+                  {/* Workspace Folder Header Row */}
+                  <div
+                    className={`group flex h-[30px] items-center justify-between rounded-lg px-1.5 transition-colors ${
+                      isActiveWorkspace
+                        ? "text-[var(--v-fg-primary)]"
+                        : "text-[var(--v-fg-secondary)]"
+                    } hover:bg-[var(--v-bg-hover)]/80`}
+                  >
                     <button
                       onClick={() =>
                         setRepoFolderState((prev) => ({
@@ -6239,38 +6251,50 @@ export function App() {
                           [repoKey]: isCollapsed ? "open" : "closed",
                         }))
                       }
-                      className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      className="flex min-w-0 flex-1 items-center gap-1.5 text-left cursor-pointer"
                     >
-                      <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)] group-hover:hidden" />
                       {isCollapsed ? (
-                        <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)] group-hover:block" />
+                        <ChevronRight className="h-3 w-3 shrink-0 text-[var(--v-fg-faint)] transition-transform group-hover:text-[var(--v-fg-muted)]" />
                       ) : (
-                        <ChevronDown className="hidden h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)] group-hover:block" />
+                        <ChevronDown className="h-3 w-3 shrink-0 text-[var(--v-fg-faint)] transition-transform group-hover:text-[var(--v-fg-muted)]" />
                       )}
-                      <span className="truncate text-[13px] font-medium text-[var(--v-fg-body)] group-hover:text-[var(--v-fg-primary)]">
+                      {isCollapsed ? (
+                        <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)]" />
+                      ) : (
+                        <FolderOpen
+                          className={`h-3.5 w-3.5 shrink-0 ${
+                            isActiveWorkspace
+                              ? "text-[var(--v-fg-primary)]"
+                              : "text-[var(--v-fg-muted)]"
+                          }`}
+                        />
+                      )}
+                      <span
+                        className={`truncate text-[12.5px] tracking-[-0.01em] ${
+                          isActiveWorkspace
+                            ? "font-semibold text-[var(--v-fg-primary)]"
+                            : "font-medium text-[var(--v-fg-body)]"
+                        }`}
+                      >
                         {repo.name}
                       </span>
-                      {isCollapsed && repoItems.length > 0 && (() => {
-                        const hasWaiting = repoItems.some((s) => s.status === "waiting_approval");
-                        const hasRunning = repoItems.some((s) => s.status === "running");
-                        return (
-                          <span className="ml-1 inline-flex shrink-0 items-center gap-1 rounded bg-[var(--v-bg-active)]/70 px-1 py-0.2 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
-                            {hasWaiting ? (
-                              <span className="h-1.5 w-1.5 rounded-full bg-[#fbbf24]" />
-                            ) : hasRunning ? (
-                              <span className="h-1.5 w-1.5 rounded-full bg-[#34d399] animate-pulse" />
-                            ) : null}
-                            {repoItems.length}
-                          </span>
-                        );
-                      })()}
+                      {repoItems.length > 0 && (
+                        <span className="ml-0.5 inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--v-bg-active)]/75 px-1.5 py-[1px] font-mono text-[9.5px] text-[var(--v-fg-muted)] tabular-nums">
+                          {isCollapsed && folderHasWaiting ? (
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#fbbf24]" />
+                          ) : isCollapsed && folderHasRunning ? (
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#34d399] animate-pulse" />
+                          ) : null}
+                          {repoItems.length}
+                        </span>
+                      )}
                     </button>
 
-                    <div className="flex items-center gap-0.5">
+                    <div className="flex shrink-0 items-center gap-0.5">
                       <button
                         onClick={() => handleQuickNewThread(repo)}
                         title={`在 ${repo.name} 中新建会话`}
-                        className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] opacity-60 transition-opacity hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:opacity-100 cursor-pointer"
+                        className="flex h-5 w-5 items-center justify-center rounded-md text-[var(--v-fg-muted)] opacity-0 transition-opacity hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:opacity-100 cursor-pointer"
                       >
                         <Plus className="h-3.5 w-3.5" />
                       </button>
@@ -6284,165 +6308,238 @@ export function App() {
                           });
                         }}
                         title={`修改 ${repo.name} 的归属文件夹路径`}
-                        className="hidden h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:flex cursor-pointer"
+                        className="hidden h-5 w-5 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:flex cursor-pointer"
                       >
                         <SquarePen className="h-3 w-3" />
                       </button>
                       <button
                         onClick={(e) => void handleRemoveRepo(repo.id, e)}
                         title={`移除文件夹 ${repo.name} 及旗下会话`}
-                        className="hidden h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171] group-hover:flex cursor-pointer"
+                        className="hidden h-5 w-5 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171] group-hover:flex cursor-pointer"
                       >
                         <X className="h-3 w-3" />
                       </button>
                     </div>
                   </div>
 
-                  {/* Thread Rows under Project */}
+                  {/* Thread Rows Connected by Crisp Subtle Tree Rail */}
                   {!isCollapsed && (
-                    <div className="space-y-0.5">
-                      {repoItems.map((w) => {
-                        const isSelected = w.id === activeSession.id;
-                        const hasPending = !!pendingApprovals[w.id] || !!pendingQuestions[w.id];
-                        return (
-                          <div
-                            key={w.id}
-                            onClick={() => {
-                              setActiveId(w.id);
-                              if (typeof window !== "undefined" && window.innerWidth < 768) {
-                                setSidebarOpen(false);
-                              }
-                            }}
-                            role="button"
-                            tabIndex={0}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                setActiveId(w.id);
-                              }
-                            }}
-                            className={`group flex w-full cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
-                              isSelected
-                                ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                                : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-surface)] hover:text-[var(--v-fg-body)]"
-                            }`}
-                          >
-                            {/* Leading Status Slot (14px wide, reserves space when idle just like Paseo/Codex) */}
-                            <div className="mt-[4px] flex h-3.5 w-3.5 shrink-0 items-center justify-center">
-                              {hasPending || w.status === "waiting_approval" ? (
-                                <span
-                                  className="h-2 w-2 rounded-full bg-[#fbbf24] ring-2 ring-[#fbbf24]/30 animate-pulse"
-                                  title="等待你的审批或确认"
-                                />
-                              ) : w.status === "running" ? (
-                                <span
-                                  className="h-2.5 w-2.5 rounded-full border-[1.5px] border-[#34d399] border-t-transparent animate-spin"
-                                  title="Running"
-                                />
-                              ) : unreadSessionIds[w.id] && !isSelected ? (
-                                <span
-                                  className="h-2 w-2 rounded-full bg-[#38bdf8] shadow-[0_0_6px_rgba(56,189,248,0.65)]"
-                                  title="后台任务已完成 · 未读新进展"
-                                />
-                              ) : null}
-                            </div>
+                    <div className="ml-[13px] space-y-0.5 border-l border-[var(--v-border-subtle)] pl-2">
+                      {repoItems.length === 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => handleQuickNewThread(repo)}
+                          className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[11.5px] text-[var(--v-fg-faint)] transition-colors hover:bg-[var(--v-bg-hover)]/70 hover:text-[var(--v-fg-secondary)] cursor-pointer"
+                        >
+                          <Plus className="h-3 w-3" />
+                          <span>新建会话</span>
+                        </button>
+                      ) : (
+                        repoItems.map((w) => {
+                          const isSelected = w.id === activeSession.id;
+                          const hasPending = !!pendingApprovals[w.id] || !!pendingQuestions[w.id];
+                          const hasDraft = !isSelected && Boolean(draftsBySession[w.id]?.trim());
+                          const isFeatureBranch =
+                            Boolean(w.branch_name) &&
+                            w.branch_name !== "main" &&
+                            w.branch_name !== "master" &&
+                            w.branch_name !== repo.default_branch;
+                          const hasDiffStats = w.insertions > 0 || w.deletions > 0;
+                          const showMetaRow =
+                            isFeatureBranch ||
+                            hasDiffStats ||
+                            hasDraft ||
+                            hasPending ||
+                            w.status === "waiting_approval";
 
-                            {/* Thread Content Column */}
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-baseline justify-between gap-1.5">
-                                {renamingSessionId === w.id ? (
-                                  <input
-                                    autoFocus
-                                    value={renamingTitle}
-                                    onClick={(e) => e.stopPropagation()}
-                                    onChange={(e) => setRenamingTitle(e.target.value)}
-                                    onBlur={() => handleCommitRenameSession(w.id)}
-                                    onKeyDown={(e) => {
-                                      e.stopPropagation();
-                                      if (e.key === "Enter") {
-                                        handleCommitRenameSession(w.id);
-                                      } else if (e.key === "Escape") {
-                                        setRenamingSessionId(null);
-                                      }
-                                    }}
-                                    className="w-full rounded border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-1.5 py-0.5 text-[12.5px] text-[var(--v-fg-primary)] focus:outline-none"
+                          const engineDotColor =
+                            w.agent_kind === "claude"
+                              ? "#e08759"
+                              : w.agent_kind === "codex"
+                              ? "#34d399"
+                              : w.agent_kind === "agy"
+                              ? "#60a5fa"
+                              : w.agent_kind === "cursor"
+                              ? "#a78bfa"
+                              : "#a1a1aa";
+
+                          return (
+                            <div
+                              key={w.id}
+                              onClick={() => {
+                                setActiveId(w.id);
+                                if (typeof window !== "undefined" && window.innerWidth < 768) {
+                                  setSidebarOpen(false);
+                                }
+                              }}
+                              role="button"
+                              tabIndex={0}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  setActiveId(w.id);
+                                }
+                              }}
+                              className={`group relative flex w-full cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 text-left transition-all duration-150 ${
+                                isSelected
+                                  ? "bg-[var(--v-bg-surface)] text-[var(--v-fg-primary)] shadow-2xs ring-1 ring-[var(--v-border-strong)]/70"
+                                  : "text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]/80 hover:text-[var(--v-fg-primary)]"
+                              }`}
+                            >
+                              {/* Subtle Left Active Pill Bar */}
+                              {isSelected && (
+                                <span
+                                  className="absolute bottom-1.5 left-0 top-1.5 w-[2.5px] rounded-full"
+                                  style={{ backgroundColor: engineDotColor }}
+                                />
+                              )}
+
+                              {/* Crisp Leading Status / Engine Indicator */}
+                              <div className="mt-[4.5px] flex h-3 w-3 shrink-0 items-center justify-center">
+                                {hasPending || w.status === "waiting_approval" ? (
+                                  <span
+                                    className="h-2 w-2 rounded-full bg-[#fbbf24] ring-2 ring-[#fbbf24]/30 animate-pulse"
+                                    title="等待你的审批或确认"
+                                  />
+                                ) : w.status === "running" ? (
+                                  <span
+                                    className="h-2.5 w-2.5 rounded-full border-[1.5px] border-[#34d399] border-t-transparent animate-spin"
+                                    title="正在执行"
+                                  />
+                                ) : unreadSessionIds[w.id] && !isSelected ? (
+                                  <span
+                                    className="h-2 w-2 rounded-full bg-[#38bdf8] shadow-[0_0_6px_rgba(56,189,248,0.65)]"
+                                    title="后台任务已完成 · 未读新进展"
                                   />
                                 ) : (
                                   <span
-                                    onDoubleClick={(e) => {
-                                      e.stopPropagation();
-                                      setRenamingSessionId(w.id);
-                                      setRenamingTitle(w.title);
+                                    className="h-[5px] w-[5px] rounded-full transition-opacity"
+                                    style={{
+                                      backgroundColor: engineDotColor,
+                                      opacity: isSelected ? 0.95 : 0.45,
                                     }}
-                                    title="Double-click to rename thread"
-                                    className={`truncate text-[13px] leading-snug ${
-                                      isSelected
-                                        ? "font-medium text-[var(--v-fg-primary)]"
-                                        : "font-normal"
-                                    }`}
-                                  >
-                                    {w.title}
-                                  </span>
+                                    title={w.model_short || w.agent_kind}
+                                  />
                                 )}
-                                <div className="flex shrink-0 items-center gap-1">
-                                  <span className="font-mono text-[11px] text-[var(--v-fg-faint)] group-hover:hidden">
-                                    {w.updated_at}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setRenamingSessionId(w.id);
-                                      setRenamingTitle(w.title);
-                                    }}
-                                    title="Rename thread"
-                                    className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] group-hover:flex"
-                                  >
-                                    <SquarePen className="h-2.5 w-2.5" />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleArchiveSession(w.id, true, e)}
-                                    title="归档会话（完整保留 Git 提交与对话历史）"
-                                    className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] group-hover:flex"
-                                  >
-                                    <Archive className="h-2.5 w-2.5" />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setSessionPendingDelete({ id: w.id, title: w.title });
-                                    }}
-                                    title="删除会话"
-                                    className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171] group-hover:flex"
-                                  >
-                                    <Trash2 className="h-2.5 w-2.5" />
-                                  </button>
-                                </div>
                               </div>
 
-                              {/* Subtle Meta Line: Branch + Draft Badge + Diff Stats */}
-                              <div className="mt-0.5 flex items-center justify-between gap-2 font-mono text-[11px] text-[var(--v-fg-muted)]">
-                                <span className="truncate">{w.branch_name}</span>
-                                <span className="flex shrink-0 items-center gap-1.5 text-[10.5px]">
-                                  {!isSelected && Boolean(draftsBySession[w.id]?.trim()) && (
-                                    <span className="rounded bg-[#f59e0b]/15 px-1 py-0.2 font-sans text-[9.5px] font-medium text-[#fbbf24]">
-                                      草稿
+                              {/* Thread Content Column */}
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center justify-between gap-1.5">
+                                  {renamingSessionId === w.id ? (
+                                    <input
+                                      autoFocus
+                                      value={renamingTitle}
+                                      onClick={(e) => e.stopPropagation()}
+                                      onChange={(e) => setRenamingTitle(e.target.value)}
+                                      onBlur={() => handleCommitRenameSession(w.id)}
+                                      onKeyDown={(e) => {
+                                        e.stopPropagation();
+                                        if (e.key === "Enter") {
+                                          handleCommitRenameSession(w.id);
+                                        } else if (e.key === "Escape") {
+                                          setRenamingSessionId(null);
+                                        }
+                                      }}
+                                      className="w-full rounded border border-[var(--v-border-strong)] bg-[var(--v-bg-canvas)] px-1.5 py-0.5 text-[12px] text-[var(--v-fg-primary)] focus:outline-none"
+                                    />
+                                  ) : (
+                                    <span
+                                      onDoubleClick={(e) => {
+                                        e.stopPropagation();
+                                        setRenamingSessionId(w.id);
+                                        setRenamingTitle(w.title);
+                                      }}
+                                      title={`${w.title} · ${w.model_short || w.agent_kind}`}
+                                      className={`truncate text-[12.5px] leading-[1.35] ${
+                                        isSelected
+                                          ? "font-medium text-[var(--v-fg-primary)]"
+                                          : "font-normal"
+                                      }`}
+                                    >
+                                      {w.title}
                                     </span>
                                   )}
-                                  {(w.insertions > 0 || w.deletions > 0) && (
-                                    <span className="flex items-center gap-1">
-                                      <span className="text-[#34d399]/80">+{w.insertions}</span>
-                                      <span className="text-[#f87171]/80">−{w.deletions}</span>
+                                  <div className="flex shrink-0 items-center gap-0.5">
+                                    <span className="font-mono text-[10px] text-[var(--v-fg-faint)] tabular-nums group-hover:hidden">
+                                      {w.updated_at}
                                     </span>
-                                  )}
-                                </span>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setRenamingSessionId(w.id);
+                                        setRenamingTitle(w.title);
+                                      }}
+                                      title="重命名会话"
+                                      className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:flex"
+                                    >
+                                      <SquarePen className="h-2.5 w-2.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => handleArchiveSession(w.id, true, e)}
+                                      title="归档会话"
+                                      className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] group-hover:flex"
+                                    >
+                                      <Archive className="h-2.5 w-2.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setSessionPendingDelete({ id: w.id, title: w.title });
+                                      }}
+                                      title="删除会话"
+                                      className="hidden h-4 w-4 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[#f87171] group-hover:flex"
+                                    >
+                                      <Trash2 className="h-2.5 w-2.5" />
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* High-Signal Meta Line (Shown ONLY when there is real info: non-default branch, diff, draft, or pending approval) */}
+                                {showMetaRow && (
+                                  <div className="mt-0.5 flex items-center justify-between gap-1.5 text-[10px] text-[var(--v-fg-muted)]">
+                                    <div className="flex min-w-0 items-center gap-1.5">
+                                      {(hasPending || w.status === "waiting_approval") && (
+                                        <span className="shrink-0 rounded bg-[#fbbf24]/15 px-1 py-[0.5px] font-medium text-[#d97706] dark:text-[#fbbf24]">
+                                          待确认
+                                        </span>
+                                      )}
+                                      {hasDraft && (
+                                        <span className="shrink-0 rounded bg-[#f59e0b]/15 px-1 py-[0.5px] font-medium text-[#d97706] dark:text-[#fbbf24]">
+                                          草稿
+                                        </span>
+                                      )}
+                                      {isFeatureBranch && (
+                                        <span className="inline-flex min-w-0 items-center gap-0.5 truncate font-mono text-[10px] text-[var(--v-fg-muted)]">
+                                          <GitBranch className="h-2.5 w-2.5 shrink-0 opacity-70" />
+                                          <span className="truncate">{w.branch_name}</span>
+                                        </span>
+                                      )}
+                                    </div>
+                                    {hasDiffStats && (
+                                      <span className="flex shrink-0 items-center gap-1 font-mono text-[10px] tabular-nums">
+                                        {w.insertions > 0 && (
+                                          <span className="text-[#10b981] dark:text-[#34d399]">
+                                            +{w.insertions}
+                                          </span>
+                                        )}
+                                        {w.deletions > 0 && (
+                                          <span className="text-[#ef4444] dark:text-[#f87171]">
+                                            −{w.deletions}
+                                          </span>
+                                        )}
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             </div>
-                          </div>
-                        );
-                      })}
+                          );
+                        })
+                      )}
                     </div>
                   )}
                 </div>
