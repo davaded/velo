@@ -1649,7 +1649,12 @@ public final class VeloStore: ObservableObject {
         _ sessionId: String,
         upToUserTurn: Int? = nil,
         upToUserText: String? = nil,
-        userTurnsFromEnd: Int? = nil
+        userTurnsFromEnd: Int? = nil,
+        title: String? = nil,
+        provider: String? = nil,
+        model: String? = nil,
+        effort: String? = nil,
+        initialPrompt: String? = nil
     ) async -> String? {
         triggerHaptic(.medium)
         switch connectionConfig {
@@ -1662,6 +1667,13 @@ public final class VeloStore: ObservableObject {
             if let t = upToUserTurn { body["up_to_user_turn"] = t }
             if let txt = upToUserText, !txt.isEmpty { body["up_to_user_text"] = txt }
             if let fromEnd = userTurnsFromEnd { body["user_turns_from_end"] = fromEnd }
+            if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["title"] = title }
+            if let provider, !provider.isEmpty { body["provider"] = provider }
+            if let model, !model.isEmpty { body["model"] = model }
+            if let effort, !effort.isEmpty { body["effort"] = effort }
+            if let initialPrompt, !initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                body["initial_prompt"] = initialPrompt
+            }
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             guard let (data, _) = try? await URLSession.shared.data(for: req),
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -1679,8 +1691,93 @@ public final class VeloStore: ObservableObject {
             if let t = upToUserTurn { payload["up_to_user_turn"] = t }
             if let txt = upToUserText, !txt.isEmpty { payload["up_to_user_text"] = txt }
             if let fromEnd = userTurnsFromEnd { payload["user_turns_from_end"] = fromEnd }
+            if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { payload["title"] = title }
+            if let provider, !provider.isEmpty { payload["provider"] = provider }
+            if let model, !model.isEmpty { payload["model"] = model }
+            if let effort, !effort.isEmpty { payload["effort"] = effort }
+            if let initialPrompt, !initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                payload["initial_prompt"] = initialPrompt
+            }
             sendEncryptedCommand(payload)
             return nil
+        case .none:
+            return nil
+        }
+    }
+
+    public func uploadDocumentAttachment(
+        data: Data,
+        filename: String,
+        mimeType: String = "application/octet-stream"
+    ) async -> String? {
+        guard !data.isEmpty, data.count <= 20 * 1024 * 1024 else { return nil }
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let url = URL(string: "\(baseURL)/api/attachments") else { return nil }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = [
+                "filename": filename,
+                "mime_type": mimeType,
+                "data_base64": data.base64EncodedString(),
+            ]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            guard let (respData, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                  let obj = (try? JSONSerialization.jsonObject(with: respData)) as? [String: Any],
+                  let savedPath = obj["path"] as? String
+            else { return nil }
+            return savedPath
+        case .e2eeRelay:
+            let uploadId = "doc-\(UUID().uuidString.prefix(12))"
+            let result: (path: String, url: String)? = await withCheckedContinuation { cont in
+                self.attachmentUploadWaiters[uploadId] = cont
+                let chunkSize = 160 * 1024
+                if data.count <= chunkSize {
+                    self.sendEncryptedCommand([
+                        "cmd": "upload_attachment",
+                        "upload_id": uploadId,
+                        "filename": filename,
+                        "mime_type": mimeType,
+                        "data_base64": data.base64EncodedString(),
+                    ])
+                } else {
+                    var slices: [Data] = []
+                    var offset = 0
+                    while offset < data.count {
+                        let end = min(data.count, offset + chunkSize)
+                        slices.append(data.subdata(in: offset..<end))
+                        offset = end
+                    }
+                    self.sendEncryptedCommand([
+                        "cmd": "upload_attachment_begin",
+                        "upload_id": uploadId,
+                        "filename": filename,
+                        "mime_type": mimeType,
+                        "total_chunks": slices.count,
+                    ])
+                    for (idx, slice) in slices.enumerated() {
+                        self.sendEncryptedCommand([
+                            "cmd": "upload_attachment_chunk",
+                            "upload_id": uploadId,
+                            "index": idx,
+                            "chunk_base64": slice.base64EncodedString(),
+                        ])
+                    }
+                    self.sendEncryptedCommand([
+                        "cmd": "upload_attachment_complete",
+                        "upload_id": uploadId,
+                    ])
+                }
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 18_000_000_000)
+                    if let pending = self?.attachmentUploadWaiters.removeValue(forKey: uploadId) {
+                        pending.resume(returning: nil)
+                    }
+                }
+            }
+            return result?.path
         case .none:
             return nil
         }

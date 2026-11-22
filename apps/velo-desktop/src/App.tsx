@@ -37,6 +37,11 @@ import { AutomationsModal } from "./components/AutomationsModal";
 import { AnalyticsAndPushModal } from "./components/AnalyticsAndPushModal";
 import { CliSessionsModal, ExternalCliSessionItem } from "./components/CliSessionsModal";
 import { QueuedPromptsBar } from "./components/QueuedPromptsBar";
+import {
+  ForkBranchModal,
+  ForkConfirmPayload,
+  ForkLaunchTarget,
+} from "./components/ForkBranchModal";
 import { ChatOutlineRail, OutlineTurnSummary } from "./components/ChatOutlineRail";
 import { SidebarQuotaBar } from "./components/SidebarQuotaBar";
 import { RemoteHostsModal } from "./components/RemoteHostsModal";
@@ -71,6 +76,7 @@ import {
   CircleGauge,
   Copy,
   FileCode2,
+  FileText,
   Folder,
   FolderPlus,
   GitBranch,
@@ -185,6 +191,26 @@ interface PendingAttachmentItem {
   filename: string;
   path: string;
   url: string;
+  isImage?: boolean;
+  displayName?: string;
+  size?: number;
+  relPath?: string;
+}
+
+interface WorkspaceFileMentionItem {
+  path: string;
+  abs_path: string;
+  name: string;
+  dir: string;
+  modified: boolean;
+  size: number;
+}
+
+function formatCompactFileSize(bytes?: number): string {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 const DEFAULT_PENDING_BY_SESSION: Record<string, PendingApprovalItem> = {};
@@ -910,6 +936,10 @@ export function App() {
     }
   }, [draftsBySession]);
   const [slashFilter, setSlashFilter] = useState<string | null>(null);
+  const [fileMentionQuery, setFileMentionQuery] = useState<string | null>(null);
+  const [fileMentionResults, setFileMentionResults] = useState<WorkspaceFileMentionItem[]>([]);
+  const [fileMentionIdx, setFileMentionIdx] = useState<number>(0);
+  const [forkLaunchTarget, setForkLaunchTarget] = useState<ForkLaunchTarget | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
   const [composerDragOver, setComposerDragOver] = useState<boolean>(false);
@@ -3073,9 +3103,78 @@ export function App() {
     setDrawerOpen(true);
   };
 
-  // Composer input handler with `/` slash skills (Agent explores worktree files autonomously)
+  // Debounced `@` workspace file mention search (respects .gitignore & prioritizes Git modified files)
+  useEffect(() => {
+    if (fileMentionQuery === null) {
+      setFileMentionResults([]);
+      setFileMentionIdx(0);
+      return;
+    }
+    const ws = canonicalRepoPath(activeSession.project_path || activeRepo.path);
+    if (!ws) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      const qs = new URLSearchParams({
+        workspace: ws,
+        q: fileMentionQuery,
+        limit: "24",
+      });
+      fetch(`${daemonUrl}/api/workspaces/files?${qs.toString()}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (cancelled) return;
+          if (Array.isArray(d?.files)) {
+            setFileMentionResults(d.files as WorkspaceFileMentionItem[]);
+            setFileMentionIdx(0);
+          }
+        })
+        .catch(() => {});
+    }, 90);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [fileMentionQuery, activeSession.project_path, activeRepo.path, daemonUrl]);
+
+  const handleSelectFileMention = useCallback(
+    (item: WorkspaceFileMentionItem) => {
+      const originSid = activeSessionIdRef.current;
+      setPendingAttachments((prev) => {
+        if (prev.some((a) => a.path === item.abs_path)) return prev;
+        return [
+          ...prev,
+          {
+            filename: item.name,
+            displayName: item.path,
+            relPath: item.path,
+            path: item.abs_path,
+            url: "",
+            isImage: false,
+            size: item.size,
+          },
+        ];
+      }, originSid);
+      setPrompt((cur) => cur.replace(/(^|\s)@[^\s@]*$/, "$1"), originSid);
+      setFileMentionQuery(null);
+      setTimeout(() => composerTextareaRef.current?.focus(), 10);
+    },
+    [setPendingAttachments, setPrompt]
+  );
+
+  // Composer input handler with `/` slash skills AND `@` workspace file mention search
   const handlePromptChange = (val: string) => {
     setPrompt(val);
+
+    // Check `@file` mention at end of input (at start or after whitespace)
+    const mentionMatch = val.match(/(?:^|\s)@([^\s@]*)$/);
+    if (mentionMatch) {
+      setFileMentionQuery(mentionMatch[1] ?? "");
+      setSlashFilter(null);
+      return;
+    } else if (fileMentionQuery !== null) {
+      setFileMentionQuery(null);
+    }
+
     if (!val.startsWith("/")) {
       setSlashFilter(null);
       return;
@@ -3116,12 +3215,15 @@ export function App() {
 
   const handleUploadImageFiles = useCallback(
     async (fileList: FileList | File[]) => {
-      const files = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
+      const files = Array.from(fileList).filter((f) => f && f.size <= 35 * 1024 * 1024);
       if (files.length === 0) return;
       const originSid = activeSessionIdRef.current;
       setUploadingAttachment(true);
       try {
         for (const file of files) {
+          const isImg =
+            file.type.startsWith("image/") ||
+            /\.(png|jpe?g|webp|gif|heic|svg)$/i.test(file.name || "");
           const dataUrl = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => resolve(String(reader.result || ""));
@@ -3132,24 +3234,31 @@ export function App() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              filename: file.name || "pasted-image.png",
-              mime_type: file.type || "image/png",
+              filename: file.name || (isImg ? "pasted-image.png" : "attached-file.txt"),
+              mime_type: file.type || (isImg ? "image/png" : "application/octet-stream"),
               data_base64: dataUrl,
             }),
           });
           if (res.ok) {
             const data = (await res.json()) as {
               filename: string;
+              original_name?: string;
+              is_image?: boolean;
               path: string;
               url: string;
+              size?: number;
             };
+            const finalIsImg = data.is_image !== undefined ? data.is_image : isImg;
             setPendingAttachments(
               (prev) => [
                 ...prev,
                 {
                   filename: data.filename,
+                  displayName: data.original_name || file.name || data.filename,
                   path: data.path,
                   url: `${daemonUrl}${data.url}`,
+                  isImage: finalIsImg,
+                  size: data.size ?? file.size,
                 },
               ],
               originSid
@@ -3234,17 +3343,35 @@ export function App() {
     preserveComposer?: boolean
   ) => {
     const attachedPaths =
-      overrideImages !== undefined ? overrideImages : pendingAttachments.map((a) => a.path);
+      overrideImages !== undefined
+        ? overrideImages
+        : pendingAttachments.filter((a) => a.isImage !== false).map((a) => a.path);
+    const attachedNonImageFiles =
+      overrideImages !== undefined
+        ? []
+        : pendingAttachments.filter((a) => a.isImage === false);
     const rawTyped = (customText ?? prompt).trim();
-    if (!rawTyped && attachedPaths.length === 0) return;
+    if (!rawTyped && attachedPaths.length === 0 && attachedNonImageFiles.length === 0) return;
 
-    const rawText = rawTyped || "Please inspect the attached image(s).";
+    const filesBlock =
+      attachedNonImageFiles.length > 0
+        ? `[Referenced Files]\n${attachedNonImageFiles
+            .map((f) => `- ${f.path}`)
+            .join("\n")}`
+        : "";
+    const baseText =
+      rawTyped ||
+      (attachedNonImageFiles.length > 0
+        ? "请分析并处理以上引用的文件。"
+        : "Please inspect the attached image(s).");
+    const rawText = filesBlock ? `${filesBlock}\n\n${baseText}` : baseText;
     const text = rawText;
-    const skillPath = matchSkillInvocation(text, localSkills)?.path;
+    const skillPath = matchSkillInvocation(baseText, localSkills)?.path;
 
     if (!preserveComposer) {
       setPrompt("");
       setSlashFilter(null);
+      setFileMentionQuery(null);
       if (overrideImages === undefined) {
         setPendingAttachments([]);
       }
@@ -3960,14 +4087,33 @@ export function App() {
     }
   };
 
-  // Fork current conversation at any turn (`POST /api/sessions/{id}/fork`)
-  const handleForkSession = async (
+  // Open the Fork Launch Modal so user can keep current model (Enter) or switch engine/model in 1 step
+  const handleForkSession = (
     upToUserTurn?: number,
     upToUserText?: string,
     userTurnsFromEnd?: number
   ) => {
     const sid = activeSession.id;
     if (!sid || sid === "draft-empty") return;
+    setForkLaunchTarget({
+      sourceSessionId: sid,
+      sourceTitle: activeSession.title || "Session",
+      repoRoot: canonicalRepoPath(activeSession.project_path || activeRepo.path),
+      currentModel: activeSession.model,
+      currentEffort: activeSession.effort || "medium",
+      currentAgentKind: activeSession.agent_kind,
+      upToUserTurn,
+      upToUserText,
+      userTurnsFromEnd,
+    });
+  };
+
+  const handleConfirmForkBranch = async (payload: ForkConfirmPayload) => {
+    if (!forkLaunchTarget) return;
+    const target = forkLaunchTarget;
+    const sid = target.sourceSessionId;
+    setForkLaunchTarget(null);
+
     const ensureRepoRegistered = (forked: VeloSession) => {
       const cp = canonicalRepoPath(forked.project_path);
       if (!cp) return;
@@ -3987,16 +4133,26 @@ export function App() {
           },
         ];
       });
+      setRepoFolderState((prev) => ({ ...prev, [cp]: "open" }));
     };
+
+    const reqBody = {
+      up_to_user_turn: target.upToUserTurn,
+      up_to_user_text: target.upToUserText,
+      user_turns_from_end: target.userTurnsFromEnd,
+      title: payload.title,
+      provider: payload.provider,
+      model: payload.model,
+      effort: payload.effort,
+      repo_root: payload.repoRoot,
+      initial_prompt: payload.initialPrompt,
+    };
+
     try {
       const res = await fetch(`${daemonUrl}/api/sessions/${sid}/fork`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          up_to_user_turn: upToUserTurn,
-          up_to_user_text: upToUserText,
-          user_turns_from_end: userTurnsFromEnd,
-        }),
+        body: JSON.stringify(reqBody),
       });
       if (res.ok) {
         const d = (await res.json()) as { ok?: boolean; session?: Record<string, unknown> };
@@ -4011,23 +4167,57 @@ export function App() {
           return;
         }
       }
-      sendE2eeCommand({
-        cmd: "fork_session",
-        session_id: sid,
-        up_to_user_turn: upToUserTurn,
-        up_to_user_text: upToUserText,
-        user_turns_from_end: userTurnsFromEnd,
-      });
+      sendE2eeCommand({ cmd: "fork_session", session_id: sid, ...reqBody });
     } catch {
-      sendE2eeCommand({
-        cmd: "fork_session",
-        session_id: sid,
-        up_to_user_turn: upToUserTurn,
-        up_to_user_text: upToUserText,
-        user_turns_from_end: userTurnsFromEnd,
-      });
+      sendE2eeCommand({ cmd: "fork_session", session_id: sid, ...reqBody });
     }
   };
+
+  const handleEditBackQueuedPrompt = useCallback(
+    (item: { id: string; input: string }) => {
+      void handleRemoveQueuedPrompt(item.id);
+      setPrompt((cur) => (cur.trim() ? `${cur}\n${item.input}` : item.input));
+      setTimeout(() => composerTextareaRef.current?.focus(), 20);
+    },
+    [handleRemoveQueuedPrompt, setPrompt]
+  );
+
+  const handleReorderQueuedPrompt = useCallback(
+    async (queueId: string, direction: "up" | "down") => {
+      const sid = activeSession.id;
+      if (!sid) return;
+      // Optimistic local reorder
+      setSessions((prev) =>
+        prev.map((s) => {
+          if (s.id !== sid) return s;
+          const q = [...(s.queued_prompts || [])];
+          const idx = q.findIndex((item) => item.id === queueId);
+          if (idx === -1) return s;
+          const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+          if (swapIdx < 0 || swapIdx >= q.length) return s;
+          [q[idx], q[swapIdx]] = [q[swapIdx], q[idx]];
+          return { ...s, queued_prompts: q };
+        })
+      );
+      try {
+        await fetch(`${daemonUrl}/api/sessions/${sid}/queue/reorder`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ queue_id: queueId, direction }),
+        });
+      } catch {
+        // ignore
+      }
+    },
+    [activeSession.id, daemonUrl]
+  );
+
+  const handleClearAllQueuedPrompts = useCallback(async () => {
+    const items = activeSession.queued_prompts || [];
+    for (const item of items) {
+      await handleRemoveQueuedPrompt(item.id);
+    }
+  }, [activeSession.queued_prompts, handleRemoveQueuedPrompt]);
 
   const handleJumpToTurn = useCallback(
     (turnKey: string) => {
@@ -7499,6 +7689,72 @@ export function App() {
                   );
                 })()}
 
+                {/* `@` Workspace File Mention Popover */}
+                {fileMentionQuery !== null && (
+                  <div className="mb-2 max-h-[240px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                    <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
+                      <span>
+                        引用工作区文件 {fileMentionQuery ? `· "${fileMentionQuery}"` : "· 最近变更优先"}
+                      </span>
+                      <span className="font-mono text-[10px]">↑↓ 选择 · Enter 插入 · Esc 关闭</span>
+                    </div>
+                    {fileMentionResults.length === 0 ? (
+                      <div className="px-2.5 py-2 text-[11.5px] text-[var(--v-fg-muted)]">
+                        未找到匹配的工作区文件
+                      </div>
+                    ) : (
+                      fileMentionResults.map((item, idx) => {
+                        const active = idx === fileMentionIdx;
+                        return (
+                          <button
+                            key={item.abs_path}
+                            type="button"
+                            onMouseEnter={() => setFileMentionIdx(idx)}
+                            onClick={() => handleSelectFileMention(item)}
+                            className={`flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors cursor-pointer ${
+                              active
+                                ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                                : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
+                            }`}
+                          >
+                            <div className="flex min-w-0 items-center gap-2">
+                              <FileCode2 className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)]" />
+                              <span className="truncate font-mono font-medium">{item.name}</span>
+                              {item.dir && (
+                                <span className="truncate font-mono text-[10.5px] text-[var(--v-fg-muted)]">
+                                  {item.dir}
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              {item.modified && (
+                                <span className="rounded bg-[#34d399]/15 px-1.5 py-0.5 text-[9.5px] font-medium text-[#34d399]">
+                                  M
+                                </span>
+                              )}
+                              {item.size > 0 && (
+                                <span className="font-mono text-[10px] text-[var(--v-fg-faint)]">
+                                  {formatCompactFileSize(item.size)}
+                                </span>
+                              )}
+                            </div>
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                )}
+
+                {/* Docked Neutral Frosted Queue Tray (Right above Composer Card) */}
+                <QueuedPromptsBar
+                  items={activeSession.queued_prompts || []}
+                  onRemove={(qid) => void handleRemoveQueuedPrompt(qid)}
+                  onRunNow={(qid) => void handleRunQueuedNow(qid)}
+                  onEditBack={(item) => handleEditBackQueuedPrompt(item)}
+                  onReorder={(qid, dir) => void handleReorderQueuedPrompt(qid, dir)}
+                  onClearAll={() => void handleClearAllQueuedPrompts()}
+                />
+
                 <div
                   onDragOver={(e) => {
                     e.preventDefault();
@@ -7512,17 +7768,20 @@ export function App() {
                       handleUploadImageFiles(e.dataTransfer.files);
                     }
                   }}
-                  className={`rounded-[18px] border bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)] ${
+                  className={`${
+                    (activeSession.queued_prompts || []).length > 0
+                      ? "rounded-b-[18px] rounded-t-[10px]"
+                      : "rounded-[18px]"
+                  } border bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)] ${
                     composerDragOver
                       ? "border-[#34d399] ring-1 ring-[#34d399]/40"
                       : "border-[var(--v-border-strong)]"
                   }`}
                 >
-                  {/* Hidden file input for ImagePlus picker */}
+                  {/* Hidden file input for any local file or image picker */}
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept="image/*"
                     multiple
                     className="hidden"
                     onChange={(e) => {
@@ -7533,46 +7792,70 @@ export function App() {
                     }}
                   />
 
-                  {/* Pending Multimodal Image Attachments Strip */}
+                  {/* Pending Multimodal Image & File Attachments Strip (Per-Session Isolated) */}
                   {(pendingAttachments.length > 0 || uploadingAttachment) && (
                     <div className="mb-2.5 flex flex-wrap items-center gap-2">
-                      {pendingAttachments.map((att, attIdx) => (
-                        <div
-                          key={`${att.filename}-${attIdx}`}
-                          className="group/att relative overflow-hidden rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)]"
-                        >
-                          <img
-                            src={att.url}
-                            alt={att.filename}
-                            className="h-14 w-14 object-cover"
-                          />
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setPendingAttachments((prev) =>
-                                prev.filter((_, i) => i !== attIdx)
-                              )
-                            }
-                            title="Remove attachment"
-                            className="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full bg-black/75 text-white opacity-0 transition-opacity group-hover/att:opacity-100 cursor-pointer"
+                      {pendingAttachments.map((att, attIdx) =>
+                        att.isImage !== false ? (
+                          <div
+                            key={`${att.filename}-${attIdx}`}
+                            className="group/att relative overflow-hidden rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)]"
                           >
-                            <X className="h-2.5 w-2.5" />
-                          </button>
-                        </div>
-                      ))}
+                            <img
+                              src={att.url}
+                              alt={att.displayName || att.filename}
+                              className="h-14 w-14 object-cover"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPendingAttachments((prev) =>
+                                  prev.filter((_, i) => i !== attIdx)
+                                )
+                              }
+                              title="移除图片"
+                              className="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full bg-black/75 text-white opacity-0 transition-opacity group-hover/att:opacity-100 cursor-pointer"
+                            >
+                              <X className="h-2.5 w-2.5" />
+                            </button>
+                          </div>
+                        ) : (
+                          <div
+                            key={`${att.path}-${attIdx}`}
+                            title={att.path}
+                            className="group/att inline-flex max-w-[260px] items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1 text-[11.5px] text-[var(--v-fg-body)]"
+                          >
+                            <FileText className="h-3.5 w-3.5 shrink-0 text-[#a78bfa]" />
+                            <span className="truncate font-mono">
+                              {att.relPath ? `@${att.relPath}` : att.displayName || att.filename}
+                            </span>
+                            {att.size ? (
+                              <span className="shrink-0 font-mono text-[10px] text-[var(--v-fg-muted)]">
+                                {formatCompactFileSize(att.size)}
+                              </span>
+                            ) : null}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPendingAttachments((prev) =>
+                                  prev.filter((_, i) => i !== attIdx)
+                                )
+                              }
+                              title="移除文件"
+                              className="ml-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171] cursor-pointer"
+                            >
+                              <X className="h-2.5 w-2.5" />
+                            </button>
+                          </div>
+                        )
+                      )}
                       {uploadingAttachment && (
-                        <div className="flex h-14 items-center rounded-xl border border-dashed border-[var(--v-border-strong)] px-3 font-mono text-[11px] text-[var(--v-fg-muted)]">
-                          Uploading image…
+                        <div className="flex h-8 items-center rounded-lg border border-dashed border-[var(--v-border-strong)] px-3 font-mono text-[11px] text-[var(--v-fg-muted)]">
+                          正在上传附件…
                         </div>
                       )}
                     </div>
                   )}
-
-                  <QueuedPromptsBar
-                    items={activeSession.queued_prompts || []}
-                    onRemove={(qid) => void handleRemoveQueuedPrompt(qid)}
-                    onRunNow={(qid) => void handleRunQueuedNow(qid)}
-                  />
 
                   {isDictating ? (
                     <div className="flex items-center gap-2.5 py-1.5">
@@ -7618,19 +7901,44 @@ export function App() {
                       onPaste={(e) => {
                         const items = e.clipboardData?.items;
                         if (!items) return;
-                        const imgFiles: File[] = [];
+                        const pastedFiles: File[] = [];
                         for (let i = 0; i < items.length; i++) {
-                          if (items[i].type.startsWith("image/")) {
+                          if (items[i].kind === "file") {
                             const file = items[i].getAsFile();
-                            if (file) imgFiles.push(file);
+                            if (file) pastedFiles.push(file);
                           }
                         }
-                        if (imgFiles.length > 0) {
+                        if (pastedFiles.length > 0) {
                           e.preventDefault();
-                          handleUploadImageFiles(imgFiles);
+                          handleUploadImageFiles(pastedFiles);
                         }
                       }}
                       onKeyDown={(e) => {
+                        if (fileMentionQuery !== null) {
+                          if (e.key === "ArrowDown" && fileMentionResults.length > 0) {
+                            e.preventDefault();
+                            setFileMentionIdx((i) => (i + 1) % fileMentionResults.length);
+                            return;
+                          }
+                          if (e.key === "ArrowUp" && fileMentionResults.length > 0) {
+                            e.preventDefault();
+                            setFileMentionIdx(
+                              (i) => (i - 1 + fileMentionResults.length) % fileMentionResults.length
+                            );
+                            return;
+                          }
+                          if ((e.key === "Enter" || e.key === "Tab") && fileMentionResults.length > 0) {
+                            e.preventDefault();
+                            const chosen = fileMentionResults[fileMentionIdx] || fileMentionResults[0];
+                            if (chosen) handleSelectFileMention(chosen);
+                            return;
+                          }
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            setFileMentionQuery(null);
+                            return;
+                          }
+                        }
                         if (e.key === "Enter" && !e.shiftKey) {
                           e.preventDefault();
                           if (
@@ -7652,11 +7960,11 @@ export function App() {
                       placeholder={
                         activeSession.status === "running" ||
                         activeSession.status === "waiting_approval"
-                          ? "正在执行中… 输入新指令按 Enter 排队，按 ⌘Enter 直接插队执行"
+                          ? "正在执行中… 输入新指令按 Enter 排队，按 ⌘Enter 直接插队执行（支持 @ 引用文件）"
                           : `Ask ${
                               modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                               activeSession.model_short
-                            } anything... (/ for commands, ⌘V paste screenshot, or click mic to dictate)`
+                            } anything... (@ 引用文件 · / 技能 · 拖拽或 ⌘V 粘贴任意文件/截图)`
                       }
                       className="w-full resize-none bg-transparent text-[13.5px] max-md:text-[16px] leading-relaxed text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
                     />
@@ -7821,11 +8129,11 @@ export function App() {
                           : "Auto-edit"}
                       </button>
 
-                      {/* Pill 4: Attach Screenshot / Image (Cmd+V or Drag & Drop) */}
+                      {/* Pill 4: Attach Any Local File or Screenshot (Drag & Drop, Paste, or Picker) */}
                       <button
                         type="button"
                         onClick={() => fileInputRef.current?.click()}
-                        title="Attach screenshot or image (or paste with ⌘V)"
+                        title="附加本地文件或图片（支持拖拽、⌘V 粘贴，或输入 @ 引用工作区文件）"
                         className="flex h-6 w-6 items-center justify-center rounded-full text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                       >
                         <ImagePlus className="h-3.5 w-3.5" />
@@ -9574,6 +9882,13 @@ export function App() {
           </div>
         </div>
       )}
+      <ForkBranchModal
+        target={forkLaunchTarget}
+        models={modelCatalog}
+        runtimes={runtimes}
+        onClose={() => setForkLaunchTarget(null)}
+        onConfirm={(payload) => void handleConfirmForkBranch(payload)}
+      />
     </div>
   );
 }

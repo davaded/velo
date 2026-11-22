@@ -82,6 +82,20 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
   const [tab, setTab] = useState<"analytics" | "search" | "push">(initialTab);
   const [analytics, setAnalytics] = useState<UsageAnalyticsDto | null>(null);
   const [quotaCards, setQuotaCards] = useState<ProviderQuotaCard[]>([]);
+  const [pricingCatalog, setPricingCatalog] = useState<{
+    override_path: string;
+    override_count: number;
+    cursor_note: string;
+    rate_cards: Array<{
+      label: string;
+      model: string;
+      input_per_m: number;
+      cached_input_per_m: number;
+      output_per_m: number;
+      note?: string;
+    }>;
+  } | null>(null);
+  const [showRateCard, setShowRateCard] = useState(false);
   const [loadingAnalytics, setLoadingAnalytics] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -114,6 +128,12 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => {
           if (Array.isArray(d?.providers)) setQuotaCards(d.providers as ProviderQuotaCard[]);
+        })
+        .catch(() => {});
+      fetch(`${daemonUrl}/api/pricing`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (d?.rate_cards) setPricingCatalog(d);
         })
         .catch(() => {});
       fetch(`${daemonUrl}/api/analytics/usage`)
@@ -379,7 +399,17 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                           {analytics.by_provider.map((b) => (
                             <tr key={b.key} className="hover:bg-[var(--v-bg-hover)]/40">
                               <td className="px-3 py-2 font-mono font-semibold text-[var(--v-fg-primary)]">
-                                {b.label}
+                                <div className="flex items-center gap-1.5">
+                                  <span>{b.label}</span>
+                                  {b.key === "cursor" && b.input_tokens === 0 && (
+                                    <span
+                                      title="Cursor CLI 原生不回传输入 Token，仅按输出折算"
+                                      className="rounded bg-[var(--v-bg-hover)] px-1.5 py-0.5 font-sans text-[9.5px] font-normal text-[var(--v-fg-muted)]"
+                                    >
+                                      仅输出折算
+                                    </span>
+                                  )}
+                                </div>
                               </td>
                               <td className="px-3 py-2 font-mono text-[var(--v-fg-muted)] tabular-nums">
                                 {b.sessions_count} / {b.turns_count}
@@ -434,6 +464,74 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                       ))}
                     </div>
                   </div>
+
+                  {/* Transparent Active Pricing Rate Card Drawer */}
+                  {pricingCatalog && (
+                    <div className="rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/25">
+                      <button
+                        type="button"
+                        onClick={() => setShowRateCard((v) => !v)}
+                        className="flex w-full items-center justify-between px-3.5 py-2.5 text-left text-[12px] font-medium text-[var(--v-fg-secondary)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                      >
+                        <span className="flex items-center gap-2">
+                          <span>计费单价参考（2026 公开 API · USD / 1M Tokens）</span>
+                          {pricingCatalog.override_count > 0 && (
+                            <span className="rounded-full bg-[#34d399]/15 px-2 py-0.5 text-[10px] text-[#34d399]">
+                              已加载 {pricingCatalog.override_count} 条自定义覆盖
+                            </span>
+                          )}
+                        </span>
+                        <span className="text-[11px] text-[var(--v-fg-muted)]">
+                          {showRateCard ? "收起 ▲" : "展开查看 ▼"}
+                        </span>
+                      </button>
+                      {showRateCard && (
+                        <div className="border-t border-[var(--v-border-subtle)] px-3.5 py-3 space-y-2">
+                          <div className="text-[11px] text-[var(--v-fg-muted)]">
+                            {pricingCatalog.cursor_note} 支持在{" "}
+                            <code className="rounded bg-[var(--v-bg-surface)] px-1 py-0.5 font-mono text-[10.5px]">
+                              {pricingCatalog.override_path}
+                            </code>{" "}
+                            自定义单价热更新。
+                          </div>
+                          <div className="overflow-hidden rounded-lg border border-[var(--v-border-subtle)]">
+                            <table className="w-full text-left text-[11.5px]">
+                              <thead className="bg-[var(--v-bg-hover)]/60 text-[10.5px] text-[var(--v-fg-muted)]">
+                                <tr>
+                                  <th className="px-2.5 py-1.5">模型系列</th>
+                                  <th className="px-2.5 py-1.5 text-right">输入</th>
+                                  <th className="px-2.5 py-1.5 text-right">缓存读</th>
+                                  <th className="px-2.5 py-1.5 text-right">输出</th>
+                                  <th className="px-2.5 py-1.5 text-right">备注</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-[var(--v-border-subtle)] font-mono tabular-nums">
+                                {pricingCatalog.rate_cards.map((rc) => (
+                                  <tr key={rc.model} className="hover:bg-[var(--v-bg-hover)]/35">
+                                    <td className="px-2.5 py-1.5 font-sans font-medium text-[var(--v-fg-primary)]">
+                                      {rc.label}
+                                    </td>
+                                    <td className="px-2.5 py-1.5 text-right text-[var(--v-fg-secondary)]">
+                                      ${rc.input_per_m.toFixed(2)}
+                                    </td>
+                                    <td className="px-2.5 py-1.5 text-right text-[#60a5fa]">
+                                      ${rc.cached_input_per_m.toFixed(3).replace(/0$/, "")}
+                                    </td>
+                                    <td className="px-2.5 py-1.5 text-right text-[var(--v-fg-primary)]">
+                                      ${rc.output_per_m.toFixed(2)}
+                                    </td>
+                                    <td className="px-2.5 py-1.5 text-right font-sans text-[10.5px] text-[var(--v-fg-muted)]">
+                                      {rc.note || "—"}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </>
               ) : null}
             </div>

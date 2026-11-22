@@ -1941,13 +1941,37 @@ async fn run_supervised_e2ee_bridge(
                                                 .get("title")
                                                 .and_then(|v| v.as_str())
                                                 .map(str::to_string);
+                                            let target_provider = cmd_val
+                                                .get("provider")
+                                                .and_then(|v| serde_json::from_value::<AgentProvider>(v.clone()).ok());
+                                            let target_model = cmd_val
+                                                .get("model")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            let target_effort = cmd_val
+                                                .get("effort")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            let target_repo = cmd_val
+                                                .get("repo_root")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
+                                            let initial_prompt = cmd_val
+                                                .get("initial_prompt")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string);
                                             if let Ok(forked) = state
-                                                .fork_session_core(
+                                                .fork_session_with_options(
                                                     sid,
                                                     up_to,
                                                     up_to_text,
                                                     from_end,
                                                     title,
+                                                    target_provider,
+                                                    target_model,
+                                                    target_effort,
+                                                    target_repo,
+                                                    initial_prompt,
                                                 )
                                                 .await
                                             {

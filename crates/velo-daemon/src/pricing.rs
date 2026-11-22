@@ -1,11 +1,14 @@
 use chrono::{Datelike, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::SystemTime;
 use uuid::Uuid;
 use velo_protocol::{AgentEvent, AgentProvider, SessionInfo};
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ModelRateCard {
     /// USD per 1,000,000 uncached input tokens
     pub input_per_m: f64,
@@ -15,179 +18,188 @@ pub struct ModelRateCard {
     pub cache_write_per_m: f64,
     /// USD per 1,000,000 output (reasoning + text) tokens
     pub output_per_m: f64,
+    /// Optional long-context threshold (e.g. 200_000 for Gemini Pro / Grok 4.6+, 100_000 for Haiku 5.5)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context_threshold: Option<u64>,
+    /// Multiplier applied when `input_tokens > long_context_threshold` (typically 2.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context_multiplier: Option<f64>,
+}
+
+impl ModelRateCard {
+    const fn flat(input: f64, cached: f64, write: f64, output: f64) -> Self {
+        Self {
+            input_per_m: input,
+            cached_input_per_m: cached,
+            cache_write_per_m: write,
+            output_per_m: output,
+            long_context_threshold: None,
+            long_context_multiplier: None,
+        }
+    }
+
+    const fn tiered(
+        input: f64,
+        cached: f64,
+        write: f64,
+        output: f64,
+        threshold: u64,
+        multiplier: f64,
+    ) -> Self {
+        Self {
+            input_per_m: input,
+            cached_input_per_m: cached,
+            cache_write_per_m: write,
+            output_per_m: output,
+            long_context_threshold: Some(threshold),
+            long_context_multiplier: Some(multiplier),
+        }
+    }
+}
+
+pub fn custom_pricing_file_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".velo").join("pricing.json"))
+}
+
+struct CachedOverrides {
+    mtime: Option<SystemTime>,
+    map: HashMap<String, ModelRateCard>,
+}
+
+static CUSTOM_OVERRIDES: std::sync::OnceLock<Mutex<CachedOverrides>> = std::sync::OnceLock::new();
+
+fn load_custom_overrides() -> HashMap<String, ModelRateCard> {
+    let Some(path) = custom_pricing_file_path() else {
+        return HashMap::new();
+    };
+    let current_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+    let lock = CUSTOM_OVERRIDES.get_or_init(|| {
+        Mutex::new(CachedOverrides {
+            mtime: None,
+            map: HashMap::new(),
+        })
+    });
+    let mut guard = lock.lock().unwrap();
+    if guard.mtime == current_mtime {
+        return guard.map.clone();
+    }
+    guard.mtime = current_mtime;
+    guard.map.clear();
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(parsed) = serde_json::from_str::<HashMap<String, ModelRateCard>>(&raw) {
+            for (k, v) in parsed {
+                guard.map.insert(k.trim().to_ascii_lowercase(), v);
+            }
+        }
+    }
+    guard.map.clone()
 }
 
 pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelRateCard {
     let m = model.unwrap_or("").trim().to_ascii_lowercase();
     let clean = m.strip_prefix("cursor:").unwrap_or(&m);
 
-    // 1. Explicit model slug matching first (handles Cursor-routed models accurately too)
-    if clean.contains("fable") || clean.contains("opus") {
-        return ModelRateCard {
-            input_per_m: 5.00,
-            cached_input_per_m: 0.50,
-            cache_write_per_m: 6.25,
-            output_per_m: 25.00,
-        };
+    // 0. Check hot-reloaded user overrides in ~/.velo/pricing.json (exact or substring key)
+    if !clean.is_empty() {
+        let overrides = load_custom_overrides();
+        if let Some(exact) = overrides.get(clean) {
+            return *exact;
+        }
+        for (pattern, card) in &overrides {
+            if !pattern.is_empty() && clean.contains(pattern.as_str()) {
+                return *card;
+            }
+        }
+    }
+
+    // 1. Explicit calibrated 2026 model slug matching (handles Cursor-routed models accurately too)
+    // Anthropic Claude 5.5 vs 4.x / Fable
+    if clean.contains("opus") || clean.contains("fable") {
+        if clean.contains("5-5") || clean.contains("5.5") {
+            return ModelRateCard::flat(4.00, 0.20, 5.00, 20.00);
+        }
+        return ModelRateCard::flat(5.00, 0.50, 6.25, 25.00);
     }
     if clean.contains("haiku") {
-        return ModelRateCard {
-            input_per_m: 1.00,
-            cached_input_per_m: 0.10,
-            cache_write_per_m: 1.25,
-            output_per_m: 5.00,
-        };
+        if clean.contains("5-5") || clean.contains("5.5") {
+            return ModelRateCard::tiered(0.10, 0.01, 0.20, 0.50, 100_000, 5.0);
+        }
+        return ModelRateCard::flat(1.00, 0.10, 1.25, 5.00);
     }
     if clean.contains("sonnet") || clean.contains("claude") {
-        return ModelRateCard {
-            input_per_m: 3.00,
-            cached_input_per_m: 0.30,
-            cache_write_per_m: 3.75,
-            output_per_m: 15.00,
-        };
+        if clean.contains("5-5") || clean.contains("5.5") {
+            return ModelRateCard::flat(2.00, 0.10, 2.50, 10.00);
+        }
+        return ModelRateCard::flat(3.00, 0.30, 3.75, 15.00);
     }
-    if clean.contains("gemini") {
+
+    // Google Gemini 4 (Neon / Hydrogen) + 3.8 Flash + 3.1/2.5 Pro & Flash
+    if clean.contains("gemini") || clean.contains("neon") || clean.contains("hydrogen") {
+        if clean.contains("neon") {
+            return ModelRateCard::tiered(3.00, 0.15, 0.0, 15.00, 200_000, 2.0);
+        }
+        if clean.contains("hydrogen") {
+            return ModelRateCard::flat(1.50, 0.15, 0.0, 7.50);
+        }
         if clean.contains("flash-lite") {
-            return ModelRateCard {
-                input_per_m: 0.10,
-                cached_input_per_m: 0.01,
-                cache_write_per_m: 0.0,
-                output_per_m: 0.40,
-            };
+            return ModelRateCard::flat(0.10, 0.01, 0.0, 0.40);
+        }
+        if clean.contains("3.8-flash") || clean.contains("3-8-flash") {
+            return ModelRateCard::flat(0.75, 0.075, 0.0, 3.75);
         }
         if clean.contains("flash") {
-            return ModelRateCard {
-                input_per_m: 0.30,
-                cached_input_per_m: 0.03,
-                cache_write_per_m: 0.0,
-                output_per_m: 2.50,
-            };
+            return ModelRateCard::flat(0.30, 0.03, 0.0, 2.50);
         }
-        return ModelRateCard {
-            input_per_m: 1.25,
-            cached_input_per_m: 0.125,
-            cache_write_per_m: 0.0,
-            output_per_m: 10.00,
-        };
+        return ModelRateCard::tiered(2.00, 0.20, 0.0, 12.00, 200_000, 2.0);
     }
+
+    // OpenAI GPT-5/6 / Codex / o3 / o4
     if clean.contains("nano") {
-        return ModelRateCard {
-            input_per_m: 0.05,
-            cached_input_per_m: 0.005,
-            cache_write_per_m: 0.0,
-            output_per_m: 0.40,
-        };
+        return ModelRateCard::flat(0.05, 0.005, 0.0, 0.40);
     }
     if clean.contains("o3-mini") || clean.contains("o4-mini") {
-        return ModelRateCard {
-            input_per_m: 1.10,
-            cached_input_per_m: 0.275,
-            cache_write_per_m: 0.0,
-            output_per_m: 4.40,
-        };
+        return ModelRateCard::flat(1.10, 0.275, 0.0, 4.40);
     }
     if clean.contains("-mini") || clean.ends_with("mini") {
-        return ModelRateCard {
-            input_per_m: 0.25,
-            cached_input_per_m: 0.025,
-            cache_write_per_m: 0.0,
-            output_per_m: 2.00,
-        };
+        return ModelRateCard::flat(0.25, 0.025, 0.0, 2.00);
     }
     if clean.contains("o3") || clean.contains("o4") {
-        return ModelRateCard {
-            input_per_m: 2.00,
-            cached_input_per_m: 0.50,
-            cache_write_per_m: 0.0,
-            output_per_m: 8.00,
-        };
+        return ModelRateCard::flat(2.00, 0.50, 0.0, 8.00);
     }
     if clean.contains("gpt-") || clean.contains("codex") {
-        return ModelRateCard {
-            input_per_m: 1.25,
-            cached_input_per_m: 0.125,
-            cache_write_per_m: 0.0,
-            output_per_m: 10.00,
-        };
+        return ModelRateCard::flat(1.25, 0.125, 0.0, 10.00);
     }
     if clean.contains("flash-lite") {
-        return ModelRateCard {
-            input_per_m: 0.10,
-            cached_input_per_m: 0.01,
-            cache_write_per_m: 0.0,
-            output_per_m: 0.40,
-        };
+        return ModelRateCard::flat(0.10, 0.01, 0.0, 0.40);
     }
     if clean.contains("flash") {
-        return ModelRateCard {
-            input_per_m: 0.30,
-            cached_input_per_m: 0.03,
-            cache_write_per_m: 0.0,
-            output_per_m: 2.50,
-        };
+        return ModelRateCard::flat(0.30, 0.03, 0.0, 2.50);
     }
-    if clean.contains("grok") && clean.contains("fast") {
-        return ModelRateCard {
-            input_per_m: 0.20,
-            cached_input_per_m: 0.05,
-            cache_write_per_m: 0.0,
-            output_per_m: 1.50,
-        };
-    }
+
+    // xAI Grok 4.7 / 4.6 / 4.3 / Build / Fast
     if clean.contains("grok") {
-        return ModelRateCard {
-            input_per_m: 3.00,
-            cached_input_per_m: 0.75,
-            cache_write_per_m: 0.0,
-            output_per_m: 15.00,
-        };
+        if clean.contains("fast") {
+            return ModelRateCard::flat(0.20, 0.05, 0.0, 1.50);
+        }
+        if clean.contains("build") {
+            return ModelRateCard::flat(1.00, 0.20, 0.0, 2.00);
+        }
+        if clean.contains("4.3") || clean.contains("4-3") {
+            return ModelRateCard::flat(1.25, 0.20, 0.0, 2.50);
+        }
+        return ModelRateCard::tiered(2.00, 0.50, 0.0, 6.00, 200_000, 2.0);
     }
 
     // 2. Provider-level default rate card
     match provider {
-        AgentProvider::Claude => ModelRateCard {
-            input_per_m: 3.00,
-            cached_input_per_m: 0.30,
-            cache_write_per_m: 3.75,
-            output_per_m: 15.00,
-        },
-        AgentProvider::Codex => ModelRateCard {
-            input_per_m: 1.25,
-            cached_input_per_m: 0.125,
-            cache_write_per_m: 0.0,
-            output_per_m: 10.00,
-        },
-        AgentProvider::Antigravity => ModelRateCard {
-            input_per_m: 1.25,
-            cached_input_per_m: 0.125,
-            cache_write_per_m: 0.0,
-            output_per_m: 10.00,
-        },
-        AgentProvider::Grok => ModelRateCard {
-            input_per_m: 3.00,
-            cached_input_per_m: 0.75,
-            cache_write_per_m: 0.0,
-            output_per_m: 15.00,
-        },
-        AgentProvider::Cursor | AgentProvider::Copilot => ModelRateCard {
-            input_per_m: 2.00,
-            cached_input_per_m: 0.25,
-            cache_write_per_m: 0.0,
-            output_per_m: 10.00,
-        },
-        AgentProvider::Qwen => ModelRateCard {
-            input_per_m: 0.80,
-            cached_input_per_m: 0.16,
-            cache_write_per_m: 0.0,
-            output_per_m: 3.20,
-        },
+        AgentProvider::Claude => ModelRateCard::flat(3.00, 0.30, 3.75, 15.00),
+        AgentProvider::Codex => ModelRateCard::flat(1.25, 0.125, 0.0, 10.00),
+        AgentProvider::Antigravity => ModelRateCard::tiered(3.00, 0.15, 0.0, 15.00, 200_000, 2.0),
+        AgentProvider::Grok => ModelRateCard::tiered(2.00, 0.50, 0.0, 6.00, 200_000, 2.0),
+        AgentProvider::Cursor | AgentProvider::Copilot => ModelRateCard::flat(2.00, 0.25, 0.0, 10.00),
+        AgentProvider::Qwen => ModelRateCard::flat(0.80, 0.16, 0.0, 3.20),
         AgentProvider::OpenCode | AgentProvider::Acp(_) | AgentProvider::Custom(_) => {
-            ModelRateCard {
-                input_per_m: 1.50,
-                cached_input_per_m: 0.20,
-                cache_write_per_m: 0.0,
-                output_per_m: 6.00,
-            }
+            ModelRateCard::flat(1.50, 0.20, 0.0, 6.00)
         }
     }
 }
@@ -201,15 +213,68 @@ pub fn compute_cost_usd(
     output_tokens: u64,
 ) -> f64 {
     let rate = lookup_rate_card(provider, model);
+    let tier_mult = match (rate.long_context_threshold, rate.long_context_multiplier) {
+        (Some(thresh), Some(mult)) if input_tokens > thresh && mult > 1.0 => mult,
+        _ => 1.0,
+    };
     let uncached_in = input_tokens
         .saturating_sub(cache_read_tokens)
         .saturating_sub(cache_write_tokens);
-    let usd = (uncached_in as f64 * rate.input_per_m
-        + cache_read_tokens as f64 * rate.cached_input_per_m
-        + cache_write_tokens as f64 * rate.cache_write_per_m
-        + output_tokens as f64 * rate.output_per_m)
+    let usd = (uncached_in as f64 * rate.input_per_m * tier_mult
+        + cache_read_tokens as f64 * rate.cached_input_per_m * tier_mult
+        + cache_write_tokens as f64 * rate.cache_write_per_m * tier_mult
+        + output_tokens as f64 * rate.output_per_m * tier_mult)
         / 1_000_000.0;
     (usd * 1_000_000.0).round() / 1_000_000.0
+}
+
+/// Returns the transparent active pricing catalog for UI display & user override discovery.
+pub fn pricing_catalog_json() -> Value {
+    let overrides = load_custom_overrides();
+    let path_str = custom_pricing_file_path()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "~/.velo/pricing.json".to_string());
+    let sample_models: &[(&str, AgentProvider, &str, &str)] = &[
+        ("Claude Opus 5.5", AgentProvider::Claude, "claude-opus-5-5", "缓存读 5%"),
+        ("Claude Opus 4.x / Fable", AgentProvider::Claude, "claude-fable-5-2", "缓存读 10%"),
+        ("Claude Sonnet 5.5", AgentProvider::Claude, "claude-sonnet-5-5", "缓存读 5%"),
+        ("Claude Sonnet 4.x", AgentProvider::Claude, "claude-sonnet-4-5", "缓存读 10%"),
+        ("Claude Haiku 5.5", AgentProvider::Claude, "claude-haiku-5-5", ">100k 5×"),
+        ("OpenAI GPT-5 / Codex", AgentProvider::Codex, "gpt-6.1-sol", "缓存读 10%"),
+        ("OpenAI o3 / o4-mini", AgentProvider::Codex, "o4-mini", "缓存读 25%"),
+        ("Gemini 4 Neon (Pro)", AgentProvider::Antigravity, "gemini-4-neon", ">200k 2×"),
+        ("Gemini 4 Hydrogen", AgentProvider::Antigravity, "gemini-4-hydrogen", "标准价"),
+        ("Gemini 3.8 Flash", AgentProvider::Antigravity, "gemini-3.8-flash", "标准价"),
+        ("Gemini 2.5 Flash", AgentProvider::Antigravity, "gemini-2.5-flash", "标准价"),
+        ("xAI Grok 4.6 / 4.7", AgentProvider::Grok, "grok-4.7", ">200k 2×"),
+        ("xAI Grok 4.3", AgentProvider::Grok, "grok-4.3", "标准价"),
+        ("xAI Grok Build", AgentProvider::Grok, "grok-build", "标准价"),
+        ("xAI Grok Fast", AgentProvider::Grok, "grok-fast", "极速低价"),
+    ];
+    let cards: Vec<Value> = sample_models
+        .iter()
+        .map(|(label, prov, slug, note)| {
+            let rc = lookup_rate_card(prov, Some(slug));
+            json!({
+                "label": label,
+                "model": slug,
+                "input_per_m": rc.input_per_m,
+                "cached_input_per_m": rc.cached_input_per_m,
+                "cache_write_per_m": rc.cache_write_per_m,
+                "output_per_m": rc.output_per_m,
+                "long_context_threshold": rc.long_context_threshold,
+                "long_context_multiplier": rc.long_context_multiplier,
+                "note": note,
+            })
+        })
+        .collect();
+    json!({
+        "ok": true,
+        "override_path": path_str,
+        "override_count": overrides.len(),
+        "cursor_note": "Cursor CLI 原生不回传 Prompt 输入 Token，其账单按输出 Token 与对应模型单价折算。",
+        "rate_cards": cards,
+    })
 }
 
 /// Authoritative per-turn cost: prefers exact provider-reported `cost_usd` when present and sane,
@@ -565,12 +630,29 @@ mod tests {
     #[test]
     fn test_rate_card_matching_avoids_gemini_mini_collision() {
         let gem = lookup_rate_card(&AgentProvider::Antigravity, Some("gemini-4-neon"));
-        assert_eq!(gem.input_per_m, 1.25);
-        assert_eq!(gem.cached_input_per_m, 0.125);
-        assert_eq!(gem.output_per_m, 10.0);
+        assert_eq!(gem.input_per_m, 3.0);
+        assert_eq!(gem.cached_input_per_m, 0.15);
+        assert_eq!(gem.output_per_m, 15.0);
 
         let cur_gem = lookup_rate_card(&AgentProvider::Cursor, Some("cursor:gemini-4-neon"));
-        assert_eq!(cur_gem.output_per_m, 10.0);
+        assert_eq!(cur_gem.output_per_m, 15.0);
+
+        let hydro = lookup_rate_card(&AgentProvider::Antigravity, Some("gemini-4-hydrogen"));
+        assert_eq!(hydro.input_per_m, 1.5);
+        assert_eq!(hydro.output_per_m, 7.5);
+
+        let grok47 = lookup_rate_card(&AgentProvider::Grok, Some("grok-4.7"));
+        assert_eq!(grok47.input_per_m, 2.0);
+        assert_eq!(grok47.output_per_m, 6.0);
+        // Long context (>200k) doubles Grok 4.7 pricing
+        let grok_long = compute_cost_usd(&AgentProvider::Grok, Some("grok-4.7"), 250_000, 0, 0, 10_000);
+        let grok_std = compute_cost_usd(&AgentProvider::Grok, Some("grok-4.7"), 100_000, 0, 0, 10_000);
+        assert!(grok_long > grok_std * 3.0);
+
+        let opus55 = lookup_rate_card(&AgentProvider::Claude, Some("claude-opus-5-5"));
+        assert_eq!(opus55.input_per_m, 4.0);
+        assert_eq!(opus55.cached_input_per_m, 0.20);
+        assert_eq!(opus55.output_per_m, 20.0);
 
         let flash = lookup_rate_card(&AgentProvider::Antigravity, Some("gemini-2.5-flash"));
         assert_eq!(flash.output_per_m, 2.5);

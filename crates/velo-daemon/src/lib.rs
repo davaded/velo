@@ -2842,6 +2842,8 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/attachments/{file}", get(get_attachment_handler))
         .route("/api/attachments-resolve", get(resolve_attachment_handler))
         .route("/api/search", get(global_search_handler))
+        .route("/api/pricing", get(pricing_catalog_handler))
+        .route("/api/workspaces/files", get(list_workspace_files_handler))
         .route("/api/analytics/usage", get(usage_analytics_handler))
         .route("/api/analytics/quotas", get(quotas_analytics_handler))
         .route(
@@ -2892,6 +2894,10 @@ pub fn build_router(state: DaemonState) -> Router {
             post(terminal_restart_handler),
         )
         .route("/api/sessions/{id}/input", post(send_input_handler))
+        .route(
+            "/api/sessions/{id}/queue/reorder",
+            post(reorder_queued_prompt_handler),
+        )
         .route(
             "/api/sessions/{id}/queue/{queue_id}/run",
             post(run_queued_prompt_handler),
@@ -4547,29 +4553,65 @@ impl DaemonState {
         if bytes.is_empty() {
             return Err("Empty attachment payload".to_string());
         }
+        let raw_name = filename.unwrap_or("").trim();
         let ext = filename
             .and_then(|f| Path::new(f).extension().and_then(|e| e.to_str()))
             .or_else(|| match mime_type {
                 Some("image/jpeg") | Some("image/jpg") => Some("jpg"),
+                Some("image/png") => Some("png"),
                 Some("image/webp") => Some("webp"),
                 Some("image/gif") => Some("gif"),
                 Some("image/svg+xml") => Some("svg"),
                 Some("image/heic") => Some("heic"),
-                _ => Some("jpg"),
+                Some("application/pdf") => Some("pdf"),
+                Some("application/json") => Some("json"),
+                Some("text/markdown") => Some("md"),
+                Some("text/csv") => Some("csv"),
+                Some(m) if m.starts_with("text/") => Some("txt"),
+                _ => Some("bin"),
             })
-            .unwrap_or("jpg")
+            .unwrap_or("bin")
             .to_ascii_lowercase();
 
         let clean_ext: String = ext
             .chars()
             .filter(|c| c.is_ascii_alphanumeric())
-            .take(8)
+            .take(10)
             .collect();
-        let final_ext = if clean_ext.is_empty() { "jpg" } else { &clean_ext };
+        let final_ext = if clean_ext.is_empty() { "bin" } else { &clean_ext };
+        let is_img = matches!(
+            final_ext,
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "heic" | "svg"
+        );
 
         use sha2::{Digest, Sha256};
         let digest_hex = hex::encode(Sha256::digest(bytes));
-        let saved_name = format!("{}.{}", &digest_hex[..32], final_ext);
+        let saved_name = if is_img {
+            format!("{}.{}", &digest_hex[..32], final_ext)
+        } else {
+            let stem = Path::new(raw_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file");
+            let clean_stem: String = stem
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(40)
+                .collect();
+            let clean_stem = clean_stem.trim_matches(|c| c == '_' || c == '.');
+            let safe_stem = if clean_stem.is_empty() {
+                "file"
+            } else {
+                clean_stem
+            };
+            format!("{}-{}.{}", &digest_hex[..12], safe_stem, final_ext)
+        };
         let _ = tokio::fs::create_dir_all(&self.attachments_dir).await;
         let dest_path = self.attachments_dir.join(&saved_name);
 
@@ -4773,17 +4815,28 @@ async fn upload_attachment_handler(
         .save_attachment_bytes(&bytes, req.filename.as_deref(), req.mime_type.as_deref())
         .await
     {
-        Ok((saved_name, dest_path)) => (
-            StatusCode::CREATED,
-            Json(json!({
-                "ok": true,
-                "filename": saved_name,
-                "path": dest_path.to_string_lossy().to_string(),
-                "url": format!("/api/attachments/{}", saved_name),
-                "size": bytes.len(),
-            })),
-        )
-            .into_response(),
+        Ok((saved_name, dest_path)) => {
+            let is_image = is_allowed_image_ext(&dest_path);
+            let original_name = req
+                .filename
+                .as_deref()
+                .and_then(|f| Path::new(f).file_name().and_then(|n| n.to_str()))
+                .unwrap_or(&saved_name)
+                .to_string();
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "filename": saved_name,
+                    "original_name": original_name,
+                    "is_image": is_image,
+                    "path": dest_path.to_string_lossy().to_string(),
+                    "url": format!("/api/attachments/{}", saved_name),
+                    "size": bytes.len(),
+                })),
+            )
+                .into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err })),
@@ -5899,6 +5952,39 @@ impl DaemonState {
         json!({ "ok": removed, "session_id": id, "queue_id": queue_id })
     }
 
+    /// Reorders a queued prompt up or down by one slot.
+    pub async fn reorder_queued_prompt_core(
+        &self,
+        id: Uuid,
+        queue_id: &str,
+        direction: &str,
+    ) -> Value {
+        let mut changed = false;
+        let mut updated_queue = Vec::new();
+        {
+            let mut guard = self.inner.write().await;
+            if let Some(s) = guard.sessions.get_mut(&id) {
+                if let Some(pos) = s.queued_prompts.iter().position(|q| q.id == queue_id) {
+                    if direction == "up" && pos > 0 {
+                        s.queued_prompts.swap(pos, pos - 1);
+                        changed = true;
+                    } else if direction == "down" && pos + 1 < s.queued_prompts.len() {
+                        s.queued_prompts.swap(pos, pos + 1);
+                        changed = true;
+                    }
+                    if changed {
+                        s.updated_at = Utc::now();
+                    }
+                }
+                updated_queue = s.queued_prompts.clone();
+            }
+        }
+        if changed {
+            let _ = self.persist_sessions().await;
+        }
+        json!({ "ok": changed, "session_id": id, "queued_prompts": updated_queue })
+    }
+
     /// Pull one queued prompt out and run it immediately, interrupting the active turn.
     pub async fn run_queued_prompt_now_core(&self, id: Uuid, queue_id: &str) -> Result<Value> {
         let item = {
@@ -6188,6 +6274,35 @@ impl DaemonState {
         user_turns_from_end: Option<usize>,
         custom_title: Option<String>,
     ) -> Result<SessionInfo> {
+        self.fork_session_with_options(
+            source_id,
+            up_to_user_turn,
+            up_to_user_text,
+            user_turns_from_end,
+            custom_title,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fork_session_with_options(
+        &self,
+        source_id: Uuid,
+        up_to_user_turn: Option<usize>,
+        up_to_user_text: Option<String>,
+        user_turns_from_end: Option<usize>,
+        custom_title: Option<String>,
+        target_provider: Option<AgentProvider>,
+        target_model: Option<String>,
+        target_effort: Option<String>,
+        target_repo_root: Option<String>,
+        initial_prompt: Option<String>,
+    ) -> Result<SessionInfo> {
         self.flush_open_assistant_text(Some(source_id)).await;
         let (src, mut cloned_events) = {
             let guard = self.inner.read().await;
@@ -6293,21 +6408,65 @@ impl DaemonState {
                 }
             });
 
-        let clean_repo = canonical_workspace_path(if src.repo_root.trim().is_empty() {
-            &src.worktree_path
+        let clean_repo = if let Some(override_repo) = target_repo_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            canonical_workspace_path(override_repo)
         } else {
-            &src.repo_root
-        });
-        let clean_wt = if src.worktree_path.trim().is_empty() {
+            canonical_workspace_path(if src.repo_root.trim().is_empty() {
+                &src.worktree_path
+            } else {
+                &src.repo_root
+            })
+        };
+        let clean_wt = if target_repo_root
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+        {
+            clean_repo.clone()
+        } else if src.worktree_path.trim().is_empty() {
             clean_repo.clone()
         } else {
             canonical_workspace_path(&src.worktree_path)
         };
 
+        let resolved_model = target_model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .or_else(|| src.model.clone());
+        let resolved_provider = target_provider.unwrap_or_else(|| {
+            if let Some(ref m) = resolved_model {
+                let lower = m.to_ascii_lowercase();
+                if lower.starts_with("cursor:") {
+                    return AgentProvider::Cursor;
+                }
+                if lower.starts_with("gpt-") || lower.contains("codex") || lower.starts_with("o3") || lower.starts_with("o4") {
+                    return AgentProvider::Codex;
+                }
+                if lower.starts_with("gemini") {
+                    return AgentProvider::Antigravity;
+                }
+                if lower.starts_with("grok") {
+                    return AgentProvider::Grok;
+                }
+                if lower.starts_with("claude") {
+                    return AgentProvider::Claude;
+                }
+            }
+            src.provider.clone()
+        });
+        let resolved_effort = target_effort
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .or_else(|| src.effort.clone());
+
         let forked = SessionInfo {
             id: new_id,
             name: fork_title,
-            provider: src.provider.clone(),
+            provider: resolved_provider,
             prompt: src.prompt.clone(),
             repo_root: clean_repo.clone(),
             worktree_path: clean_wt,
@@ -6320,8 +6479,8 @@ impl DaemonState {
             parent_session_id: Some(source_id),
             // Clear provider_session_id so next turn reconstructs exact forked transcript without mutating parent's CLI thread!
             provider_session_id: None,
-            model: src.model.clone(),
-            effort: src.effort.clone(),
+            model: resolved_model,
+            effort: resolved_effort,
             tokens_used: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -6354,6 +6513,34 @@ impl DaemonState {
             let _ = self.persist_workspaces().await;
         }
         let _ = self.persist_sessions().await;
+
+        // If user provided an immediate first prompt in the Fork Launch modal, execute it right away!
+        if let Some(first_prompt) = initial_prompt
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+        {
+            let _ = self
+                .dispatch_session_input(
+                    new_id,
+                    SessionInputRequest {
+                        input: first_prompt,
+                        model: forked.model.clone(),
+                        effort: forked.effort.clone(),
+                        provider: Some(forked.provider.clone()),
+                        reset_thread: false,
+                        truncate_to_user_turn: None,
+                        images: Vec::new(),
+                        approval_mode: None,
+                        mode: None,
+                        skill_path: None,
+                    },
+                )
+                .await;
+            let guard = self.inner.read().await;
+            if let Some(updated) = guard.sessions.get(&new_id).cloned() {
+                return Ok(updated);
+            }
+        }
         Ok(forked)
     }
 
@@ -6610,6 +6797,11 @@ struct ForkSessionRequest {
     up_to_user_text: Option<String>,
     user_turns_from_end: Option<usize>,
     title: Option<String>,
+    provider: Option<AgentProvider>,
+    model: Option<String>,
+    effort: Option<String>,
+    repo_root: Option<String>,
+    initial_prompt: Option<String>,
 }
 
 async fn fork_session_handler(
@@ -6618,12 +6810,17 @@ async fn fork_session_handler(
     Json(req): Json<ForkSessionRequest>,
 ) -> impl IntoResponse {
     match state
-        .fork_session_core(
+        .fork_session_with_options(
             id,
             req.up_to_user_turn,
             req.up_to_user_text,
             req.user_turns_from_end,
             req.title,
+            req.provider,
+            req.model,
+            req.effort,
+            req.repo_root,
+            req.initial_prompt,
         )
         .await
     {
@@ -6638,6 +6835,195 @@ async fn fork_session_handler(
         )
             .into_response(),
     }
+}
+
+async fn pricing_catalog_handler() -> impl IntoResponse {
+    Json(pricing::pricing_catalog_json())
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct WorkspaceFilesQuery {
+    workspace: Option<String>,
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
+fn fuzzy_match_file_score(rel_path: &str, query_lower: &str) -> Option<i32> {
+    if query_lower.is_empty() {
+        return Some(0);
+    }
+    let lower = rel_path.to_ascii_lowercase();
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+    if basename == query_lower {
+        return Some(1000);
+    }
+    if basename.starts_with(query_lower) {
+        return Some(850 - (basename.len() as i32).min(100));
+    }
+    if let Some(pos) = basename.find(query_lower) {
+        return Some(700 - (pos as i32) * 3 - (basename.len() as i32).min(80));
+    }
+    if let Some(pos) = lower.find(query_lower) {
+        return Some(500 - (pos as i32).min(200));
+    }
+    // Subsequence match (e.g. "atx" -> "App.tsx")
+    let mut qi = query_lower.chars().peekable();
+    let mut score = 200;
+    for ch in lower.chars() {
+        if qi.peek() == Some(&ch) {
+            qi.next();
+            score += 4;
+            if qi.peek().is_none() {
+                return Some(score - (lower.len() as i32 / 2));
+            }
+        }
+    }
+    None
+}
+
+fn collect_workspace_files_sync(workspace: &str, query: &str, limit: usize) -> Vec<Value> {
+    let root = PathBuf::from(canonical_workspace_path(workspace));
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut modified_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(&root)
+        .output()
+    {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if line.len() >= 4 {
+                    let p = line[3..].trim().trim_matches('"');
+                    if !p.is_empty() {
+                        modified_set.insert(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    const IGNORED_DIRS: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".cache",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "Pods",
+        "DerivedData",
+        ".build-device",
+        ".build-sim",
+        "Velo.app",
+    ];
+
+    let query_lower = query.trim().to_ascii_lowercase();
+    let mut candidates: Vec<(i32, bool, String, String, String, u64)> = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.clone(), 0)];
+    let mut visited = 0usize;
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 7 || visited >= 4500 {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if visited >= 4500 {
+                break;
+            }
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str.is_empty() || name_str == ".DS_Store" {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let full_path = entry.path();
+            if ft.is_dir() {
+                if IGNORED_DIRS.contains(&name_str.as_ref())
+                    || (name_str.starts_with('.') && name_str != ".github" && name_str != ".vscode")
+                {
+                    continue;
+                }
+                stack.push((full_path, depth + 1));
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            visited += 1;
+            let Ok(rel) = full_path.strip_prefix(&root) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let Some(mut score) = fuzzy_match_file_score(&rel_str, &query_lower) else {
+                continue;
+            };
+            let is_mod = modified_set.contains(&rel_str);
+            if is_mod {
+                score += 180;
+            }
+            let parent_dir = rel
+                .parent()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            candidates.push((score, is_mod, rel_str, name_str.to_string(), parent_dir, size));
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.len().cmp(&b.2.len()))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    candidates.truncate(limit.clamp(5, 80));
+
+    candidates
+        .into_iter()
+        .map(|(_, is_mod, rel_path, name, dir, size)| {
+            let abs = root.join(&rel_path).to_string_lossy().to_string();
+            json!({
+                "path": rel_path,
+                "abs_path": abs,
+                "name": name,
+                "dir": dir,
+                "modified": is_mod,
+                "size": size,
+            })
+        })
+        .collect()
+}
+
+async fn list_workspace_files_handler(
+    Query(params): Query<WorkspaceFilesQuery>,
+) -> impl IntoResponse {
+    let ws = params.workspace.unwrap_or_default();
+    if ws.trim().is_empty() {
+        return Json(json!({ "ok": true, "workspace": "", "files": [] }));
+    }
+    let q = params.q.unwrap_or_default();
+    let lim = params.limit.unwrap_or(30);
+    let ws_clone = ws.clone();
+    let files = tokio::task::spawn_blocking(move || collect_workspace_files_sync(&ws_clone, &q, lim))
+        .await
+        .unwrap_or_default();
+    Json(json!({
+        "ok": true,
+        "workspace": canonical_workspace_path(&ws),
+        "files": files,
+    }))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -6758,6 +7144,24 @@ async fn remove_queued_prompt_handler(
     Json(
         state
             .remove_queued_prompt_matching(id, &queue_id, query.input.as_deref())
+            .await,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct ReorderQueueRequest {
+    queue_id: String,
+    direction: String,
+}
+
+async fn reorder_queued_prompt_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<ReorderQueueRequest>,
+) -> impl IntoResponse {
+    Json(
+        state
+            .reorder_queued_prompt_core(id, &req.queue_id, &req.direction)
             .await,
     )
 }

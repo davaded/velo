@@ -1,10 +1,26 @@
 import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 private struct PreviewImageTarget: Identifiable {
     let id = UUID()
     let ref: String
+}
+
+private struct PendingComposerFile: Identifiable {
+    let id = UUID()
+    let name: String
+    let size: Int
+    var uploadedPath: String?
+    var isUploading: Bool = true
+}
+
+private struct ForkLaunchDraft: Identifiable {
+    let id = UUID()
+    let upToUserTurn: Int?
+    let upToUserText: String?
+    let userTurnsFromEnd: Int?
 }
 
 public struct ChatThreadView: View {
@@ -25,6 +41,9 @@ public struct ChatThreadView: View {
     @State private var renameDraftTitle: String = ""
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var pendingImages: [PendingComposerImage] = []
+    @State private var pendingFiles: [PendingComposerFile] = []
+    @State private var showFileImporter: Bool = false
+    @State private var forkDraft: ForkLaunchDraft? = nil
     @State private var annotatingImageId: UUID? = nil
     @State private var previewImageItem: PreviewImageTarget?
     @State private var jumpTargetTurnId: String? = nil
@@ -190,6 +209,62 @@ public struct ChatThreadView: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         }
+        .sheet(item: $forkDraft) { draft in
+            ForkBranchSheet(
+                store: store,
+                sourceTitle: session?.title ?? "Session",
+                repoRoot: session?.repoRoot ?? "",
+                initialModelId: selectedModelId,
+                initialEffort: selectedEffort,
+                upToUserTurn: draft.upToUserTurn,
+                upToUserText: draft.upToUserText
+            ) { title, modelOpt, effort, firstPrompt in
+                Task {
+                    if let forkedId = await store.forkSession(
+                        sessionId,
+                        upToUserTurn: draft.upToUserTurn,
+                        upToUserText: draft.upToUserText,
+                        userTurnsFromEnd: draft.userTurnsFromEnd,
+                        title: title,
+                        provider: modelOpt?.agentKind,
+                        model: modelOpt?.id ?? selectedModelId,
+                        effort: effort,
+                        initialPrompt: firstPrompt
+                    ) {
+                        onSwitchedSession?(forkedId)
+                    }
+                }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            guard case .success(let urls) = result else { return }
+            for fileUrl in urls.prefix(4) {
+                let accessed = fileUrl.startAccessingSecurityScopedResource()
+                let data = try? Data(contentsOf: fileUrl)
+                if accessed { fileUrl.stopAccessingSecurityScopedResource() }
+                guard let data, !data.isEmpty else { continue }
+                let fname = fileUrl.lastPathComponent
+                let entry = PendingComposerFile(name: fname, size: data.count)
+                let entryId = entry.id
+                pendingFiles.append(entry)
+                Task {
+                    let savedPath = await store.uploadDocumentAttachment(data: data, filename: fname)
+                    if let idx = pendingFiles.firstIndex(where: { $0.id == entryId }) {
+                        pendingFiles[idx].uploadedPath = savedPath
+                        pendingFiles[idx].isUploading = false
+                        if savedPath == nil {
+                            pendingFiles.remove(at: idx)
+                        }
+                    }
+                }
+            }
+        }
         .fullScreenCover(item: $previewImageItem) { target in
             FullscreenImagePreviewSheet(store: store, ref: target.ref)
         }
@@ -268,11 +343,11 @@ public struct ChatThreadView: View {
                 }
                 if !turns.isEmpty && !isSessionRunning {
                     Button {
-                        Task {
-                            if let forkedId = await store.forkSession(sessionId, upToUserTurn: nil) {
-                                onSwitchedSession?(forkedId)
-                            }
-                        }
+                        forkDraft = ForkLaunchDraft(
+                            upToUserTurn: nil,
+                            upToUserText: nil,
+                            userTurnsFromEnd: nil
+                        )
                     } label: {
                         Label("从当前上下文分叉新会话 (Fork)", systemImage: "arrow.branch")
                     }
@@ -620,14 +695,136 @@ public struct ChatThreadView: View {
         let oneBasedOrdinal = max(1, userTurnOrdinal + 1)
         let turnsFromEnd = max(0, totalUserTurns - oneBasedOrdinal)
         return {
-            Task {
-                if let forkedId = await store.forkSession(
-                    sessionId,
-                    upToUserTurn: oneBasedOrdinal,
-                    upToUserText: turn.userEvent?.content,
-                    userTurnsFromEnd: turnsFromEnd
-                ) {
-                    onSwitchedSession?(forkedId)
+            forkDraft = ForkLaunchDraft(
+                upToUserTurn: oneBasedOrdinal,
+                upToUserText: turn.userEvent?.content,
+                userTurnsFromEnd: turnsFromEnd
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func queuedPromptsTrayView(queuedList: [VeloQueuedPromptItem]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(VeloTheme.amber)
+                    .frame(width: 6, height: 6)
+                Text("待发队列 · \(queuedList.count)")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+
+            ForEach(Array(queuedList.enumerated()), id: \.element.id) { idx, q in
+                queuedPromptRow(idx: idx, q: q)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
+        )
+    }
+
+    private func queuedPromptRow(idx: Int, q: VeloQueuedPromptItem) -> some View {
+        HStack(spacing: 7) {
+            Text("\(idx + 1)")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 18, minHeight: 18)
+                .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+            Text(q.input)
+                .font(.system(size: 12.5))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Button {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                Task {
+                    await store.runQueuedPromptNow(sessionId: sessionId, queueId: q.id)
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 9.5, weight: .bold))
+                    Text("插队")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .foregroundStyle(VeloTheme.amber)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3.5)
+                .background(VeloTheme.amber.opacity(0.12), in: Capsule())
+                .overlay(Capsule().stroke(VeloTheme.amber.opacity(0.32), lineWidth: 0.7))
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                let pulled = q.input
+                draftPrompt = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? pulled
+                    : "\(draftPrompt)\n\(pulled)"
+                composerFocused = true
+                Task {
+                    await store.removeQueuedPrompt(sessionId: sessionId, queueId: q.id)
+                }
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                Task {
+                    await store.removeQueuedPrompt(sessionId: sessionId, queueId: q.id)
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(VeloTheme.canvas(colorScheme).opacity(0.85), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var pendingFilesStripView: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 7) {
+                ForEach(pendingFiles) { f in
+                    HStack(spacing: 5) {
+                        Image(systemName: "doc.text.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(VeloTheme.accentVioletSoft)
+                        Text(f.name)
+                            .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                            .lineLimit(1)
+                        if f.isUploading {
+                            ProgressView().scaleEffect(0.6)
+                        } else {
+                            Button {
+                                pendingFiles.removeAll { $0.id == f.id }
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                    .overlay(Capsule().stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7))
                 }
             }
         }
@@ -1059,11 +1256,11 @@ public struct ChatThreadView: View {
         case "/fork":
             draftPrompt = ""
             composerFocused = false
-            Task {
-                if let forkedId = await store.forkSession(sessionId, upToUserTurn: nil) {
-                    onSwitchedSession?(forkedId)
-                }
-            }
+            forkDraft = ForkLaunchDraft(
+                upToUserTurn: nil,
+                upToUserText: nil,
+                userTurnsFromEnd: nil
+            )
         case "/plan":
             draftPrompt = "先不要修改文件，请先给出包含具体改动文件的 `## 实施计划`（Implementation Plan），等我确认后再动手："
             composerFocused = true
@@ -1085,73 +1282,29 @@ public struct ChatThreadView: View {
         let effectiveEffort = activeModelOption.alignedEffort(from: selectedEffort)
         let hasText = !draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let uploadedPaths = pendingImages.compactMap(\.uploadedPath)
-        let isUploadingAny = pendingImages.contains(where: \.isUploading)
-        let canSend = (hasText || !uploadedPaths.isEmpty) && !isUploadingAny
+        let uploadedFilePaths = pendingFiles.compactMap(\.uploadedPath)
+        let isUploadingAny = pendingImages.contains(where: \.isUploading) || pendingFiles.contains(where: \.isUploading)
+        let canSend = (hasText || !uploadedPaths.isEmpty || !uploadedFilePaths.isEmpty) && !isUploadingAny
         let queuedList = session?.activeQueuedPrompts ?? []
+
+        let composeFinalPrompt: () -> String = {
+            let trimmed = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if uploadedFilePaths.isEmpty { return draftPrompt }
+            let header = "[Referenced Files]\n" + uploadedFilePaths.map { "- \($0)" }.joined(separator: "\n")
+            let body = trimmed.isEmpty ? "请分析并处理以上引用的文件。" : draftPrompt
+            return "\(header)\n\n\(body)"
+        }
 
         return VStack(spacing: 10) {
             offlineOutboxBanner
             slashCommandStrip
 
             if !queuedList.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "text.append")
-                            .font(.system(size: 11, weight: .semibold))
-                        Text("队列待发 (\(queuedList.count)) · 当前轮结束后自动执行")
-                            .font(.system(size: 11.5, weight: .semibold))
-                        Spacer()
-                    }
-                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                queuedPromptsTrayView(queuedList: queuedList)
+            }
 
-                    ForEach(Array(queuedList.enumerated()), id: \.element.id) { idx, q in
-                        HStack(spacing: 7) {
-                            Text("#\(idx + 1)")
-                                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                            Text(q.input)
-                                .font(.system(size: 12.5))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                            Spacer(minLength: 4)
-                            Button {
-                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                                Task {
-                                    await store.runQueuedPromptNow(sessionId: sessionId, queueId: q.id)
-                                }
-                            } label: {
-                                Text("立即执行")
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(VeloTheme.amber)
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 3)
-                                    .background(VeloTheme.amber.opacity(0.14), in: Capsule())
-                            }
-                            .buttonStyle(.plain)
-                            Button {
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                Task {
-                                    await store.removeQueuedPrompt(sessionId: sessionId, queueId: q.id)
-                                }
-                            } label: {
-                                HStack(spacing: 2) {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 9, weight: .bold))
-                                    Text("删除")
-                                        .font(.system(size: 11, weight: .medium))
-                                }
-                                .foregroundStyle(VeloTheme.coral)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(VeloTheme.accentViolet.opacity(0.09), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            if !pendingFiles.isEmpty {
+                pendingFilesStripView
             }
 
             if !pendingImages.isEmpty {
@@ -1314,6 +1467,20 @@ public struct ChatThreadView: View {
                 }
                 .disabled(pendingImages.count >= 4 || voiceRecorder.isRecording)
 
+                // Attach Any File from iOS Files App
+                Button {
+                    showFileImporter = true
+                } label: {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(pendingFiles.isEmpty ? Color.secondary : VeloTheme.accentVioletSoft)
+                        .frame(width: 31, height: 31)
+                        .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                }
+                .buttonStyle(VeloPressableButtonStyle())
+                .disabled(pendingFiles.count >= 4 || voiceRecorder.isRecording)
+                .accessibilityLabel("附加本地文件")
+
                 if UIPasteboard.general.hasImages && pendingImages.count < 4 && !voiceRecorder.isRecording {
                     Button {
                         if let pasted = UIPasteboard.general.image {
@@ -1429,10 +1596,11 @@ public struct ChatThreadView: View {
                     HStack(spacing: 6) {
                         if canSend {
                             Button {
-                                let toSend = draftPrompt
+                                let toSend = composeFinalPrompt()
                                 let attached = uploadedPaths
                                 draftPrompt = ""
                                 pendingImages.removeAll()
+                                pendingFiles.removeAll()
                                 composerFocused = false
                                 Task {
                                     await store.sendPrompt(
@@ -1455,10 +1623,11 @@ public struct ChatThreadView: View {
                             .buttonStyle(VeloPressableButtonStyle())
 
                             Button {
-                                let toSend = draftPrompt
+                                let toSend = composeFinalPrompt()
                                 let attached = uploadedPaths
                                 draftPrompt = ""
                                 pendingImages.removeAll()
+                                pendingFiles.removeAll()
                                 composerFocused = false
                                 Task {
                                     await store.sendPrompt(
@@ -1471,7 +1640,7 @@ public struct ChatThreadView: View {
                                     )
                                 }
                             } label: {
-                                Text("纠偏")
+                                Text("插队")
                                     .font(.system(size: 12, weight: .bold))
                                     .foregroundStyle(VeloTheme.amber)
                                     .padding(.horizontal, 10)
@@ -1494,15 +1663,16 @@ public struct ChatThreadView: View {
                     }
                 } else {
                     Button {
-                        let toSend = draftPrompt
-                        let trimmedCmd = toSend.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                        if trimmedCmd == "/rewind" || trimmedCmd == "/mcp" || trimmedCmd == "/fork" {
-                            executeSlashQuickAction(trimmedCmd)
+                        let rawTrimmed = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        if rawTrimmed == "/rewind" || rawTrimmed == "/mcp" || rawTrimmed == "/fork" {
+                            executeSlashQuickAction(rawTrimmed)
                             return
                         }
+                        let toSend = composeFinalPrompt()
                         let attached = uploadedPaths
                         draftPrompt = ""
                         pendingImages.removeAll()
+                        pendingFiles.removeAll()
                         composerFocused = false
                         Task {
                             await store.sendPrompt(
@@ -3850,6 +4020,137 @@ private struct FullscreenImagePreviewSheet: View {
                 displayImage = full
             }
             isLoadingHD = false
+        }
+    }
+}
+
+private struct ForkBranchSheet: View {
+    @ObservedObject var store: VeloStore
+    let sourceTitle: String
+    let repoRoot: String
+    let initialModelId: String
+    let initialEffort: String
+    let upToUserTurn: Int?
+    let upToUserText: String?
+    let onConfirm: (String, VeloModelOption?, String, String?) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var branchTitle: String = ""
+    @State private var chosenModelId: String = ""
+    @State private var chosenEffort: String = "medium"
+    @State private var initialPrompt: String = ""
+    @State private var searchQuery: String = ""
+
+    private var filteredModels: [VeloModelOption] {
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if q.isEmpty { return store.models }
+        return store.models.filter {
+            $0.label.lowercased().contains(q)
+                || $0.id.lowercased().contains(q)
+                || $0.agentKind.lowercased().contains(q)
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("分叉设置") {
+                    TextField("分支标题", text: $branchTitle)
+                    if let t = upToUserTurn {
+                        Label("从第 #\(t) 轮分叉", systemImage: "arrow.branch")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                    }
+                    if let excerpt = upToUserText, !excerpt.isEmpty {
+                        Text(excerpt)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    if !repoRoot.isEmpty {
+                        Label(VeloFormatting.shortenHomePath(repoRoot), systemImage: "folder")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("目标模型与引擎（支持跨模型接管）") {
+                    TextField("搜索模型…", text: $searchQuery)
+                        .font(.system(size: 13))
+
+                    Picker("推理强度", selection: $chosenEffort) {
+                        Text("Low").tag("low")
+                        Text("Medium").tag("medium")
+                        Text("High").tag("high")
+                        Text("Max").tag("max")
+                    }
+                    .pickerStyle(.segmented)
+
+                    ForEach(filteredModels.prefix(24)) { opt in
+                        Button {
+                            chosenModelId = opt.id
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(opt.label)
+                                        .font(.system(size: 13.5, weight: .medium))
+                                        .foregroundStyle(.primary)
+                                    Text(opt.agentKind.uppercased())
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if opt.id == initialModelId {
+                                    Text("原模型")
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.secondary.opacity(0.14), in: Capsule())
+                                }
+                                if opt.id == chosenModelId {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(VeloTheme.accentViolet)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section("首条分支指令（可选）") {
+                    TextField("留空则进入新对话后再输入…", text: $initialPrompt, axis: .vertical)
+                        .lineLimit(2...4)
+                }
+            }
+            .navigationTitle("Fork 新分支")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "确认分叉" : "分叉并执行") {
+                        let chosenOpt = store.models.first(where: { $0.id == chosenModelId })
+                        let cleanPrompt = initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        onConfirm(
+                            branchTitle.trimmingCharacters(in: .whitespacesAndNewlines),
+                            chosenOpt,
+                            chosenEffort,
+                            cleanPrompt.isEmpty ? nil : cleanPrompt
+                        )
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                }
+            }
+            .onAppear {
+                let base = sourceTitle.hasPrefix("Fork · ")
+                    ? String(sourceTitle.dropFirst("Fork · ".count))
+                    : sourceTitle
+                branchTitle = "Fork · \(base)"
+                chosenModelId = initialModelId
+                chosenEffort = initialEffort
+            }
         }
     }
 }
