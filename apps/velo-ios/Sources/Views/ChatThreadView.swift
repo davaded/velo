@@ -3308,16 +3308,45 @@ private struct InlineMarkdownText: View {
             )
     }
 
-    /// Keep identifiers like `snake_case` literal. Apple's inline markdown parser
-    /// otherwise treats the underscore as emphasis and the line collapses.
+    /// Keep identifiers like `snake_case` literal without corrupting URLs inside `[label](file://...)` / `(https://...)`.
     private static func protectWordUnderscores(_ raw: String) -> String {
-        guard let regex = try? NSRegularExpression(
-            pattern: #"(?<=[\p{L}\p{N}])_(?=[\p{L}\p{N}])"#
-        ) else {
+        guard let urlRegex = try? NSRegularExpression(pattern: #"\((?:file|https?|mailto):[^)\s]+\)"#),
+              let wordRegex = try? NSRegularExpression(pattern: #"(?<=[\p{L}\p{N}])_(?=[\p{L}\p{N}])"#)
+        else {
             return raw
         }
-        let range = NSRange(raw.startIndex..., in: raw)
-        return regex.stringByReplacingMatches(in: raw, range: range, withTemplate: "\\\\_")
+        let ns = raw as NSString
+        let matches = urlRegex.matches(in: raw, range: NSRange(location: 0, length: ns.length))
+        if matches.isEmpty {
+            return wordRegex.stringByReplacingMatches(
+                in: raw,
+                range: NSRange(location: 0, length: ns.length),
+                withTemplate: "\\\\_"
+            )
+        }
+        var out = ""
+        var cursor = 0
+        for m in matches {
+            if m.range.location > cursor {
+                let seg = ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor))
+                out += wordRegex.stringByReplacingMatches(
+                    in: seg,
+                    range: NSRange(location: 0, length: (seg as NSString).length),
+                    withTemplate: "\\\\_"
+                )
+            }
+            out += ns.substring(with: m.range)
+            cursor = m.range.location + m.range.length
+        }
+        if cursor < ns.length {
+            let tail = ns.substring(from: cursor)
+            out += wordRegex.stringByReplacingMatches(
+                in: tail,
+                range: NSRange(location: 0, length: (tail as NSString).length),
+                withTemplate: "\\\\_"
+            )
+        }
+        return out
     }
 
     private static func buildAttributed(

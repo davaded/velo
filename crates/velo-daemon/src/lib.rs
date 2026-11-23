@@ -4177,15 +4177,67 @@ async fn pick_folder_handler() -> impl IntoResponse {
 struct OpenEditorRequest {
     path: String,
     editor: String,
+    #[serde(default)]
+    line: Option<u32>,
 }
 
 async fn open_editor_handler(Json(req): Json<OpenEditorRequest>) -> impl IntoResponse {
     let target = req.path.trim();
+    let goto_target = match req.line {
+        Some(ln) if ln > 0 => format!("{}:{}", target, ln),
+        _ => target.to_string(),
+    };
     let status = match req.editor.as_str() {
-        "cursor" => Command::new("open")
-            .args(["-a", "Cursor", target])
-            .status()
-            .await,
+        "auto" => {
+            if let Ok(st) = Command::new("cursor")
+                .args(["--goto", &goto_target])
+                .status()
+                .await
+            {
+                if st.success() {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({ "ok": true, "editor": "cursor", "path": target })),
+                    )
+                        .into_response();
+                }
+            }
+            if let Ok(st) = Command::new("open")
+                .args(["-a", "Cursor", target])
+                .status()
+                .await
+            {
+                if st.success() {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({ "ok": true, "editor": "cursor", "path": target })),
+                    )
+                        .into_response();
+                }
+            }
+            Command::new("open").arg(target).status().await
+        }
+        "cursor" => {
+            if req.line.is_some() {
+                if let Ok(st) = Command::new("cursor")
+                    .args(["--goto", &goto_target])
+                    .status()
+                    .await
+                {
+                    if st.success() {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({ "ok": true, "editor": "cursor", "path": target })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            Command::new("open")
+                .args(["-a", "Cursor", target])
+                .status()
+                .await
+        }
         "vscode" => Command::new("open")
             .args(["-a", "Visual Studio Code", target])
             .status()

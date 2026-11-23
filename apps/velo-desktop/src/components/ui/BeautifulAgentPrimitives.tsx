@@ -1626,6 +1626,33 @@ function parseMarkdownBlocks(content: string): MdBlock[] {
   return blocks;
 }
 
+function parseFileHref(url: string): { path: string; line?: number } | null {
+  const trimmed = url.trim();
+  if (!trimmed.toLowerCase().startsWith("file://")) return null;
+  let rest = trimmed.slice(7);
+  if (rest.toLowerCase().startsWith("localhost/")) {
+    rest = rest.slice("localhost".length);
+  }
+  let line: number | undefined;
+  const hashIdx = rest.indexOf("#");
+  if (hashIdx >= 0) {
+    const frag = rest.slice(hashIdx + 1);
+    rest = rest.slice(0, hashIdx);
+    const lineMatch = frag.match(/^L?(\d+)/i);
+    if (lineMatch) {
+      const parsed = parseInt(lineMatch[1], 10);
+      if (Number.isFinite(parsed) && parsed > 0) line = parsed;
+    }
+  }
+  try {
+    rest = decodeURIComponent(rest);
+  } catch {
+    // keep raw path if malformed escape
+  }
+  if (!rest) return null;
+  return { path: rest, line };
+}
+
 function safeHref(url: string): string | null {
   const trimmed = url.trim();
   if (
@@ -1696,7 +1723,8 @@ function indexOfMarker(text: string, from: number, marker: string): number {
 function renderInlineMarkdown(
   text: string,
   keyBase = "i",
-  resolveImageUrl?: (src: string) => string
+  resolveImageUrl?: (src: string) => string,
+  onOpenFileLink?: (filePath: string, line?: number) => void
 ): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   let plain = "";
@@ -1764,21 +1792,81 @@ function renderInlineMarkdown(
 
     if (text[i] === "[") {
       const link = parseMarkdownLink(text, i);
-      const href = link ? safeHref(link.url) : null;
-      if (link && href) {
-        push(
-          <a
-            href={href}
-            target="_blank"
-            rel="noreferrer"
-            className="underline underline-offset-2 transition-opacity hover:opacity-80"
-            style={{ color: "var(--accent-bright)" }}
-          >
-            {renderInlineMarkdown(link.label, `${keyBase}-a${key}`, resolveImageUrl)}
-          </a>
-        );
-        i = link.end;
-        continue;
+      if (link) {
+        const fileTarget = parseFileHref(link.url);
+        if (fileTarget) {
+          const lineSuffix = fileTarget.line ? `:${fileTarget.line}` : "";
+          push(
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onOpenFileLink?.(fileTarget.path, fileTarget.line);
+              }}
+              title={`在编辑器中打开 ${fileTarget.path}${lineSuffix}`}
+              className="inline-flex items-baseline gap-0.5 rounded-[5px] px-1 py-[0.5px] font-mono text-[12.5px] underline decoration-current/35 underline-offset-2 transition-colors hover:decoration-current cursor-pointer"
+              style={{
+                color: "var(--accent-bright)",
+                backgroundColor: "var(--surface-2)",
+              }}
+            >
+              {renderInlineMarkdown(
+                link.label,
+                `${keyBase}-f${key}`,
+                resolveImageUrl,
+                onOpenFileLink
+              )}
+            </button>
+          );
+          i = link.end;
+          continue;
+        }
+        const href = safeHref(link.url);
+        if (href) {
+          push(
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="underline underline-offset-2 transition-opacity hover:opacity-80"
+              style={{ color: "var(--accent-bright)" }}
+            >
+              {renderInlineMarkdown(
+                link.label,
+                `${keyBase}-a${key}`,
+                resolveImageUrl,
+                onOpenFileLink
+              )}
+            </a>
+          );
+          i = link.end;
+          continue;
+        }
+      }
+    }
+
+    // Auto-linkify bare http:// and https:// URLs in prose (e.g. http://localhost:5173/)
+    if (text.startsWith("http://", i) || text.startsWith("https://", i)) {
+      const rest = text.slice(i);
+      const urlMatch = rest.match(/^https?:\/\/[^\s<>()[\]"'`\u3000-\u303F\uFF00-\uFFEF]+/);
+      if (urlMatch) {
+        const rawUrl = urlMatch[0].replace(/[.,;:!?]+$/, "");
+        if (rawUrl.length > 8) {
+          push(
+            <a
+              href={rawUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="underline underline-offset-2 transition-opacity hover:opacity-80"
+              style={{ color: "var(--accent-bright)" }}
+            >
+              {rawUrl}
+            </a>
+          );
+          i += rawUrl.length;
+          continue;
+        }
       }
     }
 
@@ -1794,7 +1882,12 @@ function renderInlineMarkdown(
         push(
           <strong className="font-semibold" style={{ color: "var(--fg)" }}>
             <em>
-              {renderInlineMarkdown(text.slice(i + 3, close), `${keyBase}-bi${key}`, resolveImageUrl)}
+              {renderInlineMarkdown(
+                text.slice(i + 3, close),
+                `${keyBase}-bi${key}`,
+                resolveImageUrl,
+                onOpenFileLink
+              )}
             </em>
           </strong>
         );
@@ -1814,7 +1907,12 @@ function renderInlineMarkdown(
       if (close !== -1) {
         push(
           <strong className="font-semibold" style={{ color: "var(--fg)" }}>
-            {renderInlineMarkdown(text.slice(i + 2, close), `${keyBase}-b${key}`, resolveImageUrl)}
+            {renderInlineMarkdown(
+              text.slice(i + 2, close),
+              `${keyBase}-b${key}`,
+              resolveImageUrl,
+              onOpenFileLink
+            )}
           </strong>
         );
         i = close + 2;
@@ -1827,7 +1925,12 @@ function renderInlineMarkdown(
       if (close !== -1) {
         push(
           <del style={{ color: "var(--fg-muted)" }}>
-            {renderInlineMarkdown(text.slice(i + 2, close), `${keyBase}-s${key}`, resolveImageUrl)}
+            {renderInlineMarkdown(
+              text.slice(i + 2, close),
+              `${keyBase}-s${key}`,
+              resolveImageUrl,
+              onOpenFileLink
+            )}
           </del>
         );
         i = close + 2;
@@ -1844,7 +1947,12 @@ function renderInlineMarkdown(
         if (close !== -1) {
           push(
             <em className="italic">
-              {renderInlineMarkdown(text.slice(i + 1, close), `${keyBase}-e${key}`, resolveImageUrl)}
+              {renderInlineMarkdown(
+                text.slice(i + 1, close),
+                `${keyBase}-e${key}`,
+                resolveImageUrl,
+                onOpenFileLink
+              )}
             </em>
           );
           i = close + 1;
@@ -1864,13 +1972,14 @@ function renderInlineMarkdown(
 function renderInlineLines(
   text: string,
   keyBase: string,
-  resolveImageUrl?: (src: string) => string
+  resolveImageUrl?: (src: string) => string,
+  onOpenFileLink?: (filePath: string, line?: number) => void
 ): React.ReactNode {
   const lines = text.split("\n");
   return lines.map((line, idx) => (
     <React.Fragment key={`${keyBase}-ln-${idx}`}>
       {idx > 0 && <br />}
-      {renderInlineMarkdown(line, `${keyBase}-${idx}`, resolveImageUrl)}
+      {renderInlineMarkdown(line, `${keyBase}-${idx}`, resolveImageUrl, onOpenFileLink)}
     </React.Fragment>
   ));
 }
@@ -1886,7 +1995,8 @@ export const PaseoMarkdown: React.FC<{
   isStreaming?: boolean;
   className?: string;
   resolveImageUrl?: (src: string) => string;
-}> = React.memo(({ content, isStreaming = false, className = "", resolveImageUrl }) => {
+  onOpenFileLink?: (filePath: string, line?: number) => void;
+}> = React.memo(({ content, isStreaming = false, className = "", resolveImageUrl, onOpenFileLink }) => {
   const blocks = useMemo(() => parseMarkdownBlocks(content), [content]);
 
   const renderBlock = (block: MdBlock, idx: number) => {
@@ -1897,7 +2007,7 @@ export const PaseoMarkdown: React.FC<{
       case "heading":
         return (
           <div key={key} className={headingClass(block.level)} style={{ color: "var(--fg)" }}>
-            {renderInlineMarkdown(block.text, key, resolveImageUrl)}
+            {renderInlineMarkdown(block.text, key, resolveImageUrl, onOpenFileLink)}
           </div>
         );
       case "hr":
@@ -1911,7 +2021,7 @@ export const PaseoMarkdown: React.FC<{
             className="my-2 border-l-2 pl-3 text-[13px]"
             style={{ borderColor: "var(--border-accent)", color: "var(--fg-muted)" }}
           >
-            {renderInlineLines(block.text, key, resolveImageUrl)}
+            {renderInlineLines(block.text, key, resolveImageUrl, onOpenFileLink)}
           </blockquote>
         );
       case "list":
@@ -1927,7 +2037,7 @@ export const PaseoMarkdown: React.FC<{
                   {item.checked === true ? "☑" : item.checked === false ? "☐" : item.ordered || "•"}
                 </span>
                 <span className="min-w-0 flex-1">
-                  {renderInlineLines(item.text, `${key}-li-${itemIdx}`, resolveImageUrl)}
+                  {renderInlineLines(item.text, `${key}-li-${itemIdx}`, resolveImageUrl, onOpenFileLink)}
                 </span>
               </div>
             ))}
@@ -1955,7 +2065,7 @@ export const PaseoMarkdown: React.FC<{
                       className="px-3 py-1.5 font-semibold"
                       style={{ color: "var(--fg)" }}
                     >
-                      {renderInlineLines(cell, `${key}-th-${cellIdx}`, resolveImageUrl)}
+                      {renderInlineLines(cell, `${key}-th-${cellIdx}`, resolveImageUrl, onOpenFileLink)}
                     </th>
                   ))}
                 </tr>
@@ -1969,7 +2079,7 @@ export const PaseoMarkdown: React.FC<{
                   >
                     {row.map((cell, cellIdx) => (
                       <td key={cellIdx} className="px-3 py-1.5 align-top">
-                        {renderInlineLines(cell, `${key}-td-${rowIdx}-${cellIdx}`, resolveImageUrl)}
+                        {renderInlineLines(cell, `${key}-td-${rowIdx}-${cellIdx}`, resolveImageUrl, onOpenFileLink)}
                       </td>
                     ))}
                   </tr>
@@ -2000,7 +2110,7 @@ export const PaseoMarkdown: React.FC<{
       case "paragraph":
         return (
           <p key={key} className="my-1 text-[13.5px] leading-[1.68]">
-            {renderInlineLines(block.text, key, resolveImageUrl)}
+            {renderInlineLines(block.text, key, resolveImageUrl, onOpenFileLink)}
           </p>
         );
     }

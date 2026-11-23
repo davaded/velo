@@ -5835,6 +5835,18 @@ export function App() {
     }
   };
 
+  const handleOpenLocalFileLink = useCallback(
+    (filePath: string, line?: number) => {
+      if (!filePath) return;
+      fetch(`${daemonUrl}/api/open-editor`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: filePath, editor: "auto", line }),
+      }).catch(() => {});
+    },
+    [daemonUrl]
+  );
+
   const handleOpenInEditor = async (
     editor: "cursor" | "vscode" | "zed" | "finder" | "terminal"
   ) => {
@@ -7992,6 +8004,7 @@ export function App() {
                                       ev.is_streaming_chunk && isTurnRunning && isLastTurnItem
                                     )}
                                     resolveImageUrl={resolveAttachmentUrl}
+                                    onOpenFileLink={handleOpenLocalFileLink}
                                   />
 
                                   {isLatestTurn &&
