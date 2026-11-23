@@ -1143,6 +1143,48 @@ public enum VeloFormatting {
             }
         }
 
+        if lower == "call_mcp_tool" || lower.hasPrefix("mcp_") {
+            let rawServer = (argsDict?["ServerName"] as? String)
+                ?? (argsDict?["server_name"] as? String)
+                ?? (lower.hasPrefix("mcp_") ? toolName.split(separator: "_").dropFirst().dropLast().joined(separator: "_") : "MCP")
+            let rawTool = (argsDict?["ToolName"] as? String)
+                ?? (argsDict?["tool_name"] as? String)
+                ?? (lower.hasPrefix("mcp_") ? String(toolName.split(separator: "_").last ?? "") : toolName)
+            let serverLabel: String = {
+                let sl = rawServer.lowercased()
+                if sl.contains("chrome-devtools") { return "Chrome DevTools" }
+                if sl.contains("playwright") { return "Playwright" }
+                if sl.contains("github") { return "GitHub" }
+                if sl.contains("figma") { return "Figma" }
+                return rawServer
+                    .replacingOccurrences(of: "_", with: " ")
+                    .replacingOccurrences(of: "-", with: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }()
+            let actionMap: [String: String] = [
+                "take_screenshot": "截图验证",
+                "take_snapshot": "页面快照",
+                "click": "点击元素",
+                "evaluate_script": "执行脚本",
+                "list_console_messages": "检查控制台",
+                "list_pages": "查看页面",
+                "navigate_page": "打开页面",
+                "new_page": "新建页面",
+                "fill": "填写输入",
+                "fill_form": "填写表单",
+                "hover": "悬停元素",
+                "wait_for": "等待加载",
+                "list_network_requests": "检查网络请求",
+            ]
+            let actionLabel = actionMap[rawTool.lowercased()] ?? rawTool.replacingOccurrences(of: "_", with: " ")
+            return (
+                serverLabel.isEmpty ? "MCP" : serverLabel,
+                "通过 \(serverLabel.isEmpty ? "MCP" : serverLabel) \(actionLabel)",
+                actionLabel,
+                "sparkles"
+            )
+        }
+
         if lower == "bash" || lower.contains("shell") || lower.contains("exec") || lower.contains("command") {
             let shortCmd = command.isEmpty ? "" : String(command.prefix(42))
             return (

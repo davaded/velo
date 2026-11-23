@@ -633,6 +633,7 @@ public struct ChatThreadView: View {
         return TurnBlockView(
             store: store,
             turn: turn,
+            provider: session?.agentKind ?? "claude",
             isTurnRunning: turnRunning,
             turnStartedAt: isLatest ? store.turnStartedAtBySession[sessionId] : nil,
             liveTps: isLatest ? store.liveTpsBySession[sessionId] : nil,
@@ -1879,6 +1880,7 @@ private struct ModelAndHandoffSheet: View {
 private struct TurnBlockView: View {
     @ObservedObject var store: VeloStore
     let turn: ConversationTurnBlock
+    let provider: String
     let isTurnRunning: Bool
     let turnStartedAt: Date?
     let liveTps: Double?
@@ -1927,7 +1929,8 @@ private struct TurnBlockView: View {
                     batch.append(turn.items[j])
                     j += 1
                 }
-                if batch.count >= 2 {
+                let useFocusSingle = isTurnRunning && j == total && VeloTraceEngineMode.resolve(provider) == .focusFootprint
+                if batch.count >= 2 || useFocusSingle {
                     out.append(.traceGroup(id: "trace-\(item.id)", items: batch))
                 } else {
                     out.append(.single(item: item, isLastItem: idx == total - 1))
@@ -2101,6 +2104,7 @@ private struct TurnBlockView: View {
                 case .traceGroup(_, let batch):
                     ExecutionTraceGroupView(
                         items: batch,
+                        provider: provider,
                         isTurnRunning: isTurnRunning && isLastSeg,
                         turnStartedAt: turnStartedAt,
                         defaultExpanded: !autoCollapseSteps
@@ -2113,7 +2117,8 @@ private struct TurnBlockView: View {
                             rawText: item.content,
                             startedAt: startedAt ?? turnStartedAt,
                             durationMs: durationMs,
-                            isStreaming: isStreaming && isTurnRunning && isLast
+                            isStreaming: isStreaming && isTurnRunning && isLast,
+                            showLivePreview: VeloTraceEngineMode.resolve(provider) == .claudeStream
                         )
 
                     case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isError):
@@ -2161,7 +2166,16 @@ private struct TurnBlockView: View {
             }
 
             // 3. Live / Completed Turn Status & Telemetry Footer
-            if !hasErrorWithoutAnswer || isTurnRunning {
+            let suppressDuplicateFocusFooter: Bool = {
+                guard isTurnRunning,
+                      waitingApproval == nil,
+                      waitingQuestion == nil,
+                      VeloTraceEngineMode.resolve(provider) == .focusFootprint,
+                      let lastItem = turn.items.last
+                else { return false }
+                return isProcessStep(lastItem.kind)
+            }()
+            if (!hasErrorWithoutAnswer || isTurnRunning) && !suppressDuplicateFocusFooter {
                 TurnStatusFooterView(
                     isRunning: isTurnRunning,
                     phase: computedPhase,

@@ -29,6 +29,7 @@ import {
   PaseoTurnFooter,
   PaseoTurnTelemetry,
   extractThinkingHeadline,
+  isFocusFootprintProvider,
   resolvePaseoToolPresentation,
 } from "./components/ui/BeautifulAgentPrimitives";
 import {
@@ -7713,7 +7714,12 @@ export function App() {
                                 ) {
                                   endIdx++;
                                 }
-                                if (endIdx > idx) {
+                                const useFocusGroupForSingle = Boolean(
+                                  isTurnRunning &&
+                                    endIdx === turn.items.length - 1 &&
+                                    isFocusFootprintProvider(activeSession.agent_kind)
+                                );
+                                if (endIdx > idx || useFocusGroupForSingle) {
                                   const traceSteps: PaseoTraceStepItem[] = turn.items
                                     .slice(idx, endIdx + 1)
                                     .map((stepEv, relIdx) => {
@@ -7759,6 +7765,10 @@ export function App() {
                                     <PaseoExecutionTraceGroup
                                       key={`trace-${ev.id}-${autoCollapseSteps ? "c" : "e"}`}
                                       steps={traceSteps}
+                                      provider={activeSession.agent_kind}
+                                      startedAtMs={
+                                        isLatestTurn ? activeTurnTiming?.startedAtMs : undefined
+                                      }
                                       isTurnRunning={Boolean(
                                         isTurnRunning && endIdx === turn.items.length - 1
                                       )}
@@ -7783,6 +7793,10 @@ export function App() {
                                       }
                                       durationMs={ev.duration_ms}
                                       defaultExpanded={false}
+                                      showLivePreview={
+                                        (activeSession.agent_kind || "claude").toLowerCase() ===
+                                        "claude"
+                                      }
                                     />
                                   );
                                 }
@@ -7990,6 +8004,14 @@ export function App() {
                               );
                             })()}
 
+                            {!(
+                              isTurnRunning &&
+                              !waitingLabel &&
+                              isFocusFootprintProvider(activeSession.agent_kind) &&
+                              lastTurnItem &&
+                              (lastTurnItem.kind === "thinking" ||
+                                lastTurnItem.kind === "tool_call")
+                            ) && (
                             <PaseoTurnFooter
                               isRunning={isTurnRunning}
                               phase={turnPhase}
@@ -8048,6 +8070,7 @@ export function App() {
                                   : undefined
                               }
                             />
+                            )}
                           </div>
                         );
                       })}

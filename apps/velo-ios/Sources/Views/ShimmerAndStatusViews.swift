@@ -206,6 +206,7 @@ public struct ReasoningRowView: View {
     public let startedAt: Date?
     public let durationMs: Int?
     public let isStreaming: Bool
+    public let showLivePreview: Bool
 
     @State private var isExpanded: Bool = false
 
@@ -213,16 +214,29 @@ public struct ReasoningRowView: View {
         rawText: String,
         startedAt: Date?,
         durationMs: Int?,
-        isStreaming: Bool
+        isStreaming: Bool,
+        showLivePreview: Bool = false
     ) {
         self.rawText = rawText
         self.startedAt = startedAt
         self.durationMs = durationMs
         self.isStreaming = isStreaming
+        self.showLivePreview = showLivePreview
     }
 
     public var body: some View {
         let parsed = VeloFormatting.parseReasoning(rawText)
+        let shortHeading: String = {
+            for line in parsed.lines.reversed() {
+                if line.hasPrefix("**"), line.hasSuffix("**"), line.count > 4 {
+                    let inner = String(line.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !inner.isEmpty && inner.count <= 48 && !inner.hasSuffix("…") {
+                        return inner
+                    }
+                }
+            }
+            return ""
+        }()
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
@@ -249,17 +263,17 @@ public struct ReasoningRowView: View {
                                 ? "思考中 \(VeloFormatting.formatDuration(ms: elapsedMs))"
                                 : "思考中…"
                             ShimmerTextView(
-                                parsed.summary.isEmpty ? label : "\(label) · \(parsed.summary)",
+                                shortHeading.isEmpty ? label : "\(label) · \(shortHeading)",
                                 font: .system(size: 13, weight: .medium)
                             )
                             .lineLimit(1)
                             .contentTransition(.numericText())
                         }
                     } else {
-                        let base = (durationMs ?? 0) >= 500
-                            ? "已思考 \(VeloFormatting.formatDuration(ms: durationMs!))"
-                            : "已思考"
-                        Text(parsed.summary.isEmpty ? base : "\(base) · \(parsed.summary)")
+                        let base = (durationMs ?? 0) >= 1000
+                            ? "思考了 \(VeloFormatting.formatDuration(ms: durationMs!))"
+                            : "思考过程"
+                        Text(shortHeading.isEmpty ? base : "\(base) · \(shortHeading)")
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -278,6 +292,26 @@ public struct ReasoningRowView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+
+            if isStreaming && showLivePreview && !isExpanded && !parsed.lines.isEmpty {
+                IndentRailContainer {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(parsed.lines.suffix(3).enumerated()), id: \.offset) { _, line in
+                            Text(line.replacingOccurrences(of: "**", with: ""))
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .mask(
+                        LinearGradient(
+                            colors: [.clear, .black.opacity(0.85), .black],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                }
+            }
 
             if isExpanded && !parsed.lines.isEmpty {
                 IndentRailContainer {
@@ -304,6 +338,23 @@ public struct ReasoningRowView: View {
 
 // MARK: - 7. Unified Collapsible Execution Trace Group (Consecutive `Thought` + `MCP` / Tool Calls)
 
+public enum VeloTraceEngineMode {
+    case focusFootprint
+    case codexSummary
+    case claudeStream
+
+    public static func resolve(_ provider: String) -> VeloTraceEngineMode {
+        let p = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if p == "agy" || p == "antigravity" || p == "cursor" || p == "grok" {
+            return .focusFootprint
+        }
+        if p == "codex" {
+            return .codexSummary
+        }
+        return .claudeStream
+    }
+}
+
 private enum VeloFlatActivityRow: Identifiable {
     case thinking(TimelineEventItem)
     case tool(TimelineEventItem)
@@ -319,6 +370,26 @@ private enum VeloFlatActivityRow: Identifiable {
     }
 }
 
+private struct VeloFootprintItem {
+    let label: String
+    let count: Int
+}
+
+private struct VeloFootprintRow: Identifiable {
+    let tag: String
+    let items: [VeloFootprintItem]
+    let extraCount: Int
+    var id: String { tag }
+}
+
+private struct VeloFocusFootprintData {
+    let liveLabel: String
+    let livePhase: AgentLivePhase
+    let visibleStepCount: Int
+    let hasError: Bool
+    let rows: [VeloFootprintRow]
+}
+
 private enum VeloActivityStreamBuilder {
     private static let fillerLines: Set<String> = [
         "i'm thinking through how to approach this",
@@ -330,6 +401,16 @@ private enum VeloActivityStreamBuilder {
         "alright",
         "hmm",
     ]
+
+    static func isInternalNoise(_ item: TimelineEventItem) -> Bool {
+        guard case .toolCall(_, _, _, let summary, _, _) = item.kind else { return false }
+        let s = (summary ?? "").lowercased()
+        return s.contains(".gemini/antigravity-cli/mcp/")
+            || s.contains(".gemini/antigravity/mcp/")
+            || s.contains(".system_generated/steps/")
+            || s.contains(".system_generated/logs/")
+            || s.hasSuffix(".json") && s.contains("chrome-devtools")
+    }
 
     static func isNoiseThinking(_ raw: String) -> Bool {
         let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -364,26 +445,38 @@ private enum VeloActivityStreamBuilder {
             || lower.contains("find")
     }
 
-    static func build(_ items: [TimelineEventItem], isTurnRunning: Bool) -> [VeloFlatActivityRow] {
-        var rows: [VeloFlatActivityRow] = []
-        var i = 0
-        while i < items.count {
-            let item = items[i]
+    static func build(_ items: [TimelineEventItem], isTurnRunning: Bool, hideNoise: Bool) -> [VeloFlatActivityRow] {
+        var filtered: [TimelineEventItem] = []
+        for item in items {
             switch item.kind {
             case .thinking(_, _, let isStreaming):
                 if (isTurnRunning && isStreaming) || !isNoiseThinking(item.content) {
-                    rows.append(.thinking(item))
+                    filtered.append(item)
                 }
-                i += 1
+            case .toolCall:
+                if hideNoise && isInternalNoise(item) { continue }
+                filtered.append(item)
+            default:
+                break
+            }
+        }
 
+        var rows: [VeloFlatActivityRow] = []
+        var i = 0
+        while i < filtered.count {
+            let item = filtered[i]
+            switch item.kind {
+            case .thinking:
+                rows.append(.thinking(item))
+                i += 1
             case .toolCall:
                 if isExplorationTool(item) {
                     var j = i
-                    while j + 1 < items.count && isExplorationTool(items[j + 1]) {
+                    while j + 1 < filtered.count && isExplorationTool(filtered[j + 1]) {
                         j += 1
                     }
                     if j > i {
-                        let slice = Array(items[i...j])
+                        let slice = Array(filtered[i...j])
                         rows.append(.exploreBatch(id: "explore-\(item.id)-\(slice.count)", items: slice))
                         i = j + 1
                         continue
@@ -391,7 +484,6 @@ private enum VeloActivityStreamBuilder {
                 }
                 rows.append(.tool(item))
                 i += 1
-
             default:
                 i += 1
             }
@@ -399,11 +491,116 @@ private enum VeloActivityStreamBuilder {
         return rows
     }
 
+    static func buildFocusFootprint(_ items: [TimelineEventItem], isTurnRunning: Bool) -> VeloFocusFootprintData {
+        var hasError = false
+        var visibleStepCount = 0
+        var activeVerb = ""
+        var latestVerb = ""
+
+        var editOrder: [String] = []
+        var editCounts: [String: Int] = [:]
+        var cmdOrder: [String] = []
+        var cmdCounts: [String: Int] = [:]
+        var mcpOrder: [String] = []
+        var mcpCounts: [String: Int] = [:]
+        var mcpActions: [String: [String]] = [:]
+        var readFiles: [String] = []
+        var searchCount = 0
+
+        for item in items {
+            switch item.kind {
+            case .thinking:
+                if !isNoiseThinking(item.content) { visibleStepCount += 1 }
+            case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isErr):
+                if isErr { hasError = true }
+                if isInternalNoise(item) { continue }
+                visibleStepCount += 1
+                latestVerb = workingVerb
+                if isTurnRunning && output == nil { activeVerb = workingVerb }
+
+                let lower = toolName.lowercased()
+                let s = (summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if lower.contains("edit") || lower.contains("write") || lower.contains("patch") || lower.contains("file_change") {
+                    let base = s.split(separator: "/").last.map(String.init) ?? (s.isEmpty ? "代码文件" : s)
+                    if editCounts[base] == nil { editOrder.append(base) }
+                    editCounts[base, default: 0] += 1
+                } else if lower.contains("bash") || lower.contains("shell") || lower.contains("cmd") || lower.contains("command") {
+                    let firstLine = s.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? "shell"
+                    let shortCmd = firstLine.count > 36 ? String(firstLine.prefix(34)) + "…" : firstLine
+                    if cmdCounts[shortCmd] == nil { cmdOrder.append(shortCmd) }
+                    cmdCounts[shortCmd, default: 0] += 1
+                } else if lower == "call_mcp_tool" || lower.hasPrefix("mcp_") {
+                    let srv = displayName.isEmpty ? "MCP" : displayName
+                    let act = s.isEmpty ? "调用" : s
+                    if mcpCounts[srv] == nil { mcpOrder.append(srv) }
+                    mcpCounts[srv, default: 0] += 1
+                    var acts = mcpActions[srv] ?? []
+                    if !acts.contains(act) { acts.append(act) }
+                    mcpActions[srv] = acts
+                } else if lower.contains("read") || lower.contains("view") || lower == "list_dir" {
+                    let base = s.split(separator: "/").last.map(String.init) ?? ""
+                    if !base.isEmpty && !readFiles.contains(base) { readFiles.append(base) }
+                } else if lower.contains("search") || lower.contains("grep") || lower.contains("glob") || lower.contains("find") {
+                    searchCount += 1
+                }
+            default:
+                break
+            }
+        }
+
+        var rows: [VeloFootprintRow] = []
+        if !editOrder.isEmpty {
+            let shown = editOrder.prefix(3).map { VeloFootprintItem(label: $0, count: editCounts[$0] ?? 1) }
+            rows.append(VeloFootprintRow(tag: "修改", items: shown, extraCount: max(0, editOrder.count - 3)))
+        }
+        if !cmdOrder.isEmpty {
+            let shown = cmdOrder.prefix(2).map { VeloFootprintItem(label: $0, count: cmdCounts[$0] ?? 1) }
+            rows.append(VeloFootprintRow(tag: "命令", items: shown, extraCount: max(0, cmdOrder.count - 2)))
+        }
+        if !mcpOrder.isEmpty {
+            let shown = mcpOrder.prefix(2).map { srv in
+                let acts = (mcpActions[srv] ?? []).prefix(2).joined(separator: " / ")
+                return VeloFootprintItem(label: "\(srv) · \(acts)", count: mcpCounts[srv] ?? 1)
+            }
+            rows.append(VeloFootprintRow(tag: "MCP", items: shown, extraCount: max(0, mcpOrder.count - 2)))
+        }
+        if rows.count < 3 && (!readFiles.isEmpty || searchCount > 0) {
+            var shown = readFiles.prefix(3).map { VeloFootprintItem(label: $0, count: 1) }
+            if shown.isEmpty && searchCount > 0 {
+                shown = [VeloFootprintItem(label: "代码检索", count: searchCount)]
+            }
+            rows.append(VeloFootprintRow(tag: "阅读", items: shown, extraCount: max(0, readFiles.count - 3)))
+        }
+
+        let liveLabel: String
+        let livePhase: AgentLivePhase
+        if !activeVerb.isEmpty {
+            liveLabel = "正在\(activeVerb)…"
+            livePhase = .tool(verb: activeVerb)
+        } else if !latestVerb.isEmpty {
+            liveLabel = "正在思考下一步…"
+            livePhase = .thinking
+        } else {
+            liveLabel = "正在思考…"
+            livePhase = .thinking
+        }
+
+        return VeloFocusFootprintData(
+            liveLabel: liveLabel,
+            livePhase: livePhase,
+            visibleStepCount: max(visibleStepCount, 1),
+            hasError: hasError,
+            rows: Array(rows.prefix(3))
+        )
+    }
+
     static func summarizeCompleted(_ items: [TimelineEventItem]) -> (label: String, secondary: String?, hasError: Bool) {
         var readCount = 0
         var searchCount = 0
         var editCount = 0
         var shellCount = 0
+        var mcpCount = 0
+        var mcpServerName = ""
         var otherCount = 0
         var realThinkCount = 0
         var hasError = false
@@ -413,8 +610,9 @@ private enum VeloActivityStreamBuilder {
             switch item.kind {
             case .thinking:
                 if !isNoiseThinking(item.content) { realThinkCount += 1 }
-            case .toolCall(let toolName, _, _, let summary, _, let isErr):
+            case .toolCall(let toolName, let displayName, _, let summary, _, let isErr):
                 if isErr { hasError = true }
+                if isInternalNoise(item) { continue }
                 let lower = toolName.lowercased()
                 if lower.contains("read") || lower.contains("view") || lower == "list_dir" {
                     readCount += 1
@@ -428,6 +626,9 @@ private enum VeloActivityStreamBuilder {
                     }
                 } else if lower.contains("bash") || lower.contains("shell") || lower.contains("cmd") || lower.contains("command") {
                     shellCount += 1
+                } else if lower == "call_mcp_tool" || lower.hasPrefix("mcp_") {
+                    mcpCount += 1
+                    if mcpServerName.isEmpty && !displayName.isEmpty { mcpServerName = displayName }
                 } else {
                     otherCount += 1
                 }
@@ -437,11 +638,16 @@ private enum VeloActivityStreamBuilder {
         }
 
         var parts: [String] = []
-        if readCount > 0 { parts.append("读取 \(readCount) 个文件") }
-        if searchCount > 0 { parts.append("检索 \(searchCount) 次") }
-        if editCount > 0 { parts.append("修改 \(editCount) 处") }
+        if !editedFiles.isEmpty {
+            parts.append("修改 \(editedFiles.count) 个文件")
+        } else if editCount > 0 {
+            parts.append("修改 \(editCount) 处")
+        }
         if shellCount > 0 { parts.append("运行 \(shellCount) 次命令") }
-        if otherCount > 0 { parts.append("\(otherCount) 项工具") }
+        if mcpCount > 0 { parts.append("\(mcpServerName.isEmpty ? "MCP" : mcpServerName) \(mcpCount) 次") }
+        if readCount > 0 && parts.count < 3 { parts.append("读取 \(readCount) 个文件") }
+        if searchCount > 0 && parts.count < 3 { parts.append("检索 \(searchCount) 次") }
+        if otherCount > 0 && parts.count < 3 { parts.append("\(otherCount) 项工具") }
         if parts.isEmpty && realThinkCount > 0 {
             parts.append("思考 \(realThinkCount) 次")
         }
@@ -574,6 +780,7 @@ private struct VeloExploreBatchRowView: View {
 
 public struct ExecutionTraceGroupView: View {
     public let items: [TimelineEventItem]
+    public let provider: String
     public let isTurnRunning: Bool
     public let turnStartedAt: Date?
     public let defaultExpanded: Bool
@@ -583,18 +790,20 @@ public struct ExecutionTraceGroupView: View {
 
     public init(
         items: [TimelineEventItem],
+        provider: String = "claude",
         isTurnRunning: Bool = false,
         turnStartedAt: Date? = nil,
         defaultExpanded: Bool = false
     ) {
         self.items = items
+        self.provider = provider
         self.isTurnRunning = isTurnRunning
         self.turnStartedAt = turnStartedAt
         self.defaultExpanded = defaultExpanded
     }
 
     @ViewBuilder
-    private func flatActivityList(_ rows: [VeloFlatActivityRow]) -> some View {
+    private func flatActivityList(_ rows: [VeloFlatActivityRow], engineMode: VeloTraceEngineMode) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
                 let isLastRow = idx == rows.count - 1
@@ -605,7 +814,8 @@ public struct ExecutionTraceGroupView: View {
                             rawText: item.content,
                             startedAt: startedAt ?? turnStartedAt,
                             durationMs: durationMs,
-                            isStreaming: isStreaming && isTurnRunning && isLastRow
+                            isStreaming: isStreaming && isTurnRunning && isLastRow,
+                            showLivePreview: engineMode == .claudeStream
                         )
                     }
                 case .exploreBatch(_, let batchItems):
@@ -636,15 +846,91 @@ public struct ExecutionTraceGroupView: View {
     }
 
     public var body: some View {
-        let rows = VeloActivityStreamBuilder.build(items, isTurnRunning: isTurnRunning)
+        let engineMode = VeloTraceEngineMode.resolve(provider)
+        let rows = VeloActivityStreamBuilder.build(
+            items,
+            isTurnRunning: isTurnRunning,
+            hideNoise: engineMode == .focusFootprint
+        )
         let summary = VeloActivityStreamBuilder.summarizeCompleted(items)
         let expanded = userExpanded ?? false
 
-        if rows.isEmpty {
+        if engineMode == .focusFootprint && isTurnRunning {
+            let fp = VeloActivityStreamBuilder.buildFocusFootprint(items, isTurnRunning: isTurnRunning)
+            VStack(alignment: .leading, spacing: 5) {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
+                        userExpanded = !expanded
+                    }
+                } label: {
+                    HStack(spacing: 7) {
+                        OrbitalStatusIcon(phase: fp.livePhase)
+                            .frame(width: 15)
+                        ShimmerTextView(fp.liveLabel, font: .system(size: 12.5, weight: .medium))
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        if let origin = turnStartedAt {
+                            TimelineView(.periodic(from: .now, by: 1.0)) { ctx in
+                                let sec = max(0, Int(ctx.date.timeIntervalSince(origin)))
+                                Text(VeloFormatting.formatDuration(ms: sec * 1000))
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        Text("\(fp.visibleStepCount) 步")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                    }
+                    .padding(.vertical, 3.5)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .onChange(of: isTurnRunning) { wasRunning, nowRunning in
+                    if wasRunning && !nowRunning {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
+                            userExpanded = nil
+                        }
+                    }
+                }
+
+                if !expanded && !fp.rows.isEmpty {
+                    IndentRailContainer {
+                        VStack(alignment: .leading, spacing: 3.5) {
+                            ForEach(fp.rows) { row in
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(row.tag)
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(.tertiary)
+                                        .frame(width: 26, alignment: .leading)
+                                    let joined = row.items.map { it in
+                                        it.count > 1 ? "\(it.label) ×\(it.count)" : it.label
+                                    }.joined(separator: " · ") + (row.extraCount > 0 ? " 等 +\(row.extraCount)" : "")
+                                    Text(joined)
+                                        .font(.system(size: 11.5, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 1)
+                    }
+                } else if expanded && !rows.isEmpty {
+                    IndentRailContainer {
+                        flatActivityList(rows, engineMode: engineMode)
+                            .padding(.vertical, 2)
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+        } else if rows.isEmpty {
             EmptyView()
         } else if isTurnRunning || defaultExpanded {
-            // Flat Codex/Cursor activity stream while running (no outer box, no phase nesting!)
-            flatActivityList(rows)
+            flatActivityList(rows, engineMode: engineMode)
                 .onChange(of: isTurnRunning) { wasRunning, nowRunning in
                     if wasRunning && !nowRunning {
                         withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
@@ -710,7 +996,7 @@ public struct ExecutionTraceGroupView: View {
 
                 if expanded {
                     IndentRailContainer {
-                        flatActivityList(rows)
+                        flatActivityList(rows, engineMode: engineMode)
                             .padding(.vertical, 2)
                     }
                     .transition(.opacity.combined(with: .move(edge: .top)))
