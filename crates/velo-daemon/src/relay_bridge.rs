@@ -598,10 +598,12 @@ async fn run_supervised_e2ee_bridge(
     state: DaemonState,
     mut cfg_rx: watch::Receiver<BridgeTargetConfig>,
 ) {
+    let mut consecutive_failures: u32 = 0;
     loop {
         let cfg = cfg_rx.borrow_and_update().clone();
         match connect_async(&cfg.connect_ws_url).await {
             Ok((ws_stream, _)) => {
+                consecutive_failures = 0;
                 BRIDGE_CONNECTED.store(true, Ordering::SeqCst);
                 info!(
                     "Daemon Zero-Trust E2EE Bridge connected to {} (room {})",
@@ -3001,17 +3003,29 @@ async fn run_supervised_e2ee_bridge(
             }
             Err(err) => {
                 BRIDGE_CONNECTED.store(false, Ordering::SeqCst);
-                warn!(
-                    "Daemon E2EE bridge connect to {} failed ({}); retrying...",
-                    cfg.connect_ws_url, err
-                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures <= 3 || consecutive_failures % 5 == 0 {
+                    warn!(
+                        "Daemon E2EE bridge connect to {} failed (attempt #{}, {}); retrying...",
+                        cfg.connect_ws_url, consecutive_failures, err
+                    );
+                }
             }
         }
 
-        // Wait 2s before reconnecting, or wake immediately if target config changed
+        // Exponential backoff (2s -> 4s -> 8s -> 15s -> 30s cap) while offline; wake immediately on config change
+        let backoff_secs: u64 = match consecutive_failures {
+            0 | 1 => 2,
+            2 => 4,
+            3 => 8,
+            4 => 15,
+            _ => 30,
+        };
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-            _ = cfg_rx.changed() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            _ = cfg_rx.changed() => {
+                consecutive_failures = 0;
+            }
         }
     }
 }

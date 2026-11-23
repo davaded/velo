@@ -172,6 +172,7 @@ impl VeloSqliteStore {
              PRAGMA busy_timeout = 5000;
              PRAGMA temp_store = MEMORY;
              PRAGMA cache_size = -16000;
+             PRAGMA wal_checkpoint(TRUNCATE);
              CREATE TABLE IF NOT EXISTS sessions (
                  id TEXT PRIMARY KEY,
                  created_at TEXT NOT NULL,

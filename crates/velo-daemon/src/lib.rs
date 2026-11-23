@@ -249,19 +249,21 @@ pub fn enrich_history_turn_metrics(events: &[AgentEvent]) -> Vec<AgentEvent> {
             );
 
         if already_normalized {
-            let final_usage = (*usage_events.last().unwrap()).clone();
-            let mut turn_out: Vec<AgentEvent> = turn_slice
-                .iter()
-                .filter(|e| !matches!(e, AgentEvent::UsageUpdated { .. }))
-                .cloned()
-                .collect();
-            if turn_out.len() > 1 && is_terminal_status_event(&turn_out[turn_out.len() - 1]) {
-                turn_out.insert(turn_out.len() - 1, final_usage);
-            } else {
-                turn_out.push(final_usage);
+            if let Some(last_usage) = usage_events.last() {
+                let final_usage = (*last_usage).clone();
+                let mut turn_out: Vec<AgentEvent> = turn_slice
+                    .iter()
+                    .filter(|e| !matches!(e, AgentEvent::UsageUpdated { .. }))
+                    .cloned()
+                    .collect();
+                if turn_out.len() > 1 && is_terminal_status_event(&turn_out[turn_out.len() - 1]) {
+                    turn_out.insert(turn_out.len() - 1, final_usage);
+                } else {
+                    turn_out.push(final_usage);
+                }
+                out.extend(turn_out);
+                continue;
             }
-            out.extend(turn_out);
-            continue;
         }
 
         let mut raw_steps: Vec<RawUsageStep> = Vec::new();
@@ -1074,6 +1076,18 @@ impl DaemonState {
     pub async fn new() -> Result<Self> {
         let velo_home = default_velo_home();
         tokio::fs::create_dir_all(&velo_home).await?;
+        // Keep long-running LaunchAgent log files bounded (<5 MB) on daemon startup
+        let logs_dir = velo_home.join("logs");
+        for log_name in ["daemon.err.log", "daemon.out.log"] {
+            let log_path = logs_dir.join(log_name);
+            if let Ok(meta) = tokio::fs::metadata(&log_path).await {
+                if meta.len() > 5 * 1024 * 1024 {
+                    let backup = logs_dir.join(format!("{}.1", log_name));
+                    let _ = tokio::fs::copy(&log_path, &backup).await;
+                    let _ = tokio::fs::write(&log_path, b"").await;
+                }
+            }
+        }
         let db_path = velo_home.join("velo.db");
         let state_file = velo_home.join("sessions.json");
         let events_dir = velo_home.join("events");
@@ -4187,33 +4201,57 @@ async fn open_editor_handler(Json(req): Json<OpenEditorRequest>) -> impl IntoRes
     };
     let status = match req.editor.as_str() {
         "auto" => {
-            if let Ok(st) = Command::new("cursor")
-                .args(["--goto", &goto_target])
-                .status()
-                .await
-            {
-                if st.success() {
-                    return (
-                        StatusCode::OK,
-                        Json(json!({ "ok": true, "editor": "cursor", "path": target })),
-                    )
-                        .into_response();
+            let has_cursor_app = Path::new("/Applications/Cursor.app").exists();
+            let has_vscode_app = Path::new("/Applications/Visual Studio Code.app").exists();
+            let has_zed_app = Path::new("/Applications/Zed.app").exists();
+            if has_cursor_app {
+                if let Ok(st) = Command::new("cursor")
+                    .args(["--goto", &goto_target])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+                {
+                    if st.success() {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({ "ok": true, "editor": "cursor", "path": target })),
+                        )
+                            .into_response();
+                    }
                 }
-            }
-            if let Ok(st) = Command::new("open")
-                .args(["-a", "Cursor", target])
-                .status()
-                .await
-            {
-                if st.success() {
-                    return (
-                        StatusCode::OK,
-                        Json(json!({ "ok": true, "editor": "cursor", "path": target })),
-                    )
-                        .into_response();
+                Command::new("open")
+                    .args(["-a", "Cursor", target])
+                    .status()
+                    .await
+            } else if has_vscode_app {
+                if let Ok(st) = Command::new("code")
+                    .args(["--goto", &goto_target])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+                {
+                    if st.success() {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({ "ok": true, "editor": "vscode", "path": target })),
+                        )
+                            .into_response();
+                    }
                 }
+                Command::new("open")
+                    .args(["-a", "Visual Studio Code", target])
+                    .status()
+                    .await
+            } else if has_zed_app {
+                Command::new("open")
+                    .args(["-a", "Zed", target])
+                    .status()
+                    .await
+            } else {
+                Command::new("open").arg(target).status().await
             }
-            Command::new("open").arg(target).status().await
         }
         "cursor" => {
             if req.line.is_some() {

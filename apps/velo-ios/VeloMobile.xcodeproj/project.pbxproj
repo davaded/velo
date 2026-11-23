@@ -18,7 +18,6 @@
 		767F27888C59D51418FB6A3E /* VeloCliSessionsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71E30A64F2D5609BA9178BD4 /* VeloCliSessionsSheet.swift */; };
 		8B43636C1DD169FBE665CA6C /* VeloLiveActivityExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FEF16B141B3999FF30C8FA64 /* VeloLiveActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		97D055905EB279BECD30AE6E /* RootSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */; };
-		AC50B5D5C5084CDF2BD2D4B2 /* VeloVoiceRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25AC32F5DCF4E51E8FFD3B07 /* VeloVoiceRecorder.swift */; };
 		B6D84F598B9090DF91FEE791 /* VeloSessionActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3F6064556E00520D2601592 /* VeloSessionActivityAttributes.swift */; };
 		B77B9C130A452EF84106382D /* VeloImageAnnotatorSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */; };
 		B87DE1091DB0CCCA2E33F72E /* VeloLiveActivityBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DE87A57ED7EFAC041356DA9 /* VeloLiveActivityBundle.swift */; };
@@ -56,7 +55,6 @@
 
 /* Begin PBXFileReference section */
 		1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootSessionsView.swift; sourceTree = "<group>"; };
-		25AC32F5DCF4E51E8FFD3B07 /* VeloVoiceRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloVoiceRecorder.swift; sourceTree = "<group>"; };
 		2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloImageAnnotatorSheet.swift; sourceTree = "<group>"; };
 		462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloAttachmentCache.swift; sourceTree = "<group>"; };
 		4B23793B28F46BDB8C60A104 /* VeloModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloModels.swift; sourceTree = "<group>"; };
@@ -150,7 +148,6 @@
 				462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */,
 				C851CC5E307FD7AEA5B93E5B /* VeloLiveActivityManager.swift */,
 				CC020058B3917BAE9C4C26A5 /* VeloStore.swift */,
-				25AC32F5DCF4E51E8FFD3B07 /* VeloVoiceRecorder.swift */,
 			);
 			path = Networking;
 			sourceTree = "<group>";
@@ -292,7 +289,6 @@
 				3C2C377806E4507B74A17A15 /* VeloRemoteHostsSheet.swift in Sources */,
 				B6D84F598B9090DF91FEE791 /* VeloSessionActivityAttributes.swift in Sources */,
 				00EF0E4CAD7E2FEBB6F1E847 /* VeloStore.swift in Sources */,
-				AC50B5D5C5084CDF2BD2D4B2 /* VeloVoiceRecorder.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

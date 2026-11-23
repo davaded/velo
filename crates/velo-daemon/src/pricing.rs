@@ -79,7 +79,7 @@ fn load_custom_overrides() -> HashMap<String, ModelRateCard> {
             map: HashMap::new(),
         })
     });
-    let mut guard = lock.lock().unwrap();
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     if guard.mtime == current_mtime {
         return guard.map.clone();
     }
