@@ -415,6 +415,8 @@ export interface AgentEvent {
   kind: "user" | "thinking" | "tool_call" | "assistant";
   content: string;
   images?: string[];
+  client_msg_id?: string;
+  seq?: number;
   is_streaming_chunk?: boolean;
   tool_name?: string;
   tool_args?: string;

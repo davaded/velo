@@ -286,6 +286,7 @@ async fn main() -> Result<()> {
                 approval_mode: None,
                 setup_command: None,
                 use_worktree,
+                client_msg_id: None,
             };
 
             let session: SessionInfo = http_post_json(addr, "/api/sessions", &req).await?;
@@ -357,7 +358,7 @@ async fn main() -> Result<()> {
 
                 while let Some(Ok(msg)) = ws_stream.next().await {
                     if let tokio_tungstenite::tungstenite::Message::Text(txt) = msg {
-                        if let Ok(WsServerMessage::Event { event }) =
+                        if let Ok(WsServerMessage::Event { event, .. }) =
                             serde_json::from_str::<WsServerMessage>(&txt)
                         {
                             if event.session_id() == target.id {

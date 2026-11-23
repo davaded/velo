@@ -1052,12 +1052,19 @@ pub struct DaemonInner {
     pub monitor_version: u64,
 }
 
+/// Broadcast wrapper carrying the authoritative SQLite `seq` (if persisted) alongside the event.
+#[derive(Debug, Clone)]
+pub struct SequencedAgentEvent {
+    pub seq: Option<i64>,
+    pub event: AgentEvent,
+}
+
 #[derive(Clone)]
 pub struct DaemonState {
     pub inner: Arc<RwLock<DaemonInner>>,
     pub db: storage::VeloSqliteStore,
     pub agent_event_tx: broadcast::Sender<AgentEvent>,
-    pub event_tx: broadcast::Sender<AgentEvent>,
+    pub event_tx: broadcast::Sender<SequencedAgentEvent>,
     pub snapshot_tx: broadcast::Sender<Vec<SessionInfo>>,
     pub worktree_mgr: WorktreeManager,
     pub state_file: PathBuf,
@@ -2013,16 +2020,14 @@ impl DaemonState {
                     }
                 }
 
-                for out_ev in outbound_events {
-                    let _ = state.event_tx.send(out_ev);
-                }
-
                 if let Some(u_ev) = db_usage_to_upsert {
                     let _ = state.db.upsert_turn_usage_event(session_id, &u_ev);
                 }
+                let mut persisted_seq: Option<i64> = None;
                 if let Some(a_ev) = db_event_to_append {
                     match state.db.append_event(session_id, &a_ev) {
                         Ok(seq) => {
+                            persisted_seq = Some(seq);
                             if let AgentEvent::MessageDelta { text, .. } = &a_ev {
                                 if !text.starts_with("[stderr]") && !text.trim().is_empty() {
                                     let mut guard = state.inner.write().await;
@@ -2045,6 +2050,21 @@ impl DaemonState {
                         }
                         Err(err) => warn!("failed to append session event: {err}"),
                     }
+                }
+                for out_ev in outbound_events {
+                    let is_ephemeral = matches!(
+                        out_ev,
+                        AgentEvent::ThinkingChunk { .. }
+                            | AgentEvent::MessageChunk { .. }
+                            | AgentEvent::TerminalOutput { .. }
+                            | AgentEvent::PtyOutput { .. }
+                            | AgentEvent::DiffUpdated { .. }
+                            | AgentEvent::BrowserCommand { .. }
+                    );
+                    let _ = state.event_tx.send(SequencedAgentEvent {
+                        seq: if is_ephemeral { None } else { persisted_seq },
+                        event: out_ev,
+                    });
                 }
                 if let Some((cfg, kind, sess, detail)) = push_notification_job {
                     tokio::spawn(async move {
@@ -2099,6 +2119,7 @@ impl DaemonState {
                                     approval_mode: None,
                                     mode: None,
                                     skill_path: queued_item.skill_path,
+                                    client_msg_id: None,
                                 },
                             )
                             .await;
@@ -2578,6 +2599,7 @@ impl DaemonState {
                 approval_mode: Some("auto_edit".to_string()),
                 setup_command: None,
                 use_worktree: true,
+                client_msg_id: None,
             })
             .await?;
 
@@ -2643,6 +2665,7 @@ impl DaemonState {
                 req.effort,
                 req.images,
                 req.approval_mode.unwrap_or_else(default_approval_mode),
+                req.client_msg_id,
             )
             .await?;
 
@@ -2689,6 +2712,7 @@ impl DaemonState {
             effort,
             images,
             default_approval_mode(),
+            None,
         )
         .await
     }
@@ -2709,6 +2733,7 @@ impl DaemonState {
         effort: Option<String>,
         images: Vec<String>,
         approval_mode: String,
+        client_msg_id: Option<String>,
     ) -> Result<SessionInfo> {
         let worktree_path = velo_worktree::ensure_usable_workspace_dir(&worktree_path).await;
         let repo_root = if tokio::fs::metadata(&repo_root)
@@ -2767,6 +2792,7 @@ impl DaemonState {
                 session_id,
                 text: prompt.clone(),
                 images: images.clone(),
+                client_msg_id,
                 timestamp: now,
             })
         } else {
@@ -2797,8 +2823,8 @@ impl DaemonState {
         }
         let _ = self.db.upsert_session(&session);
         if let Some(uev) = initial_user_ev {
-            let _ = self.db.append_event(session_id, &uev);
-            let _ = self.event_tx.send(uev);
+            let seq = self.db.append_event(session_id, &uev).ok();
+            let _ = self.event_tx.send(SequencedAgentEvent { seq, event: uev });
         }
 
         // If the user created an empty worktree thread (e.g. via New Thread / Advanced Worktree)
@@ -5097,7 +5123,13 @@ async fn terminal_start_handler(
             .into_response();
     }
 
-    match velo_agent::spawn_interactive_shell(id, wt_path.clone(), cols, rows, state.event_tx.clone())
+    match velo_agent::spawn_interactive_shell(
+        id,
+        wt_path.clone(),
+        cols,
+        rows,
+        state.agent_event_tx.clone(),
+    )
     {
         Ok(shell) => {
             let pid = shell.pid;
@@ -5140,7 +5172,7 @@ async fn terminal_input_handler(
             .map(|s| PathBuf::from(&s.worktree_path))
             .unwrap_or_else(fallback_workspace_dir);
         if let Ok(shell) =
-            velo_agent::spawn_interactive_shell(id, wt_path, 96, 28, state.event_tx.clone())
+            velo_agent::spawn_interactive_shell(id, wt_path, 96, 28, state.agent_event_tx.clone())
         {
             guard.shells.insert(id, shell);
         }
@@ -5196,7 +5228,13 @@ async fn terminal_restart_handler(
         .map(|s| PathBuf::from(&s.worktree_path))
         .unwrap_or_else(fallback_workspace_dir);
 
-    match velo_agent::spawn_interactive_shell(id, wt_path.clone(), 96, 28, state.event_tx.clone()) {
+    match velo_agent::spawn_interactive_shell(
+        id,
+        wt_path.clone(),
+        96,
+        28,
+        state.agent_event_tx.clone(),
+    ) {
         Ok(shell) => {
             let pid = shell.pid;
             guard.shells.insert(id, shell);
@@ -5762,6 +5800,7 @@ impl DaemonState {
             session_id: id,
             text: req.input.clone(),
             images: req.images.clone(),
+            client_msg_id: req.client_msg_id.clone(),
             timestamp: Utc::now(),
         };
         {
@@ -5780,12 +5819,16 @@ impl DaemonState {
                 .or_default()
                 .push(user_ev.clone());
         }
-        if req.truncate_to_user_turn.is_some() {
+        let user_seq = if req.truncate_to_user_turn.is_some() {
             let _ = self.persist_session_events(id).await;
+            None
         } else {
-            let _ = self.db.append_event(id, &user_ev);
-        }
-        let _ = self.event_tx.send(user_ev);
+            self.db.append_event(id, &user_ev).ok()
+        };
+        let _ = self.event_tx.send(SequencedAgentEvent {
+            seq: user_seq,
+            event: user_ev,
+        });
 
         let model_input =
             extensions::skill_turn_prompt(&req.input, req.skill_path.as_deref());
@@ -6049,6 +6092,7 @@ impl DaemonState {
                 req.effort.clone().or_else(|| source_session.effort.clone()),
                 Vec::new(),
                 source_session.approval_mode.clone(),
+                None,
             )
             .await?;
 
@@ -6093,6 +6137,7 @@ impl DaemonState {
                         approval_mode: Some(source_session.approval_mode),
                         mode: None,
                         skill_path: None,
+                        client_msg_id: None,
                     },
                 )
                 .await?;
@@ -6204,6 +6249,7 @@ impl DaemonState {
                 approval_mode: None,
                 mode: Some("steer".to_string()),
                 skill_path: item.skill_path,
+                client_msg_id: None,
             },
         )
         .await
@@ -6251,12 +6297,18 @@ impl DaemonState {
             }
             guard.event_history.entry(session_id).or_default().push(note_ev.clone());
         }
-        let _ = self.db.append_event(session_id, &note_ev);
-        let _ = self.event_tx.send(note_ev);
-        let _ = self.event_tx.send(AgentEvent::DiffUpdated {
-            session_id,
-            stats: fresh_diff,
-            timestamp: Utc::now(),
+        let note_seq = self.db.append_event(session_id, &note_ev).ok();
+        let _ = self.event_tx.send(SequencedAgentEvent {
+            seq: note_seq,
+            event: note_ev,
+        });
+        let _ = self.event_tx.send(SequencedAgentEvent {
+            seq: None,
+            event: AgentEvent::DiffUpdated {
+                session_id,
+                stats: fresh_diff,
+                timestamp: Utc::now(),
+            },
         });
         let _ = self.persist_sessions().await;
 
@@ -6724,6 +6776,7 @@ impl DaemonState {
                         approval_mode: None,
                         mode: None,
                         skill_path: None,
+                        client_msg_id: None,
                     },
                 )
                 .await;
@@ -7115,6 +7168,7 @@ impl DaemonState {
             session_id: sid,
             text: prompt.to_string(),
             images: Vec::new(),
+            client_msg_id: None,
             timestamp: now,
         };
 
@@ -7124,9 +7178,12 @@ impl DaemonState {
             guard.event_history.insert(sid, vec![user_ev.clone()]);
             guard.live_turns.insert(sid, LiveTurnMetrics::new(0, 0.0));
         }
-        let _ = self.db.append_event(sid, &user_ev);
+        let user_seq = self.db.append_event(sid, &user_ev).ok();
         let _ = self.persist_sessions().await;
-        let _ = self.event_tx.send(user_ev);
+        let _ = self.event_tx.send(SequencedAgentEvent {
+            seq: user_seq,
+            event: user_ev,
+        });
 
         let quoted_prompt = hosts::shell_quote_single(prompt);
         let remote_cmd = match prov {
@@ -8421,6 +8478,7 @@ async fn committee_handler(
             approval_mode: None,
             setup_command: None,
             use_worktree: true,
+            client_msg_id: None,
         };
         match state.create_session(create_req).await {
             Ok(s) => spawned.push(s),
@@ -8470,6 +8528,7 @@ async fn loop_handler(
         approval_mode: None,
         setup_command: None,
         use_worktree,
+        client_msg_id: None,
     };
 
     let initial_session = match state.create_session(create_req).await {
@@ -8498,7 +8557,8 @@ async fn loop_handler(
         for iter in 1..=max_iters {
             // Wait for current_session_id to finish
             loop {
-                let Ok(ev) = rx.recv().await else { return };
+                let Ok(seq_ev) = rx.recv().await else { return };
+                let ev = seq_ev.event;
                 if ev.session_id() == current_session_id {
                     if let AgentEvent::StatusChanged { status, .. } = ev {
                         if matches!(
@@ -8884,13 +8944,16 @@ async fn browser_inspect_handler(
     Json(req): Json<BrowserInspectRequest>,
 ) -> impl IntoResponse {
     if let Some(sid) = req.session_id {
-        let _ = state.event_tx.send(AgentEvent::BrowserCommand {
-            session_id: sid,
-            action: "open".to_string(),
-            url: Some(req.url.clone()),
-            selector: None,
-            script: None,
-            timestamp: Utc::now(),
+        let _ = state.event_tx.send(SequencedAgentEvent {
+            seq: None,
+            event: AgentEvent::BrowserCommand {
+                session_id: sid,
+                action: "open".to_string(),
+                url: Some(req.url.clone()),
+                selector: None,
+                script: None,
+                timestamp: Utc::now(),
+            },
         });
     }
     Json(inspect_url_summary(&req.url).await)
@@ -9367,6 +9430,7 @@ pub async fn handle_mcp_request_for_session(
                         approval_mode: None,
                         setup_command: None,
                         use_worktree,
+                        client_msg_id: None,
                     };
                     match state.create_session(req).await {
                         Ok(s) => json!({
@@ -9495,13 +9559,16 @@ pub async fn handle_mcp_request_for_session(
                                 s.preview_url = Some(url.clone());
                             }
                         }
-                        let _ = state.event_tx.send(AgentEvent::BrowserCommand {
-                            session_id: sid,
-                            action: "open".to_string(),
-                            url: Some(url.clone()),
-                            selector: None,
-                            script: None,
-                            timestamp: Utc::now(),
+                        let _ = state.event_tx.send(SequencedAgentEvent {
+                            seq: None,
+                            event: AgentEvent::BrowserCommand {
+                                session_id: sid,
+                                action: "open".to_string(),
+                                url: Some(url.clone()),
+                                selector: None,
+                                script: None,
+                                timestamp: Utc::now(),
+                            },
                         });
                     }
                     let summary = inspect_url_summary(&url).await;
@@ -9591,8 +9658,11 @@ async fn handle_ws_client(socket: WebSocket, state: DaemonState) {
                     }
                 }
             }
-            Ok(event) = event_rx.recv() => {
-                if let Ok(payload) = serde_json::to_string(&WsServerMessage::Event { event }) {
+            Ok(seq_ev) = event_rx.recv() => {
+                if let Ok(payload) = serde_json::to_string(&WsServerMessage::Event {
+                    event: seq_ev.event,
+                    seq: seq_ev.seq,
+                }) {
                     if sender.send(Message::Text(payload.into())).await.is_err() {
                         break;
                     }
@@ -9894,6 +9964,7 @@ composer-2.5 - Composer 2.5
             approval_mode: None,
             setup_command: None,
             use_worktree: true,
+            client_msg_id: None,
         };
 
         let session = state.create_session(req).await?;
@@ -9923,6 +9994,7 @@ composer-2.5 - Composer 2.5
             approval_mode: None,
             setup_command: None,
             use_worktree: false,
+            client_msg_id: None,
         };
         let inplace_sess = state.create_session(inplace_req).await?;
         assert_eq!(inplace_sess.worktree_path, inplace_sess.repo_root);
@@ -9982,21 +10054,26 @@ composer-2.5 - Composer 2.5
                 approval_mode: None,
                 setup_command: None,
                 use_worktree: false,
+                client_msg_id: Some("cid-missing-1".to_string()),
             })
             .await?;
         assert!(missing_dir.is_dir(), "missing workspace dir should auto-create");
 
         state.stop_session_by_id(missing_sess.id).await;
         let mut saw_stopped = false;
+        let mut saw_seq = false;
         for _ in 0..16 {
-            if let Ok(Ok(ev)) =
+            if let Ok(Ok(seq_ev)) =
                 tokio::time::timeout(std::time::Duration::from_millis(120), rx.recv()).await
             {
+                if seq_ev.seq.is_some() {
+                    saw_seq = true;
+                }
                 if let AgentEvent::StatusChanged {
                     session_id,
                     status: SessionStatus::Stopped,
                     ..
-                } = ev
+                } = seq_ev.event
                 {
                     if session_id == missing_sess.id {
                         saw_stopped = true;
@@ -10006,6 +10083,7 @@ composer-2.5 - Composer 2.5
             }
         }
         assert!(saw_stopped, "stop_session_by_id must broadcast StatusChanged::Stopped");
+        assert!(saw_seq, "persisted WS events must carry authoritative SQLite seq");
 
         let _ = tokio::fs::remove_dir_all(&temp_base).await;
         Ok(())
@@ -10027,6 +10105,7 @@ composer-2.5 - Composer 2.5
                 session_id: sid,
                 text: "Analyze CUA state and fix TPS".to_string(),
                 images: Vec::new(),
+                client_msg_id: None,
                 timestamp: ms(0),
             },
             AgentEvent::UsageUpdated {
@@ -10121,6 +10200,7 @@ composer-2.5 - Composer 2.5
                 session_id: sid,
                 text: "Quick AGY check".to_string(),
                 images: Vec::new(),
+                client_msg_id: None,
                 timestamp: ms(90_000),
             },
             AgentEvent::ThinkingDelta {
@@ -10505,6 +10585,7 @@ composer-2.5 - Composer 2.5
                 session_id: src_id,
                 text: "Turn 1 prompt".to_string(),
                 images: vec![],
+                client_msg_id: None,
                 timestamp: now,
             },
             AgentEvent::MessageDelta {
@@ -10516,6 +10597,7 @@ composer-2.5 - Composer 2.5
                 session_id: src_id,
                 text: "Turn 2 target prompt".to_string(),
                 images: vec![],
+                client_msg_id: None,
                 timestamp: now,
             },
             AgentEvent::ProviderSessionBound {
@@ -10532,6 +10614,7 @@ composer-2.5 - Composer 2.5
                 session_id: src_id,
                 text: "Turn 3 should be excluded".to_string(),
                 images: vec![],
+                client_msg_id: None,
                 timestamp: now,
             },
             AgentEvent::MessageDelta {

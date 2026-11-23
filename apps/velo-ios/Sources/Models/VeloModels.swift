@@ -802,6 +802,7 @@ public struct TimelineEventItem: Identifiable, Codable, Equatable, Sendable {
     public var inlineDiffNew: String? = nil
     public var subagentRole: String? = nil
     public var subagentPrompt: String? = nil
+    public var clientMsgId: String? = nil
 }
 
 public enum VeloInlineDiffExtractor {

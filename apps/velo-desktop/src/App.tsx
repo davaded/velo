@@ -28,6 +28,7 @@ import {
   PaseoTraceStepItem,
   PaseoTurnFooter,
   PaseoTurnTelemetry,
+  extractThinkingHeadline,
   resolvePaseoToolPresentation,
 } from "./components/ui/BeautifulAgentPrimitives";
 import {
@@ -332,14 +333,19 @@ function reconstructEventsFromHistory(
     if (evType === "user_message") {
       const text = String(ev.text ?? "").trim();
       const imgs = Array.isArray(ev.images) ? ev.images.map(String).filter(Boolean) : [];
+      const clientMsgId =
+        typeof ev.client_msg_id === "string" && ev.client_msg_id.trim()
+          ? ev.client_msg_id.trim()
+          : undefined;
       if (text || imgs.length > 0) {
         reconstructed.push({
-          id: `u-hist-${i}`,
+          id: clientMsgId ? `u-hist-${clientMsgId}` : `u-hist-${i}`,
           session_id: sid,
           timestamp: ts,
           kind: "user",
           content: text,
           images: imgs.length > 0 ? imgs : undefined,
+          client_msg_id: clientMsgId,
         });
         activeHistUserIdx = reconstructed.length - 1;
         activeHistStartMs = tsMs;
@@ -1357,6 +1363,14 @@ export function App() {
 
   const activeSessionIdRef = useRef<string>(activeSession.id);
   activeSessionIdRef.current = activeSession.id;
+  const sessionsStatusRef = useRef<Record<string, string>>({});
+  sessionsStatusRef.current = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const s of sessions) {
+      map[s.id] = s.status;
+    }
+    return map;
+  }, [sessions]);
 
   const [promptProgrammaticNonce, setPromptProgrammaticNonce] = useState<number>(0);
   const [hasComposerText, setHasComposerText] = useState<boolean>(() =>
@@ -1828,14 +1842,119 @@ export function App() {
                   return prev;
                 }
                 if (isIncrementalAppend && cur.length > 0) {
-                  const tailKeys = new Set(
-                    cur.slice(-12).map((e) => `${e.kind}|${e.timestamp}|${e.content.slice(0, 64)}`)
-                  );
-                  const fresh = reconstructed.filter(
-                    (e) => !tailKeys.has(`${e.kind}|${e.timestamp}|${e.content.slice(0, 64)}`)
-                  );
-                  if (fresh.length === 0) return prev;
-                  return { ...prev, [sid]: [...cur, ...fresh] };
+                  const next = [...cur];
+                  let mutated = false;
+                  for (const incoming of reconstructed) {
+                    if (incoming.kind === "user") {
+                      const trimmedIn = incoming.content.trim();
+                      let existingIdx = -1;
+                      if (incoming.client_msg_id) {
+                        for (let i = next.length - 1; i >= 0; i--) {
+                          if (
+                            next[i].kind === "user" &&
+                            next[i].client_msg_id === incoming.client_msg_id
+                          ) {
+                            existingIdx = i;
+                            break;
+                          }
+                        }
+                      }
+                      if (existingIdx === -1) {
+                        const floor = Math.max(0, next.length - 60);
+                        for (let i = next.length - 1; i >= floor; i--) {
+                          if (
+                            next[i].kind === "user" &&
+                            next[i].content.trim() === trimmedIn
+                          ) {
+                            existingIdx = i;
+                            break;
+                          }
+                        }
+                      }
+                      if (existingIdx !== -1) {
+                        next[existingIdx] = {
+                          ...next[existingIdx],
+                          id: incoming.id,
+                          timestamp: incoming.timestamp,
+                          client_msg_id: incoming.client_msg_id ?? next[existingIdx].client_msg_id,
+                          duration_ms: incoming.duration_ms ?? next[existingIdx].duration_ms,
+                          completed_at: incoming.completed_at ?? next[existingIdx].completed_at,
+                          tps: incoming.tps ?? next[existingIdx].tps,
+                          input_tokens: incoming.input_tokens ?? next[existingIdx].input_tokens,
+                          output_tokens: incoming.output_tokens ?? next[existingIdx].output_tokens,
+                          cache_read_tokens:
+                            incoming.cache_read_tokens ?? next[existingIdx].cache_read_tokens,
+                          cost_usd: incoming.cost_usd ?? next[existingIdx].cost_usd,
+                        };
+                        mutated = true;
+                        continue;
+                      }
+                      next.push(incoming);
+                      mutated = true;
+                      continue;
+                    }
+
+                    if (incoming.kind === "tool_call") {
+                      const existingToolIdx = next.findIndex(
+                        (e) => e.kind === "tool_call" && e.id === incoming.id
+                      );
+                      if (existingToolIdx !== -1) {
+                        next[existingToolIdx] = {
+                          ...next[existingToolIdx],
+                          ...incoming,
+                        };
+                        mutated = true;
+                        continue;
+                      }
+                      next.push(incoming);
+                      mutated = true;
+                      continue;
+                    }
+
+                    // Determine current turn boundary for thinking/assistant deduplication
+                    let turnStart = 0;
+                    for (let i = next.length - 1; i >= 0; i--) {
+                      if (next[i].kind === "user") {
+                        turnStart = i + 1;
+                        break;
+                      }
+                    }
+
+                    if (incoming.kind === "thinking") {
+                      const trimmedIn = incoming.content.trim();
+                      const alreadyInTurn = next
+                        .slice(turnStart)
+                        .some(
+                          (e) =>
+                            e.kind === "thinking" &&
+                            (e.content.trim() === trimmedIn || e.content.includes(trimmedIn))
+                        );
+                      if (alreadyInTurn) continue;
+                      next.push(incoming);
+                      mutated = true;
+                      continue;
+                    }
+
+                    if (incoming.kind === "assistant") {
+                      let folded = false;
+                      for (let i = next.length - 1; i >= turnStart; i--) {
+                        if (next[i].kind !== "assistant") continue;
+                        const fold = foldAssistantProjection(next[i].content, incoming.content);
+                        if (fold === "distinct") continue;
+                        folded = true;
+                        if (fold === "incoming") {
+                          next[i] = { ...next[i], content: incoming.content };
+                          mutated = true;
+                        }
+                        break;
+                      }
+                      if (!folded) {
+                        next.push(incoming);
+                        mutated = true;
+                      }
+                    }
+                  }
+                  return mutated ? { ...prev, [sid]: next } : prev;
                 }
                 return { ...prev, [sid]: reconstructed };
               });
@@ -1941,7 +2060,11 @@ export function App() {
     const resyncActiveOnFocus = () => {
       refreshSessions();
       const sid = activeSessionIdRef.current;
-      if (sid) {
+      const activeStatus = sid ? sessionsStatusRef.current[sid] : undefined;
+      const isLiveRunningWithWs =
+        directWsConnectedRef.current &&
+        (activeStatus === "running" || activeStatus === "waiting_approval");
+      if (sid && !isLiveRunningWithWs) {
         syncSessionEventsFromDaemon(sid, { incremental: true });
       }
       if (isPinnedToBottomRef.current) {
@@ -2462,6 +2585,8 @@ export function App() {
       }
 
       const now = new Date().toLocaleTimeString([], { hour12: false });
+      const frameSeq =
+        raw.kind === "event" && typeof raw.seq === "number" ? (raw.seq as number) : undefined;
       const evObj =
         raw.kind === "event" && raw.event && typeof raw.event === "object"
           ? (raw.event as Record<string, unknown>)
@@ -2470,6 +2595,30 @@ export function App() {
       const evType = String(evObj.type ?? "");
       const sid = String(evObj.session_id ?? "");
       if (!sid) return;
+
+      // Advance authoritative SQLite cursor from WS events so focus resync hits `unchanged: true`,
+      // and ignore stale persisted WS frames that were already superseded by a newer HTTP sync.
+      if (frameSeq !== undefined) {
+        const prevMeta = eventsMetaBySessionRef.current[sid];
+        const prevNewest = prevMeta?.newestSeq ?? null;
+        if (
+          prevNewest !== null &&
+          frameSeq <= prevNewest &&
+          evType !== "status_changed" &&
+          evType !== "usage_updated"
+        ) {
+          return;
+        }
+        if (prevNewest === null || frameSeq > prevNewest) {
+          const parsedEvTs =
+            typeof evObj.timestamp === "string" ? new Date(evObj.timestamp).getTime() : NaN;
+          eventsMetaBySessionRef.current[sid] = {
+            newestSeq: frameSeq,
+            eventCount: (prevMeta?.eventCount ?? 0) + 1,
+            latestTsMs: Number.isNaN(parsedEvTs) ? Date.now() : parsedEvTs,
+          };
+        }
+      }
 
       // Preserve strict ordering: flush any buffered streaming chunks for this session
       // before applying lifecycle, tool, final delta, or error events.
@@ -2481,10 +2630,17 @@ export function App() {
         delete ttftRecordedBySessionRef.current[sid];
         const text = String(evObj.text ?? "").trim();
         const imgs = Array.isArray(evObj.images) ? evObj.images.map(String).filter(Boolean) : [];
+        const clientMsgId =
+          typeof evObj.client_msg_id === "string" && evObj.client_msg_id.trim()
+            ? evObj.client_msg_id.trim()
+            : undefined;
         if (!text && imgs.length === 0) return;
         const parsedTs =
           typeof evObj.timestamp === "string" ? new Date(evObj.timestamp).getTime() : NaN;
         const turnOriginMs = Number.isNaN(parsedTs) ? Date.now() : parsedTs;
+        const serverTsLabel = Number.isNaN(parsedTs)
+          ? now
+          : new Date(parsedTs).toLocaleTimeString([], { hour12: false });
         turnStartMsRef.current[sid] = turnOriginMs;
         stepStartMsRef.current[sid] = turnOriginMs;
         delete streamOutCharsRef.current[sid];
@@ -2504,15 +2660,38 @@ export function App() {
         });
         setEventsBySession((prev) => {
           const list = prev[sid] || [];
-          // Only deduplicate against an unconfirmed optimistic bubble sent from THIS desktop window (`u-local-*`)
-          for (let i = list.length - 1; i >= Math.max(0, list.length - 3); i--) {
+          // 1. Deterministic correlation via client_msg_id across full session history
+          if (clientMsgId) {
+            for (let i = list.length - 1; i >= 0; i--) {
+              if (list[i].kind === "user" && list[i].client_msg_id === clientMsgId) {
+                const next = [...list];
+                next[i] = {
+                  ...next[i],
+                  id: `u-sync-${frameSeq ?? Date.now()}`,
+                  timestamp: serverTsLabel,
+                  seq: frameSeq ?? next[i].seq,
+                  images: imgs.length > 0 ? imgs : next[i].images,
+                };
+                return { ...prev, [sid]: next };
+              }
+            }
+          }
+          // 2. Fallback: match unconfirmed optimistic bubble (`u-local-*`) within recent 20 events
+          for (let i = list.length - 1; i >= Math.max(0, list.length - 20); i--) {
             if (
               list[i].kind === "user" &&
               list[i].id.startsWith("u-local-") &&
               list[i].content.trim() === text
             ) {
               const next = [...list];
-              next[i] = { ...next[i], id: `u-sync-${Date.now()}` };
+              next[i] = {
+                ...next[i],
+                id: `u-sync-${frameSeq ?? Date.now()}`,
+                timestamp: serverTsLabel,
+                client_msg_id: clientMsgId ?? next[i].client_msg_id,
+                seq: frameSeq ?? next[i].seq,
+                images: imgs.length > 0 ? imgs : next[i].images,
+              };
               return { ...prev, [sid]: next };
             }
           }
@@ -2521,12 +2700,14 @@ export function App() {
             [sid]: [
               ...list,
               {
-                id: `u-ws-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                id: `u-ws-${frameSeq ?? Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
                 session_id: sid,
-                timestamp: now,
+                timestamp: serverTsLabel,
                 kind: "user",
                 content: text,
                 images: imgs.length > 0 ? imgs : undefined,
+                client_msg_id: clientMsgId,
+                seq: frameSeq,
               },
             ],
           };
@@ -3937,13 +4118,15 @@ export function App() {
 
     const now = new Date().toLocaleTimeString([], { hour12: false });
     const baseEvents = overridePriorEvents ?? (eventsBySession[activeSession.id] || []);
+    const clientMsgId = `cmsg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const userEv: AgentEvent = {
-      id: `u-local-${Date.now()}`,
+      id: `u-local-${clientMsgId}`,
       session_id: activeSession.id,
       timestamp: now,
       kind: "user",
       content: text,
       images: attachedPaths.length > 0 ? attachedPaths : undefined,
+      client_msg_id: clientMsgId,
     };
 
     const startedAtMs = Date.now();
@@ -4195,6 +4378,7 @@ export function App() {
           images: attachedPaths,
           mode: executionMode ?? null,
           skill_path: skillPath ?? null,
+          client_msg_id: clientMsgId,
         }),
       });
 
@@ -4222,6 +4406,7 @@ export function App() {
           approval_mode: activeSession.approval_mode,
           images: attachedPaths,
           use_worktree: wantsIsolatedWorktree,
+          client_msg_id: clientMsgId,
         }),
       });
 
@@ -4314,6 +4499,7 @@ export function App() {
           effort: activeSession.effort || "medium",
           approval_mode: activeSession.approval_mode,
           skill_path: skillPath,
+          client_msg_id: clientMsgId,
         })
       ) {
         return;
@@ -7311,18 +7497,18 @@ export function App() {
                         let turnPhase: AgentStatusPhase = "working";
                         let turnStatusLabel: string | undefined = "Working…";
                         if (isTurnRunning) {
+                          const latestThinkingEv = [...turn.items]
+                            .reverse()
+                            .find((e) => e.kind === "thinking");
+                          const latestThinkHeadline = latestThinkingEv
+                            ? extractThinkingHeadline(latestThinkingEv.content)
+                            : "";
                           if (waitingLabel) {
                             turnPhase = "waiting";
                             turnStatusLabel = waitingLabel;
                           } else if (!lastTurnItem) {
                             turnPhase = "thinking";
                             turnStatusLabel = undefined;
-                          } else if (
-                            lastTurnItem.kind === "thinking" &&
-                            lastTurnItem.is_streaming_chunk
-                          ) {
-                            turnPhase = "working";
-                            turnStatusLabel = "Working…";
                           } else if (
                             lastTurnItem.kind === "tool_call" &&
                             lastTurnItem.tool_output === undefined
@@ -7345,9 +7531,17 @@ export function App() {
                           ) {
                             turnPhase = "writing";
                             turnStatusLabel = "Writing…";
+                          } else if (lastTurnItem.kind === "thinking") {
+                            turnPhase = "thinking";
+                            turnStatusLabel = latestThinkHeadline
+                              ? `思考 · ${latestThinkHeadline}`
+                              : undefined;
+                          } else if (lastTurnItem.kind === "tool_call") {
+                            turnPhase = "thinking";
+                            turnStatusLabel = "正在分析结果并规划下一阶段…";
                           } else {
                             turnPhase = "working";
-                            turnStatusLabel = "Working…";
+                            turnStatusLabel = latestThinkHeadline || "Working…";
                           }
                         }
 
@@ -7596,7 +7790,7 @@ export function App() {
                                         (isLatestTurn ? activeTurnTiming?.startedAtMs : undefined)
                                       }
                                       durationMs={ev.duration_ms}
-                                      defaultExpanded={false}
+                                      defaultExpanded={isStreamingThinking}
                                     />
                                   );
                                 }

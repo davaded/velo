@@ -788,6 +788,12 @@ public final class VeloStore: ObservableObject {
         reportPresence(focused: true, sessionId: sessionId)
         let meta = eventsMetaBySession[sessionId]
         let hasCachedEvents = !(eventsBySession[sessionId]?.isEmpty ?? true)
+        let sessionObj = sessions.first(where: { $0.id == sessionId })
+        if incremental && isConnected && hasCachedEvents &&
+            (sessionObj?.status == .running || sessionObj?.status == .waitingApproval)
+        {
+            return
+        }
         let useIncremental = incremental && meta != nil && hasCachedEvents
 
         switch connectionConfig {
@@ -840,12 +846,9 @@ public final class VeloStore: ObservableObject {
             if isIncrementalAppend {
                 guard !items.isEmpty else { return }
                 if !Self.hasStreamingTimelineItem(self.eventsBySession[sessionId] ?? []) {
-                    var existing = self.eventsBySession[sessionId] ?? []
-                    let tailKeys = Set(existing.suffix(12).map { "\($0.timestamp)|\($0.content.prefix(64))" })
-                    let fresh = items.filter { !tailKeys.contains("\($0.timestamp)|\($0.content.prefix(64))") }
-                    if !fresh.isEmpty {
-                        existing.append(contentsOf: fresh)
-                        self.eventsBySession[sessionId] = existing
+                    let existing = self.eventsBySession[sessionId] ?? []
+                    if let merged = Self.mergeIncrementalTimelineEvents(existing: existing, incoming: items) {
+                        self.eventsBySession[sessionId] = merged
                         self.scheduleCacheSave()
                     }
                 }
@@ -1164,12 +1167,14 @@ public final class VeloStore: ObservableObject {
         }
 
         // Optimistically append user bubble & mark session running
+        let clientMsgId = "cmsg-\(UUID().uuidString.prefix(12).lowercased())"
         let userItem = TimelineEventItem(
-            id: "u-local-\(UUID().uuidString.prefix(8))",
+            id: "u-local-\(clientMsgId)",
             sessionId: sessionId,
             timestamp: timeStr,
             content: clean,
-            kind: .user(images: images)
+            kind: .user(images: images),
+            clientMsgId: clientMsgId
         )
         list.append(userItem)
         eventsBySession[sessionId] = list
@@ -1213,6 +1218,7 @@ public final class VeloStore: ObservableObject {
                 "provider": providerKind,
                 "images": images,
                 "approval_mode": approvalMode,
+                "client_msg_id": clientMsgId,
             ]
             if let truncIdx = truncateToUserTurn {
                 body["truncate_to_user_turn"] = truncIdx
@@ -1248,6 +1254,7 @@ public final class VeloStore: ObservableObject {
                 "provider": providerKind,
                 "images": images,
                 "approval_mode": approvalMode,
+                "client_msg_id": clientMsgId,
             ]
             if let truncIdx = truncateToUserTurn {
                 payload["truncate_to_user_turn"] = truncIdx
@@ -3507,12 +3514,9 @@ public final class VeloStore: ObservableObject {
                                 fallbackProvider: prov
                             )
                             if !parsed.isEmpty && !Self.hasStreamingTimelineItem(eventsBySession[sid] ?? []) {
-                                var existing = eventsBySession[sid] ?? []
-                                let tailKeys = Set(existing.suffix(12).map { "\($0.timestamp)|\($0.content.prefix(64))" })
-                                let fresh = parsed.filter { !tailKeys.contains("\($0.timestamp)|\($0.content.prefix(64))") }
-                                if !fresh.isEmpty {
-                                    existing.append(contentsOf: fresh)
-                                    eventsBySession[sid] = existing
+                                let existing = eventsBySession[sid] ?? []
+                                if let merged = Self.mergeIncrementalTimelineEvents(existing: existing, incoming: parsed) {
+                                    eventsBySession[sid] = merged
                                     scheduleCacheSave()
                                 }
                             }
@@ -3610,6 +3614,9 @@ public final class VeloStore: ObservableObject {
             }
         }
 
+        let frameSeq: Int? = (raw["kind"] as? String) == "event"
+            ? VeloSessionItem.intValue(raw["seq"])
+            : nil
         let evObj: [String: Any] = {
             if let kind = raw["kind"] as? String, kind == "event",
                let inner = raw["event"] as? [String: Any]
@@ -3623,6 +3630,25 @@ public final class VeloStore: ObservableObject {
               let sid = evObj["session_id"] as? String, !sid.isEmpty
         else { return }
 
+        if let frameSeq {
+            let prevMeta = eventsMetaBySession[sid]
+            if let prevNewest = prevMeta?.newestSeq,
+               frameSeq <= prevNewest,
+               evType != "status_changed",
+               evType != "usage_updated"
+            {
+                return
+            }
+            if prevMeta == nil || frameSeq > (prevMeta?.newestSeq ?? -1) {
+                let tsMs = Int((Self.parseServerDate(evObj["timestamp"]) ?? Date()).timeIntervalSince1970 * 1000)
+                eventsMetaBySession[sid] = (
+                    newestSeq: frameSeq,
+                    eventCount: (prevMeta?.eventCount ?? 0) + 1,
+                    latestTsMs: tsMs
+                )
+            }
+        }
+
         if evType != "thinking_chunk" && evType != "message_chunk" {
             flushPendingStreamChunks(onlySessionId: sid)
         }
@@ -3635,6 +3661,7 @@ public final class VeloStore: ObservableObject {
         case "user_message":
             let text = (evObj["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let imgs = (evObj["images"] as? [String]) ?? []
+            let clientMsgId = (evObj["client_msg_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty || !imgs.isEmpty else { return }
             if !sessions.contains(where: { $0.id == sid }) {
                 Task { await refreshSessionsAndActiveEvents() }
@@ -3646,15 +3673,35 @@ public final class VeloStore: ObservableObject {
             streamStatsBySession.removeValue(forKey: sid)
 
             var list = eventsBySession[sid] ?? []
-            if let localIdx = list.lastIndex(where: { item in
-                guard item.id.hasPrefix("u-local-") || item.id.hasPrefix("u-init-") else { return false }
-                if case .user = item.kind {
-                    return item.content == text || (text == "请查看附图" && item.content.isEmpty)
+            let matchedIdx: Int? = {
+                if let cid = clientMsgId, !cid.isEmpty {
+                    if let idx = list.lastIndex(where: { item in
+                        if case .user = item.kind { return item.clientMsgId == cid }
+                        return false
+                    }) {
+                        return idx
+                    }
                 }
-                return false
-            }) {
-                list[localIdx].id = "u-sync-\(UUID().uuidString.prefix(8))"
+                let floor = max(0, list.count - 20)
+                for idx in stride(from: list.count - 1, through: floor, by: -1) {
+                    let item = list[idx]
+                    guard item.id.hasPrefix("u-local-") || item.id.hasPrefix("u-init-") else { continue }
+                    if case .user = item.kind {
+                        if item.content.trimmingCharacters(in: .whitespacesAndNewlines) == text
+                            || (text == "请查看附图" && item.content.isEmpty)
+                        {
+                            return idx
+                        }
+                    }
+                }
+                return nil
+            }()
+            if let localIdx = matchedIdx {
+                list[localIdx].id = "u-sync-\(frameSeq.map(String.init) ?? String(UUID().uuidString.prefix(8)))"
                 list[localIdx].timestamp = nowLabel
+                if let cid = clientMsgId, !cid.isEmpty {
+                    list[localIdx].clientMsgId = cid
+                }
                 if !imgs.isEmpty {
                     list[localIdx].kind = .user(images: imgs)
                 }
@@ -3662,11 +3709,12 @@ public final class VeloStore: ObservableObject {
             } else {
                 list.append(
                     TimelineEventItem(
-                        id: "u-ws-\(UUID().uuidString.prefix(8))",
+                        id: "u-ws-\(frameSeq.map(String.init) ?? String(UUID().uuidString.prefix(8)))",
                         sessionId: sid,
                         timestamp: nowLabel,
                         content: text,
-                        kind: .user(images: imgs)
+                        kind: .user(images: imgs),
+                        clientMsgId: clientMsgId
                     )
                 )
                 eventsBySession[sid] = list
@@ -4269,6 +4317,114 @@ public final class VeloStore: ObservableObject {
         return "distinct"
     }
 
+    /// Idempotently merges newly fetched incremental events without duplicating optimistic user bubbles,
+    /// active tool calls, or reasoning/assistant entries inside the current turn.
+    private static func mergeIncrementalTimelineEvents(
+        existing: [TimelineEventItem],
+        incoming: [TimelineEventItem]
+    ) -> [TimelineEventItem]? {
+        guard !incoming.isEmpty else { return nil }
+        var next = existing
+        var mutated = false
+
+        for item in incoming {
+            switch item.kind {
+            case .user:
+                let trimmed = item.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                var matchedIdx: Int?
+                if let cid = item.clientMsgId, !cid.isEmpty {
+                    matchedIdx = next.lastIndex(where: { cur in
+                        if case .user = cur.kind { return cur.clientMsgId == cid }
+                        return false
+                    })
+                }
+                if matchedIdx == nil {
+                    let floor = max(0, next.count - 60)
+                    for i in stride(from: next.count - 1, through: floor, by: -1) {
+                        if case .user = next[i].kind,
+                           next[i].content.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed
+                        {
+                            matchedIdx = i
+                            break
+                        }
+                    }
+                }
+                if let idx = matchedIdx {
+                    next[idx].id = item.id
+                    next[idx].timestamp = item.timestamp
+                    if let cid = item.clientMsgId, !cid.isEmpty { next[idx].clientMsgId = cid }
+                    if let d = item.durationMs { next[idx].durationMs = d }
+                    if let c = item.completedAt { next[idx].completedAt = c }
+                    if let t = item.telemetry { next[idx].telemetry = t }
+                    mutated = true
+                } else {
+                    next.append(item)
+                    mutated = true
+                }
+
+            case .toolCall:
+                if let idx = next.firstIndex(where: { cur in
+                    if case .toolCall = cur.kind { return cur.id == item.id }
+                    return false
+                }) {
+                    next[idx] = item
+                    mutated = true
+                } else {
+                    next.append(item)
+                    mutated = true
+                }
+
+            case .thinking:
+                let turnStart = (next.lastIndex(where: { if case .user = $0.kind { return true }; return false }) ?? -1) + 1
+                let trimmed = item.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                let dup = next[turnStart...].contains { cur in
+                    if case .thinking = cur.kind {
+                        let ct = cur.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return ct == trimmed || ct.contains(trimmed)
+                    }
+                    return false
+                }
+                if !dup {
+                    next.append(item)
+                    mutated = true
+                }
+
+            case .assistant:
+                let turnStart = (next.lastIndex(where: { if case .user = $0.kind { return true }; return false }) ?? -1) + 1
+                var folded = false
+                if turnStart < next.count {
+                    for i in stride(from: next.count - 1, through: turnStart, by: -1) {
+                        if case .assistant = next[i].kind {
+                            let fold = foldAssistantProjection(previous: next[i].content, incoming: item.content)
+                            if fold == "distinct" { continue }
+                            folded = true
+                            if fold == "incoming" {
+                                next[i].content = item.content
+                                mutated = true
+                            }
+                            break
+                        }
+                    }
+                }
+                if !folded {
+                    next.append(item)
+                    mutated = true
+                }
+
+            case .error:
+                let dup = next.last.map { cur in
+                    if case .error = cur.kind { return cur.content == item.content }
+                    return false
+                } ?? false
+                if !dup {
+                    next.append(item)
+                    mutated = true
+                }
+            }
+        }
+        return mutated ? next : nil
+    }
+
     private static func hasStreamingTimelineItem(_ items: [TimelineEventItem]) -> Bool {
         items.contains { item in
             switch item.kind {
@@ -4328,14 +4484,16 @@ public final class VeloStore: ObservableObject {
             case "user_message":
                 let text = ((ev["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let imgs = (ev["images"] as? [String]) ?? []
+                let cid = (ev["client_msg_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !text.isEmpty || !imgs.isEmpty {
                     out.append(
                         TimelineEventItem(
-                            id: "u-hist-\(i)",
+                            id: (cid != nil && !cid!.isEmpty) ? "u-hist-\(cid!)" : "u-hist-\(i)",
                             sessionId: sessionId,
                             timestamp: tsLabel,
                             content: text,
-                            kind: .user(images: imgs)
+                            kind: .user(images: imgs),
+                            clientMsgId: (cid != nil && !cid!.isEmpty) ? cid : nil
                         )
                     )
                     activeUserIdx = out.count - 1

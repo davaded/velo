@@ -239,6 +239,8 @@ pub enum AgentEvent {
         text: String,
         #[serde(default)]
         images: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
         timestamp: DateTime<Utc>,
     },
     ProviderSessionBound {
@@ -425,6 +427,8 @@ pub struct CreateSessionRequest {
     pub setup_command: Option<String>,
     #[serde(default)]
     pub use_worktree: bool,
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
 }
 
 /// Request payload to hand off an existing session's worktree & context to another agent.
@@ -462,6 +466,9 @@ pub struct SessionInputRequest {
     /// Path of a `SKILL.md` to follow for this turn. Stored user text stays `input`.
     #[serde(default)]
     pub skill_path: Option<String>,
+    /// Client-generated optimistic message correlation ID for deterministic deduplication.
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
 }
 
 /// Client-to-daemon WebSocket command envelope.
@@ -489,7 +496,11 @@ pub enum WsClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WsServerMessage {
-    Event { event: AgentEvent },
+    Event {
+        event: AgentEvent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
+    },
     SessionsSnapshot { sessions: Vec<SessionInfo> },
     Pong,
 }

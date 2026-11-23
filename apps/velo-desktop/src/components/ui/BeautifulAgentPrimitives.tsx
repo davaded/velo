@@ -604,6 +604,22 @@ export const PaseoExpandableBadge: React.FC<{
   );
 };
 
+export function isPlaceholderReasoningText(raw: string): boolean {
+  const t = raw.trim().replace(/\*\*/g, "").trim();
+  return /^Reasoning completed\s*\(\d+\s+thinking tokens\)$/i.test(t);
+}
+
+export function extractThinkingTokensFromPlaceholder(raw: string): number | null {
+  const m = raw.match(/Reasoning completed\s*\((\d+)\s+thinking tokens\)/i);
+  return m ? Number(m[1]) : null;
+}
+
+export function extractThinkingHeadline(raw: string): string {
+  if (!raw || isPlaceholderReasoningText(raw)) return "";
+  const { summary } = parseReasoningContent(raw);
+  return summary;
+}
+
 /**
  * Helper to clean raw reasoning text (strips fake boilerplate and formats **bold** headers)
  */
@@ -625,7 +641,7 @@ function parseReasoningContent(raw: string): {
     return { summary: "", cleanedLines: [] };
   }
 
-  // Extract latest headline or last line as summary, stripping markdown **
+  // Extract latest headline or first substantive line as summary, stripping markdown **
   let summary = "";
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
@@ -635,7 +651,10 @@ function parseReasoningContent(raw: string): {
     }
   }
   if (!summary) {
-    summary = lines[lines.length - 1].replace(/\*\*/g, "").trim();
+    summary = lines[0].replace(/\*\*/g, "").trim();
+  }
+  if (summary.length > 84) {
+    summary = `${summary.slice(0, 82).trimEnd()}…`;
   }
 
   return { summary, cleanedLines: lines };
@@ -1241,6 +1260,286 @@ export interface PaseoTraceStepItem {
   fileArg?: string;
 }
 
+export interface ExecutionPhase {
+  id: string;
+  index: number;
+  title: string;
+  tokenBadge?: string;
+  thinkingStep?: PaseoTraceStepItem;
+  toolSteps: PaseoTraceStepItem[];
+  hasError: boolean;
+  isAnyToolRunning: boolean;
+  isStreamingThinking: boolean;
+  durationMs?: number;
+}
+
+function derivePhaseTitleFromTools(toolSteps: PaseoTraceStepItem[]): string {
+  if (toolSteps.length === 0) return "分析与规划";
+  const edits: string[] = [];
+  const reads: string[] = [];
+  const searches: string[] = [];
+  let shells = 0;
+  let others = 0;
+  let firstOther = "";
+
+  for (const st of toolSteps) {
+    const pres = resolvePaseoToolPresentation(st.toolName || "Tool", st.input, st.output);
+    const shortName = pres.summary ? pres.summary.split("/").pop() || pres.summary : "";
+    if (pres.kind === "edit") {
+      if (shortName && !edits.includes(shortName)) edits.push(shortName);
+      else if (edits.length === 0) edits.push("代码");
+    } else if (pres.kind === "read") {
+      if (shortName && !reads.includes(shortName)) reads.push(shortName);
+      else if (reads.length === 0) reads.push("文件");
+    } else if (pres.kind === "search") {
+      if (pres.summary && !searches.includes(pres.summary)) searches.push(pres.summary);
+      else if (searches.length === 0) searches.push("代码");
+    } else if (pres.kind === "shell") {
+      shells++;
+    } else {
+      others++;
+      if (!firstOther) firstOther = pres.displayName;
+    }
+  }
+
+  const parts: string[] = [];
+  if (edits.length > 0) {
+    parts.push(
+      edits.length === 1 ? `修改 ${edits[0]}` : `修改 ${edits[0]} 等 ${edits.length} 个文件`
+    );
+  }
+  if (reads.length > 0) {
+    parts.push(
+      reads.length === 1 ? `查看 ${reads[0]}` : `查看 ${reads[0]} 等 ${reads.length} 个文件`
+    );
+  }
+  if (searches.length > 0) {
+    const q = searches[0].slice(0, 26);
+    parts.push(`检索 ${q}`);
+  }
+  if (shells > 0) {
+    parts.push(shells === 1 ? "执行命令验证" : `执行 ${shells} 次命令`);
+  }
+  if (others > 0 && parts.length === 0) {
+    parts.push(others === 1 ? `调用 ${firstOther}` : `调用 ${firstOther} 等 ${others} 项工具`);
+  }
+  return parts.slice(0, 2).join(" · ") || "执行工具步骤";
+}
+
+export function groupStepsIntoPhases(
+  steps: PaseoTraceStepItem[],
+  isTurnRunning: boolean
+): ExecutionPhase[] {
+  const rawPhases: Array<{
+    id: string;
+    thinkingStep?: PaseoTraceStepItem;
+    toolSteps: PaseoTraceStepItem[];
+  }> = [];
+
+  for (const st of steps) {
+    if (st.kind === "thinking") {
+      rawPhases.push({
+        id: st.id,
+        thinkingStep: st,
+        toolSteps: [],
+      });
+    } else {
+      const last = rawPhases[rawPhases.length - 1];
+      if (last) {
+        last.toolSteps.push(st);
+      } else {
+        rawPhases.push({
+          id: st.id,
+          toolSteps: [st],
+        });
+      }
+    }
+  }
+
+  return rawPhases.map((rp, idx) => {
+    const rawThink = rp.thinkingStep?.text || "";
+    const placeholderTokens = extractThinkingTokensFromPlaceholder(rawThink);
+    const realHeadline = extractThinkingHeadline(rawThink);
+    const title =
+      realHeadline ||
+      (rp.toolSteps.length > 0
+        ? derivePhaseTitleFromTools(rp.toolSteps)
+        : placeholderTokens
+        ? `深度推理 (${placeholderTokens} tokens)`
+        : "分析上下文");
+
+    const hasError = rp.toolSteps.some((t) => Boolean(t.isError));
+    const isAnyToolRunning =
+      isTurnRunning && rp.toolSteps.some((t) => t.output === undefined);
+    const isStreamingThinking = Boolean(
+      isTurnRunning && rp.thinkingStep?.isStreamingThinking
+    );
+
+    return {
+      id: rp.id,
+      index: idx + 1,
+      title,
+      tokenBadge: placeholderTokens ? `${placeholderTokens} tok` : undefined,
+      thinkingStep: rp.thinkingStep,
+      toolSteps: rp.toolSteps,
+      hasError,
+      isAnyToolRunning,
+      isStreamingThinking,
+      durationMs: rp.thinkingStep?.durationMs,
+    };
+  });
+}
+
+const ExecutionPhaseRow: React.FC<{
+  phase: ExecutionPhase;
+  isActivePhase: boolean;
+  isTurnRunning: boolean;
+  onOpenDiffForFile?: (fileArg?: string) => void;
+}> = ({ phase, isActivePhase, isTurnRunning, onOpenDiffForFile }) => {
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
+  const prevActiveRef = useRef<boolean>(isActivePhase);
+
+  // Smoothly auto-collapse a phase when the agent moves on to the next phase
+  useEffect(() => {
+    if (prevActiveRef.current && !isActivePhase) {
+      setUserExpanded(null);
+    }
+    prevActiveRef.current = isActivePhase;
+  }, [isActivePhase]);
+
+  const expanded = userExpanded ?? isActivePhase;
+  const rawThink = phase.thinkingStep?.text || "";
+  const isPlaceholder = isPlaceholderReasoningText(rawThink);
+  const parsedThink = useMemo(
+    () => (rawThink && !isPlaceholder ? parseReasoningContent(rawThink) : { summary: "", cleanedLines: [] }),
+    [rawThink, isPlaceholder]
+  );
+  // Drop redundant first line when it duplicates the phase title
+  const detailThinkLines = useMemo(() => {
+    if (parsedThink.cleanedLines.length === 0) return [];
+    const firstClean = parsedThink.cleanedLines[0].replace(/\*\*/g, "").trim();
+    if (firstClean === phase.title && parsedThink.cleanedLines.length > 1) {
+      return parsedThink.cleanedLines.slice(1);
+    }
+    return parsedThink.cleanedLines;
+  }, [parsedThink.cleanedLines, phase.title]);
+
+  const hasExpandableBody = detailThinkLines.length > 0 || phase.toolSteps.length > 0;
+  const toolCount = phase.toolSteps.length;
+  const metaPills: string[] = [];
+  if (toolCount > 0) metaPills.push(`${toolCount} 工具`);
+  if (phase.tokenBadge) metaPills.push(phase.tokenBadge);
+  if (phase.durationMs && phase.durationMs >= 1000) {
+    metaPills.push(formatPaseoDuration(phase.durationMs));
+  }
+
+  return (
+    <div className="py-0.5">
+      <div
+        role={hasExpandableBody ? "button" : undefined}
+        tabIndex={hasExpandableBody ? 0 : undefined}
+        onClick={() => {
+          if (hasExpandableBody) setUserExpanded((prev) => !(prev ?? isActivePhase));
+        }}
+        onKeyDown={(e) => {
+          if (hasExpandableBody && (e.key === "Enter" || e.key === " ")) {
+            e.preventDefault();
+            setUserExpanded((prev) => !(prev ?? isActivePhase));
+          }
+        }}
+        className={`group flex items-center gap-2 rounded-[7px] px-1.5 py-1 text-[12.5px] transition-colors ${
+          hasExpandableBody ? "cursor-pointer hover:bg-[var(--surface-1)]" : "cursor-default"
+        }`}
+      >
+        {/* Phase Status Indicator */}
+        <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+          {isActivePhase ? (
+            <Sparkles
+              className="h-3.5 w-3.5 velo-sparkle-breath"
+              style={{ color: "var(--accent)" }}
+            />
+          ) : phase.hasError ? (
+            <TriangleAlert
+              className="h-3 w-3"
+              style={{ color: "var(--status-danger)" }}
+            />
+          ) : (
+            <Check
+              className="h-3 w-3"
+              style={{ color: "var(--status-success)" }}
+            />
+          )}
+        </span>
+
+        {/* Phase Title */}
+        <span
+          className={`min-w-0 flex-1 truncate ${
+            isActivePhase
+              ? "beautiful-shimmer-text font-medium"
+              : "font-normal"
+          }`}
+          style={!isActivePhase ? { color: expanded ? "var(--fg)" : "var(--fg-muted)" } : undefined}
+          title={phase.title}
+        >
+          {phase.title}
+        </span>
+
+        {/* Compact Phase Meta */}
+        {metaPills.length > 0 && (
+          <span
+            className="shrink-0 font-mono-code text-[11px] tabular-nums"
+            style={{ color: "var(--fg-extra-muted)" }}
+          >
+            {metaPills.join(" · ")}
+          </span>
+        )}
+
+        {hasExpandableBody && (
+          <ChevronRight
+            className="h-3 w-3 shrink-0 transition-transform duration-150 opacity-55 group-hover:opacity-100"
+            style={{
+              color: "var(--fg-muted)",
+              transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
+            }}
+          />
+        )}
+      </div>
+
+      {/* Expanded Phase Detail: Thinking Body + Tool Calls */}
+      {expanded && hasExpandableBody && (
+        <div
+          className="ml-[7px] mt-0.5 mb-1 border-l pl-3.5 space-y-1"
+          style={{ borderColor: "var(--border-subtle)" }}
+        >
+          {detailThinkLines.length > 0 && (
+            <div
+              className="selectable-text max-h-[180px] overflow-y-auto py-0.5 space-y-1 text-[12.5px] leading-[1.55]"
+              style={{ color: "var(--fg-muted)" }}
+            >
+              {detailThinkLines.map((line, i) => renderFormattedLine(line, i))}
+            </div>
+          )}
+          {phase.toolSteps.length > 0 && (
+            <div className="space-y-0.5">
+              {phase.toolSteps.map((st) => (
+                <BeautifulToolCallCard
+                  key={st.id}
+                  toolName={st.toolName || "Tool"}
+                  input={st.input}
+                  output={st.output}
+                  isError={st.isError}
+                  isActive={isTurnRunning}
+                  onOpenDiffTab={() => onOpenDiffForFile?.(st.fileArg)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const PaseoExecutionTraceGroup: React.FC<{
   steps: PaseoTraceStepItem[];
   isTurnRunning?: boolean;
@@ -1248,101 +1547,112 @@ export const PaseoExecutionTraceGroup: React.FC<{
   onOpenDiffForFile?: (fileArg?: string) => void;
 }> = ({ steps, isTurnRunning = false, defaultExpanded = false, onOpenDiffForFile }) => {
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
-  const expanded = userExpanded ?? defaultExpanded;
+  const prevRunningRef = useRef<boolean>(isTurnRunning);
+
+  // Auto-collapse smoothly when turn finishes if user enabled default-collapsed steps
+  useEffect(() => {
+    if (prevRunningRef.current && !isTurnRunning) {
+      setUserExpanded(null);
+    }
+    prevRunningRef.current = isTurnRunning;
+  }, [isTurnRunning]);
+
+  // While running, always show phased timeline by default so user sees stage-by-stage progress
+  const expanded = userExpanded ?? (isTurnRunning ? true : defaultExpanded);
+
+  const phases = useMemo(
+    () => groupStepsIntoPhases(steps, isTurnRunning),
+    [steps, isTurnRunning]
+  );
 
   const meta = useMemo(() => {
     let thinkCount = 0;
     let toolCount = 0;
     let hasError = false;
-    let isAnyRunning = false;
-    let latestStepHint = "";
+    let activeToolHint = "";
 
     for (const st of steps) {
       if (st.kind === "thinking") {
         thinkCount++;
-        const parsed = parseReasoningContent(st.text || "");
-        if (parsed.summary) {
-          latestStepHint = parsed.summary;
-        }
-        if (isTurnRunning && st.isStreamingThinking) {
-          isAnyRunning = true;
-        }
       } else {
         toolCount++;
         if (st.isError) hasError = true;
-        const pres = resolvePaseoToolPresentation(
-          st.toolName || "Tool",
-          st.input,
-          st.output
-        );
         if (isTurnRunning && st.output === undefined) {
-          isAnyRunning = true;
-          latestStepHint = pres.summary
+          const pres = resolvePaseoToolPresentation(
+            st.toolName || "Tool",
+            st.input,
+            st.output
+          );
+          activeToolHint = pres.summary
             ? `${pres.displayName} · ${pres.summary}`
             : pres.workingVerb;
-        } else {
-          latestStepHint = pres.summary
-            ? `${pres.displayName} · ${pres.summary}`
-            : pres.displayName;
         }
       }
     }
 
+    const lastPhase = phases[phases.length - 1];
+    const lastStep = steps[steps.length - 1];
+    const isWaitingBetweenSteps =
+      isTurnRunning &&
+      Boolean(lastStep) &&
+      ((lastStep.kind === "tool_call" && lastStep.output !== undefined) ||
+        (lastStep.kind === "thinking" && !lastStep.isStreamingThinking));
+
     const parts: string[] = [];
     if (thinkCount > 0) parts.push(`思考 ${thinkCount} 次`);
-    if (toolCount > 0) parts.push(`工具/MCP ${toolCount} 次`);
+    if (toolCount > 0) parts.push(`工具 ${toolCount} 次`);
     const countsText = parts.join(" · ");
 
-    const label = isAnyRunning
-      ? `执行中 (${steps.length} 步)`
+    const label = isTurnRunning
+      ? `执行中 · 第 ${phases.length} 阶段`
+      : phases.length > 1
+      ? `已完成 ${phases.length} 个阶段`
       : `已收起 ${steps.length} 步执行过程`;
-    const secondaryLabel = isAnyRunning
-      ? latestStepHint
-        ? `· ${latestStepHint}`
+
+    const latestHint = activeToolHint || lastPhase?.title || "";
+    const secondaryLabel = isTurnRunning
+      ? latestHint
+        ? `· ${latestHint}`
         : `· ${countsText}`
-      : `· ${countsText}${latestStepHint ? ` · ${latestStepHint}` : ""}`;
+      : `· ${countsText}${latestHint ? ` · ${latestHint}` : ""}`;
 
     return {
       label,
       secondaryLabel,
       hasError,
-      isAnyRunning,
+      isWaitingBetweenSteps,
     };
-  }, [steps, isTurnRunning]);
+  }, [steps, phases, isTurnRunning]);
 
   return (
     <PaseoExpandableBadge
       label={meta.label}
       secondaryLabel={meta.secondaryLabel}
-      icon={meta.isAnyRunning ? Sparkles : Wrench}
+      icon={isTurnRunning ? Sparkles : Wrench}
       isExpanded={expanded}
-      onToggle={() => setUserExpanded((prev) => !(prev ?? defaultExpanded))}
-      isLoading={meta.isAnyRunning}
+      onToggle={() => setUserExpanded((prev) => !(prev ?? (isTurnRunning ? true : defaultExpanded)))}
+      isLoading={isTurnRunning}
       isError={meta.hasError}
       borderlessWhenExpanded
     >
       <PaseoIndentRail className="space-y-0.5 py-0.5">
-        {steps.map((st) =>
-          st.kind === "thinking" ? (
-            <BeautifulThinkingBlock
-              key={st.id}
-              text={st.text || ""}
-              isStreaming={Boolean(isTurnRunning && st.isStreamingThinking)}
-              startedAtMs={st.startedAtMs}
-              durationMs={st.durationMs}
-              defaultExpanded={false}
+        {phases.map((phase, idx) => (
+          <ExecutionPhaseRow
+            key={phase.id}
+            phase={phase}
+            isActivePhase={isTurnRunning && idx === phases.length - 1}
+            isTurnRunning={isTurnRunning}
+            onOpenDiffForFile={onOpenDiffForFile}
+          />
+        ))}
+        {meta.isWaitingBetweenSteps && (
+          <div className="flex items-center gap-2 px-1.5 py-1 text-[12px] select-none">
+            <Sparkles
+              className="h-3 w-3 shrink-0 velo-sparkle-breath"
+              style={{ color: "var(--accent)" }}
             />
-          ) : (
-            <BeautifulToolCallCard
-              key={st.id}
-              toolName={st.toolName || "Tool"}
-              input={st.input}
-              output={st.output}
-              isError={st.isError}
-              isActive={isTurnRunning}
-              onOpenDiffTab={() => onOpenDiffForFile?.(st.fileArg)}
-            />
-          )
+            <TextShimmer className="text-[12px]">正在分析结果并规划下一阶段…</TextShimmer>
+          </div>
         )}
       </PaseoIndentRail>
     </PaseoExpandableBadge>

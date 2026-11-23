@@ -3,7 +3,8 @@ use chrono::Utc;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
@@ -853,8 +854,28 @@ impl AgentSpawner {
         let stdout_task = tokio::spawn(async move {
             let mut reader = TokioBufReader::new(stdout).lines();
             let mut saw_message_delta = false;
+            let mut agy_tailer = if matches!(provider_clone, AgentProvider::Antigravity) {
+                Some(AgyTranscriptTailer::new())
+            } else {
+                None
+            };
             while let Ok(Some(line)) = reader.next_line().await {
-                let parsed = parse_agent_stdout_line(session_id, &provider_clone, &line);
+                let mut parsed = parse_agent_stdout_line(session_id, &provider_clone, &line);
+                if let Some(tailer) = agy_tailer.as_mut() {
+                    tailer.observe_stdout_line(&line);
+                    for ev in &mut parsed {
+                        if let AgentEvent::ThinkingDelta { text, .. } = ev {
+                            if text.starts_with("**Reasoning completed (") {
+                                if let Some(step_idx) = extract_agy_step_index(&line) {
+                                    let enriched = tailer.fetch_thinking_for_step(step_idx).await;
+                                    if let Some(real_thinking) = enriched {
+                                        *text = real_thinking;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 for ev in &parsed {
                     match ev {
                         AgentEvent::MessageDelta { .. } | AgentEvent::MessageChunk { .. } => {
@@ -1839,6 +1860,263 @@ fn extract_cursor_tool_call(tc_opt: Option<&Value>) -> (String, Value, Option<St
         }
     }
     ("Tool".to_string(), json!({}), None, false)
+}
+
+/// Extracts `step_update.step_index` from an `agy --output-format stream-json` stdout line.
+fn extract_agy_step_index(line: &str) -> Option<u64> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') || !trimmed.contains("\"step_index\"") {
+        return None;
+    }
+    let val: Value = serde_json::from_str(trimmed).ok()?;
+    val.pointer("/step_update/step_index").and_then(|v| v.as_u64())
+}
+
+/// Formats authentic AGY `thinking` text with a concise leading `**Phase headline**` so
+/// downstream phased-trace UIs can display a crisp stage summary while preserving the full
+/// chain-of-thought body when expanded.
+pub fn format_agy_thinking_with_headline(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Truncate extremely long thoughts safely on a UTF-8 char boundary
+    let capped: String = if trimmed.chars().count() > 6000 {
+        let mut s: String = trimmed.chars().take(6000).collect();
+        s.push('…');
+        s
+    } else {
+        trimmed.to_string()
+    };
+
+    // If the text already starts with a markdown **bold** heading, keep it as-is
+    let first_non_empty = capped.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if first_non_empty.starts_with("**") && first_non_empty.ends_with("**") && first_non_empty.len() > 4 {
+        return Some(capped);
+    }
+
+    // Pick the first substantive sentence/clause, skipping generic filler openers
+    let filler_prefixes = [
+        "i'm thinking through how to approach this",
+        "i am thinking through how to approach this",
+        "let me think",
+        "let's think",
+        "let's see",
+        "okay,",
+        "alright,",
+        "hmm,",
+    ];
+    let candidate_line = capped
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            if line.is_empty() {
+                return false;
+            }
+            let lower = line.to_ascii_lowercase();
+            !filler_prefixes
+                .iter()
+                .any(|p| lower == *p || lower.trim_end_matches('.') == *p)
+        })
+        .unwrap_or(first_non_empty);
+
+    // Strip inline markdown noise and extract first clause/sentence up to ~68 chars
+    let cleaned = candidate_line
+        .replace("**", "")
+        .replace('`', "")
+        .trim_start_matches(|c: char| c == '#' || c == '-' || c == '*' || c.is_whitespace())
+        .trim()
+        .to_string();
+
+    if cleaned.is_empty() {
+        return Some(capped);
+    }
+
+    let first_sentence = cleaned
+        .split(['\n', '。', '！', '？'])
+        .next()
+        .unwrap_or(&cleaned)
+        .split(". ")
+        .next()
+        .unwrap_or(&cleaned)
+        .trim()
+        .trim_end_matches(['.', ':', ';', ',', '：', '；', '，']);
+
+    let headline: String = if first_sentence.chars().count() > 72 {
+        let mut cut: String = first_sentence.chars().take(70).collect();
+        if let Some(last_sp) = cut.rfind(' ') {
+            if last_sp >= 32 {
+                cut.truncate(last_sp);
+            }
+        }
+        cut.trim_end().to_string() + "…"
+    } else {
+        first_sentence.to_string()
+    };
+
+    if headline.is_empty() {
+        Some(capped)
+    } else {
+        Some(format!("**{}**\n{}", headline, capped))
+    }
+}
+
+/// Incrementally tails `~/.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/transcript.jsonl`
+/// by byte offset so `agy --output-format stream-json` steps receive real thinking text instead of
+/// opaque token-count placeholders.
+struct AgyTranscriptTailer {
+    conv_id: Option<String>,
+    transcript_path: Option<PathBuf>,
+    byte_offset: u64,
+    by_step: HashMap<u64, String>,
+    custom_roots: Option<Vec<PathBuf>>,
+}
+
+impl AgyTranscriptTailer {
+    fn new() -> Self {
+        Self {
+            conv_id: None,
+            transcript_path: None,
+            byte_offset: 0,
+            by_step: HashMap::new(),
+            custom_roots: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self {
+            conv_id: None,
+            transcript_path: None,
+            byte_offset: 0,
+            by_step: HashMap::new(),
+            custom_roots: Some(roots),
+        }
+    }
+
+    fn observe_stdout_line(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.contains("conversation_id") {
+            return;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+            let cid = val
+                .get("conversation_id")
+                .or_else(|| val.pointer("/step_update/conversation_id"))
+                .or_else(|| val.pointer("/result/conversation_id"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(cid) = cid {
+                if self.conv_id.as_deref() != Some(cid) {
+                    self.conv_id = Some(cid.to_string());
+                    self.transcript_path = None;
+                    self.byte_offset = 0;
+                    self.by_step.clear();
+                }
+            }
+        }
+    }
+
+    fn resolve_transcript_path(&mut self) -> Option<PathBuf> {
+        if let Some(ref p) = self.transcript_path {
+            if p.is_file() {
+                return Some(p.clone());
+            }
+        }
+        let cid = self.conv_id.as_deref()?;
+        let roots: Vec<PathBuf> = if let Some(ref custom) = self.custom_roots {
+            custom.clone()
+        } else {
+            let home = dirs::home_dir()?;
+            vec![
+                home.join(".gemini/antigravity-cli/brain"),
+                home.join(".gemini/antigravity/brain"),
+            ]
+        };
+        for root in roots {
+            let candidate = root
+                .join(cid)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl");
+            if candidate.is_file() {
+                self.transcript_path = Some(candidate.clone());
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn read_new_entries(&mut self) {
+        let Some(path) = self.resolve_transcript_path() else {
+            return;
+        };
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return;
+        };
+        let Ok(meta) = file.metadata() else {
+            return;
+        };
+        if meta.len() < self.byte_offset {
+            self.byte_offset = 0;
+        }
+        if meta.len() == self.byte_offset {
+            return;
+        }
+        if file.seek(SeekFrom::Start(self.byte_offset)).is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_err() || buf.is_empty() {
+            return;
+        }
+        // Only consume up to the last complete newline so partial writes are never lost
+        let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
+            return;
+        };
+        let complete = &buf[..=last_nl];
+        self.byte_offset += complete.len() as u64;
+
+        let Ok(chunk_str) = std::str::from_utf8(complete) else {
+            return;
+        };
+        for raw_line in chunk_str.lines() {
+            let line = raw_line.trim();
+            if !line.starts_with('{') || !line.contains("\"thinking\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(si) = v.get("step_index").and_then(|x| x.as_u64()) else {
+                continue;
+            };
+            if let Some(th) = v
+                .get("thinking")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.trim().is_empty())
+            {
+                if let Some(formatted) = format_agy_thinking_with_headline(th) {
+                    self.by_step.insert(si, formatted);
+                }
+            }
+        }
+    }
+
+    async fn fetch_thinking_for_step(&mut self, step_idx: u64) -> Option<String> {
+        if let Some(hit) = self.by_step.get(&step_idx) {
+            return Some(hit.clone());
+        }
+        self.read_new_entries();
+        if let Some(hit) = self.by_step.get(&step_idx) {
+            return Some(hit.clone());
+        }
+        // Handle tiny flush race between agy stdout step_update and transcript.jsonl write
+        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        self.read_new_entries();
+        self.by_step.get(&step_idx).cloned()
+    }
 }
 
 /// Parses a single stdout line from Claude Code (`stream-json`), OpenAI Codex (`--json`), Google Antigravity (`agy --output-format stream-json`), or other agents into `AgentEvent`s.
@@ -3349,5 +3627,39 @@ mod tests {
                 .try_send_warm_turn("hello after reap", &[], None, None)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn test_agy_transcript_tailer_extracts_phased_thinking() {
+        let tmp = std::env::temp_dir().join(format!("velo-agy-tailer-{}", Uuid::new_v4()));
+        let cid = "conv-test-123";
+        let logs_dir = tmp.join(cid).join(".system_generated").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let transcript = logs_dir.join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"step_index":10,"type":"PLANNER_RESPONSE","thinking":"I'm thinking through how to approach this.\n\nThe login check fails because Local State points to the wrong Chrome profile. Let's inspect flowManager.ts."}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut tailer = AgyTranscriptTailer::with_roots(vec![tmp.clone()]);
+        tailer.observe_stdout_line(&format!(r#"{{"event":"init","conversation_id":"{}"}}"#, cid));
+        let got = tailer.fetch_thinking_for_step(10).await.expect("step 10 thinking");
+        assert!(got.starts_with("**The login check fails because Local State points to the wrong"));
+        assert!(got.contains("inspect flowManager.ts"));
+
+        // Append a second step incrementally and ensure offset tailing picks it up
+        let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(
+            f,
+            r#"{{"step_index":14,"type":"PLANNER_RESPONSE","thinking":"**Verify Chrome profile patch**\nRunning unit tests to confirm fix."}}"#
+        )
+        .unwrap();
+        let got2 = tailer.fetch_thinking_for_step(14).await.expect("step 14 thinking");
+        assert!(got2.starts_with("**Verify Chrome profile patch**"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

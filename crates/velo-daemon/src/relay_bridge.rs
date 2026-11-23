@@ -114,6 +114,7 @@ fn compact_event_for_relay(ev: &AgentEvent, max_tool_output_chars: usize) -> Age
             session_id,
             text,
             images,
+            client_msg_id,
             timestamp,
         } => AgentEvent::UserMessage {
             session_id: *session_id,
@@ -124,6 +125,7 @@ fn compact_event_for_relay(ev: &AgentEvent, max_tool_output_chars: usize) -> Age
                 .filter(|img| img.len() < 4096)
                 .cloned()
                 .collect(),
+            client_msg_id: client_msg_id.clone(),
             timestamp: *timestamp,
         },
         other => other.clone(),
@@ -676,9 +678,12 @@ async fn run_supervised_e2ee_bridge(
                                 }
                             }
                         }
-                        Ok(ev) = event_rx.recv() => {
-                            let compact_ev = compact_event_for_relay(&ev, 2800);
-                            if let Ok(val) = serde_json::to_value(WsServerMessage::Event { event: compact_ev }) {
+                        Ok(seq_ev) = event_rx.recv() => {
+                            let compact_ev = compact_event_for_relay(&seq_ev.event, 2800);
+                            if let Ok(val) = serde_json::to_value(WsServerMessage::Event {
+                                event: compact_ev,
+                                seq: seq_ev.seq,
+                            }) {
                                 if let Some(frame_txt) =
                                     send_sealed_with_key(&val, &active_key_hex, &mut out_nonce)
                                 {
@@ -991,6 +996,10 @@ async fn run_supervised_e2ee_bridge(
                                                 .get("skill_path")
                                                 .and_then(|v| v.as_str())
                                                 .map(|s| s.to_string());
+                                            let client_msg_id = cmd_val
+                                                .get("client_msg_id")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string());
                                             if let Err(err) = state
                                                 .dispatch_session_input(
                                                     sid,
@@ -1005,6 +1014,7 @@ async fn run_supervised_e2ee_bridge(
                                                         approval_mode,
                                                         mode,
                                                         skill_path,
+                                                        client_msg_id,
                                                     },
                                                 )
                                                 .await
@@ -1027,7 +1037,10 @@ async fn run_supervised_e2ee_bridge(
                                                         },
                                                     ] {
                                                         if let Ok(val) = serde_json::to_value(
-                                                            WsServerMessage::Event { event: ev },
+                                                            WsServerMessage::Event {
+                                                                event: ev,
+                                                                seq: None,
+                                                            },
                                                         ) {
                                                             if let Some(frame_txt) =
                                                                 send_sealed_with_key(
@@ -1231,6 +1244,10 @@ async fn run_supervised_e2ee_bridge(
                                             .map(str::to_string),
                                         setup_command: None,
                                         use_worktree,
+                                        client_msg_id: cmd_val
+                                            .get("client_msg_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string),
                                     };
                                     match state.create_session(req).await {
                                         Ok(_) => {

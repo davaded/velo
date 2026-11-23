@@ -304,6 +304,265 @@ public struct ReasoningRowView: View {
 
 // MARK: - 7. Unified Collapsible Execution Trace Group (Consecutive `Thought` + `MCP` / Tool Calls)
 
+private struct VeloExecutionPhase: Identifiable {
+    let id: String
+    let index: Int
+    let title: String
+    let tokenBadge: String?
+    let thinkingItem: TimelineEventItem?
+    let toolItems: [TimelineEventItem]
+    let hasError: Bool
+    let durationMs: Int?
+}
+
+private enum VeloPhaseGrouping {
+    static func isPlaceholderThinking(_ raw: String) -> Bool {
+        let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "**", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.lowercased().hasPrefix("reasoning completed (")
+            && cleaned.lowercased().hasSuffix(" thinking tokens)")
+    }
+
+    static func placeholderTokens(_ raw: String) -> Int? {
+        guard isPlaceholderThinking(raw) else { return nil }
+        let digits = raw.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        return Int(digits)
+    }
+
+    static func extractHeadline(_ raw: String) -> String {
+        guard !isPlaceholderThinking(raw) else { return "" }
+        let lines = raw
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("正在分析工作区上下文") }
+        guard !lines.isEmpty else { return "" }
+        for line in lines.reversed() {
+            if line.hasPrefix("**"), line.hasSuffix("**"), line.count > 4 {
+                return String(line.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        let first = lines[0].replacingOccurrences(of: "**", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return first.count > 64 ? String(first.prefix(62)) + "…" : first
+    }
+
+    static func deriveTitleFromTools(_ tools: [TimelineEventItem]) -> String {
+        guard !tools.isEmpty else { return "分析与规划" }
+        var edits: [String] = []
+        var reads: [String] = []
+        var shells = 0
+        var others = 0
+        var firstOther = ""
+        for item in tools {
+            if case .toolCall(let toolName, let displayName, _, let summary, _, _) = item.kind {
+                let lower = toolName.lowercased()
+                let shortName = (summary ?? "").split(separator: "/").last.map(String.init) ?? ""
+                if lower.contains("edit") || lower.contains("write") || lower.contains("patch") {
+                    if !shortName.isEmpty, !edits.contains(shortName) { edits.append(shortName) }
+                    else if edits.isEmpty { edits.append("代码") }
+                } else if lower.contains("read") || lower.contains("view") || lower == "list_dir" {
+                    if !shortName.isEmpty, !reads.contains(shortName) { reads.append(shortName) }
+                    else if reads.isEmpty { reads.append("文件") }
+                } else if lower.contains("bash") || lower.contains("shell") || lower.contains("command") {
+                    shells += 1
+                } else {
+                    others += 1
+                    if firstOther.isEmpty { firstOther = displayName }
+                }
+            }
+        }
+        var parts: [String] = []
+        if !edits.isEmpty {
+            parts.append(edits.count == 1 ? "修改 \(edits[0])" : "修改 \(edits[0]) 等 \(edits.count) 处")
+        }
+        if !reads.isEmpty {
+            parts.append(reads.count == 1 ? "查看 \(reads[0])" : "查看 \(reads[0]) 等 \(reads.count) 处")
+        }
+        if shells > 0 {
+            parts.append(shells == 1 ? "执行命令验证" : "执行 \(shells) 次命令")
+        }
+        if others > 0 && parts.isEmpty {
+            parts.append(others == 1 ? "调用 \(firstOther)" : "调用 \(firstOther) 等 \(others) 项")
+        }
+        return parts.prefix(2).joined(separator: " · ").isEmpty ? "执行工具步骤" : parts.prefix(2).joined(separator: " · ")
+    }
+
+    static func group(_ items: [TimelineEventItem]) -> [VeloExecutionPhase] {
+        var raw: [(id: String, thinking: TimelineEventItem?, tools: [TimelineEventItem])] = []
+        for item in items {
+            switch item.kind {
+            case .thinking:
+                raw.append((id: item.id, thinking: item, tools: []))
+            case .toolCall:
+                if !raw.isEmpty {
+                    raw[raw.count - 1].tools.append(item)
+                } else {
+                    raw.append((id: item.id, thinking: nil, tools: [item]))
+                }
+            default:
+                break
+            }
+        }
+        return raw.enumerated().map { idx, entry in
+            let rawThink = entry.thinking?.content ?? ""
+            let tok = placeholderTokens(rawThink)
+            let headline = extractHeadline(rawThink)
+            let title: String
+            if !headline.isEmpty {
+                title = headline
+            } else if !entry.tools.isEmpty {
+                title = deriveTitleFromTools(entry.tools)
+            } else if let tok {
+                title = "深度推理 (\(tok) tokens)"
+            } else {
+                title = "分析上下文"
+            }
+            let hasErr = entry.tools.contains { item in
+                if case .toolCall(_, _, _, _, _, let isErr) = item.kind { return isErr }
+                return false
+            }
+            var dur: Int?
+            if let th = entry.thinking, case .thinking(_, let d, _) = th.kind {
+                dur = d
+            }
+            return VeloExecutionPhase(
+                id: entry.id,
+                index: idx + 1,
+                title: title,
+                tokenBadge: tok.map { "\($0) tok" },
+                thinkingItem: entry.thinking,
+                toolItems: entry.tools,
+                hasError: hasErr,
+                durationMs: dur
+            )
+        }
+    }
+}
+
+private struct VeloExecutionPhaseRowView: View {
+    let phase: VeloExecutionPhase
+    let isActivePhase: Bool
+    let isTurnRunning: Bool
+    let turnStartedAt: Date?
+
+    @State private var userExpanded: Bool? = nil
+
+    private var isExpanded: Bool {
+        userExpanded ?? isActivePhase
+    }
+
+    private var hasThinkDetail: Bool {
+        guard let th = phase.thinkingItem else { return false }
+        return !th.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !VeloPhaseGrouping.isPlaceholderThinking(th.content)
+    }
+
+    private var hasBody: Bool {
+        hasThinkDetail || !phase.toolItems.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                guard hasBody else { return }
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.84)) {
+                    userExpanded = !isExpanded
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    if isActivePhase {
+                        OrbitalStatusIcon(phase: .thinking)
+                            .frame(width: 14)
+                    } else if phase.hasError {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(VeloTheme.coral)
+                            .frame(width: 14)
+                    } else {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(VeloTheme.emerald)
+                            .frame(width: 14)
+                    }
+
+                    if isActivePhase {
+                        ShimmerTextView(phase.title, font: .system(size: 12.5, weight: .medium))
+                            .lineLimit(1)
+                    } else {
+                        Text(phase.title)
+                            .font(.system(size: 12.5, weight: .regular))
+                            .foregroundStyle(isExpanded ? .primary : .secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    if !phase.toolItems.isEmpty {
+                        Text("\(phase.toolItems.count) 工具")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    } else if let tok = phase.tokenBadge {
+                        Text(tok)
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+
+                    if hasBody {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    }
+                }
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onChange(of: isActivePhase) { wasActive, nowActive in
+                if wasActive && !nowActive {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                        userExpanded = nil
+                    }
+                }
+            }
+
+            if isExpanded && hasBody {
+                IndentRailContainer {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if hasThinkDetail, let th = phase.thinkingItem {
+                            Text(th.content.trimmingCharacters(in: .whitespacesAndNewlines))
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(.secondary)
+                                .lineSpacing(3)
+                                .textSelection(.enabled)
+                        }
+                        ForEach(phase.toolItems) { item in
+                            if case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isError) = item.kind {
+                                ToolCallRowView(
+                                    toolName: toolName,
+                                    displayName: displayName,
+                                    workingVerb: workingVerb,
+                                    summary: summary,
+                                    output: output,
+                                    isError: isError,
+                                    inlineDiffOld: item.inlineDiffOld,
+                                    inlineDiffNew: item.inlineDiffNew,
+                                    subagentRole: item.subagentRole,
+                                    subagentPrompt: item.subagentPrompt,
+                                    nested: true,
+                                    isTurnRunning: isTurnRunning
+                                )
+                            }
+                        }
+                    }
+                    .padding(.vertical, 1)
+                }
+            }
+        }
+    }
+}
+
 public struct ExecutionTraceGroupView: View {
     public let items: [TimelineEventItem]
     public let isTurnRunning: Bool
@@ -311,7 +570,7 @@ public struct ExecutionTraceGroupView: View {
     public let defaultExpanded: Bool
 
     @Environment(\.colorScheme) private var colorScheme
-    @State private var expanded: Bool
+    @State private var userExpanded: Bool? = nil
 
     public init(
         items: [TimelineEventItem],
@@ -323,18 +582,42 @@ public struct ExecutionTraceGroupView: View {
         self.isTurnRunning = isTurnRunning
         self.turnStartedAt = turnStartedAt
         self.defaultExpanded = defaultExpanded
-        self._expanded = State(initialValue: defaultExpanded)
+    }
+
+    private var expanded: Bool {
+        userExpanded ?? (isTurnRunning ? true : defaultExpanded)
     }
 
     public var body: some View {
         let meta = VeloFormatting.summarizeExecutionTrace(items)
-        let activelyRunning = isTurnRunning && meta.isRunning
+        let phases = VeloPhaseGrouping.group(items)
+        let activelyRunning = isTurnRunning
+        let isWaitingBetweenSteps: Bool = {
+            guard isTurnRunning, let last = items.last else { return false }
+            switch last.kind {
+            case .toolCall(_, _, _, _, let output, _):
+                return output != nil
+            case .thinking(_, _, let isStreaming):
+                return !isStreaming
+            default:
+                return false
+            }
+        }()
+        let activeHeaderText: String = {
+            if let activeLabel = meta.activeLabel, !activeLabel.isEmpty {
+                return "第 \(phases.count) 阶段 · \(activeLabel)"
+            }
+            if let lastPhase = phases.last {
+                return "第 \(phases.count) 阶段 · \(lastPhase.title)"
+            }
+            return "执行中 (\(items.count) 步)"
+        }()
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
-                    expanded.toggle()
+                    userExpanded = !expanded
                 }
             } label: {
                 HStack(spacing: 7) {
@@ -352,23 +635,27 @@ public struct ExecutionTraceGroupView: View {
                         .frame(width: 16)
                     }
 
-                    if activelyRunning, let activeLabel = meta.activeLabel {
+                    if activelyRunning {
                         ShimmerTextView(
-                            activeLabel,
+                            activeHeaderText,
                             font: .system(size: 12.5, weight: .medium)
                         )
                         .lineLimit(1)
                     } else {
-                        Text(expanded ? "执行过程明细 (\(items.count) 步)" : meta.title)
-                            .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        Text(
+                            phases.count > 1
+                                ? "已完成 \(phases.count) 个阶段 · \(meta.title)"
+                                : meta.title
+                        )
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                     }
 
                     Spacer(minLength: 4)
 
                     if activelyRunning {
-                        Text("\(items.count) 步")
+                        Text("\(phases.count) 阶段")
                             .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                             .foregroundStyle(VeloTheme.accentVioletSoft)
                             .padding(.horizontal, 6)
@@ -403,43 +690,37 @@ public struct ExecutionTraceGroupView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
-            .onChange(of: defaultExpanded) { _, newDefault in
+            .onChange(of: isTurnRunning) { wasRunning, nowRunning in
+                if wasRunning && !nowRunning {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
+                        userExpanded = nil
+                    }
+                }
+            }
+            .onChange(of: defaultExpanded) { _, _ in
                 withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
-                    expanded = newDefault
+                    userExpanded = nil
                 }
             }
 
             if expanded {
                 IndentRailContainer {
-                    VStack(alignment: .leading, spacing: 5) {
-                        ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
-                            let isLastInBatch = idx == items.count - 1
-                            switch item.kind {
-                            case .thinking(let startedAt, let durationMs, let isStreaming):
-                                ReasoningRowView(
-                                    rawText: item.content,
-                                    startedAt: startedAt ?? turnStartedAt,
-                                    durationMs: durationMs,
-                                    isStreaming: isStreaming && isTurnRunning && isLastInBatch
-                                )
-                            case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isError):
-                                ToolCallRowView(
-                                    toolName: toolName,
-                                    displayName: displayName,
-                                    workingVerb: workingVerb,
-                                    summary: summary,
-                                    output: output,
-                                    isError: isError,
-                                    inlineDiffOld: item.inlineDiffOld,
-                                    inlineDiffNew: item.inlineDiffNew,
-                                    subagentRole: item.subagentRole,
-                                    subagentPrompt: item.subagentPrompt,
-                                    nested: true,
-                                    isTurnRunning: isTurnRunning
-                                )
-                            default:
-                                EmptyView()
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(phases.enumerated()), id: \.element.id) { idx, phase in
+                            VeloExecutionPhaseRowView(
+                                phase: phase,
+                                isActivePhase: isTurnRunning && idx == phases.count - 1,
+                                isTurnRunning: isTurnRunning,
+                                turnStartedAt: turnStartedAt
+                            )
+                        }
+                        if isWaitingBetweenSteps {
+                            HStack(spacing: 6) {
+                                OrbitalStatusIcon(phase: .thinking)
+                                    .frame(width: 14)
+                                ShimmerTextView("正在分析结果并规划下一阶段…", font: .system(size: 12))
                             }
+                            .padding(.vertical, 2)
                         }
                     }
                     .padding(.vertical, 2)
