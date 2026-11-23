@@ -304,240 +304,249 @@ public struct ReasoningRowView: View {
 
 // MARK: - 7. Unified Collapsible Execution Trace Group (Consecutive `Thought` + `MCP` / Tool Calls)
 
-private struct VeloExecutionPhase: Identifiable {
-    let id: String
-    let index: Int
-    let title: String
-    let tokenBadge: String?
-    let thinkingItem: TimelineEventItem?
-    let toolItems: [TimelineEventItem]
-    let hasError: Bool
-    let durationMs: Int?
+private enum VeloFlatActivityRow: Identifiable {
+    case thinking(TimelineEventItem)
+    case tool(TimelineEventItem)
+    case exploreBatch(id: String, items: [TimelineEventItem])
+
+    var id: String {
+        switch self {
+        case .thinking(let item), .tool(let item):
+            return item.id
+        case .exploreBatch(let id, _):
+            return id
+        }
+    }
 }
 
-private enum VeloPhaseGrouping {
-    static func isPlaceholderThinking(_ raw: String) -> Bool {
+private enum VeloActivityStreamBuilder {
+    private static let fillerLines: Set<String> = [
+        "i'm thinking through how to approach this",
+        "i am thinking through how to approach this",
+        "let me think",
+        "let's think",
+        "let's see",
+        "okay",
+        "alright",
+        "hmm",
+    ]
+
+    static func isNoiseThinking(_ raw: String) -> Bool {
         let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "**", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.lowercased().hasPrefix("reasoning completed (")
+        if cleaned.lowercased().hasPrefix("reasoning completed (")
             && cleaned.lowercased().hasSuffix(" thinking tokens)")
-    }
-
-    static func placeholderTokens(_ raw: String) -> Int? {
-        guard isPlaceholderThinking(raw) else { return nil }
-        let digits = raw.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-        return Int(digits)
-    }
-
-    static func extractHeadline(_ raw: String) -> String {
-        guard !isPlaceholderThinking(raw) else { return "" }
-        let lines = raw
+        {
+            return true
+        }
+        let substantive = cleaned
             .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("正在分析工作区上下文") }
-        guard !lines.isEmpty else { return "" }
-        for line in lines.reversed() {
-            if line.hasPrefix("**"), line.hasSuffix("**"), line.count > 4 {
-                return String(line.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            .map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                    .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,:…"))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
             }
-        }
-        let first = lines[0].replacingOccurrences(of: "**", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return first.count > 64 ? String(first.prefix(62)) + "…" : first
+            .filter { !$0.isEmpty && !fillerLines.contains($0) }
+        return substantive.isEmpty
     }
 
-    static func deriveTitleFromTools(_ tools: [TimelineEventItem]) -> String {
-        guard !tools.isEmpty else { return "分析与规划" }
-        var edits: [String] = []
-        var reads: [String] = []
-        var shells = 0
-        var others = 0
-        var firstOther = ""
-        for item in tools {
-            if case .toolCall(let toolName, let displayName, _, let summary, _, _) = item.kind {
-                let lower = toolName.lowercased()
-                let shortName = (summary ?? "").split(separator: "/").last.map(String.init) ?? ""
-                if lower.contains("edit") || lower.contains("write") || lower.contains("patch") {
-                    if !shortName.isEmpty, !edits.contains(shortName) { edits.append(shortName) }
-                    else if edits.isEmpty { edits.append("代码") }
-                } else if lower.contains("read") || lower.contains("view") || lower == "list_dir" {
-                    if !shortName.isEmpty, !reads.contains(shortName) { reads.append(shortName) }
-                    else if reads.isEmpty { reads.append("文件") }
-                } else if lower.contains("bash") || lower.contains("shell") || lower.contains("command") {
-                    shells += 1
-                } else {
-                    others += 1
-                    if firstOther.isEmpty { firstOther = displayName }
+    static func isExplorationTool(_ item: TimelineEventItem) -> Bool {
+        guard case .toolCall(let toolName, _, _, _, _, _) = item.kind else { return false }
+        let lower = toolName.lowercased()
+        return lower.contains("read")
+            || lower.contains("view")
+            || lower == "list_dir"
+            || lower.contains("search")
+            || lower.contains("grep")
+            || lower.contains("glob")
+            || lower.contains("find")
+    }
+
+    static func build(_ items: [TimelineEventItem], isTurnRunning: Bool) -> [VeloFlatActivityRow] {
+        var rows: [VeloFlatActivityRow] = []
+        var i = 0
+        while i < items.count {
+            let item = items[i]
+            switch item.kind {
+            case .thinking(_, _, let isStreaming):
+                if (isTurnRunning && isStreaming) || !isNoiseThinking(item.content) {
+                    rows.append(.thinking(item))
                 }
+                i += 1
+
+            case .toolCall:
+                if isExplorationTool(item) {
+                    var j = i
+                    while j + 1 < items.count && isExplorationTool(items[j + 1]) {
+                        j += 1
+                    }
+                    if j > i {
+                        let slice = Array(items[i...j])
+                        rows.append(.exploreBatch(id: "explore-\(item.id)-\(slice.count)", items: slice))
+                        i = j + 1
+                        continue
+                    }
+                }
+                rows.append(.tool(item))
+                i += 1
+
+            default:
+                i += 1
             }
         }
-        var parts: [String] = []
-        if !edits.isEmpty {
-            parts.append(edits.count == 1 ? "修改 \(edits[0])" : "修改 \(edits[0]) 等 \(edits.count) 处")
-        }
-        if !reads.isEmpty {
-            parts.append(reads.count == 1 ? "查看 \(reads[0])" : "查看 \(reads[0]) 等 \(reads.count) 处")
-        }
-        if shells > 0 {
-            parts.append(shells == 1 ? "执行命令验证" : "执行 \(shells) 次命令")
-        }
-        if others > 0 && parts.isEmpty {
-            parts.append(others == 1 ? "调用 \(firstOther)" : "调用 \(firstOther) 等 \(others) 项")
-        }
-        return parts.prefix(2).joined(separator: " · ").isEmpty ? "执行工具步骤" : parts.prefix(2).joined(separator: " · ")
+        return rows
     }
 
-    static func group(_ items: [TimelineEventItem]) -> [VeloExecutionPhase] {
-        var raw: [(id: String, thinking: TimelineEventItem?, tools: [TimelineEventItem])] = []
+    static func summarizeCompleted(_ items: [TimelineEventItem]) -> (label: String, secondary: String?, hasError: Bool) {
+        var readCount = 0
+        var searchCount = 0
+        var editCount = 0
+        var shellCount = 0
+        var otherCount = 0
+        var realThinkCount = 0
+        var hasError = false
+        var editedFiles: [String] = []
+
         for item in items {
             switch item.kind {
             case .thinking:
-                raw.append((id: item.id, thinking: item, tools: []))
-            case .toolCall:
-                if !raw.isEmpty {
-                    raw[raw.count - 1].tools.append(item)
+                if !isNoiseThinking(item.content) { realThinkCount += 1 }
+            case .toolCall(let toolName, _, _, let summary, _, let isErr):
+                if isErr { hasError = true }
+                let lower = toolName.lowercased()
+                if lower.contains("read") || lower.contains("view") || lower == "list_dir" {
+                    readCount += 1
+                } else if lower.contains("search") || lower.contains("grep") || lower.contains("glob") || lower.contains("find") {
+                    searchCount += 1
+                } else if lower.contains("edit") || lower.contains("write") || lower.contains("patch") || lower.contains("file_change") {
+                    editCount += 1
+                    let shortName = (summary ?? "").split(separator: "/").last.map(String.init) ?? ""
+                    if !shortName.isEmpty, !editedFiles.contains(shortName) {
+                        editedFiles.append(shortName)
+                    }
+                } else if lower.contains("bash") || lower.contains("shell") || lower.contains("cmd") || lower.contains("command") {
+                    shellCount += 1
                 } else {
-                    raw.append((id: item.id, thinking: nil, tools: [item]))
+                    otherCount += 1
                 }
             default:
                 break
             }
         }
-        return raw.enumerated().map { idx, entry in
-            let rawThink = entry.thinking?.content ?? ""
-            let tok = placeholderTokens(rawThink)
-            let headline = extractHeadline(rawThink)
-            let title: String
-            if !headline.isEmpty {
-                title = headline
-            } else if !entry.tools.isEmpty {
-                title = deriveTitleFromTools(entry.tools)
-            } else if let tok {
-                title = "深度推理 (\(tok) tokens)"
-            } else {
-                title = "分析上下文"
-            }
-            let hasErr = entry.tools.contains { item in
-                if case .toolCall(_, _, _, _, _, let isErr) = item.kind { return isErr }
-                return false
-            }
-            var dur: Int?
-            if let th = entry.thinking, case .thinking(_, let d, _) = th.kind {
-                dur = d
-            }
-            return VeloExecutionPhase(
-                id: entry.id,
-                index: idx + 1,
-                title: title,
-                tokenBadge: tok.map { "\($0) tok" },
-                thinkingItem: entry.thinking,
-                toolItems: entry.tools,
-                hasError: hasErr,
-                durationMs: dur
-            )
+
+        var parts: [String] = []
+        if readCount > 0 { parts.append("读取 \(readCount) 个文件") }
+        if searchCount > 0 { parts.append("检索 \(searchCount) 次") }
+        if editCount > 0 { parts.append("修改 \(editCount) 处") }
+        if shellCount > 0 { parts.append("运行 \(shellCount) 次命令") }
+        if otherCount > 0 { parts.append("\(otherCount) 项工具") }
+        if parts.isEmpty && realThinkCount > 0 {
+            parts.append("思考 \(realThinkCount) 次")
         }
+
+        let label = parts.isEmpty ? "执行了 \(items.count) 步操作" : "已\(parts.joined(separator: " · "))"
+        let secondary: String? = editedFiles.isEmpty
+            ? nil
+            : editedFiles.prefix(2).joined(separator: ", ") + (editedFiles.count > 2 ? " 等" : "")
+        return (label, secondary, hasError)
     }
 }
 
-private struct VeloExecutionPhaseRowView: View {
-    let phase: VeloExecutionPhase
-    let isActivePhase: Bool
+private struct VeloExploreBatchRowView: View {
+    let items: [TimelineEventItem]
     let isTurnRunning: Bool
-    let turnStartedAt: Date?
+    @State private var expanded = false
 
-    @State private var userExpanded: Bool? = nil
+    private var meta: (label: String, secondary: String?, isRunning: Bool, hasError: Bool, iconName: String) {
+        var readCount = 0
+        var searchCount = 0
+        var hasError = false
+        var activeVerb = ""
+        var targets: [String] = []
 
-    private var isExpanded: Bool {
-        userExpanded ?? isActivePhase
-    }
+        for item in items {
+            if case .toolCall(let toolName, _, let workingVerb, let summary, let output, let isErr) = item.kind {
+                if isErr { hasError = true }
+                let lower = toolName.lowercased()
+                let isRead = lower.contains("read") || lower.contains("view") || lower == "list_dir"
+                if isRead { readCount += 1 } else { searchCount += 1 }
+                if isTurnRunning && output == nil {
+                    activeVerb = workingVerb
+                }
+                let s = (summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let shortT = isRead ? (s.split(separator: "/").last.map(String.init) ?? s) : String(s.prefix(24))
+                if !shortT.isEmpty, !targets.contains(shortT) {
+                    targets.append(shortT)
+                }
+            }
+        }
 
-    private var hasThinkDetail: Bool {
-        guard let th = phase.thinkingItem else { return false }
-        return !th.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !VeloPhaseGrouping.isPlaceholderThinking(th.content)
-    }
-
-    private var hasBody: Bool {
-        hasThinkDetail || !phase.toolItems.isEmpty
+        let running = isTurnRunning && !activeVerb.isEmpty
+        var parts: [String] = []
+        if readCount > 0 { parts.append("读取 \(readCount) 个文件") }
+        if searchCount > 0 { parts.append("检索 \(searchCount) 次") }
+        let label = running ? "\(activeVerb)…" : "已\(parts.joined(separator: " · "))"
+        let secondary: String? = running
+            ? (items.count > 1 ? "共 \(items.count) 项" : nil)
+            : (targets.isEmpty ? nil : targets.prefix(2).joined(separator: ", ") + (targets.count > 2 ? " 等" : ""))
+        return (label, secondary, running, hasError, readCount >= searchCount ? "eye" : "magnifyingglass")
     }
 
     var body: some View {
+        let info = meta
         VStack(alignment: .leading, spacing: 4) {
             Button {
-                guard hasBody else { return }
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 withAnimation(.spring(response: 0.24, dampingFraction: 0.84)) {
-                    userExpanded = !isExpanded
+                    expanded.toggle()
                 }
             } label: {
                 HStack(spacing: 6) {
-                    if isActivePhase {
-                        OrbitalStatusIcon(phase: .thinking)
-                            .frame(width: 14)
-                    } else if phase.hasError {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(VeloTheme.coral)
-                            .frame(width: 14)
+                    if info.isRunning {
+                        OrbitalStatusIcon(phase: .working)
+                            .frame(width: 15)
                     } else {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(VeloTheme.emerald)
-                            .frame(width: 14)
+                        Image(systemName: info.hasError ? "exclamationmark.triangle.fill" : info.iconName)
+                            .font(.system(size: 11))
+                            .foregroundStyle(info.hasError ? VeloTheme.coral : .secondary)
+                            .frame(width: 15)
                     }
 
-                    if isActivePhase {
-                        ShimmerTextView(phase.title, font: .system(size: 12.5, weight: .medium))
+                    if info.isRunning {
+                        ShimmerTextView(info.label, font: .system(size: 12.5, weight: .medium))
                             .lineLimit(1)
                     } else {
-                        Text(phase.title)
+                        Text(info.label)
                             .font(.system(size: 12.5, weight: .regular))
-                            .foregroundStyle(isExpanded ? .primary : .secondary)
+                            .foregroundStyle(expanded ? .primary : .secondary)
+                            .lineLimit(1)
+                    }
+
+                    if let sec = info.secondary {
+                        Text(sec)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.tertiary)
                             .lineLimit(1)
                     }
 
                     Spacer(minLength: 4)
 
-                    if !phase.toolItems.isEmpty {
-                        Text("\(phase.toolItems.count) 工具")
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                    } else if let tok = phase.tokenBadge {
-                        Text(tok)
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                    }
-
-                    if hasBody {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.tertiary)
-                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    }
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
                 }
                 .padding(.vertical, 3)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .onChange(of: isActivePhase) { wasActive, nowActive in
-                if wasActive && !nowActive {
-                    withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
-                        userExpanded = nil
-                    }
-                }
-            }
 
-            if isExpanded && hasBody {
+            if expanded {
                 IndentRailContainer {
                     VStack(alignment: .leading, spacing: 4) {
-                        if hasThinkDetail, let th = phase.thinkingItem {
-                            Text(th.content.trimmingCharacters(in: .whitespacesAndNewlines))
-                                .font(.system(size: 12.5))
-                                .foregroundStyle(.secondary)
-                                .lineSpacing(3)
-                                .textSelection(.enabled)
-                        }
-                        ForEach(phase.toolItems) { item in
+                        ForEach(items) { item in
                             if case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isError) = item.kind {
                                 ToolCallRowView(
                                     toolName: toolName,
@@ -584,148 +593,128 @@ public struct ExecutionTraceGroupView: View {
         self.defaultExpanded = defaultExpanded
     }
 
-    private var expanded: Bool {
-        userExpanded ?? (isTurnRunning ? true : defaultExpanded)
+    @ViewBuilder
+    private func flatActivityList(_ rows: [VeloFlatActivityRow]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
+                let isLastRow = idx == rows.count - 1
+                switch row {
+                case .thinking(let item):
+                    if case .thinking(let startedAt, let durationMs, let isStreaming) = item.kind {
+                        ReasoningRowView(
+                            rawText: item.content,
+                            startedAt: startedAt ?? turnStartedAt,
+                            durationMs: durationMs,
+                            isStreaming: isStreaming && isTurnRunning && isLastRow
+                        )
+                    }
+                case .exploreBatch(_, let batchItems):
+                    VeloExploreBatchRowView(
+                        items: batchItems,
+                        isTurnRunning: isTurnRunning
+                    )
+                case .tool(let item):
+                    if case .toolCall(let toolName, let displayName, let workingVerb, let summary, let output, let isError) = item.kind {
+                        ToolCallRowView(
+                            toolName: toolName,
+                            displayName: displayName,
+                            workingVerb: workingVerb,
+                            summary: summary,
+                            output: output,
+                            isError: isError,
+                            inlineDiffOld: item.inlineDiffOld,
+                            inlineDiffNew: item.inlineDiffNew,
+                            subagentRole: item.subagentRole,
+                            subagentPrompt: item.subagentPrompt,
+                            nested: false,
+                            isTurnRunning: isTurnRunning
+                        )
+                    }
+                }
+            }
+        }
     }
 
     public var body: some View {
-        let meta = VeloFormatting.summarizeExecutionTrace(items)
-        let phases = VeloPhaseGrouping.group(items)
-        let activelyRunning = isTurnRunning
-        let isWaitingBetweenSteps: Bool = {
-            guard isTurnRunning, let last = items.last else { return false }
-            switch last.kind {
-            case .toolCall(_, _, _, _, let output, _):
-                return output != nil
-            case .thinking(_, _, let isStreaming):
-                return !isStreaming
-            default:
-                return false
-            }
-        }()
-        let activeHeaderText: String = {
-            if let activeLabel = meta.activeLabel, !activeLabel.isEmpty {
-                return "第 \(phases.count) 阶段 · \(activeLabel)"
-            }
-            if let lastPhase = phases.last {
-                return "第 \(phases.count) 阶段 · \(lastPhase.title)"
-            }
-            return "执行中 (\(items.count) 步)"
-        }()
+        let rows = VeloActivityStreamBuilder.build(items, isTurnRunning: isTurnRunning)
+        let summary = VeloActivityStreamBuilder.summarizeCompleted(items)
+        let expanded = userExpanded ?? false
 
-        VStack(alignment: .leading, spacing: 6) {
-            Button {
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
-                    userExpanded = !expanded
+        if rows.isEmpty {
+            EmptyView()
+        } else if isTurnRunning || defaultExpanded {
+            // Flat Codex/Cursor activity stream while running (no outer box, no phase nesting!)
+            flatActivityList(rows)
+                .onChange(of: isTurnRunning) { wasRunning, nowRunning in
+                    if wasRunning && !nowRunning {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
+                            userExpanded = nil
+                        }
+                    }
                 }
-            } label: {
-                HStack(spacing: 7) {
-                    if activelyRunning {
-                        OrbitalStatusIcon(phase: .working)
-                            .frame(width: 16)
-                    } else {
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                        userExpanded = !expanded
+                    }
+                } label: {
+                    HStack(spacing: 7) {
                         Image(
-                            systemName: meta.hasError
+                            systemName: summary.hasError
                                 ? "exclamationmark.triangle.fill"
-                                : "square.stack.3d.up.fill"
+                                : "wrench.and.screwdriver"
                         )
-                        .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundStyle(meta.hasError ? VeloTheme.coral : VeloTheme.accentVioletSoft.opacity(0.9))
-                        .frame(width: 16)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(summary.hasError ? VeloTheme.coral : .secondary)
+                        .frame(width: 15)
+
+                        Text(summary.label)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+
+                        if let sec = summary.secondary {
+                            Text(sec)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+
+                        Spacer(minLength: 4)
+
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
                     }
-
-                    if activelyRunning {
-                        ShimmerTextView(
-                            activeHeaderText,
-                            font: .system(size: 12.5, weight: .medium)
-                        )
-                        .lineLimit(1)
-                    } else {
-                        Text(
-                            phases.count > 1
-                                ? "已完成 \(phases.count) 个阶段 · \(meta.title)"
-                                : meta.title
-                        )
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    }
-
-                    Spacer(minLength: 4)
-
-                    if activelyRunning {
-                        Text("\(phases.count) 阶段")
-                            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(VeloTheme.accentVioletSoft)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1.5)
-                            .background(VeloTheme.accentViolet.opacity(0.14), in: Capsule())
-                    }
-
-                    Text(expanded ? "收起" : "展开")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.tertiary)
-
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9.5, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        VeloTheme.elevatedSurface(colorScheme).opacity(0.55),
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7)
+                    )
+                    .contentShape(Rectangle())
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6.5)
-                .background(
-                    VeloTheme.elevatedSurface(colorScheme).opacity(0.62),
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(
-                            activelyRunning
-                                ? VeloTheme.accentViolet.opacity(0.32)
-                                : VeloTheme.hairline(colorScheme),
-                            lineWidth: 0.75
-                        )
-                )
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
-            .onChange(of: isTurnRunning) { wasRunning, nowRunning in
-                if wasRunning && !nowRunning {
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
+                .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
+                .onChange(of: defaultExpanded) { _, _ in
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
                         userExpanded = nil
                     }
                 }
-            }
-            .onChange(of: defaultExpanded) { _, _ in
-                withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
-                    userExpanded = nil
-                }
-            }
 
-            if expanded {
-                IndentRailContainer {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(phases.enumerated()), id: \.element.id) { idx, phase in
-                            VeloExecutionPhaseRowView(
-                                phase: phase,
-                                isActivePhase: isTurnRunning && idx == phases.count - 1,
-                                isTurnRunning: isTurnRunning,
-                                turnStartedAt: turnStartedAt
-                            )
-                        }
-                        if isWaitingBetweenSteps {
-                            HStack(spacing: 6) {
-                                OrbitalStatusIcon(phase: .thinking)
-                                    .frame(width: 14)
-                                ShimmerTextView("正在分析结果并规划下一阶段…", font: .system(size: 12))
-                            }
+                if expanded {
+                    IndentRailContainer {
+                        flatActivityList(rows)
                             .padding(.vertical, 2)
-                        }
                     }
-                    .padding(.vertical, 2)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
     }

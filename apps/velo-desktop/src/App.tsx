@@ -7524,24 +7524,16 @@ export function App() {
                               lastTurnItem.tool_output
                             );
                             turnPhase = "tool";
-                            turnStatusLabel = `Working · ${pres.workingVerb}…`;
+                            turnStatusLabel = `${pres.workingVerb}…`;
                           } else if (
                             lastTurnItem.kind === "assistant" &&
                             lastTurnItem.is_streaming_chunk
                           ) {
                             turnPhase = "writing";
                             turnStatusLabel = "Writing…";
-                          } else if (lastTurnItem.kind === "thinking") {
-                            turnPhase = "thinking";
-                            turnStatusLabel = latestThinkHeadline
-                              ? `思考 · ${latestThinkHeadline}`
-                              : undefined;
-                          } else if (lastTurnItem.kind === "tool_call") {
-                            turnPhase = "thinking";
-                            turnStatusLabel = "正在分析结果并规划下一阶段…";
                           } else {
-                            turnPhase = "working";
-                            turnStatusLabel = latestThinkHeadline || "Working…";
+                            turnPhase = "thinking";
+                            turnStatusLabel = latestThinkHeadline || undefined;
                           }
                         }
 
@@ -7790,7 +7782,7 @@ export function App() {
                                         (isLatestTurn ? activeTurnTiming?.startedAtMs : undefined)
                                       }
                                       durationMs={ev.duration_ms}
-                                      defaultExpanded={isStreamingThinking}
+                                      defaultExpanded={false}
                                     />
                                   );
                                 }

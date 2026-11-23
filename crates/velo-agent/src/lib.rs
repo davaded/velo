@@ -863,18 +863,26 @@ impl AgentSpawner {
                 let mut parsed = parse_agent_stdout_line(session_id, &provider_clone, &line);
                 if let Some(tailer) = agy_tailer.as_mut() {
                     tailer.observe_stdout_line(&line);
-                    for ev in &mut parsed {
-                        if let AgentEvent::ThinkingDelta { text, .. } = ev {
+                    let mut filtered_parsed = Vec::with_capacity(parsed.len());
+                    for mut ev in parsed {
+                        if let AgentEvent::ThinkingDelta { ref mut text, .. } = ev {
                             if text.starts_with("**Reasoning completed (") {
                                 if let Some(step_idx) = extract_agy_step_index(&line) {
-                                    let enriched = tailer.fetch_thinking_for_step(step_idx).await;
-                                    if let Some(real_thinking) = enriched {
-                                        *text = real_thinking;
+                                    match tailer.fetch_thinking_for_step(step_idx).await {
+                                        AgyStepThinkingLookup::Content(real_thinking) => {
+                                            *text = real_thinking;
+                                        }
+                                        AgyStepThinkingLookup::FillerOrEmpty => {
+                                            continue;
+                                        }
+                                        AgyStepThinkingLookup::Unavailable => {}
                                     }
                                 }
                             }
                         }
+                        filtered_parsed.push(ev);
                     }
+                    parsed = filtered_parsed;
                 }
                 for ev in &parsed {
                     match ev {
@@ -1872,93 +1880,57 @@ fn extract_agy_step_index(line: &str) -> Option<u64> {
     val.pointer("/step_update/step_index").and_then(|v| v.as_u64())
 }
 
-/// Formats authentic AGY `thinking` text with a concise leading `**Phase headline**` so
-/// downstream phased-trace UIs can display a crisp stage summary while preserving the full
-/// chain-of-thought body when expanded.
+/// Cleans authentic AGY `thinking` text by stripping generic filler openers (e.g.
+/// `"I'm thinking through how to approach this."`) and capping extreme length, without
+/// prepending synthetic truncated headlines. Returns `None` when the step only contained filler.
 pub fn format_agy_thinking_with_headline(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    // Truncate extremely long thoughts safely on a UTF-8 char boundary
-    let capped: String = if trimmed.chars().count() > 6000 {
-        let mut s: String = trimmed.chars().take(6000).collect();
-        s.push('…');
-        s
-    } else {
-        trimmed.to_string()
-    };
 
-    // If the text already starts with a markdown **bold** heading, keep it as-is
-    let first_non_empty = capped.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    if first_non_empty.starts_with("**") && first_non_empty.ends_with("**") && first_non_empty.len() > 4 {
-        return Some(capped);
-    }
-
-    // Pick the first substantive sentence/clause, skipping generic filler openers
-    let filler_prefixes = [
+    let filler_lines = [
         "i'm thinking through how to approach this",
         "i am thinking through how to approach this",
         "let me think",
         "let's think",
         "let's see",
-        "okay,",
-        "alright,",
-        "hmm,",
+        "okay",
+        "alright",
+        "hmm",
     ];
-    let candidate_line = capped
+    let substantive_lines: Vec<&str> = trimmed
         .lines()
-        .map(str::trim)
-        .find(|line| {
-            if line.is_empty() {
-                return false;
-            }
-            let lower = line.to_ascii_lowercase();
-            !filler_prefixes
-                .iter()
-                .any(|p| lower == *p || lower.trim_end_matches('.') == *p)
+        .skip_while(|line| {
+            let norm = line
+                .trim()
+                .to_ascii_lowercase()
+                .trim_end_matches(['.', '!', '?', ',', ':', '…'])
+                .trim()
+                .to_string();
+            norm.is_empty() || filler_lines.contains(&norm.as_str())
         })
-        .unwrap_or(first_non_empty);
+        .collect();
 
-    // Strip inline markdown noise and extract first clause/sentence up to ~68 chars
-    let cleaned = candidate_line
-        .replace("**", "")
-        .replace('`', "")
-        .trim_start_matches(|c: char| c == '#' || c == '-' || c == '*' || c.is_whitespace())
-        .trim()
-        .to_string();
-
-    if cleaned.is_empty() {
-        return Some(capped);
+    let joined = substantive_lines.join("\n").trim().to_string();
+    if joined.is_empty() {
+        return None;
     }
 
-    let first_sentence = cleaned
-        .split(['\n', '。', '！', '？'])
-        .next()
-        .unwrap_or(&cleaned)
-        .split(". ")
-        .next()
-        .unwrap_or(&cleaned)
-        .trim()
-        .trim_end_matches(['.', ':', ';', ',', '：', '；', '，']);
-
-    let headline: String = if first_sentence.chars().count() > 72 {
-        let mut cut: String = first_sentence.chars().take(70).collect();
-        if let Some(last_sp) = cut.rfind(' ') {
-            if last_sp >= 32 {
-                cut.truncate(last_sp);
-            }
-        }
-        cut.trim_end().to_string() + "…"
+    if joined.chars().count() > 6000 {
+        let mut s: String = joined.chars().take(6000).collect();
+        s.push('…');
+        Some(s)
     } else {
-        first_sentence.to_string()
-    };
-
-    if headline.is_empty() {
-        Some(capped)
-    } else {
-        Some(format!("**{}**\n{}", headline, capped))
+        Some(joined)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgyStepThinkingLookup {
+    Content(String),
+    FillerOrEmpty,
+    Unavailable,
 }
 
 /// Incrementally tails `~/.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/transcript.jsonl`
@@ -1968,7 +1940,7 @@ struct AgyTranscriptTailer {
     conv_id: Option<String>,
     transcript_path: Option<PathBuf>,
     byte_offset: u64,
-    by_step: HashMap<u64, String>,
+    by_step: HashMap<u64, Option<String>>,
     custom_roots: Option<Vec<PathBuf>>,
 }
 
@@ -2092,30 +2064,32 @@ impl AgyTranscriptTailer {
             let Some(si) = v.get("step_index").and_then(|x| x.as_u64()) else {
                 continue;
             };
-            if let Some(th) = v
-                .get("thinking")
-                .and_then(|x| x.as_str())
-                .filter(|s| !s.trim().is_empty())
-            {
-                if let Some(formatted) = format_agy_thinking_with_headline(th) {
-                    self.by_step.insert(si, formatted);
-                }
+            if let Some(th) = v.get("thinking").and_then(|x| x.as_str()) {
+                let cleaned = format_agy_thinking_with_headline(th);
+                self.by_step.insert(si, cleaned);
             }
         }
     }
 
-    async fn fetch_thinking_for_step(&mut self, step_idx: u64) -> Option<String> {
-        if let Some(hit) = self.by_step.get(&step_idx) {
-            return Some(hit.clone());
+    async fn fetch_thinking_for_step(&mut self, step_idx: u64) -> AgyStepThinkingLookup {
+        let lookup = |m: &HashMap<u64, Option<String>>| match m.get(&step_idx) {
+            Some(Some(s)) => AgyStepThinkingLookup::Content(s.clone()),
+            Some(None) => AgyStepThinkingLookup::FillerOrEmpty,
+            None => AgyStepThinkingLookup::Unavailable,
+        };
+        let first = lookup(&self.by_step);
+        if first != AgyStepThinkingLookup::Unavailable {
+            return first;
         }
         self.read_new_entries();
-        if let Some(hit) = self.by_step.get(&step_idx) {
-            return Some(hit.clone());
+        let second = lookup(&self.by_step);
+        if second != AgyStepThinkingLookup::Unavailable {
+            return second;
         }
         // Handle tiny flush race between agy stdout step_update and transcript.jsonl write
         tokio::time::sleep(std::time::Duration::from_millis(35)).await;
         self.read_new_entries();
-        self.by_step.get(&step_idx).cloned()
+        lookup(&self.by_step)
     }
 }
 
@@ -3647,19 +3621,36 @@ mod tests {
 
         let mut tailer = AgyTranscriptTailer::with_roots(vec![tmp.clone()]);
         tailer.observe_stdout_line(&format!(r#"{{"event":"init","conversation_id":"{}"}}"#, cid));
-        let got = tailer.fetch_thinking_for_step(10).await.expect("step 10 thinking");
-        assert!(got.starts_with("**The login check fails because Local State points to the wrong"));
-        assert!(got.contains("inspect flowManager.ts"));
+        let got = tailer.fetch_thinking_for_step(10).await;
+        assert_eq!(
+            got,
+            AgyStepThinkingLookup::Content(
+                "The login check fails because Local State points to the wrong Chrome profile. Let's inspect flowManager.ts.".to_string()
+            )
+        );
 
-        // Append a second step incrementally and ensure offset tailing picks it up
+        // Append a pure-filler step + a native bold-headed step incrementally
         let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(
+            f,
+            r#"{{"step_index":12,"type":"PLANNER_RESPONSE","thinking":"I'm thinking through how to approach this."}}"#
+        )
+        .unwrap();
         writeln!(
             f,
             r#"{{"step_index":14,"type":"PLANNER_RESPONSE","thinking":"**Verify Chrome profile patch**\nRunning unit tests to confirm fix."}}"#
         )
         .unwrap();
-        let got2 = tailer.fetch_thinking_for_step(14).await.expect("step 14 thinking");
-        assert!(got2.starts_with("**Verify Chrome profile patch**"));
+        assert_eq!(
+            tailer.fetch_thinking_for_step(12).await,
+            AgyStepThinkingLookup::FillerOrEmpty
+        );
+        match tailer.fetch_thinking_for_step(14).await {
+            AgyStepThinkingLookup::Content(s) => {
+                assert!(s.starts_with("**Verify Chrome profile patch**"));
+            }
+            other => panic!("expected Content, got {:?}", other),
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
