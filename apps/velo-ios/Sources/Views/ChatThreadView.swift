@@ -47,8 +47,6 @@ public struct ChatThreadView: View {
     @State private var annotatingImageId: UUID? = nil
     @State private var previewImageItem: PreviewImageTarget?
     @State private var jumpTargetTurnId: String? = nil
-    @StateObject private var voiceRecorder = VeloVoiceRecorder()
-    @State private var isTranscribingVoice: Bool = false
     @State private var isLoadingOlderHistory: Bool = false
     @State private var didInitialBottomScroll: Bool = false
     @State private var isPinnedToBottom: Bool = true
@@ -1420,67 +1418,12 @@ public struct ChatThreadView: View {
                 }
             }
 
-            if voiceRecorder.isRecording {
-                // Pure Visual Acoustic Soundwave Feedback (Zero Text Labels)
-                HStack(spacing: 10) {
-                    Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        withAnimation(.snappy(duration: 0.2)) {
-                            voiceRecorder.cancelRecording()
-                        }
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 12.5, weight: .bold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 32, height: 32)
-                            .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
-                    }
-                    .buttonStyle(VeloPressableButtonStyle())
-
-                    VoiceRecordingWaveformBar(levels: voiceRecorder.barLevels)
-                        .frame(height: 34)
-                        .frame(maxWidth: .infinity)
-
-                    Button {
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        isTranscribingVoice = true
-                        Task {
-                            let outcome = await voiceRecorder.stopAndTranscribe()
-                            var recognized = outcome.text
-                            if (recognized == nil || recognized?.isEmpty == true),
-                               let backupData = outcome.fallbackAudio
-                            {
-                                recognized = await store.transcribeVoiceData(backupData)
-                            }
-                            if let text = recognized, !text.isEmpty {
-                                draftPrompt = draftPrompt.isEmpty ? text : "\(draftPrompt) \(text)"
-                                composerFocused = true
-                            }
-                            isTranscribingVoice = false
-                        }
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(VeloTheme.coral.opacity(0.18))
-                                .frame(width: 34, height: 34)
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 13.5, weight: .bold))
-                                .foregroundStyle(VeloTheme.coral)
-                        }
-                    }
-                    .buttonStyle(VeloPressableButtonStyle())
-                }
+            TextField("向 \(cat.shortBadge) 发送指令或附图…", text: $draftPrompt, axis: .vertical)
+                .lineLimit(1...5)
+                .focused($composerFocused)
+                .font(.system(size: 15))
                 .padding(.horizontal, 4)
-                .padding(.vertical, 3)
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
-            } else {
-                TextField("向 \(cat.shortBadge) 发送指令或附图…", text: $draftPrompt, axis: .vertical)
-                    .lineLimit(1...5)
-                    .focused($composerFocused)
-                    .font(.system(size: 15))
-                    .padding(.horizontal, 4)
-                    .padding(.top, 2)
-            }
+                .padding(.top, 2)
 
             HStack(spacing: 7) {
                 // Paseo-Style Compressed Photo / Screenshot Picker
@@ -1495,7 +1438,7 @@ public struct ChatThreadView: View {
                         .frame(width: 31, height: 31)
                         .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
                 }
-                .disabled(pendingImages.count >= 4 || voiceRecorder.isRecording)
+                .disabled(pendingImages.count >= 4)
 
                 // Attach Any File from iOS Files App
                 Button {
@@ -1508,10 +1451,10 @@ public struct ChatThreadView: View {
                         .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
                 }
                 .buttonStyle(VeloPressableButtonStyle())
-                .disabled(pendingFiles.count >= 4 || voiceRecorder.isRecording)
+                .disabled(pendingFiles.count >= 4)
                 .accessibilityLabel("附加本地文件")
 
-                if UIPasteboard.general.hasImages && pendingImages.count < 4 && !voiceRecorder.isRecording {
+                if UIPasteboard.general.hasImages && pendingImages.count < 4 {
                     Button {
                         if let pasted = UIPasteboard.general.image {
                             enqueueComposerImage(pasted, filename: "clipboard-\(Int(Date().timeIntervalSince1970)).jpg")
@@ -1525,33 +1468,6 @@ public struct ChatThreadView: View {
                     }
                     .buttonStyle(VeloPressableButtonStyle())
                     .accessibilityLabel("粘贴剪贴板图片")
-                }
-
-                // Voice-to-Prompt Microphone Dictation Button (Icon-only, zero text)
-                if !voiceRecorder.isRecording {
-                    Button {
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        composerFocused = false
-                        Task {
-                            _ = await voiceRecorder.startRecording()
-                        }
-                    } label: {
-                        Group {
-                            if isTranscribingVoice {
-                                ProgressView()
-                                    .scaleEffect(0.75)
-                            } else {
-                                Image(systemName: "mic.fill")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(Color.secondary)
-                            }
-                        }
-                        .frame(width: 31, height: 31)
-                        .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
-                    }
-                    .buttonStyle(VeloPressableButtonStyle())
-                    .disabled(isTranscribingVoice)
-                    .accessibilityLabel("语音输入")
                 }
 
                 // Categorized Model & Handoff Sheet Trigger
@@ -3110,48 +3026,6 @@ private struct FencedCodeCardView: View {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
                 .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.9)
         )
-    }
-}
-
-private struct VoiceRecordingWaveformBar: View {
-    let levels: [CGFloat]
-    @State private var pulseDot: Bool = false
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(VeloTheme.coral)
-                .frame(width: 7.5, height: 7.5)
-                .scaleEffect(pulseDot ? 1.18 : 0.78)
-                .opacity(pulseDot ? 1.0 : 0.45)
-                .animation(.easeInOut(duration: 0.65).repeatForever(autoreverses: true), value: pulseDot)
-
-            HStack(alignment: .center, spacing: 3.2) {
-                ForEach(Array(levels.enumerated()), id: \.offset) { _, lv in
-                    Capsule(style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [VeloTheme.coral, VeloTheme.accentVioletSoft],
-                                startPoint: .bottom,
-                                endPoint: .top
-                            )
-                        )
-                        .frame(width: 3.0, height: max(4, min(26, lv * 26)))
-                        .animation(.interpolatingSpring(stiffness: 260, damping: 19), value: lv)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .center)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 4)
-        .background(VeloTheme.coral.opacity(0.09), in: Capsule())
-        .overlay(
-            Capsule()
-                .stroke(VeloTheme.coral.opacity(0.24), lineWidth: 0.8)
-        )
-        .onAppear {
-            pulseDot = true
-        }
     }
 }
 

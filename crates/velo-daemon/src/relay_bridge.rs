@@ -2765,34 +2765,6 @@ async fn run_supervised_e2ee_bridge(
                                         }
                                     }
                                 }
-                                "transcribe_audio" => {
-                                    let req_id = cmd_val
-                                        .get("request_id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let b64 = cmd_val
-                                        .get("audio_base64")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    let mime = cmd_val
-                                        .get("mime_type")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("audio/m4a");
-                                    let lang = cmd_val.get("language").and_then(|v| v.as_str());
-                                    let res =
-                                        state.transcribe_audio_base64(b64, mime, lang).await;
-                                    let resp = json!({
-                                        "type": "transcription_result",
-                                        "request_id": req_id,
-                                        "result": res,
-                                    });
-                                    if let Some(frame_txt) =
-                                        send_sealed_with_key(&resp, &active_key_hex, &mut out_nonce)
-                                    {
-                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
-                                    }
-                                }
                                 "list_automations" => {
                                     let list = {
                                         let guard = state.inner.read().await;

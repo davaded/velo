@@ -42,12 +42,8 @@
 	<string>用于扫描 Mac 端 Velo 配对二维码（支持局域网、Tailscale 及端到端加密中继）</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>用于在同 Wi-Fi 或 Tailscale 下直连你的 Mac Velo 守护进程</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>用于录制语音指令并通过端到端加密通道转写为 Prompt</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>用于将对话中的高清图片或截图保存到系统相册</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>用于将你的语音实时识别为对话指令</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 </dict>

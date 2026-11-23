@@ -73,7 +73,6 @@ public final class VeloStore: ObservableObject {
     private var attachmentDownloadWaiters: [String: [CheckedContinuation<Data?, Never>]] = [:]
     private var attachmentChunkBuffers: [String: IncomingAttachmentBuffer] = [:]
     private var attachmentUploadWaiters: [String: CheckedContinuation<(path: String, url: String)?, Never>] = [:]
-    private var transcriptionWaiters: [String: CheckedContinuation<String?, Never>] = [:]
     private var skillContentWaiters: [String: CheckedContinuation<String?, Never>] = [:]
     private var e2eeNonceCounter: UInt64 = UInt64(Date().timeIntervalSince1970 * 1_000_000)
     private var ephemeralPrivateKey: Curve25519.KeyAgreement.PrivateKey?
@@ -2191,51 +2190,6 @@ public final class VeloStore: ObservableObject {
         }
     }
 
-    public func transcribeVoiceData(_ audioData: Data) async -> String? {
-        guard !audioData.isEmpty else { return nil }
-        let b64 = audioData.base64EncodedString()
-        switch connectionConfig {
-        case .direct(let baseURL):
-            guard let url = URL(string: "\(baseURL)/api/transcribe") else { return nil }
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try? JSONSerialization.data(withJSONObject: [
-                "audio_base64": b64,
-                "mime_type": "audio/m4a",
-                "language": "zh",
-            ])
-            guard let (data, _) = try? await URLSession.shared.data(for: req),
-                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  (obj["ok"] as? Bool) == true,
-                  let text = obj["text"] as? String,
-                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            else { return nil }
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        case .e2eeRelay:
-            let reqId = "tr-\(UUID().uuidString.prefix(10))"
-            return await withCheckedContinuation { cont in
-                self.transcriptionWaiters[reqId] = cont
-                self.sendEncryptedCommand([
-                    "cmd": "transcribe_audio",
-                    "request_id": reqId,
-                    "audio_base64": b64,
-                    "mime_type": "audio/m4a",
-                    "language": "zh",
-                ])
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 25_000_000_000)
-                    if let waiter = self?.transcriptionWaiters.removeValue(forKey: reqId) {
-                        waiter.resume(returning: nil)
-                    }
-                }
-            }
-        case .none:
-            return nil
-        }
-    }
-
     public func loadOlderEventsPage(for sessionId: String) async {
         let beforeSeq = oldestSeqBySession[sessionId]
         switch connectionConfig {
@@ -3529,15 +3483,6 @@ public final class VeloStore: ObservableObject {
             case "automations_snapshot":
                 if let arr = raw["automations"] as? [[String: Any]] {
                     automations = arr.compactMap(VeloAutomationItem.fromJSON)
-                }
-                return
-            case "transcription_result":
-                if let reqId = raw["request_id"] as? String,
-                   let waiter = transcriptionWaiters.removeValue(forKey: reqId)
-                {
-                    let resObj = (raw["result"] as? [String: Any]) ?? [:]
-                    let txt = (resObj["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    waiter.resume(returning: (txt?.isEmpty == false) ? txt : nil)
                 }
                 return
             case "events_page":

@@ -45,7 +45,6 @@ pub mod quota;
 pub mod relay_bridge;
 pub mod service;
 pub mod storage;
-pub mod voice;
 
 pub fn canonical_workspace_path(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -3024,7 +3023,6 @@ pub fn build_router(state: DaemonState) -> Router {
             get(list_repo_hooks_handler).post(set_repo_hook_handler),
         )
         .route("/api/browser/inspect", post(browser_inspect_handler))
-        .route("/api/transcribe", post(transcribe_audio_handler))
         .route(
             "/api/automations",
             get(list_automations_handler).post(create_automation_handler),
@@ -8163,20 +8161,6 @@ impl DaemonState {
         )
         .await
     }
-
-    pub async fn transcribe_audio_base64(
-        &self,
-        audio_base64: &str,
-        mime_type: &str,
-        language: Option<&str>,
-    ) -> Value {
-        let bytes = match decode_base64_payload(audio_base64) {
-            Ok(b) if !b.is_empty() => b,
-            _ => return json!({ "ok": false, "error": "Invalid or empty audio payload" }),
-        };
-        let temp_dir = self.attachments_dir.join("voice-tmp");
-        voice::transcribe_audio(&temp_dir, &bytes, mime_type, language).await
-    }
 }
 
 #[derive(serde::Deserialize)]
@@ -8872,31 +8856,6 @@ async fn browser_inspect_handler(
         });
     }
     Json(inspect_url_summary(&req.url).await)
-}
-
-async fn transcribe_audio_handler(
-    State(state): State<DaemonState>,
-    Json(req): Json<voice::TranscribeRequest>,
-) -> impl IntoResponse {
-    let bytes = match decode_base64_payload(&req.audio_base64) {
-        Ok(b) if !b.is_empty() => b,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "ok": false, "error": "Invalid or empty audio payload" })),
-            )
-                .into_response();
-        }
-    };
-    let temp_dir = state.attachments_dir.join("voice-tmp");
-    let res = voice::transcribe_audio(
-        &temp_dir,
-        &bytes,
-        &req.mime_type,
-        req.language.as_deref(),
-    )
-    .await;
-    (StatusCode::OK, Json(res)).into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]

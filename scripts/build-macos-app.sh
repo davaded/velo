@@ -41,10 +41,6 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<'PLIST'
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
-  <key>NSMicrophoneUsageDescription</key>
-  <string>用于录制语音指令并实时识别为对话输入</string>
-  <key>NSSpeechRecognitionUsageDescription</key>
-  <string>用于通过 macOS 原生语音引擎将语音实时识别为文字</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsArbitraryLoads</key>
@@ -57,8 +53,6 @@ swiftc -O \
   "${ROOT_DIR}/apps/velo-desktop/macos-shell/VeloApp.swift" \
   -framework Cocoa \
   -framework WebKit \
-  -framework AVFoundation \
-  -framework Speech \
   -framework UserNotifications \
   -o "${MACOS_DIR}/Velo"
 

@@ -98,7 +98,6 @@ import {
   Play,
   Lock,
   MessageSquarePlus,
-  Mic,
   Monitor,
   Moon,
   MoreHorizontal,
@@ -1147,13 +1146,6 @@ export function App() {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
   const [composerDragOver, setComposerDragOver] = useState<boolean>(false);
-  const [isDictating, setIsDictating] = useState<boolean>(false);
-  const [isTranscribingVoice, setIsTranscribingVoice] = useState<boolean>(false);
-  const [voiceLevels, setVoiceLevels] = useState<number[]>(() => Array(24).fill(0.16));
-  const speechRecRef = useRef<{ stop: () => void; abort?: () => void } | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const discardRecordingRef = useRef<boolean>(false);
-  const webAudioCleanupRef = useRef<(() => void) | null>(null);
   const [oldestSeqBySession, setOldestSeqBySession] = useState<Record<string, number>>({});
   const [hasMoreHistoryBySession, setHasMoreHistoryBySession] = useState<Record<string, boolean>>({});
   const [loadingOlderBySession, setLoadingOlderBySession] = useState<Record<string, boolean>>({});
@@ -5041,272 +5033,6 @@ export function App() {
     }).catch(() => {});
   };
 
-  const startBrowserAudioMeter = async (): Promise<MediaStream | null> => {
-    if (!navigator.mediaDevices?.getUserMedia) return null;
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (AudioCtx) {
-        const ctx = new AudioCtx();
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 64;
-        source.connect(analyser);
-        const freq = new Uint8Array(analyser.frequencyBinCount);
-        let rafId = 0;
-        let phase = 0;
-        let lastTick = 0;
-        const tick = (ts: number) => {
-          if (ts - lastTick >= 42) {
-            lastTick = ts;
-            phase += 0.5;
-            analyser.getByteFrequencyData(freq);
-            let sum = 0;
-            for (let i = 0; i < freq.length; i++) sum += freq[i];
-            const avg = sum / Math.max(1, freq.length * 255);
-            const idle = 0.16 + 0.07 * Math.abs(Math.sin(phase));
-            const lvl = Math.min(1, Math.max(idle, Math.pow(avg, 0.7) * 1.45));
-            setVoiceLevels((prev) => [...prev.slice(1), lvl]);
-          }
-          rafId = requestAnimationFrame(tick);
-        };
-        rafId = requestAnimationFrame(tick);
-        webAudioCleanupRef.current = () => {
-          cancelAnimationFrame(rafId);
-          stream.getTracks().forEach((t) => t.stop());
-          ctx.close().catch(() => {});
-          webAudioCleanupRef.current = null;
-        };
-      }
-      return stream;
-    } catch {
-      return null;
-    }
-  };
-
-  const handleFinishVoiceDictation = () => {
-    discardRecordingRef.current = false;
-    const nw = window as unknown as {
-      __VELO_NATIVE_VOICE__?: boolean;
-      webkit?: { messageHandlers?: { veloVoice?: { postMessage: (msg: string) => void } } };
-    };
-    if (nw.__VELO_NATIVE_VOICE__ && nw.webkit?.messageHandlers?.veloVoice) {
-      setIsDictating(false);
-      setIsTranscribingVoice(true);
-      nw.webkit.messageHandlers.veloVoice.postMessage("stop");
-      return;
-    }
-    setIsDictating(false);
-    speechRecRef.current?.stop();
-    speechRecRef.current = null;
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      setIsTranscribingVoice(true);
-      mediaRecorderRef.current.stop();
-    } else {
-      webAudioCleanupRef.current?.();
-      setVoiceLevels(Array(24).fill(0.16));
-    }
-  };
-
-  const handleCancelVoiceDictation = () => {
-    discardRecordingRef.current = true;
-    setIsDictating(false);
-    setIsTranscribingVoice(false);
-    const nw = window as unknown as {
-      __VELO_NATIVE_VOICE__?: boolean;
-      webkit?: { messageHandlers?: { veloVoice?: { postMessage: (msg: string) => void } } };
-    };
-    if (nw.__VELO_NATIVE_VOICE__ && nw.webkit?.messageHandlers?.veloVoice) {
-      nw.webkit.messageHandlers.veloVoice.postMessage("cancel");
-    }
-    if (speechRecRef.current) {
-      if (speechRecRef.current.abort) speechRecRef.current.abort();
-      else speechRecRef.current.stop();
-      speechRecRef.current = null;
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      mediaRecorderRef.current.stop();
-    }
-    webAudioCleanupRef.current?.();
-    setVoiceLevels(Array(24).fill(0.16));
-  };
-
-  // Hands-Free Voice Dictation Input (Native macOS Speech.framework -> Web Speech -> `/api/transcribe`)
-  const handleToggleVoiceDictation = async () => {
-    if (isDictating) {
-      handleFinishVoiceDictation();
-      return;
-    }
-
-    discardRecordingRef.current = false;
-    setVoiceLevels(Array(24).fill(0.18));
-
-    const nw = window as unknown as {
-      __VELO_NATIVE_VOICE__?: boolean;
-      __veloOnNativeVoiceLevels?: (levels: number[]) => void;
-      __veloOnNativeVoiceResult?: (text: string) => void;
-      __veloOnNativeVoiceFallback?: () => void;
-      webkit?: { messageHandlers?: { veloVoice?: { postMessage: (msg: string) => void } } };
-    };
-
-    const voiceOriginSid = activeSessionIdRef.current;
-
-    if (nw.__VELO_NATIVE_VOICE__ && nw.webkit?.messageHandlers?.veloVoice) {
-      nw.__veloOnNativeVoiceLevels = (levels: number[]) => {
-        if (Array.isArray(levels) && levels.length > 0) {
-          setVoiceLevels(levels);
-        }
-      };
-      nw.__veloOnNativeVoiceResult = (text: string) => {
-        setIsDictating(false);
-        setIsTranscribingVoice(false);
-        setVoiceLevels(Array(24).fill(0.16));
-        const clean = (text || "").trim();
-        if (clean && !discardRecordingRef.current) {
-          setPrompt((prev) => (prev ? `${prev} ${clean}` : clean), voiceOriginSid);
-          if (activeSessionIdRef.current === voiceOriginSid) {
-            setTimeout(() => composerTextareaRef.current?.focus(), 20);
-          }
-        }
-      };
-      nw.__veloOnNativeVoiceFallback = () => {
-        // If macOS Speech permission is disabled, gracefully fall back to browser/daemon MediaRecorder
-        nw.__VELO_NATIVE_VOICE__ = false;
-        setIsDictating(false);
-        void handleToggleVoiceDictation();
-      };
-      setIsDictating(true);
-      nw.webkit.messageHandlers.veloVoice.postMessage("start");
-      return;
-    }
-
-    const w = window as unknown as {
-      SpeechRecognition?: new () => {
-        lang: string;
-        continuous: boolean;
-        interimResults: boolean;
-        onresult: ((ev: { results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal?: boolean }> }) => void) | null;
-        onerror: (() => void) | null;
-        onend: (() => void) | null;
-        start: () => void;
-        stop: () => void;
-        abort?: () => void;
-      };
-      webkitSpeechRecognition?: new () => {
-        lang: string;
-        continuous: boolean;
-        interimResults: boolean;
-        onresult: ((ev: { results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal?: boolean }> }) => void) | null;
-        onerror: (() => void) | null;
-        onend: (() => void) | null;
-        start: () => void;
-        stop: () => void;
-        abort?: () => void;
-      };
-    };
-
-    const SpeechCtor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (SpeechCtor) {
-      try {
-        await startBrowserAudioMeter();
-        const rec = new SpeechCtor();
-        rec.lang = navigator.language || "zh-CN";
-        rec.continuous = true;
-        rec.interimResults = false;
-        rec.onresult = (ev) => {
-          if (discardRecordingRef.current) return;
-          let finalChunk = "";
-          for (let i = 0; i < ev.results.length; i++) {
-            const resItem = ev.results[i];
-            if (resItem.isFinal !== false && resItem[0]?.transcript) {
-              finalChunk = resItem[0].transcript;
-            }
-          }
-          if (finalChunk.trim()) {
-            setPrompt(
-              (prev) => (prev ? `${prev} ${finalChunk.trim()}` : finalChunk.trim()),
-              voiceOriginSid
-            );
-          }
-        };
-        rec.onerror = () => {
-          webAudioCleanupRef.current?.();
-          setIsDictating(false);
-        };
-        rec.onend = () => {
-          webAudioCleanupRef.current?.();
-          setIsDictating(false);
-        };
-        speechRecRef.current = rec;
-        setIsDictating(true);
-        rec.start();
-        return;
-      } catch {
-        webAudioCleanupRef.current?.();
-      }
-    }
-
-    const stream = await startBrowserAudioMeter();
-    if (stream) {
-      try {
-        const chunks: BlobPart[] = [];
-        const mr = new MediaRecorder(stream);
-        mr.ondataavailable = (e) => {
-          if (e.data.size > 0) chunks.push(e.data);
-        };
-        mr.onstop = async () => {
-          webAudioCleanupRef.current?.();
-          setVoiceLevels(Array(24).fill(0.16));
-          if (discardRecordingRef.current) {
-            setIsDictating(false);
-            setIsTranscribingVoice(false);
-            return;
-          }
-          try {
-            const blob = new Blob(chunks, { type: mr.mimeType || "audio/webm" });
-            const b64 = await new Promise<string>((resolve) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve(String(reader.result || ""));
-              reader.readAsDataURL(blob);
-            });
-            const res = await fetch(`${daemonUrl}/api/transcribe`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                audio_base64: b64,
-                mime_type: blob.type || "audio/webm",
-                language: "zh",
-              }),
-            });
-            if (res.ok) {
-              const d = (await res.json()) as { ok?: boolean; text?: string };
-              if (d.ok && d.text?.trim()) {
-                setPrompt(
-                  (prev) => (prev ? `${prev} ${d.text!.trim()}` : d.text!.trim()),
-                  voiceOriginSid
-                );
-                if (activeSessionIdRef.current === voiceOriginSid) {
-                  setTimeout(() => composerTextareaRef.current?.focus(), 20);
-                }
-              }
-            }
-          } finally {
-            setIsDictating(false);
-            setIsTranscribingVoice(false);
-          }
-        };
-        mediaRecorderRef.current = mr;
-        setIsDictating(true);
-        mr.start();
-      } catch {
-        webAudioCleanupRef.current?.();
-        setIsDictating(false);
-      }
-    }
-  };
-
   const handleSaveRepoHook = async (repoPath: string, cmd: string) => {
     setRepoHooks((prev) => ({ ...prev, [repoPath]: cmd }));
     await fetch(`${daemonUrl}/api/hooks`, {
@@ -8723,49 +8449,13 @@ export function App() {
                     </div>
                   )}
 
-                  {isDictating ? (
-                    <div className="flex items-center gap-2.5 py-1.5">
-                      <button
-                        type="button"
-                        onClick={handleCancelVoiceDictation}
-                        aria-label="Cancel voice recording"
-                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--v-bg-active)] text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-primary)] cursor-pointer"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-
-                      <div className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-full border border-[#f87171]/25 bg-[#f87171]/10 px-3">
-                        <span className="h-2 w-2 shrink-0 rounded-full bg-[#f87171] animate-pulse" />
-                        <div className="flex flex-1 items-center justify-center gap-[3.5px]">
-                          {voiceLevels.map((lv, idx) => (
-                            <span
-                              key={idx}
-                              style={{
-                                height: `${Math.max(4, Math.min(24, Math.round(lv * 24)))}px`,
-                              }}
-                              className="w-[3px] rounded-full bg-gradient-to-t from-[#f87171] to-[#a78bfa] transition-[height] duration-75"
-                            />
-                          ))}
-                        </div>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={handleFinishVoiceDictation}
-                        aria-label="Finish voice recording"
-                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#f87171]/20 text-[#f87171] transition-colors hover:bg-[#f87171]/30 cursor-pointer"
-                      >
-                        <Check className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  ) : (
-                    <IsolatedComposerTextarea
-                      sessionId={activeSession.id}
-                      initialValue={draftsLatestRef.current[activeSession.id] ?? ""}
-                      programmaticNonce={promptProgrammaticNonce}
-                      textareaRef={composerTextareaRef}
-                      onLiveChange={handleComposerLiveChange}
-                      onCommitDraft={commitDraftToState}
+                  <IsolatedComposerTextarea
+                    sessionId={activeSession.id}
+                    initialValue={draftsLatestRef.current[activeSession.id] ?? ""}
+                    programmaticNonce={promptProgrammaticNonce}
+                    textareaRef={composerTextareaRef}
+                    onLiveChange={handleComposerLiveChange}
+                    onCommitDraft={commitDraftToState}
                       onPaste={(e) => {
                         const items = e.clipboardData?.items;
                         if (!items) return;
@@ -8864,9 +8554,8 @@ export function App() {
                             } anything... (@ 引用文件 · / 技能 · 拖拽或 ⌘V 粘贴任意文件/截图)`
                       }
                     />
-                  )}
 
-                  {/* Composer Bottom Toolbar: Concrete Model Picker (Claude / Codex / ACP) + Effort + Permission Mode + Voice */}
+                  {/* Composer Bottom Toolbar: Concrete Model Picker (Claude / Codex / ACP) + Effort + Permission Mode */}
                   <div className="relative mt-1.5 flex flex-wrap items-center justify-between gap-2">
                     {/* 1. Categorized & Searchable Engine + Model Picker Popover */}
                     {modelPickerOpen && (
@@ -9036,19 +8725,6 @@ export function App() {
                       >
                         <ImagePlus className="h-3.5 w-3.5" />
                       </button>
-
-                      {/* Pill 5: Voice Dictation Input (Icon-only, zero text while recording) */}
-                      {!isDictating && (
-                        <button
-                          type="button"
-                          onClick={() => void handleToggleVoiceDictation()}
-                          disabled={isTranscribingVoice}
-                          title="Voice dictation"
-                          className="flex h-6 w-6 items-center justify-center rounded-full text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer disabled:opacity-50"
-                        >
-                          <Mic className={`h-3.5 w-3.5 ${isTranscribingVoice ? "animate-pulse text-[#f87171]" : ""}`} />
-                        </button>
-                      )}
                     </div>
 
                     {/* Right Controls: BeautifulContextMeter (Real Token & USD Telemetry) + Submit / Stop Disc */}
