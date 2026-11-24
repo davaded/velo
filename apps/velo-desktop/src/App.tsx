@@ -1035,6 +1035,27 @@ export function App() {
   const [modelCatalog, setModelCatalog] = useState<ModelOption[]>(MODEL_CATALOG);
   const [modelPickerOpen, setModelPickerOpen] = useState<boolean>(false);
   const [effortPickerOpen, setEffortPickerOpen] = useState<boolean>(false);
+  const effortPickerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!effortPickerOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (effortPickerRef.current?.contains(target)) return;
+      if (target.closest("[data-effort-picker-trigger='true']")) return;
+      setEffortPickerOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setEffortPickerOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [effortPickerOpen]);
 
   // Live Diff & Worktree Files per Session
   const [diffsBySession, setDiffsBySession] = useState<Record<string, DiffFileItem[]>>({});
@@ -8984,41 +9005,36 @@ export function App() {
                       />
                     )}
 
-                    {/* 2. Reasoning Effort Popover (Strictly scoped to active model's real supportedEfforts) */}
+                    {/* 2. Reasoning Effort Popover (Opaque crisp surface + click-outside dismissal) */}
                     {effortPickerOpen && activeSupportedEfforts.length > 0 && (
-                      <>
-                        <div
-                          className="fixed inset-0 z-20"
-                          onClick={() => setEffortPickerOpen(false)}
-                          aria-hidden="true"
-                        />
-                        <div
-                          onClick={(e) => e.stopPropagation()}
-                          className="v-glass-popover v-popover-in absolute bottom-9 left-[165px] z-30 w-[184px] rounded-2xl p-1.5"
-                        >
-                          <div className="px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
-                            思考 / 推理强度
-                          </div>
-                          {activeSupportedEfforts.map((eff) => {
-                            const active = activeEffectiveEffort === eff;
-                            return (
-                              <button
-                                key={eff}
-                                type="button"
-                                onClick={() => handleSelectSessionEffort(eff)}
-                                className={`v-press flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] cursor-pointer ${
-                                  active
-                                    ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
-                                    : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
-                                }`}
-                              >
-                                <span>{EFFORT_DISPLAY_LABELS[eff] || eff}</span>
-                                {active && <Check className="h-3.5 w-3.5 text-[#34d399]" />}
-                              </button>
-                            );
-                          })}
+                      <div
+                        ref={effortPickerRef}
+                        onClick={(e) => e.stopPropagation()}
+                        className="v-popover-in absolute bottom-9 left-[165px] z-40 w-[184px] rounded-2xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5"
+                        style={{ boxShadow: "var(--v-shadow-popover)" }}
+                      >
+                        <div className="px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
+                          思考 / 推理强度
                         </div>
-                      </>
+                        {activeSupportedEfforts.map((eff) => {
+                          const active = activeEffectiveEffort === eff;
+                          return (
+                            <button
+                              key={eff}
+                              type="button"
+                              onClick={() => handleSelectSessionEffort(eff)}
+                              className={`v-press flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] cursor-pointer ${
+                                active
+                                  ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
+                                  : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
+                              }`}
+                            >
+                              <span>{EFFORT_DISPLAY_LABELS[eff] || eff}</span>
+                              {active && <Check className="h-3.5 w-3.5 text-[#34d399]" />}
+                            </button>
+                          );
+                        })}
+                      </div>
                     )}
 
                     <div className="flex flex-wrap items-center gap-1.5">
@@ -9030,6 +9046,7 @@ export function App() {
                         return (
                           <button
                             type="button"
+                            data-model-picker-trigger="true"
                             onClick={() => {
                               setEffortPickerOpen(false);
                               setModelPickerOpen((o) => !o);
@@ -9062,6 +9079,7 @@ export function App() {
                       {activeSupportedEfforts.length > 0 && (
                         <button
                           type="button"
+                          data-effort-picker-trigger="true"
                           disabled={activeSupportedEfforts.length === 1}
                           onClick={() => {
                             setModelPickerOpen(false);
@@ -9113,13 +9131,20 @@ export function App() {
                       </button>
                     </div>
 
-                    {/* Right Controls: BeautifulContextMeter (Real Token & USD Telemetry) + Submit / Stop Disc */}
+                    {/* Right Controls: Clean T3/Claude-style right bar (Conditional Diff shortcut ONLY when files changed + Submit / Stop Disc) */}
                     <div className="flex items-center gap-2">
-                      <BeautifulContextMeter
-                        usedTokens={activeSession.tokens_used || 0}
-                        maxTokens={activeSession.tokens_limit || 200000}
-                        costUsd={activeSession.cost_usd || 0}
-                      />
+                      {((activeSession.insertions || 0) > 0 ||
+                        (activeSession.deletions || 0) > 0) && (
+                        <button
+                          type="button"
+                          onClick={() => openDiffForFile()}
+                          title="查看当前工作区代码变更 (Review Diff)"
+                          className="v-press inline-flex h-6 items-center gap-1 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-2 font-mono text-[11px] tabular-nums hover:border-[var(--v-border-strong)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                        >
+                          <span className="text-[#34d399]">+{activeSession.insertions || 0}</span>
+                          <span className="text-[#f87171]">−{activeSession.deletions || 0}</span>
+                        </button>
+                      )}
                       {activeSession.status === "running" ||
                       activeSession.status === "waiting_approval" ? (
                         <div className="flex items-center gap-1.5">

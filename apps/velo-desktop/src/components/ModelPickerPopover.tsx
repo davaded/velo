@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Copy, Search, Settings, Terminal, X } from "lucide-react";
 import type { ModelOption } from "../mockData";
 import { EngineBrandGlyph } from "./ui/EngineBrandIcon";
@@ -181,6 +181,29 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
   const [query, setQuery] = useState<string>("");
   const [copiedCmd, setCopiedCmd] = useState<boolean>(false);
   const [highlightIdx, setHighlightIdx] = useState<number>(0);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+
+  // Close reliably on clicking ANY blank area outside the popover (even when an ancestor uses backdrop-filter)
+  useEffect(() => {
+    const handlePointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (popoverRef.current?.contains(target)) return;
+      if (target.closest("[data-model-picker-trigger='true']")) return;
+      onClose();
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose]);
 
   const countsByTab = useMemo(() => {
     const counts: Record<EngineTabKey, number> = {
@@ -229,19 +252,14 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
   const tabIsCrossEngine = isSessionBound && selectedTab !== currentTab;
 
   return (
-    <>
-      {/* Transparent click-away backdrop */}
-      <div
-        className="fixed inset-0 z-20"
-        onClick={onClose}
-        aria-hidden="true"
-      />
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="v-glass-popover v-popover-in absolute bottom-9 left-0 z-30 w-[436px] max-w-[calc(100vw-28px)] rounded-2xl p-2"
-      >
-        {/* 1. Search Input (searches across ALL 330+ models instantly with ↑↓ / Enter) */}
-        <div className="mb-2 flex items-center gap-2 rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/80 px-2.5 py-1.5 transition-colors focus-within:border-[var(--v-border-strong)]">
+    <div
+      ref={popoverRef}
+      onClick={(e) => e.stopPropagation()}
+      className="v-popover-in absolute bottom-9 left-0 z-40 w-[436px] max-w-[calc(100vw-28px)] rounded-2xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-2"
+      style={{ boxShadow: "var(--v-shadow-popover)" }}
+    >
+      {/* 1. Search Input (searches across ALL 330+ models instantly with ↑↓ / Enter) */}
+      <div className="mb-2 flex items-center gap-2 rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-2.5 py-1.5 transition-colors focus-within:border-[var(--v-border-strong)]">
           <Search className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)]" />
           <input
             autoFocus
@@ -505,17 +523,16 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
             <Settings className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
             <span>管理引擎与 Hooks…</span>
           </button>
-          <div className="flex items-center gap-1.5 pr-1 text-[10px] text-[var(--v-fg-faint)]">
-            <span className="inline-flex items-center gap-0.5">
-              <VeloKbd>↑↓</VeloKbd> 选择
-            </span>
-            <span className="inline-flex items-center gap-0.5">
-              <VeloKbd>↵</VeloKbd> 切换
-            </span>
-          </div>
+        <div className="flex items-center gap-1.5 pr-1 text-[10px] text-[var(--v-fg-faint)]">
+          <span className="inline-flex items-center gap-0.5">
+            <VeloKbd>↑↓</VeloKbd> 选择
+          </span>
+          <span className="inline-flex items-center gap-0.5">
+            <VeloKbd>↵</VeloKbd> 切换
+          </span>
         </div>
       </div>
-    </>
+    </div>
   );
 };
 
