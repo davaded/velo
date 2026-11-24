@@ -260,8 +260,8 @@ public struct ReasoningRowView: View {
                         TimelineView(.periodic(from: .now, by: 1.0)) { ctx in
                             let elapsedMs = Int(max(0, ctx.date.timeIntervalSince(startedAt ?? ctx.date)) * 1000)
                             let label = elapsedMs >= 1000
-                                ? "思考中 \(VeloFormatting.formatDuration(ms: elapsedMs))"
-                                : "思考中…"
+                                ? "Thinking for \(VeloFormatting.formatDuration(ms: elapsedMs))"
+                                : "Thinking…"
                             ShimmerTextView(
                                 shortHeading.isEmpty ? label : "\(label) · \(shortHeading)",
                                 font: .system(size: 13, weight: .medium)
@@ -271,8 +271,8 @@ public struct ReasoningRowView: View {
                         }
                     } else {
                         let base = (durationMs ?? 0) >= 1000
-                            ? "思考了 \(VeloFormatting.formatDuration(ms: durationMs!))"
-                            : "思考过程"
+                            ? "Thought for \(VeloFormatting.formatDuration(ms: durationMs!))"
+                            : "Thought"
                         Text(shortHeading.isEmpty ? base : "\(base) · \(shortHeading)")
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(.secondary)
@@ -376,15 +376,16 @@ private struct VeloFootprintItem {
 }
 
 private struct VeloFootprintRow: Identifiable {
-    let tag: String
+    let category: String
+    let iconName: String
+    let isActive: Bool
     let items: [VeloFootprintItem]
     let extraCount: Int
-    var id: String { tag }
+    var id: String { category }
 }
 
 private struct VeloFocusFootprintData {
-    let liveLabel: String
-    let livePhase: AgentLivePhase
+    let activeToolVerb: String
     let visibleStepCount: Int
     let hasError: Bool
     let rows: [VeloFootprintRow]
@@ -495,7 +496,7 @@ private enum VeloActivityStreamBuilder {
         var hasError = false
         var visibleStepCount = 0
         var activeVerb = ""
-        var latestVerb = ""
+        var activeCategory = ""
 
         var editOrder: [String] = []
         var editCounts: [String: Int] = [:]
@@ -515,32 +516,44 @@ private enum VeloActivityStreamBuilder {
                 if isErr { hasError = true }
                 if isInternalNoise(item) { continue }
                 visibleStepCount += 1
-                latestVerb = workingVerb
-                if isTurnRunning && output == nil { activeVerb = workingVerb }
 
                 let lower = toolName.lowercased()
+                let isEdit = lower.contains("edit") || lower.contains("write") || lower.contains("patch") || lower.contains("file_change")
+                let isShell = lower.contains("bash") || lower.contains("shell") || lower.contains("cmd") || lower.contains("command")
+                let isMcp = lower == "call_mcp_tool" || lower.hasPrefix("mcp_")
+                let isRead = lower.contains("read") || lower.contains("view") || lower == "list_dir"
+                let isSearch = lower.contains("search") || lower.contains("grep") || lower.contains("glob") || lower.contains("find")
+
+                if isTurnRunning && output == nil {
+                    activeVerb = workingVerb
+                    if isEdit { activeCategory = "edit" }
+                    else if isShell { activeCategory = "shell" }
+                    else if isMcp { activeCategory = "mcp" }
+                    else if isRead || isSearch { activeCategory = "read" }
+                }
+
                 let s = (summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if lower.contains("edit") || lower.contains("write") || lower.contains("patch") || lower.contains("file_change") {
-                    let base = s.split(separator: "/").last.map(String.init) ?? (s.isEmpty ? "代码文件" : s)
+                if isEdit {
+                    let base = s.split(separator: "/").last.map(String.init) ?? (s.isEmpty ? "file" : s)
                     if editCounts[base] == nil { editOrder.append(base) }
                     editCounts[base, default: 0] += 1
-                } else if lower.contains("bash") || lower.contains("shell") || lower.contains("cmd") || lower.contains("command") {
+                } else if isShell {
                     let firstLine = s.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? "shell"
                     let shortCmd = firstLine.count > 36 ? String(firstLine.prefix(34)) + "…" : firstLine
                     if cmdCounts[shortCmd] == nil { cmdOrder.append(shortCmd) }
                     cmdCounts[shortCmd, default: 0] += 1
-                } else if lower == "call_mcp_tool" || lower.hasPrefix("mcp_") {
+                } else if isMcp {
                     let srv = displayName.isEmpty ? "MCP" : displayName
-                    let act = s.isEmpty ? "调用" : s
+                    let act = s.isEmpty ? "Call" : s
                     if mcpCounts[srv] == nil { mcpOrder.append(srv) }
                     mcpCounts[srv, default: 0] += 1
                     var acts = mcpActions[srv] ?? []
                     if !acts.contains(act) { acts.append(act) }
                     mcpActions[srv] = acts
-                } else if lower.contains("read") || lower.contains("view") || lower == "list_dir" {
+                } else if isRead {
                     let base = s.split(separator: "/").last.map(String.init) ?? ""
                     if !base.isEmpty && !readFiles.contains(base) { readFiles.append(base) }
-                } else if lower.contains("search") || lower.contains("grep") || lower.contains("glob") || lower.contains("find") {
+                } else if isSearch {
                     searchCount += 1
                 }
             default:
@@ -551,43 +564,29 @@ private enum VeloActivityStreamBuilder {
         var rows: [VeloFootprintRow] = []
         if !editOrder.isEmpty {
             let shown = editOrder.prefix(3).map { VeloFootprintItem(label: $0, count: editCounts[$0] ?? 1) }
-            rows.append(VeloFootprintRow(tag: "修改", items: shown, extraCount: max(0, editOrder.count - 3)))
+            rows.append(VeloFootprintRow(category: "edit", iconName: "pencil", isActive: activeCategory == "edit", items: shown, extraCount: max(0, editOrder.count - 3)))
         }
         if !cmdOrder.isEmpty {
             let shown = cmdOrder.prefix(2).map { VeloFootprintItem(label: $0, count: cmdCounts[$0] ?? 1) }
-            rows.append(VeloFootprintRow(tag: "命令", items: shown, extraCount: max(0, cmdOrder.count - 2)))
+            rows.append(VeloFootprintRow(category: "shell", iconName: "terminal", isActive: activeCategory == "shell", items: shown, extraCount: max(0, cmdOrder.count - 2)))
         }
         if !mcpOrder.isEmpty {
             let shown = mcpOrder.prefix(2).map { srv in
                 let acts = (mcpActions[srv] ?? []).prefix(2).joined(separator: " / ")
                 return VeloFootprintItem(label: "\(srv) · \(acts)", count: mcpCounts[srv] ?? 1)
             }
-            rows.append(VeloFootprintRow(tag: "MCP", items: shown, extraCount: max(0, mcpOrder.count - 2)))
+            rows.append(VeloFootprintRow(category: "mcp", iconName: "sparkles", isActive: activeCategory == "mcp", items: shown, extraCount: max(0, mcpOrder.count - 2)))
         }
         if rows.count < 3 && (!readFiles.isEmpty || searchCount > 0) {
             var shown = readFiles.prefix(3).map { VeloFootprintItem(label: $0, count: 1) }
             if shown.isEmpty && searchCount > 0 {
-                shown = [VeloFootprintItem(label: "代码检索", count: searchCount)]
+                shown = [VeloFootprintItem(label: "Code search", count: searchCount)]
             }
-            rows.append(VeloFootprintRow(tag: "阅读", items: shown, extraCount: max(0, readFiles.count - 3)))
-        }
-
-        let liveLabel: String
-        let livePhase: AgentLivePhase
-        if !activeVerb.isEmpty {
-            liveLabel = "正在\(activeVerb)…"
-            livePhase = .tool(verb: activeVerb)
-        } else if !latestVerb.isEmpty {
-            liveLabel = "正在思考下一步…"
-            livePhase = .thinking
-        } else {
-            liveLabel = "正在思考…"
-            livePhase = .thinking
+            rows.append(VeloFootprintRow(category: "read", iconName: readFiles.isEmpty ? "magnifyingglass" : "eye", isActive: activeCategory == "read", items: shown, extraCount: max(0, readFiles.count - 3)))
         }
 
         return VeloFocusFootprintData(
-            liveLabel: liveLabel,
-            livePhase: livePhase,
+            activeToolVerb: activeVerb,
             visibleStepCount: max(visibleStepCount, 1),
             hasError: hasError,
             rows: Array(rows.prefix(3))
@@ -639,23 +638,23 @@ private enum VeloActivityStreamBuilder {
 
         var parts: [String] = []
         if !editedFiles.isEmpty {
-            parts.append("修改 \(editedFiles.count) 个文件")
+            parts.append("Edited \(editedFiles.count) \(editedFiles.count == 1 ? "file" : "files")")
         } else if editCount > 0 {
-            parts.append("修改 \(editCount) 处")
+            parts.append("\(editCount) \(editCount == 1 ? "edit" : "edits")")
         }
-        if shellCount > 0 { parts.append("运行 \(shellCount) 次命令") }
-        if mcpCount > 0 { parts.append("\(mcpServerName.isEmpty ? "MCP" : mcpServerName) \(mcpCount) 次") }
-        if readCount > 0 && parts.count < 3 { parts.append("读取 \(readCount) 个文件") }
-        if searchCount > 0 && parts.count < 3 { parts.append("检索 \(searchCount) 次") }
-        if otherCount > 0 && parts.count < 3 { parts.append("\(otherCount) 项工具") }
+        if shellCount > 0 { parts.append("\(shellCount) \(shellCount == 1 ? "command" : "commands")") }
+        if mcpCount > 0 { parts.append("\(mcpServerName.isEmpty ? "MCP" : mcpServerName) ×\(mcpCount)") }
+        if readCount > 0 && parts.count < 3 { parts.append("Read \(readCount) \(readCount == 1 ? "file" : "files")") }
+        if searchCount > 0 && parts.count < 3 { parts.append("\(searchCount) \(searchCount == 1 ? "search" : "searches")") }
+        if otherCount > 0 && parts.count < 3 { parts.append("\(otherCount) \(otherCount == 1 ? "tool" : "tools")") }
         if parts.isEmpty && realThinkCount > 0 {
-            parts.append("思考 \(realThinkCount) 次")
+            parts.append("Thought \(realThinkCount) \(realThinkCount == 1 ? "time" : "times")")
         }
 
-        let label = parts.isEmpty ? "执行了 \(items.count) 步操作" : "已\(parts.joined(separator: " · "))"
+        let label = parts.isEmpty ? "\(items.count) steps" : parts.joined(separator: " · ")
         let secondary: String? = editedFiles.isEmpty
             ? nil
-            : editedFiles.prefix(2).joined(separator: ", ") + (editedFiles.count > 2 ? " 等" : "")
+            : editedFiles.prefix(2).joined(separator: ", ") + (editedFiles.count > 2 ? " +\(editedFiles.count - 2)" : "")
         return (label, secondary, hasError)
     }
 }
@@ -691,12 +690,12 @@ private struct VeloExploreBatchRowView: View {
 
         let running = isTurnRunning && !activeVerb.isEmpty
         var parts: [String] = []
-        if readCount > 0 { parts.append("读取 \(readCount) 个文件") }
-        if searchCount > 0 { parts.append("检索 \(searchCount) 次") }
-        let label = running ? "\(activeVerb)…" : "已\(parts.joined(separator: " · "))"
+        if readCount > 0 { parts.append("Read \(readCount) \(readCount == 1 ? "file" : "files")") }
+        if searchCount > 0 { parts.append("Searched \(searchCount) \(searchCount == 1 ? "query" : "queries")") }
+        let label = running ? "\(activeVerb)…" : parts.joined(separator: " · ")
         let secondary: String? = running
-            ? (items.count > 1 ? "共 \(items.count) 项" : nil)
-            : (targets.isEmpty ? nil : targets.prefix(2).joined(separator: ", ") + (targets.count > 2 ? " 等" : ""))
+            ? (items.count > 1 ? "\(items.count) items" : nil)
+            : (targets.isEmpty ? nil : targets.prefix(2).joined(separator: ", ") + (targets.count > 2 ? " +\(targets.count - 2)" : ""))
         return (label, secondary, running, hasError, readCount >= searchCount ? "eye" : "magnifyingglass")
     }
 
@@ -787,6 +786,8 @@ public struct ExecutionTraceGroupView: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var userExpanded: Bool? = nil
+    @State private var heldVerb: String = ""
+    @State private var verbDecayTask: Task<Void, Never>? = nil
 
     public init(
         items: [TimelineEventItem],
@@ -857,6 +858,10 @@ public struct ExecutionTraceGroupView: View {
 
         if engineMode == .focusFootprint && isTurnRunning {
             let fp = VeloActivityStreamBuilder.buildFocusFootprint(items, isTurnRunning: isTurnRunning)
+            let effectiveVerb = fp.activeToolVerb.isEmpty ? heldVerb : fp.activeToolVerb
+            let headerPhase: AgentLivePhase = effectiveVerb.isEmpty ? .thinking : .tool(verb: effectiveVerb)
+            let headerLabel = effectiveVerb.isEmpty ? "Thinking…" : "\(effectiveVerb)…"
+
             VStack(alignment: .leading, spacing: 5) {
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -865,9 +870,9 @@ public struct ExecutionTraceGroupView: View {
                     }
                 } label: {
                     HStack(spacing: 7) {
-                        OrbitalStatusIcon(phase: fp.livePhase)
+                        OrbitalStatusIcon(phase: headerPhase)
                             .frame(width: 15)
-                        ShimmerTextView(fp.liveLabel, font: .system(size: 12.5, weight: .medium))
+                        ShimmerTextView(headerLabel, font: .system(size: 12.5, weight: .medium))
                             .lineLimit(1)
                         Spacer(minLength: 4)
                         if let origin = turnStartedAt {
@@ -878,9 +883,11 @@ public struct ExecutionTraceGroupView: View {
                                     .foregroundStyle(.tertiary)
                             }
                         }
-                        Text("\(fp.visibleStepCount) 步")
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.tertiary)
+                        if fp.visibleStepCount > 1 {
+                            Text("\(fp.visibleStepCount) steps")
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
                         Image(systemName: "chevron.right")
                             .font(.system(size: 9.5, weight: .bold))
                             .foregroundStyle(.tertiary)
@@ -890,8 +897,23 @@ public struct ExecutionTraceGroupView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .onChange(of: fp.activeToolVerb) { _, newVerb in
+                    verbDecayTask?.cancel()
+                    if !newVerb.isEmpty {
+                        heldVerb = newVerb
+                    } else if !heldVerb.isEmpty {
+                        verbDecayTask = Task {
+                            try? await Task.sleep(nanoseconds: 1_200_000_000)
+                            if !Task.isCancelled {
+                                await MainActor.run { heldVerb = "" }
+                            }
+                        }
+                    }
+                }
                 .onChange(of: isTurnRunning) { wasRunning, nowRunning in
                     if wasRunning && !nowRunning {
+                        verbDecayTask?.cancel()
+                        heldVerb = ""
                         withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
                             userExpanded = nil
                         }
@@ -902,18 +924,25 @@ public struct ExecutionTraceGroupView: View {
                     IndentRailContainer {
                         VStack(alignment: .leading, spacing: 3.5) {
                             ForEach(fp.rows) { row in
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text(row.tag)
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(.tertiary)
-                                        .frame(width: 26, alignment: .leading)
+                                HStack(alignment: .center, spacing: 7) {
+                                    Image(systemName: row.iconName)
+                                        .font(.system(size: 10.5, weight: .medium))
+                                        .foregroundStyle(
+                                            row.isActive ? VeloTheme.accentVioletSoft : Color.secondary.opacity(0.65)
+                                        )
+                                        .frame(width: 14)
                                     let joined = row.items.map { it in
                                         it.count > 1 ? "\(it.label) ×\(it.count)" : it.label
-                                    }.joined(separator: " · ") + (row.extraCount > 0 ? " 等 +\(row.extraCount)" : "")
-                                    Text(joined)
-                                        .font(.system(size: 11.5, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
+                                    }.joined(separator: " · ") + (row.extraCount > 0 ? " +\(row.extraCount)" : "")
+                                    if row.isActive {
+                                        ShimmerTextView(joined, font: .system(size: 11.5, design: .monospaced))
+                                            .lineLimit(1)
+                                    } else {
+                                        Text(joined)
+                                            .font(.system(size: 11.5, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
                                 }
                             }
                         }

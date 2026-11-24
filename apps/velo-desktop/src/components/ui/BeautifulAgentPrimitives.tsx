@@ -786,11 +786,11 @@ export const BeautifulThinkingBlock: React.FC<{
 
   const primaryLabel = isStreaming
     ? Math.round(liveThinkMs / 1000) >= 1
-      ? `思考中 · ${formatPaseoDuration(liveThinkMs)}`
-      : "思考中…"
+      ? `Thinking for ${formatPaseoDuration(liveThinkMs)}`
+      : "Thinking…"
     : durationMs !== undefined && durationMs >= 1000
-    ? `思考了 ${formatPaseoDuration(durationMs)}`
-    : "思考过程";
+    ? `Thought for ${formatPaseoDuration(durationMs)}`
+    : "Thought";
 
   const displaySecondary = summary ? `· ${summary}` : undefined;
   const renderSoftPreview = Boolean(isStreaming && showLivePreview && hasDetail && !effectiveExpanded);
@@ -852,25 +852,25 @@ export const BeautifulThinkingBlock: React.FC<{
  * ============================================================================
  */
 const MCP_ACTION_LABELS: Record<string, string> = {
-  take_screenshot: "截图验证",
-  take_snapshot: "页面快照",
-  click: "点击元素",
-  evaluate_script: "执行脚本",
-  list_console_messages: "检查控制台",
-  list_pages: "查看页面",
-  navigate_page: "打开页面",
-  new_page: "新建页面",
-  close_page: "关闭页面",
-  select_page: "切换页面",
-  fill: "填写输入",
-  fill_form: "填写表单",
-  hover: "悬停元素",
-  press_key: "按键操作",
-  wait_for: "等待加载",
-  list_network_requests: "检查网络请求",
-  get_network_request: "网络详情",
-  get_console_message: "日志详情",
-  resize_page: "调整视口",
+  take_screenshot: "Screenshot",
+  take_snapshot: "Snapshot",
+  click: "Click",
+  evaluate_script: "Evaluate",
+  list_console_messages: "Console",
+  list_pages: "Pages",
+  navigate_page: "Navigate",
+  new_page: "New page",
+  close_page: "Close page",
+  select_page: "Select page",
+  fill: "Fill",
+  fill_form: "Fill form",
+  hover: "Hover",
+  press_key: "Key press",
+  wait_for: "Wait",
+  list_network_requests: "Network",
+  get_network_request: "Request",
+  get_console_message: "Log",
+  resize_page: "Resize",
 };
 
 function formatMcpServerLabel(rawServer: string): string {
@@ -938,7 +938,7 @@ export function resolvePaseoToolPresentation(
       MCP_ACTION_LABELS[rawTool.toLowerCase()] || rawTool.replace(/_/g, " ");
     return {
       displayName: serverLabel,
-      workingVerb: `通过 ${serverLabel} ${actionLabel}`,
+      workingVerb: `${serverLabel} · ${actionLabel}`,
       summary: actionLabel,
       icon: Sparkles,
       kind: "mcp",
@@ -986,7 +986,7 @@ export function resolvePaseoToolPresentation(
   ) {
     return {
       displayName: "Shell",
-      workingVerb: "运行命令",
+      workingVerb: "Running command",
       summary: command || shortPath,
       icon: SquareTerminal,
       kind: "shell",
@@ -997,7 +997,7 @@ export function resolvePaseoToolPresentation(
     const baseName = shortPath ? shortPath.split("/").pop() || shortPath : undefined;
     return {
       displayName: "Read",
-      workingVerb: baseName ? `读取 ${baseName}` : "读取文件",
+      workingVerb: baseName ? `Reading ${baseName}` : "Reading file",
       summary: shortPath || command,
       icon: Eye,
       kind: "read",
@@ -1014,7 +1014,7 @@ export function resolvePaseoToolPresentation(
     const baseName = shortPath ? shortPath.split("/").pop() || shortPath : undefined;
     return {
       displayName: lower.includes("write") ? "Write" : "Edit",
-      workingVerb: baseName ? `修改 ${baseName}` : "修改代码",
+      workingVerb: baseName ? `Editing ${baseName}` : "Editing code",
       summary: shortPath || command,
       icon: Pencil,
       kind: "edit",
@@ -1030,7 +1030,7 @@ export function resolvePaseoToolPresentation(
   ) {
     return {
       displayName: "Search",
-      workingVerb: query ? `检索 "${query.slice(0, 28)}"` : "检索代码",
+      workingVerb: query ? `Searching "${query.slice(0, 28)}"` : "Searching",
       summary: query || shortPath || command,
       icon: Search,
       kind: "search",
@@ -1039,7 +1039,7 @@ export function resolvePaseoToolPresentation(
   if (lower.includes("task") || lower.includes("agent")) {
     return {
       displayName: "Task",
-      workingVerb: "子代理执行中",
+      workingVerb: "Running subagent",
       summary: shortPath || command,
       icon: Bot,
       kind: "other",
@@ -1523,23 +1523,23 @@ const ExploreBatchRow: React.FC<{
 
     const isAnyRunning = Boolean(isTurnRunning && runningVerb);
     const labelParts: string[] = [];
-    if (readCount > 0) labelParts.push(`读取 ${readCount} 个文件`);
-    if (searchCount > 0) labelParts.push(`检索 ${searchCount} 次`);
+    if (readCount > 0) labelParts.push(`Read ${readCount} ${readCount === 1 ? "file" : "files"}`);
+    if (searchCount > 0)
+      labelParts.push(`Searched ${searchCount} ${searchCount === 1 ? "query" : "queries"}`);
 
-    const label = isAnyRunning
-      ? `${runningVerb}…`
-      : `已${labelParts.join(" · ")}`;
+    const label = isAnyRunning ? `${runningVerb}…` : labelParts.join(" · ");
 
     const preview =
       targets.length > 0
-        ? targets.slice(0, 2).join(", ") + (targets.length > 2 ? ` 等 ${targets.length} 项` : "")
+        ? targets.slice(0, 2).join(", ") +
+          (targets.length > 2 ? ` +${targets.length - 2}` : "")
         : undefined;
 
     return {
       label,
       secondaryLabel: isAnyRunning
         ? readCount + searchCount > 1
-          ? `· 共 ${readCount + searchCount} 项`
+          ? `· ${readCount + searchCount} items`
           : undefined
         : preview,
       hasError,
@@ -1576,16 +1576,20 @@ const ExploreBatchRow: React.FC<{
   );
 };
 
+interface FocusFootprintRow {
+  category: "edit" | "shell" | "mcp" | "read";
+  icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
+  isActive: boolean;
+  items: Array<{ label: string; count: number; fileArg?: string }>;
+  extraCount: number;
+}
+
 interface FocusFootprintData {
-  liveLabel: string;
-  livePhase: AgentStatusPhase;
+  activeToolVerb: string;
+  activeCategory: "edit" | "shell" | "mcp" | "read" | null;
   visibleStepCount: number;
   hasError: boolean;
-  rows: Array<{
-    tag: string;
-    items: Array<{ label: string; count: number; fileArg?: string }>;
-    extraCount: number;
-  }>;
+  rows: FocusFootprintRow[];
 }
 
 function buildFocusFootprintData(
@@ -1595,7 +1599,7 @@ function buildFocusFootprintData(
   let hasError = false;
   let visibleStepCount = 0;
   let activeToolVerb = "";
-  let latestToolVerb = "";
+  let activeCategory: FocusFootprintData["activeCategory"] = null;
 
   const editMap = new Map<string, { label: string; count: number; fileArg?: string }>();
   const cmdMap = new Map<string, { label: string; count: number }>();
@@ -1615,13 +1619,16 @@ function buildFocusFootprintData(
     if (pres.isInternalNoise) continue;
 
     visibleStepCount++;
-    latestToolVerb = pres.workingVerb;
     if (isTurnRunning && st.output === undefined) {
       activeToolVerb = pres.workingVerb;
+      if (pres.kind === "edit") activeCategory = "edit";
+      else if (pres.kind === "shell") activeCategory = "shell";
+      else if (pres.kind === "mcp") activeCategory = "mcp";
+      else if (pres.kind === "read" || pres.kind === "search") activeCategory = "read";
     }
 
     if (pres.kind === "edit") {
-      const base = pres.summary ? pres.summary.split("/").pop() || pres.summary : "代码文件";
+      const base = pres.summary ? pres.summary.split("/").pop() || pres.summary : "file";
       const prev = editMap.get(base);
       if (prev) prev.count += 1;
       else editMap.set(base, { label: base, count: 1, fileArg: st.fileArg || pres.filePath });
@@ -1633,7 +1640,7 @@ function buildFocusFootprintData(
       else cmdMap.set(shortCmd, { label: shortCmd, count: 1 });
     } else if (pres.kind === "mcp") {
       const srv = pres.mcpServer || pres.displayName || "MCP";
-      const act = pres.mcpAction || pres.summary || "调用";
+      const act = pres.mcpAction || pres.summary || "Call";
       const prev = mcpMap.get(srv);
       if (prev) {
         prev.count += 1;
@@ -1649,12 +1656,14 @@ function buildFocusFootprintData(
     }
   }
 
-  const rows: FocusFootprintData["rows"] = [];
+  const rows: FocusFootprintRow[] = [];
 
   if (editMap.size > 0) {
     const all = Array.from(editMap.values());
     rows.push({
-      tag: "修改",
+      category: "edit",
+      icon: Pencil,
+      isActive: activeCategory === "edit",
       items: all.slice(0, 3),
       extraCount: Math.max(0, all.length - 3),
     });
@@ -1663,7 +1672,9 @@ function buildFocusFootprintData(
   if (cmdMap.size > 0) {
     const all = Array.from(cmdMap.values());
     rows.push({
-      tag: "命令",
+      category: "shell",
+      icon: SquareTerminal,
+      isActive: activeCategory === "shell",
       items: all.slice(0, 2),
       extraCount: Math.max(0, all.length - 2),
     });
@@ -1675,38 +1686,35 @@ function buildFocusFootprintData(
       count: m.count,
     }));
     rows.push({
-      tag: "MCP",
+      category: "mcp",
+      icon: Sparkles,
+      isActive: activeCategory === "mcp",
       items: mcpItems.slice(0, 2),
       extraCount: Math.max(0, mcpItems.length - 2),
     });
   }
 
-  // Only add Read/Search row if we still have room within the 3-row budget
+  // Only add Read/Search node if we still have room within the 3-row budget
   if (rows.length < 3 && (readSet.length > 0 || searchCount > 0)) {
     const items: Array<{ label: string; count: number }> = [];
     for (const f of readSet.slice(0, 3)) {
       items.push({ label: f, count: 1 });
     }
     if (items.length === 0 && searchCount > 0) {
-      items.push({ label: `代码检索`, count: searchCount });
+      items.push({ label: "Code search", count: searchCount });
     }
     rows.push({
-      tag: "阅读",
+      category: "read",
+      icon: readSet.length > 0 ? Eye : Search,
+      isActive: activeCategory === "read",
       items,
       extraCount: Math.max(0, readSet.length - 3),
     });
   }
 
-  const livePhase: AgentStatusPhase = activeToolVerb ? "tool" : "thinking";
-  const liveLabel = activeToolVerb
-    ? `正在${activeToolVerb}…`
-    : latestToolVerb
-    ? "正在思考下一步…"
-    : "正在思考…";
-
   return {
-    liveLabel,
-    livePhase,
+    activeToolVerb,
+    activeCategory,
     visibleStepCount: Math.max(visibleStepCount, 1),
     hasError,
     rows: rows.slice(0, 3),
@@ -1754,23 +1762,30 @@ function summarizeCompletedActivity(steps: PaseoTraceStepItem[]): {
 
   const parts: string[] = [];
   if (editedFiles.length > 0) {
-    parts.push(`修改 ${editedFiles.length} 个文件`);
+    parts.push(`Edited ${editedFiles.length} ${editedFiles.length === 1 ? "file" : "files"}`);
   } else if (editCount > 0) {
-    parts.push(`修改 ${editCount} 处`);
+    parts.push(`${editCount} ${editCount === 1 ? "edit" : "edits"}`);
   }
-  if (shellCount > 0) parts.push(`运行 ${shellCount} 次命令`);
-  if (mcpCount > 0) parts.push(`${mcpServerName || "MCP"} ${mcpCount} 次`);
-  if (readCount > 0 && parts.length < 3) parts.push(`读取 ${readCount} 个文件`);
-  if (searchCount > 0 && parts.length < 3) parts.push(`检索 ${searchCount} 次`);
-  if (otherCount > 0 && parts.length < 3) parts.push(`${otherCount} 项工具`);
+  if (shellCount > 0) parts.push(`${shellCount} ${shellCount === 1 ? "command" : "commands"}`);
+  if (mcpCount > 0) parts.push(`${mcpServerName || "MCP"} ×${mcpCount}`);
+  if (readCount > 0 && parts.length < 3) {
+    parts.push(`Read ${readCount} ${readCount === 1 ? "file" : "files"}`);
+  }
+  if (searchCount > 0 && parts.length < 3) {
+    parts.push(`${searchCount} ${searchCount === 1 ? "search" : "searches"}`);
+  }
+  if (otherCount > 0 && parts.length < 3) {
+    parts.push(`${otherCount} ${otherCount === 1 ? "tool" : "tools"}`);
+  }
   if (parts.length === 0 && realThinkCount > 0) {
-    parts.push(`思考 ${realThinkCount} 次`);
+    parts.push(`Thought ${realThinkCount} ${realThinkCount === 1 ? "time" : "times"}`);
   }
 
-  const label = parts.length > 0 ? `已${parts.join(" · ")}` : `执行了 ${steps.length} 步操作`;
+  const label = parts.length > 0 ? parts.join(" · ") : `${steps.length} steps`;
   const secondaryLabel =
     editedFiles.length > 0
-      ? editedFiles.slice(0, 2).join(", ") + (editedFiles.length > 2 ? " 等" : "")
+      ? editedFiles.slice(0, 2).join(", ") +
+        (editedFiles.length > 2 ? ` +${editedFiles.length - 2}` : "")
       : undefined;
 
   return { label, secondaryLabel, hasError };
@@ -1857,6 +1872,7 @@ export const PaseoExecutionTraceGroup: React.FC<{
   onOpenDiffForFile,
 }) => {
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
+  const [heldToolVerb, setHeldToolVerb] = useState<string>("");
   const prevRunningRef = useRef<boolean>(isTurnRunning);
   const engineMode = resolveTraceEngineMode(provider);
 
@@ -1864,6 +1880,7 @@ export const PaseoExecutionTraceGroup: React.FC<{
   useEffect(() => {
     if (prevRunningRef.current && !isTurnRunning) {
       setUserExpanded(null);
+      setHeldToolVerb("");
     }
     prevRunningRef.current = isTurnRunning;
   }, [isTurnRunning]);
@@ -1880,6 +1897,24 @@ export const PaseoExecutionTraceGroup: React.FC<{
         : null,
     [steps, isTurnRunning, engineMode]
   );
+
+  // 1.2s transition buffer so fast 0.2s tool calls don't flash frantically back to `Thinking…`
+  const rawActiveVerb = footprint?.activeToolVerb || "";
+  useEffect(() => {
+    if (!isTurnRunning) {
+      setHeldToolVerb("");
+      return;
+    }
+    if (rawActiveVerb) {
+      setHeldToolVerb(rawActiveVerb);
+      return;
+    }
+    if (!heldToolVerb) return;
+    const timer = window.setTimeout(() => {
+      setHeldToolVerb("");
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [rawActiveVerb, isTurnRunning, heldToolVerb]);
 
   const completedSummary = useMemo(() => summarizeCompletedActivity(steps), [steps]);
 
@@ -1934,9 +1969,13 @@ export const PaseoExecutionTraceGroup: React.FC<{
     </div>
   );
 
-  // 1. AGY / Cursor / Grok Running Mode: 1 live focus line + max 3 categorized footprint rows (zero spam!)
+  // 1. AGY / Cursor / Grok Running Mode: minimalist header + ChainOfThought semantic icon nodes
   if (engineMode === "focus_footprint" && isTurnRunning && footprint) {
     const drawerOpen = userExpanded ?? false;
+    const effectiveVerb = footprint.activeToolVerb || heldToolVerb;
+    const headerPhase: AgentStatusPhase = effectiveVerb ? "tool" : "thinking";
+    const headerLabel = effectiveVerb ? `${effectiveVerb}…` : "Thinking…";
+
     return (
       <div className="my-0.5 select-none">
         <div
@@ -1951,17 +1990,19 @@ export const PaseoExecutionTraceGroup: React.FC<{
           }}
           className="-mx-2 flex items-center gap-2 rounded-[8px] px-2 py-1.5 text-[13px] transition-colors hover:bg-[var(--surface-1)] cursor-pointer"
         >
-          <PromptKitStatusIcon phase={footprint.livePhase} size={15} />
+          <PromptKitStatusIcon phase={headerPhase} size={15} />
           <TextShimmer className="min-w-0 flex-1 truncate font-medium">
-            {footprint.liveLabel}
+            {headerLabel}
           </TextShimmer>
           {startedAtMs !== undefined && <PaseoLiveElapsed startedAtMs={startedAtMs} />}
-          <span
-            className="shrink-0 font-mono-code text-[11px] tabular-nums"
-            style={{ color: "var(--fg-extra-muted)" }}
-          >
-            {footprint.visibleStepCount} 步
-          </span>
+          {footprint.visibleStepCount > 1 && (
+            <span
+              className="shrink-0 font-mono-code text-[11px] tabular-nums"
+              style={{ color: "var(--fg-extra-muted)" }}
+            >
+              {footprint.visibleStepCount} steps
+            </span>
+          )}
           <ChevronRight
             className="h-3.5 w-3.5 shrink-0 transition-transform duration-150"
             style={{
@@ -1971,57 +2012,60 @@ export const PaseoExecutionTraceGroup: React.FC<{
           />
         </div>
 
-        {/* Default collapsed view: up to 3 calm categorized footprint rows */}
+        {/* Default collapsed view: up to 3 ChainOfThought semantic icon nodes */}
         {!drawerOpen && footprint.rows.length > 0 && (
           <div
-            className="ml-[7px] mt-0.5 border-l pl-3.5 py-0.5 space-y-1"
+            className="ml-[7px] mt-0.5 border-l pl-3 py-0.5 space-y-1"
             style={{ borderColor: "var(--border-subtle)" }}
           >
-            {footprint.rows.map((row) => (
-              <div
-                key={row.tag}
-                className="flex items-baseline gap-2.5 text-[12px] leading-[1.45]"
-              >
-                <span
-                  className="w-7 shrink-0 text-[11px] font-medium"
-                  style={{ color: "var(--fg-extra-muted)" }}
-                >
-                  {row.tag}
-                </span>
+            {footprint.rows.map((row) => {
+              const RowIcon = row.icon;
+              return (
                 <div
-                  className="min-w-0 flex-1 truncate font-mono-code text-[11.5px]"
-                  style={{ color: "var(--fg-muted)" }}
+                  key={row.category}
+                  className="flex items-center gap-2 text-[12px] leading-[1.45]"
                 >
-                  {row.items.map((it, idx) => (
-                    <React.Fragment key={`${it.label}-${idx}`}>
-                      {idx > 0 && (
-                        <span className="mx-1.5 opacity-45">·</span>
-                      )}
-                      {it.fileArg && onOpenDiffForFile ? (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onOpenDiffForFile(it.fileArg);
-                          }}
-                          className="hover:underline hover:text-[var(--fg)] cursor-pointer"
-                        >
-                          {it.label}
-                        </button>
-                      ) : (
-                        <span>{it.label}</span>
-                      )}
-                      {it.count > 1 && (
-                        <span className="ml-0.5 opacity-60">×{it.count}</span>
-                      )}
-                    </React.Fragment>
-                  ))}
-                  {row.extraCount > 0 && (
-                    <span className="ml-1.5 opacity-60">等 +{row.extraCount}</span>
-                  )}
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                    <RowIcon
+                      className={`h-3 w-3 ${row.isActive ? "velo-sparkle-breath" : ""}`}
+                      style={{
+                        color: row.isActive ? "var(--accent)" : "var(--fg-extra-muted)",
+                      }}
+                    />
+                  </span>
+                  <div
+                    className={`min-w-0 flex-1 truncate font-mono-code text-[11.5px] ${
+                      row.isActive ? "beautiful-shimmer-text" : ""
+                    }`}
+                    style={!row.isActive ? { color: "var(--fg-muted)" } : undefined}
+                  >
+                    {row.items.map((it, idx) => (
+                      <React.Fragment key={`${it.label}-${idx}`}>
+                        {idx > 0 && <span className="mx-1.5 opacity-40">·</span>}
+                        {it.fileArg && onOpenDiffForFile ? (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onOpenDiffForFile(it.fileArg);
+                            }}
+                            className="hover:underline hover:text-[var(--fg)] cursor-pointer"
+                          >
+                            {it.label}
+                          </button>
+                        ) : (
+                          <span>{it.label}</span>
+                        )}
+                        {it.count > 1 && <span className="ml-0.5 opacity-60">×{it.count}</span>}
+                      </React.Fragment>
+                    ))}
+                    {row.extraCount > 0 && (
+                      <span className="ml-1.5 opacity-55">+{row.extraCount}</span>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 

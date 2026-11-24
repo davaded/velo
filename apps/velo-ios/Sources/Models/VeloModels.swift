@@ -1162,24 +1162,25 @@ public enum VeloFormatting {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             }()
             let actionMap: [String: String] = [
-                "take_screenshot": "截图验证",
-                "take_snapshot": "页面快照",
-                "click": "点击元素",
-                "evaluate_script": "执行脚本",
-                "list_console_messages": "检查控制台",
-                "list_pages": "查看页面",
-                "navigate_page": "打开页面",
-                "new_page": "新建页面",
-                "fill": "填写输入",
-                "fill_form": "填写表单",
-                "hover": "悬停元素",
-                "wait_for": "等待加载",
-                "list_network_requests": "检查网络请求",
+                "take_screenshot": "Screenshot",
+                "take_snapshot": "Snapshot",
+                "click": "Click",
+                "evaluate_script": "Evaluate",
+                "list_console_messages": "Console",
+                "list_pages": "Pages",
+                "navigate_page": "Navigate",
+                "new_page": "New page",
+                "fill": "Fill",
+                "fill_form": "Fill form",
+                "hover": "Hover",
+                "wait_for": "Wait",
+                "list_network_requests": "Network",
             ]
             let actionLabel = actionMap[rawTool.lowercased()] ?? rawTool.replacingOccurrences(of: "_", with: " ")
+            let srv = serverLabel.isEmpty ? "MCP" : serverLabel
             return (
-                serverLabel.isEmpty ? "MCP" : serverLabel,
-                "通过 \(serverLabel.isEmpty ? "MCP" : serverLabel) \(actionLabel)",
+                srv,
+                "\(srv) · \(actionLabel)",
                 actionLabel,
                 "sparkles"
             )
