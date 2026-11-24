@@ -1,6 +1,13 @@
 import React, { useEffect, useState } from "react";
-import { BarChart3, Bell, Check, Search, Shield, Sparkles, X } from "lucide-react";
-import { ProviderQuotaCard } from "./SidebarQuotaBar";
+import { BarChart3, Bell, Check, Clock, RefreshCw, Search, Shield, Sparkles, X } from "lucide-react";
+import {
+  ProviderQuotaCard,
+  formatResetCountdown,
+  getQuotaProviderMeta,
+  resolveQuotaBarGradient,
+  resolveQuotaPctColorClass,
+} from "./SidebarQuotaBar";
+import { EngineBrandGlyph } from "./ui/EngineBrandIcon";
 
 interface BucketStats {
   key: string;
@@ -112,6 +119,31 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
   } | null>(null);
   const [showRateCard, setShowRateCard] = useState(false);
   const [loadingAnalytics, setLoadingAnalytics] = useState(false);
+  const [refreshingQuotas, setRefreshingQuotas] = useState(false);
+
+  const refreshQuotas = async () => {
+    setRefreshingQuotas(true);
+    try {
+      const r = await fetch(`${daemonUrl}/api/analytics/quotas?refresh=1`);
+      if (r.ok) {
+        const d = await r.json();
+        if (Array.isArray(d?.providers)) setQuotaCards(d.providers as ProviderQuotaCard[]);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setRefreshingQuotas(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, onClose]);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHitDto[]>([]);
@@ -226,16 +258,17 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
+      className="v-modal-backdrop-in fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
       onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="flex max-h-[84vh] w-full max-w-[720px] flex-col overflow-hidden rounded-2xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] shadow-2xl"
+        style={{ boxShadow: "var(--v-shadow-modal)" }}
+        className="v-modal-in flex max-h-[84vh] w-full max-w-[740px] flex-col overflow-hidden rounded-2xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)]"
       >
         {/* Header & Segmented Tabs */}
         <div className="flex items-center justify-between border-b border-[var(--v-border-subtle)] px-5 py-3.5">
-          <div className="flex items-center gap-1.5 rounded-xl bg-[var(--v-bg-hover)] p-1">
+          <div className="flex items-center gap-1 rounded-xl bg-[var(--v-bg-hover)] p-1">
             {(
               [
                 { id: "analytics", label: "用量与账单", icon: BarChart3 },
@@ -249,7 +282,7 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                 <button
                   key={item.id}
                   onClick={() => setTab(item.id)}
-                  className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium transition-colors cursor-pointer ${
+                  className={`v-press flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium transition-colors cursor-pointer ${
                     active
                       ? "bg-[var(--v-bg-surface)] text-[var(--v-fg-primary)] shadow-sm"
                       : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
@@ -263,7 +296,7 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
           </div>
           <button
             onClick={onClose}
-            className="flex h-7 w-7 items-center justify-center rounded-lg text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            className="v-press flex h-7 w-7 items-center justify-center rounded-lg text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
           >
             <X className="h-4 w-4" />
           </button>
@@ -280,76 +313,150 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
               ) : analytics ? (
                 <>
                   {/* 5h & 7d Subscription Rate-Limit Windows */}
-                  {quotaCards.length > 0 && (
-                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                      {quotaCards.map((card) => (
-                        <div
-                          key={card.provider}
-                          className="rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/45 p-3.5"
-                        >
-                          <div className="mb-2.5 flex items-center justify-between">
-                            <span className="text-[12.5px] font-semibold text-[var(--v-fg-primary)]">
-                              {card.label}
-                            </span>
-                            <span className="rounded-md bg-[var(--v-bg-active)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--v-fg-muted)]">
-                              {card.plan_badge}
-                            </span>
-                          </div>
-                          <div className="space-y-2">
-                            {card.mode !== "subscription" || card.windows.length === 0 ? (
-                              <div className="text-[11.5px] text-[var(--v-fg-muted)]">
-                                {card.summary_text ||
-                                  (card.mode === "api_key"
-                                    ? "API Key 按量模式 · 无 5h/7d 速率窗口"
-                                    : "当前未登录该 CLI 账号")}
-                              </div>
-                            ) : (
-                              card.windows.map((w) => {
-                                const rem = Math.max(0, Math.min(100, w.remaining_percent));
-                                const resetHrs =
-                                  typeof w.reset_in_seconds === "number" && w.reset_in_seconds > 0
-                                    ? w.reset_in_seconds >= 86400
-                                      ? `${Math.floor(w.reset_in_seconds / 86400)}d ${Math.floor((w.reset_in_seconds % 86400) / 3600)}h 后重置`
-                                      : `${Math.floor(w.reset_in_seconds / 3600)}h ${Math.floor((w.reset_in_seconds % 3600) / 60)}m 后重置`
-                                    : "";
-                                const rightLabel = `${
-                                  w.detail_text ? `${w.detail_text} · ` : ""
-                                }剩余 ${Math.round(rem)}%${resetHrs ? ` · ${resetHrs}` : ""}`;
-                                return (
-                                  <div key={w.id} className="space-y-1">
-                                    <div className="flex items-center justify-between text-[11px]">
-                                      <span className="text-[var(--v-fg-secondary)]">{w.label}</span>
-                                      <span className="font-mono text-[10.5px] text-[var(--v-fg-muted)] tabular-nums">
-                                        {rightLabel}
+                  {quotaCards.length > 0 && (() => {
+                    const subscriptionQuotaCards = quotaCards.filter(
+                      (c) => c.mode === "subscription" && c.windows.length > 0
+                    );
+                    const otherQuotaCards = quotaCards.filter(
+                      (c) => c.mode !== "subscription" || c.windows.length === 0
+                    );
+
+                    return (
+                      <div className="space-y-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[12px] font-semibold text-[var(--v-fg-secondary)]">
+                            订阅配额与速率窗口
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void refreshQuotas()}
+                            className="v-press inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                          >
+                            <RefreshCw className={`h-3 w-3 ${refreshingQuotas ? "animate-spin" : ""}`} />
+                            <span>刷新配额</span>
+                          </button>
+                        </div>
+
+                        {subscriptionQuotaCards.length > 0 && (
+                          <div
+                            className={`grid grid-cols-1 gap-3 ${
+                              subscriptionQuotaCards.length > 1 ? "sm:grid-cols-2" : ""
+                            }`}
+                          >
+                            {subscriptionQuotaCards.map((card) => {
+                              const meta = getQuotaProviderMeta(card.provider, card.label);
+                              return (
+                                <div
+                                  key={card.provider}
+                                  className="flex flex-col rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/35 p-3.5 transition-colors hover:border-[var(--v-border-strong)]"
+                                >
+                                  <div className="mb-3 flex items-center justify-between gap-2 border-b border-[var(--v-border-subtle)]/75 pb-2.5">
+                                    <div className="flex min-w-0 items-center gap-2">
+                                      <span
+                                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg"
+                                        style={{ backgroundColor: meta.tintBg }}
+                                      >
+                                        <EngineBrandGlyph engine={card.provider} size={13.5} colored />
+                                      </span>
+                                      <span className="truncate text-[12.5px] font-semibold text-[var(--v-fg-primary)]">
+                                        {card.label}
                                       </span>
                                     </div>
-                                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
-                                      <div
-                                        style={{ width: `${Math.max(4, rem)}%` }}
-                                        className={`h-full rounded-full ${
-                                          w.status === "exhausted"
-                                            ? "bg-[#f87171]"
-                                            : w.status === "warning"
-                                            ? "bg-[#fbbf24]"
-                                            : card.provider === "antigravity"
-                                            ? "bg-[#60a5fa]"
-                                            : card.provider === "cursor"
-                                            ? "bg-[#a78bfa]"
-                                            : card.provider === "claude"
-                                            ? "bg-[#fb923c]"
-                                            : "bg-[#34d399]"
-                                        }`}
-                                      />
-                                    </div>
+                                    <span className="shrink-0 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-2 py-0.5 font-mono text-[10px] font-medium text-[var(--v-fg-secondary)]">
+                                      {card.plan_badge}
+                                    </span>
                                   </div>
-                                );
-                              })
-                            )}
+
+                                  <div className="space-y-3">
+                                    {card.windows.map((w) => {
+                                      const rem = Math.max(0, Math.min(100, w.remaining_percent));
+                                      const gradient = resolveQuotaBarGradient(w.status, meta.gradient);
+                                      const resetTxt = formatResetCountdown(w.reset_in_seconds, true);
+
+                                      return (
+                                        <div key={w.id} className="space-y-1.5">
+                                          <div className="flex items-center justify-between gap-2">
+                                            <span className="truncate text-[11.5px] font-medium text-[var(--v-fg-body)]">
+                                              {w.label}
+                                            </span>
+                                            <span
+                                              className={`shrink-0 font-mono text-[12px] font-semibold tabular-nums ${resolveQuotaPctColorClass(
+                                                w.status
+                                              )}`}
+                                            >
+                                              {Math.round(rem)}%
+                                            </span>
+                                          </div>
+
+                                          <div className="h-[5px] w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
+                                            <div
+                                              style={{
+                                                width: `${Math.max(3, rem)}%`,
+                                                background: gradient,
+                                                transition: "width 320ms var(--ease-swift)",
+                                              }}
+                                              className="h-full rounded-full"
+                                            />
+                                          </div>
+
+                                          <div className="flex items-center justify-between gap-2 text-[10.5px] text-[var(--v-fg-muted)]">
+                                            <span className="truncate font-mono tabular-nums">
+                                              {w.detail_text || `已用 ${Math.round(w.used_percent)}%`}
+                                            </span>
+                                            {resetTxt ? (
+                                              <span className="inline-flex shrink-0 items-center gap-1 font-mono tabular-nums text-[var(--v-fg-faint)]">
+                                                <Clock className="h-2.5 w-2.5" />
+                                                <span>{resetTxt}</span>
+                                              </span>
+                                            ) : null}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              );
+                            })}
                           </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                        )}
+
+                        {otherQuotaCards.length > 0 && (
+                          <div className="flex flex-wrap items-center gap-2">
+                            {otherQuotaCards.map((card) => {
+                              const statusText =
+                                card.summary_text ||
+                                (card.mode === "api_key"
+                                  ? "API Key 按量模式"
+                                  : "当前未登录 CLI 账号");
+                              return (
+                                <div
+                                  key={card.provider}
+                                  title={`${card.label} · ${card.plan_badge} · ${statusText}`}
+                                  className="inline-flex max-w-full items-center gap-2 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-hover)]/25 px-2.5 py-1.5 text-[11px]"
+                                >
+                                  <EngineBrandGlyph
+                                    engine={card.provider}
+                                    size={12}
+                                    colored={card.mode === "api_key"}
+                                    className={card.mode === "api_key" ? "shrink-0" : "shrink-0 opacity-60"}
+                                  />
+                                  <span className="shrink-0 font-medium text-[var(--v-fg-secondary)]">
+                                    {card.label}
+                                  </span>
+                                  <span className="shrink-0 rounded bg-[var(--v-bg-active)] px-1.5 py-0.5 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
+                                    {card.plan_badge}
+                                  </span>
+                                  <span className="truncate text-[10.5px] text-[var(--v-fg-muted)]">
+                                    {statusText}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
 
                   {/* KPI Cards */}
                   <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -415,6 +522,7 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                             <tr key={b.key} className="hover:bg-[var(--v-bg-hover)]/40">
                               <td className="px-3 py-2 font-mono font-semibold text-[var(--v-fg-primary)]">
                                 <div className="flex items-center gap-1.5">
+                                  <EngineBrandGlyph engine={b.key} size={12.5} colored className="shrink-0" />
                                   <span>{b.label}</span>
                                   {b.key === "cursor" && b.input_tokens === 0 && (
                                     <span
