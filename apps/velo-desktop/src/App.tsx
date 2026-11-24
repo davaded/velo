@@ -1276,11 +1276,31 @@ export function App() {
   const queuedIntentRef = useRef<Map<string, "drop" | "run">>(new Map());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  const resizeSnapRafRef = useRef<number | null>(null);
+
+  const nudgeWebKitScrollRepaint = useCallback((el: HTMLDivElement | null, pinToBottom: boolean) => {
+    if (!el) return;
+    const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+    const target = pinToBottom ? maxScroll : Math.min(el.scrollTop, maxScroll);
+    programmaticScrollRef.current = true;
+    // Force WKWebView's ScrollingTree composited tile cache to re-sync after height shrinks / layer unmounts
+    if (maxScroll > 0) {
+      el.scrollTop = target > 0 ? target - 1 : 1;
+      void el.offsetHeight;
+    }
+    el.scrollTop = target;
+    lastScrollTopRef.current = el.scrollTop;
+    requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+    });
+  }, []);
+
   const snapChatToBottomImmediate = useCallback(() => {
     const el = chatScrollRef.current;
     if (!el) return;
+    const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
     programmaticScrollRef.current = true;
-    el.scrollTop = el.scrollHeight;
+    el.scrollTop = maxScroll;
     lastScrollTopRef.current = el.scrollTop;
     requestAnimationFrame(() => {
       programmaticScrollRef.current = false;
@@ -1294,9 +1314,10 @@ export function App() {
       requestAnimationFrame(() => {
         const el = chatScrollRef.current;
         if (el) {
+          const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
           programmaticScrollRef.current = true;
-          el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-          lastScrollTopRef.current = el.scrollHeight;
+          el.scrollTo({ top: maxScroll, behavior: "smooth" });
+          lastScrollTopRef.current = maxScroll;
           window.setTimeout(() => {
             programmaticScrollRef.current = false;
           }, 260);
@@ -1314,21 +1335,38 @@ export function App() {
   }, [snapChatToBottomImmediate]);
 
   // Auto-keep viewport locked to the very bottom whenever content height or window size
-  // changes while in PinnedBottom mode (fixes focus-resync / markdown / image height jumps).
+  // changes while in PinnedBottom mode. Always defer via rAF so WKWebView never mutates
+  // scrollTop synchronously inside a ResizeObserver layout pass.
   useEffect(() => {
     if (typeof ResizeObserver === "undefined") return;
     const contentEl = chatContentRef.current;
     const scrollEl = chatScrollRef.current;
     if (!contentEl && !scrollEl) return;
     const ro = new ResizeObserver(() => {
-      if (isPinnedToBottomRef.current) {
-        snapChatToBottomImmediate();
-      }
+      if (resizeSnapRafRef.current !== null) return;
+      resizeSnapRafRef.current = requestAnimationFrame(() => {
+        resizeSnapRafRef.current = null;
+        const el = chatScrollRef.current;
+        if (!el) return;
+        const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+        if (isPinnedToBottomRef.current) {
+          snapChatToBottomImmediate();
+        } else if (el.scrollTop > maxScroll) {
+          // Clamp out-of-bounds scrollTop when an expanded trace collapses above the viewport
+          nudgeWebKitScrollRepaint(el, false);
+        }
+      });
     });
     if (contentEl) ro.observe(contentEl);
     if (scrollEl) ro.observe(scrollEl);
-    return () => ro.disconnect();
-  }, [snapChatToBottomImmediate]);
+    return () => {
+      ro.disconnect();
+      if (resizeSnapRafRef.current !== null) {
+        cancelAnimationFrame(resizeSnapRafRef.current);
+        resizeSnapRafRef.current = null;
+      }
+    };
+  }, [snapChatToBottomImmediate, nudgeWebKitScrollRepaint]);
 
   const activeSession = useMemo<VeloSession>(() => {
     const found =
@@ -1959,8 +1997,12 @@ export function App() {
                 }
                 return { ...prev, [sid]: reconstructed };
               });
-              if (sid === activeSessionIdRef.current && isPinnedToBottomRef.current) {
-                requestAnimationFrame(() => snapChatToBottomImmediate());
+              if (sid === activeSessionIdRef.current) {
+                requestAnimationFrame(() => {
+                  requestAnimationFrame(() => {
+                    nudgeWebKitScrollRepaint(chatScrollRef.current, isPinnedToBottomRef.current);
+                  });
+                });
               }
             }
           }
@@ -1981,7 +2023,7 @@ export function App() {
           }
         });
     },
-    [daemonUrl, e2eeRelayConfig, snapChatToBottomImmediate]
+    [daemonUrl, e2eeRelayConfig, snapChatToBottomImmediate, nudgeWebKitScrollRepaint]
   );
 
   const loadOlderEventsForSession = useCallback(
@@ -2973,6 +3015,13 @@ export function App() {
             refreshSessionDiffAndFiles(sid);
           }
           syncSessionEventsFromDaemon(sid);
+          if (sid === activeSessionIdRef.current) {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                nudgeWebKitScrollRepaint(chatScrollRef.current, isPinnedToBottomRef.current);
+              });
+            });
+          }
         }
         return;
       }
@@ -3387,6 +3436,7 @@ export function App() {
       refreshSessions,
       scrollChatToBottom,
       syncSessionEventsFromDaemon,
+      nudgeWebKitScrollRepaint,
     ]
   );
 
@@ -7440,9 +7490,12 @@ export function App() {
                   const turns: ConversationTurn[] = [];
                   for (const ev of activeEvents) {
                     if (ev.kind === "user") {
-                      turns.push({ key: ev.id, userEv: ev, items: [] });
+                      const stableKey = ev.client_msg_id
+                        ? `turn-${ev.client_msg_id}`
+                        : `turn-u-${turns.length}`;
+                      turns.push({ key: stableKey, userEv: ev, items: [] });
                     } else if (turns.length === 0) {
-                      turns.push({ key: `turn-init-${ev.id}`, userEv: null, items: [ev] });
+                      turns.push({ key: "turn-init", userEv: null, items: [ev] });
                     } else {
                       turns[turns.length - 1].items.push(ev);
                     }
@@ -7763,7 +7816,7 @@ export function App() {
                                     });
                                   return (
                                     <PaseoExecutionTraceGroup
-                                      key={`trace-${ev.id}-${autoCollapseSteps ? "c" : "e"}`}
+                                      key={`trace-${turn.key}-${idx}-${autoCollapseSteps ? "c" : "e"}`}
                                       steps={traceSteps}
                                       provider={activeSession.agent_kind}
                                       startedAtMs={
