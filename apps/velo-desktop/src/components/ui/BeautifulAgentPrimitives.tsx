@@ -232,6 +232,8 @@ export const PaseoTurnFooter: React.FC<{
     const primaryStatus = waitingLabel
       ? waitingLabel
       : statusLabel || (effectivePhase === "thinking" ? "Thinking" : "Working");
+    const liveSec = Math.max(0, Math.round(liveMs / 1000));
+    const formattedElapsed = formatPaseoDuration(liveMs);
 
     return (
       <div
@@ -249,6 +251,15 @@ export const PaseoTurnFooter: React.FC<{
             </span>
           ) : (
             <TextShimmer className="font-normal truncate">{primaryStatus}</TextShimmer>
+          )}
+          {!waitingLabel && liveSec >= 1 && (
+            <span
+              className="text-[12.5px] tabular-nums"
+              style={{ color: "var(--fg-extra-muted)" }}
+              data-testid="turn-working-elapsed"
+            >
+              · {formattedElapsed}
+            </span>
           )}
         </div>
       </div>
@@ -1908,8 +1919,10 @@ function resolveInlineTraceSummary(
         ? latestHeadline
         : activeVerb
       : latestHeadline || "Thinking";
+    const runningIcon =
+      label === "Thinking" && !hasError ? Sparkles : pickIcon();
     return {
-      icon: pickIcon(),
+      icon: runningIcon,
       label,
       activeVerb: activeVerb || latestHeadline,
       hasError,
@@ -1965,12 +1978,14 @@ export const PaseoExecutionTraceGroup: React.FC<{
 }> = ({
   steps,
   provider,
+  startedAtMs,
   isTurnRunning = false,
   defaultExpanded = false,
   onOpenDiffForFile,
 }) => {
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
   const [heldLabel, setHeldLabel] = useState<string>("");
+  const [fallbackStartMs] = useState<number>(() => Date.now());
   const prevRunningRef = useRef<boolean>(isTurnRunning);
   const engineMode = resolveTraceEngineMode(provider);
 
@@ -2073,6 +2088,8 @@ export const PaseoExecutionTraceGroup: React.FC<{
     </div>
   );
 
+  const effectiveStartedAtMs = startedAtMs ?? fallbackStartMs;
+
   return (
     <div className="my-1 select-none">
       <button
@@ -2089,7 +2106,7 @@ export const PaseoExecutionTraceGroup: React.FC<{
             color: inlineSummary.hasError
               ? "var(--status-danger)"
               : isTurnRunning
-              ? "var(--fg-muted)"
+              ? "var(--accent)"
               : "var(--fg-extra-muted)",
           }}
         />
@@ -2109,6 +2126,15 @@ export const PaseoExecutionTraceGroup: React.FC<{
         >
           {displayLabel}
         </span>
+        {isTurnRunning && (
+          <span
+            className="inline-flex shrink-0 items-center gap-1 text-[12px]"
+            style={{ color: "var(--fg-extra-muted)" }}
+          >
+            <span>·</span>
+            <PaseoLiveElapsed startedAtMs={effectiveStartedAtMs} />
+          </span>
+        )}
         <ChevronRight
           strokeWidth={1.75}
           className="h-[13px] w-[13px] shrink-0 opacity-60 transition-all duration-150 group-hover/trace:opacity-100"
@@ -2836,7 +2862,17 @@ export const PaseoMarkdown: React.FC<{
   resolveImageUrl?: (src: string) => string;
   onOpenFileLink?: (filePath: string, line?: number) => void;
 }> = React.memo(({ content, isStreaming = false, className = "", resolveImageUrl, onOpenFileLink }) => {
-  const blocks = useMemo(() => parseMarkdownBlocks(content), [content]);
+  const sanitizedContent = useMemo(
+    () =>
+      content
+        .replace(/<ask_question_pending\s*\/?>/gi, "")
+        .replace(/<\/ask_question_pending>/gi, "")
+        .replace(/<ephemeral_message>[\s\S]*?<\/ephemeral_message>/gi, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trimEnd(),
+    [content]
+  );
+  const blocks = useMemo(() => parseMarkdownBlocks(sanitizedContent), [sanitizedContent]);
 
   const renderBlock = (block: MdBlock, idx: number) => {
     const key = `md-${idx}`;

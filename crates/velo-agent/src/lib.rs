@@ -2227,12 +2227,15 @@ pub fn parse_agent_stdout_line(
                                         let text_delta =
                                             su.get("text_delta").and_then(|v| v.as_str());
                                         if let Some(td) = text_delta.filter(|s| !s.is_empty()) {
-                                            events.push(AgentEvent::MessageChunk {
-                                                session_id,
-                                                delta: td.to_string(),
-                                                replace: false,
-                                                timestamp: Utc::now(),
-                                            });
+                                            let cleaned = sanitize_agy_visible_text(td);
+                                            if !cleaned.is_empty() {
+                                                events.push(AgentEvent::MessageChunk {
+                                                    session_id,
+                                                    delta: cleaned,
+                                                    replace: false,
+                                                    timestamp: Utc::now(),
+                                                });
+                                            }
                                         } else if state == "DONE" && text_delta.is_none() {
                                             let think_toks = su
                                                 .pointer("/usage/thinking_tokens")
@@ -2311,11 +2314,14 @@ pub fn parse_agent_stdout_line(
                                         .and_then(|v| v.as_str())
                                         .filter(|s| !s.trim().is_empty())
                                     {
-                                        events.push(AgentEvent::MessageDelta {
-                                            session_id,
-                                            text: resp.to_string(),
-                                            timestamp: Utc::now(),
-                                        });
+                                        let cleaned = sanitize_agy_visible_text(resp);
+                                        if !cleaned.trim().is_empty() {
+                                            events.push(AgentEvent::MessageDelta {
+                                                session_id,
+                                                text: cleaned,
+                                                timestamp: Utc::now(),
+                                            });
+                                        }
                                     }
                                 } else if let Some(err_str) = res
                                     .get("error")
@@ -3355,6 +3361,31 @@ pub fn resolve_agy_model_and_effort(
     });
 
     (base_model, resolved_effort)
+}
+
+fn sanitize_agy_visible_text(raw: &str) -> String {
+    let mut s = raw.to_string();
+    // Strip internal AGY control markers that AGY's own UI replaces with interactive widgets
+    for marker in [
+        "<ask_question_pending />",
+        "<ask_question_pending/>",
+        "<ask_question_pending>",
+        "</ask_question_pending>",
+    ] {
+        if s.contains(marker) {
+            s = s.replace(marker, "");
+        }
+    }
+    // Strip <ephemeral_message>...</ephemeral_message> blocks if leaked
+    while let Some(start) = s.find("<ephemeral_message>") {
+        if let Some(end_rel) = s[start..].find("</ephemeral_message>") {
+            let end = start + end_rel + "</ephemeral_message>".len();
+            s.replace_range(start..end, "");
+        } else {
+            break;
+        }
+    }
+    s
 }
 
 #[cfg(test)]

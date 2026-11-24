@@ -281,8 +281,10 @@ pub fn pricing_catalog_json() -> Value {
     })
 }
 
-/// Authoritative per-turn cost: prefers exact provider-reported `cost_usd` when present and sane,
-/// otherwise computes from the model rate card (automatically healing legacy inflated rows).
+/// Authoritative API-equivalent per-turn cost computed directly from calibrated model rate cards.
+/// For Claude CLI, exact provider-reported `stored_cost_usd` is preserved when within sane bounds;
+/// for all other providers (AGY / Codex / Cursor / Grok), strictly uses true token counts × API rate card
+/// so stale legacy snapshots never inflate bills.
 pub fn effective_turn_cost_usd(
     provider: &AgentProvider,
     model: Option<&str>,
@@ -300,29 +302,48 @@ pub fn effective_turn_cost_usd(
         cache_write_tokens,
         output_tokens,
     );
-    if stored_cost_usd <= 0.0 {
-        return computed;
+    if input_tokens + output_tokens == 0 {
+        return stored_cost_usd.max(0.0);
     }
-    // If legacy rate/double-counting inflated `stored_cost_usd` above what the recorded
-    // tokens can actually cost at the calibrated rate card, heal to the token-accurate cost.
-    if computed > 0.0 && stored_cost_usd > computed * 1.35 {
-        return computed;
+    if matches!(provider, AgentProvider::Claude)
+        && stored_cost_usd > 0.0
+        && computed > 0.0
+        && stored_cost_usd >= computed * 0.65
+        && stored_cost_usd <= computed * 1.35
+    {
+        return stored_cost_usd;
     }
-    stored_cost_usd
+    computed
 }
 
-/// Reconciles `session.cost_usd` and `session.output_tokens` directly from its persisted
-/// `UsageUpdated` turn history so session cards and analytics totals never drift apart.
-pub fn reconcile_session_usage(session: &mut SessionInfo, history: &[AgentEvent]) -> bool {
-    let enriched = crate::enrich_history_turn_metrics(history);
-    let mut sum_out = 0u64;
-    let mut sum_cost = 0.0f64;
-    let mut last_in = 0u64;
-    let mut last_cache = 0u64;
-    let mut last_ctx = 0u64;
-    let mut saw_usage = false;
+#[derive(Debug, Clone)]
+pub struct NormalizedUsageTurn {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub context_window: u64,
+    pub cost_usd: f64,
+    pub output_tps: f64,
+    pub timestamp: chrono::DateTime<Utc>,
+}
 
-    for ev in &enriched {
+/// Normalizes persisted turn usage events into true per-turn deltas.
+/// In particular, Antigravity (`agy`) CLI emits *cumulative conversation-total* token counters
+/// on every turn (`1.07M -> 1.42M -> 6.89M`). Summing them raw double/triple-counts both tokens
+/// and API-equivalent cost, and causes bogus `999.9 tok/s` spikes.
+pub fn normalize_session_usage_turns(
+    provider: &AgentProvider,
+    model: Option<&str>,
+    enriched: &[AgentEvent],
+) -> Vec<NormalizedUsageTurn> {
+    let is_cumulative_provider = matches!(provider, AgentProvider::Antigravity);
+    let mut prev_in = 0u64;
+    let mut prev_cache = 0u64;
+    let mut prev_out = 0u64;
+    let mut out = Vec::new();
+
+    for ev in enriched {
         if let AgentEvent::UsageUpdated {
             input_tokens,
             output_tokens,
@@ -330,34 +351,97 @@ pub fn reconcile_session_usage(session: &mut SessionInfo, history: &[AgentEvent]
             cache_write_tokens,
             context_window,
             cost_usd,
+            output_tps,
+            timestamp,
             ..
         } = ev
         {
-            saw_usage = true;
-            sum_out = sum_out.saturating_add(*output_tokens);
-            sum_cost += effective_turn_cost_usd(
-                &session.provider,
-                session.model.as_deref(),
-                *input_tokens,
-                *cache_read_tokens,
+            let (d_in, d_cache, d_out, norm_tps) = if is_cumulative_provider {
+                let is_monotonic_continuation = (prev_in > 0 || prev_out > 0)
+                    && *input_tokens >= prev_in
+                    && *output_tokens >= prev_out;
+                let (di, dc, do_) = if is_monotonic_continuation {
+                    let di = input_tokens.saturating_sub(prev_in);
+                    let dc = cache_read_tokens.saturating_sub(prev_cache).min(di);
+                    let do_ = output_tokens.saturating_sub(prev_out);
+                    (di, dc, do_)
+                } else {
+                    (*input_tokens, (*cache_read_tokens).min(*input_tokens), *output_tokens)
+                };
+                prev_in = *input_tokens;
+                prev_cache = *cache_read_tokens;
+                prev_out = *output_tokens;
+
+                // Discard bogus 999.9 tok/s spikes produced by dividing cumulative totals by short turn time
+                let clean_tps = if *output_tps >= 300.0 {
+                    0.0
+                } else {
+                    *output_tps
+                };
+                (di, dc, do_, clean_tps)
+            } else {
+                let clean_tps = if *output_tps >= 450.0 { 0.0 } else { *output_tps };
+                (
+                    *input_tokens,
+                    (*cache_read_tokens).min(*input_tokens),
+                    *output_tokens,
+                    clean_tps,
+                )
+            };
+
+            let eff_cost = effective_turn_cost_usd(
+                provider,
+                model,
+                d_in,
+                d_cache,
                 *cache_write_tokens,
-                *output_tokens,
+                d_out,
                 *cost_usd,
             );
-            if *input_tokens > 0 {
-                last_in = *input_tokens;
-            }
-            if *cache_read_tokens > 0 {
-                last_cache = *cache_read_tokens;
-            }
-            if *context_window > 0 {
-                last_ctx = *context_window;
-            }
+
+            out.push(NormalizedUsageTurn {
+                input_tokens: d_in,
+                cache_read_tokens: d_cache,
+                cache_write_tokens: *cache_write_tokens,
+                output_tokens: d_out,
+                context_window: *context_window,
+                cost_usd: eff_cost,
+                output_tps: norm_tps,
+                timestamp: *timestamp,
+            });
         }
     }
 
-    if !saw_usage {
+    out
+}
+
+/// Reconciles `session.cost_usd` and `session.output_tokens` directly from its persisted
+/// `UsageUpdated` turn history so session cards and analytics totals never drift apart.
+pub fn reconcile_session_usage(session: &mut SessionInfo, history: &[AgentEvent]) -> bool {
+    let enriched = crate::enrich_history_turn_metrics(history);
+    let turns = normalize_session_usage_turns(&session.provider, session.model.as_deref(), &enriched);
+    if turns.is_empty() {
         return false;
+    }
+
+    let mut sum_out = 0u64;
+    let mut sum_cost = 0.0f64;
+    let mut last_in = 0u64;
+    let mut last_cache = 0u64;
+    let mut last_ctx = 0u64;
+
+    for t in &turns {
+        sum_out = sum_out.saturating_add(t.output_tokens);
+        sum_cost += t.cost_usd;
+        if t.input_tokens > 0 {
+            last_in = t.input_tokens;
+        }
+        if t.cache_read_tokens > 0 {
+            last_cache = t.cache_read_tokens;
+        }
+        if t.context_window > 0 {
+            last_ctx = t.context_window;
+        }
     }
 
     let rounded_cost = (sum_cost * 1_000_000.0).round() / 1_000_000.0;
@@ -414,6 +498,21 @@ pub struct BucketStats {
     pub cost_usd: f64,
 }
 
+#[derive(Default, Clone, Serialize)]
+pub struct ModelCostBucket {
+    pub model: String,
+    pub provider: String,
+    pub turns_count: usize,
+    pub input_tokens: u64,
+    pub uncached_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_tokens: u64,
+    pub input_per_m: f64,
+    pub cached_input_per_m: f64,
+    pub output_per_m: f64,
+    pub cost_usd: f64,
+}
+
 pub fn build_usage_analytics(
     sessions: &HashMap<Uuid, SessionInfo>,
     histories: &HashMap<Uuid, Vec<AgentEvent>>,
@@ -431,9 +530,18 @@ pub fn build_usage_analytics(
 
     let mut by_provider: HashMap<String, (BucketStats, f64, u64)> = HashMap::new();
     let mut by_workspace: HashMap<String, (BucketStats, f64, u64)> = HashMap::new();
+    let mut by_model: HashMap<String, ModelCostBucket> = HashMap::new();
 
     for s in sessions.values() {
         let p_key = provider_key(&s.provider).to_string();
+        let model_label = s
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&p_key)
+            .to_string();
+        let rate = lookup_rate_card(&s.provider, s.model.as_deref());
         let ws_key = if s.repo_root.trim().is_empty() {
             "default".to_string()
         } else {
@@ -479,84 +587,83 @@ pub fn build_usage_analytics(
 
         if let Some(raw_evs) = histories.get(&s.id) {
             let enriched = crate::enrich_history_turn_metrics(raw_evs);
+            let norm_turns =
+                normalize_session_usage_turns(&s.provider, s.model.as_deref(), &enriched);
             let mut sess_had_usage = false;
-            for ev in &enriched {
-                if let AgentEvent::UsageUpdated {
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    cost_usd,
-                    output_tps,
-                    timestamp,
-                    ..
-                } = ev
-                {
-                    sess_had_usage = true;
-                    total_turns += 1;
-                    let eff_cost = effective_turn_cost_usd(
-                        &s.provider,
-                        s.model.as_deref(),
-                        *input_tokens,
-                        *cache_read_tokens,
-                        *cache_write_tokens,
-                        *output_tokens,
-                        *cost_usd,
-                    );
+            for t in &norm_turns {
+                sess_had_usage = true;
+                total_turns += 1;
+                let eff_cost = t.cost_usd;
+                let uncached_in = t
+                    .input_tokens
+                    .saturating_sub(t.cache_read_tokens)
+                    .saturating_sub(t.cache_write_tokens);
 
-                    total_in += *input_tokens;
-                    total_cache += *cache_read_tokens;
-                    total_out += *output_tokens;
-                    total_cost += eff_cost;
+                total_in += t.input_tokens;
+                total_cache += t.cache_read_tokens;
+                total_out += t.output_tokens;
+                total_cost += eff_cost;
 
-                    if timestamp.year() == now.year() && timestamp.ordinal() == now.ordinal() {
-                        today_cost += eff_cost;
-                        today_tokens += input_tokens.saturating_add(*output_tokens);
-                    }
+                if t.timestamp.year() == now.year() && t.timestamp.ordinal() == now.ordinal() {
+                    today_cost += eff_cost;
+                    today_tokens += t.input_tokens.saturating_add(t.output_tokens);
+                }
 
-                    if *output_tps >= 0.5 && *output_tokens > 0 {
-                        tps_weighted_sum += *output_tps * (*output_tokens as f64);
-                        tps_weight_tok += *output_tokens;
-                    }
+                if t.output_tps >= 0.5 && t.output_tokens > 0 {
+                    tps_weighted_sum += t.output_tps * (t.output_tokens as f64);
+                    tps_weight_tok += t.output_tokens;
+                }
 
-                    if let Some((b, w_sum, w_tok)) = by_provider.get_mut(&p_key) {
-                        b.turns_count += 1;
-                        b.input_tokens += *input_tokens;
-                        b.cache_read_tokens += *cache_read_tokens;
-                        b.output_tokens += *output_tokens;
-                        b.cost_usd += eff_cost;
-                        if *output_tps >= 0.5 && *output_tokens > 0 {
-                            *w_sum += *output_tps * (*output_tokens as f64);
-                            *w_tok += *output_tokens;
-                        }
-                    }
-
-                    if let Some((b, w_sum, w_tok)) = by_workspace.get_mut(&ws_key) {
-                        b.turns_count += 1;
-                        b.input_tokens += *input_tokens;
-                        b.cache_read_tokens += *cache_read_tokens;
-                        b.output_tokens += *output_tokens;
-                        b.cost_usd += eff_cost;
-                        if *output_tps >= 0.5 && *output_tokens > 0 {
-                            *w_sum += *output_tps * (*output_tokens as f64);
-                            *w_tok += *output_tokens;
-                        }
+                if let Some((b, w_sum, w_tok)) = by_provider.get_mut(&p_key) {
+                    b.turns_count += 1;
+                    b.input_tokens += t.input_tokens;
+                    b.cache_read_tokens += t.cache_read_tokens;
+                    b.output_tokens += t.output_tokens;
+                    b.cost_usd += eff_cost;
+                    if t.output_tps >= 0.5 && t.output_tokens > 0 {
+                        *w_sum += t.output_tps * (t.output_tokens as f64);
+                        *w_tok += t.output_tokens;
                     }
                 }
+
+                if let Some((b, w_sum, w_tok)) = by_workspace.get_mut(&ws_key) {
+                    b.turns_count += 1;
+                    b.input_tokens += t.input_tokens;
+                    b.cache_read_tokens += t.cache_read_tokens;
+                    b.output_tokens += t.output_tokens;
+                    b.cost_usd += eff_cost;
+                    if t.output_tps >= 0.5 && t.output_tokens > 0 {
+                        *w_sum += t.output_tps * (t.output_tokens as f64);
+                        *w_tok += t.output_tokens;
+                    }
+                }
+
+                let m_key = format!("{}:{}", p_key, model_label);
+                let mb = by_model.entry(m_key).or_insert_with(|| ModelCostBucket {
+                    model: model_label.clone(),
+                    provider: p_key.to_uppercase(),
+                    input_per_m: rate.input_per_m,
+                    cached_input_per_m: rate.cached_input_per_m,
+                    output_per_m: rate.output_per_m,
+                    ..Default::default()
+                });
+                mb.turns_count += 1;
+                mb.input_tokens += t.input_tokens;
+                mb.uncached_input_tokens += uncached_in;
+                mb.cache_read_tokens += t.cache_read_tokens;
+                mb.output_tokens += t.output_tokens;
+                mb.cost_usd += eff_cost;
             }
             if !sess_had_usage && (s.input_tokens > 0 || s.output_tokens > 0 || s.cost_usd > 0.0) {
-                let eff_cost = if s.cost_usd > 0.0 {
-                    s.cost_usd
-                } else {
-                    compute_cost_usd(
-                        &s.provider,
-                        s.model.as_deref(),
-                        s.input_tokens,
-                        s.cache_read_tokens,
-                        0,
-                        s.output_tokens,
-                    )
-                };
+                let eff_cost = effective_turn_cost_usd(
+                    &s.provider,
+                    s.model.as_deref(),
+                    s.input_tokens,
+                    s.cache_read_tokens,
+                    0,
+                    s.output_tokens,
+                    s.cost_usd,
+                );
                 total_in += s.input_tokens;
                 total_cache += s.cache_read_tokens;
                 total_out += s.output_tokens;
@@ -564,6 +671,20 @@ pub fn build_usage_analytics(
             }
         }
     }
+
+    let mut by_model_list: Vec<ModelCostBucket> = by_model
+        .into_values()
+        .map(|mut m| {
+            m.cost_usd = (m.cost_usd * 10_000.0).round() / 10_000.0;
+            m
+        })
+        .collect();
+    by_model_list.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.output_tokens.cmp(&a.output_tokens))
+    });
 
     let finalize_buckets = |map: HashMap<String, (BucketStats, f64, u64)>| -> Vec<BucketStats> {
         let mut list: Vec<BucketStats> = map
@@ -623,6 +744,7 @@ pub fn build_usage_analytics(
         "today_cost_usd": (today_cost * 10_000.0).round() / 10_000.0,
         "today_tokens": today_tokens,
         "by_provider": finalize_buckets(by_provider),
+        "by_model": by_model_list,
         "by_workspace": finalize_buckets(by_workspace),
     })
 }
@@ -630,6 +752,42 @@ pub fn build_usage_analytics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_agy_cumulative_usage_normalized_to_true_deltas() {
+        let sid = Uuid::new_v4();
+        let make = |in_tok: u64, cache: u64, out_tok: u64| AgentEvent::UsageUpdated {
+            session_id: sid,
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            total_tokens: in_tok + out_tok,
+            cache_read_tokens: cache,
+            cache_write_tokens: 0,
+            context_window: 0,
+            cost_usd: 0.0,
+            output_tps: 999.9,
+            is_turn_total: true,
+            timestamp: Utc::now(),
+        };
+        let events = vec![
+            make(1_077_232, 958_870, 15_181),
+            make(1_424_138, 1_184_246, 18_508),
+            make(6_888_059, 6_340_842, 96_978),
+            // New underlying conversation reset:
+            make(265_052, 213_551, 6_132),
+            make(893_463, 464_507, 11_151),
+        ];
+        let turns = normalize_session_usage_turns(
+            &AgentProvider::Antigravity,
+            Some("gemini-4-neon"),
+            &events,
+        );
+        let total_in: u64 = turns.iter().map(|t| t.input_tokens).sum();
+        let total_out: u64 = turns.iter().map(|t| t.output_tokens).sum();
+        assert_eq!(total_in, 6_888_059 + 893_463);
+        assert_eq!(total_out, 96_978 + 11_151);
+        assert!(turns.iter().all(|t| t.output_tps == 0.0));
+    }
 
     #[test]
     fn test_rate_card_matching_avoids_gemini_mini_collision() {

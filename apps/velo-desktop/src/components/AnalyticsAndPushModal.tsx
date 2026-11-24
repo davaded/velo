@@ -15,6 +15,20 @@ interface BucketStats {
   cost_usd: number;
 }
 
+interface ModelCostBucket {
+  model: string;
+  provider: string;
+  turns_count: number;
+  input_tokens: number;
+  uncached_input_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  input_per_m: number;
+  cached_input_per_m: number;
+  output_per_m: number;
+  cost_usd: number;
+}
+
 interface UsageAnalyticsDto {
   sessions_count: number;
   turns_count: number;
@@ -28,6 +42,7 @@ interface UsageAnalyticsDto {
   today_cost_usd: number;
   today_tokens: number;
   by_provider: BucketStats[];
+  by_model?: ModelCostBucket[];
   by_workspace: BucketStats[];
 }
 
@@ -432,6 +447,57 @@ export const AnalyticsAndPushModal: React.FC<Props> = ({
                       </table>
                     </div>
                   </div>
+
+                  {/* By Model (Transparent Official API Cost Breakdown) */}
+                  {analytics.by_model && analytics.by_model.length > 0 && (
+                    <div>
+                      <div className="mb-2 flex items-center justify-between">
+                        <span className="text-[12px] font-semibold text-[var(--v-fg-secondary)]">
+                          按模型 API 等效账单明细
+                        </span>
+                        <span className="text-[10.5px] text-[var(--v-fg-muted)]">
+                          真实增量 Token × 官方 API 单价（$/1M）
+                        </span>
+                      </div>
+                      <div className="overflow-hidden rounded-xl border border-[var(--v-border-subtle)]">
+                        <table className="w-full text-left text-[11.5px]">
+                          <thead className="bg-[var(--v-bg-hover)]/70 text-[10.5px] text-[var(--v-fg-muted)]">
+                            <tr>
+                              <th className="px-3 py-2">模型</th>
+                              <th className="px-3 py-2">API 单价 (入/缓/出)</th>
+                              <th className="px-3 py-2">未缓存入 / 缓存读 / 输出</th>
+                              <th className="px-3 py-2 text-right">API 折算</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-[var(--v-border-subtle)] font-mono tabular-nums">
+                            {analytics.by_model.map((m) => (
+                              <tr key={`${m.provider}-${m.model}`} className="hover:bg-[var(--v-bg-hover)]/40">
+                                <td className="px-3 py-2 font-sans">
+                                  <div className="font-medium text-[var(--v-fg-primary)]">
+                                    {m.model}
+                                  </div>
+                                  <div className="font-mono text-[10px] text-[var(--v-fg-muted)]">
+                                    {m.provider} · {m.turns_count} 轮
+                                  </div>
+                                </td>
+                                <td className="px-3 py-2 text-[10.5px] text-[var(--v-fg-muted)]">
+                                  ${m.input_per_m.toFixed(2)} / ${m.cached_input_per_m.toFixed(3).replace(/0$/, "")} / ${m.output_per_m.toFixed(2)}
+                                </td>
+                                <td className="px-3 py-2 text-[11px] text-[var(--v-fg-secondary)]">
+                                  {fmtTokens(m.uncached_input_tokens)} /{" "}
+                                  <span className="text-[#60a5fa]">{fmtTokens(m.cache_read_tokens)}</span> /{" "}
+                                  <span className="text-[var(--v-fg-primary)]">{fmtTokens(m.output_tokens)}</span>
+                                </td>
+                                <td className="px-3 py-2 text-right font-semibold text-[var(--v-fg-primary)]">
+                                  {fmtUsd(m.cost_usd)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
 
                   {/* By Workspace */}
                   <div>

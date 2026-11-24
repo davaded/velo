@@ -889,7 +889,8 @@ public struct ExecutionTraceGroupView: View {
             let liveLabel = !activeVerb.isEmpty
                 ? (!latestHeadline.isEmpty ? latestHeadline : activeVerb)
                 : (!latestHeadline.isEmpty ? latestHeadline : "Thinking")
-            return (icon, liveLabel, activeVerb.isEmpty ? latestHeadline : activeVerb, hasError)
+            let liveIcon = (liveLabel == "Thinking" && !hasError) ? "sparkles" : icon
+            return (liveIcon, liveLabel, activeVerb.isEmpty ? latestHeadline : activeVerb, hasError)
         }
 
         let completedLabel = !latestHeadline.isEmpty ? latestHeadline : summary.label
@@ -927,11 +928,24 @@ public struct ExecutionTraceGroupView: View {
                     HStack(spacing: 6) {
                         Image(systemName: info.icon)
                             .font(.system(size: 13, weight: .regular))
-                            .foregroundStyle(info.hasError ? VeloTheme.coral : Color.secondary.opacity(0.78))
+                            .foregroundStyle(
+                                info.hasError
+                                    ? VeloTheme.coral
+                                    : (isTurnRunning ? VeloTheme.accentVioletSoft : Color.secondary.opacity(0.78))
+                            )
 
                         if isTurnRunning {
                             ShimmerTextView(displayLabel, font: .system(size: 13.5, weight: .regular))
                                 .lineLimit(1)
+                            if let origin = turnStartedAt {
+                                TimelineView(.periodic(from: .now, by: 1.0)) { ctx in
+                                    let sec = max(0, Int(ctx.date.timeIntervalSince(origin)))
+                                    Text("· \(VeloFormatting.formatDuration(ms: sec * 1000))")
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .foregroundStyle(Color.secondary.opacity(0.65))
+                                        .contentTransition(.numericText())
+                                }
+                            }
                         } else {
                             Text(displayLabel)
                                 .font(.system(size: 13.5, weight: .regular))
