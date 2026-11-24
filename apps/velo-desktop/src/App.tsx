@@ -9131,20 +9131,8 @@ export function App() {
                       </button>
                     </div>
 
-                    {/* Right Controls: Clean T3/Claude-style right bar (Conditional Diff shortcut ONLY when files changed + Submit / Stop Disc) */}
+                    {/* Right Controls: Minimal Submit / Stop Disc */}
                     <div className="flex items-center gap-2">
-                      {((activeSession.insertions || 0) > 0 ||
-                        (activeSession.deletions || 0) > 0) && (
-                        <button
-                          type="button"
-                          onClick={() => openDiffForFile()}
-                          title="查看当前工作区代码变更 (Review Diff)"
-                          className="v-press inline-flex h-6 items-center gap-1 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-2 font-mono text-[11px] tabular-nums hover:border-[var(--v-border-strong)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
-                        >
-                          <span className="text-[#34d399]">+{activeSession.insertions || 0}</span>
-                          <span className="text-[#f87171]">−{activeSession.deletions || 0}</span>
-                        </button>
-                      )}
                       {activeSession.status === "running" ||
                       activeSession.status === "waiting_approval" ? (
                         <div className="flex items-center gap-1.5">
