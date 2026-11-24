@@ -112,9 +112,17 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
         }
     }
 
-    // 1. Explicit calibrated 2026 model slug matching (handles Cursor-routed models accurately too)
-    // Anthropic Claude 5.5 vs 4.x / Fable
-    if clean.contains("opus") || clean.contains("fable") {
+    // 1. Official calibrated 2026 API pricing (USD per 1M tokens)
+    //    Verified against ai.google.dev/gemini-api/docs/pricing, claude.com, openai.com, docs.x.ai
+    let now_date = Utc::now().date_naive();
+    let after_nov_2026 = now_date >= chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let after_dec_2026 = now_date >= chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+
+    // Anthropic Claude (Fable 5.2, Opus 5.5/4.x, Sonnet 5.5/4.x, Haiku 5.5/4.x)
+    if clean.contains("fable") {
+        return ModelRateCard::flat(8.00, 0.20, 10.00, 40.00);
+    }
+    if clean.contains("opus") {
         if clean.contains("5-5") || clean.contains("5.5") {
             return ModelRateCard::flat(4.00, 0.20, 5.00, 20.00);
         }
@@ -122,7 +130,7 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
     }
     if clean.contains("haiku") {
         if clean.contains("5-5") || clean.contains("5.5") {
-            return ModelRateCard::tiered(0.10, 0.01, 0.20, 0.50, 100_000, 5.0);
+            return ModelRateCard::tiered(0.10, 0.01, 0.125, 0.50, 100_000, 5.0);
         }
         return ModelRateCard::flat(1.00, 0.10, 1.25, 5.00);
     }
@@ -133,23 +141,43 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
         return ModelRateCard::flat(3.00, 0.30, 3.75, 15.00);
     }
 
-    // Google Gemini 4 (Neon / Hydrogen / Carbon) + 3.8 Flash + 3.1/2.5 Pro & Flash
+    // Google Gemini 4 (Carbon / Argon / Neon / Hydrogen) + 3.8 Flash + 3.5 Flash-Lite + 3.1/2.5
     if clean.contains("gemini")
+        || clean.contains("carbon")
+        || clean.contains("argon")
         || clean.contains("neon")
         || clean.contains("hydrogen")
-        || clean.contains("carbon")
     {
-        if clean.contains("neon") {
-            return ModelRateCard::tiered(3.00, 0.15, 0.0, 15.00, 200_000, 2.0);
+        if clean.contains("carbon") || clean.contains("argon") {
+            // Official Google AI Studio pricing: $2/$0.10/$10 intro through Nov 30, 2026; $4/$0.20/$20 from Dec 1, 2026
+            if after_nov_2026 {
+                return ModelRateCard::flat(4.00, 0.20, 0.0, 20.00);
+            }
+            return ModelRateCard::flat(2.00, 0.10, 0.0, 10.00);
         }
-        if clean.contains("hydrogen") || clean.contains("carbon") {
-            return ModelRateCard::flat(1.50, 0.15, 0.0, 7.50);
+        if clean.contains("neon") {
+            return ModelRateCard::flat(3.00, 0.15, 3.75, 15.00);
+        }
+        if clean.contains("hydrogen") {
+            return ModelRateCard::flat(1.50, 0.075, 1.875, 7.50);
+        }
+        if clean.contains("3.8-flash")
+            || clean.contains("3-8-flash")
+            || clean.contains("3.7-flash")
+            || clean.contains("3-7-flash")
+            || clean.contains("3.6-flash")
+            || clean.contains("3-6-flash")
+        {
+            if after_dec_2026 {
+                return ModelRateCard::flat(1.50, 0.15, 0.0, 7.50);
+            }
+            return ModelRateCard::flat(0.75, 0.075, 0.0, 3.75);
+        }
+        if clean.contains("3.5-flash-lite") || clean.contains("3-5-flash-lite") {
+            return ModelRateCard::flat(0.30, 0.03, 0.0, 2.50);
         }
         if clean.contains("flash-lite") {
             return ModelRateCard::flat(0.10, 0.01, 0.0, 0.40);
-        }
-        if clean.contains("3.8-flash") || clean.contains("3-8-flash") {
-            return ModelRateCard::flat(0.75, 0.075, 0.0, 3.75);
         }
         if clean.contains("flash") {
             return ModelRateCard::flat(0.30, 0.03, 0.0, 2.50);
@@ -157,7 +185,7 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
         return ModelRateCard::tiered(2.00, 0.20, 0.0, 12.00, 200_000, 2.0);
     }
 
-    // OpenAI GPT-5/6 / Codex / o3 / o4
+    // OpenAI GPT-6.1-Sol / GPT-5.6-Sol / GPT-5.4 / GPT-5 / Codex / o3 / o4
     if clean.contains("nano") {
         return ModelRateCard::flat(0.05, 0.005, 0.0, 0.40);
     }
@@ -169,6 +197,15 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
     }
     if clean.contains("o3") || clean.contains("o4") {
         return ModelRateCard::flat(2.00, 0.50, 0.0, 8.00);
+    }
+    if clean.contains("6.1") || clean.contains("6-1") {
+        return ModelRateCard::flat(2.00, 0.10, 2.50, 10.00);
+    }
+    if clean.contains("5.6") || clean.contains("5-6") {
+        return ModelRateCard::flat(4.00, 0.40, 0.0, 20.00);
+    }
+    if clean.contains("5.4") || clean.contains("5-4") {
+        return ModelRateCard::flat(2.50, 0.25, 0.0, 15.00);
     }
     if clean.contains("gpt-") || clean.contains("codex") {
         return ModelRateCard::flat(1.25, 0.125, 0.0, 10.00);
@@ -196,9 +233,9 @@ pub fn lookup_rate_card(provider: &AgentProvider, model: Option<&str>) -> ModelR
 
     // 2. Provider-level default rate card
     match provider {
-        AgentProvider::Claude => ModelRateCard::flat(3.00, 0.30, 3.75, 15.00),
-        AgentProvider::Codex => ModelRateCard::flat(1.25, 0.125, 0.0, 10.00),
-        AgentProvider::Antigravity => ModelRateCard::tiered(3.00, 0.15, 0.0, 15.00, 200_000, 2.0),
+        AgentProvider::Claude => ModelRateCard::flat(2.00, 0.10, 2.50, 10.00),
+        AgentProvider::Codex => ModelRateCard::flat(2.00, 0.10, 2.50, 10.00),
+        AgentProvider::Antigravity => ModelRateCard::flat(3.00, 0.15, 3.75, 15.00),
         AgentProvider::Grok => ModelRateCard::tiered(2.00, 0.50, 0.0, 6.00, 200_000, 2.0),
         AgentProvider::Cursor | AgentProvider::Copilot => ModelRateCard::flat(2.00, 0.25, 0.0, 10.00),
         AgentProvider::Qwen => ModelRateCard::flat(0.80, 0.16, 0.0, 3.20),
@@ -239,20 +276,20 @@ pub fn pricing_catalog_json() -> Value {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "~/.velo/pricing.json".to_string());
     let sample_models: &[(&str, AgentProvider, &str, &str)] = &[
+        ("Gemini 4 Carbon", AgentProvider::Antigravity, "gemini-4-carbon", "11/30前优惠价，12/1起$4/$20"),
+        ("Gemini 4 Neon", AgentProvider::Antigravity, "gemini-4-neon", "缓存读 5%"),
+        ("Gemini 4 Hydrogen", AgentProvider::Antigravity, "gemini-4-hydrogen", "缓存读 5%"),
+        ("Gemini 3.8 Flash", AgentProvider::Antigravity, "gemini-3.8-flash", "12/31前优惠价"),
+        ("Gemini 2.5 Flash", AgentProvider::Antigravity, "gemini-2.5-flash", "缓存读 10%"),
+        ("Claude Fable 5.2", AgentProvider::Claude, "claude-fable-5-2", "缓存读 2.5%"),
         ("Claude Opus 5.5", AgentProvider::Claude, "claude-opus-5-5", "缓存读 5%"),
-        ("Claude Opus 4.x / Fable", AgentProvider::Claude, "claude-fable-5-2", "缓存读 10%"),
         ("Claude Sonnet 5.5", AgentProvider::Claude, "claude-sonnet-5-5", "缓存读 5%"),
-        ("Claude Sonnet 4.x", AgentProvider::Claude, "claude-sonnet-4-5", "缓存读 10%"),
         ("Claude Haiku 5.5", AgentProvider::Claude, "claude-haiku-5-5", ">100k 5×"),
-        ("OpenAI GPT-5 / Codex", AgentProvider::Codex, "gpt-6.1-sol", "缓存读 10%"),
-        ("OpenAI o3 / o4-mini", AgentProvider::Codex, "o4-mini", "缓存读 25%"),
-        ("Gemini 4 Neon (Pro)", AgentProvider::Antigravity, "gemini-4-neon", ">200k 2×"),
-        ("Gemini 4 Hydrogen", AgentProvider::Antigravity, "gemini-4-hydrogen", "标准价"),
-        ("Gemini 3.8 Flash", AgentProvider::Antigravity, "gemini-3.8-flash", "标准价"),
-        ("Gemini 2.5 Flash", AgentProvider::Antigravity, "gemini-2.5-flash", "标准价"),
-        ("xAI Grok 4.6 / 4.7", AgentProvider::Grok, "grok-4.7", ">200k 2×"),
-        ("xAI Grok 4.3", AgentProvider::Grok, "grok-4.3", "标准价"),
-        ("xAI Grok Build", AgentProvider::Grok, "grok-build", "标准价"),
+        ("OpenAI GPT-6.1-Sol", AgentProvider::Codex, "gpt-6.1-sol", "缓存读 5%"),
+        ("OpenAI GPT-5.6-Sol", AgentProvider::Codex, "gpt-5.6-sol", "缓存读 10%"),
+        ("OpenAI GPT-5.4", AgentProvider::Codex, "gpt-5.4", "缓存读 10%"),
+        ("OpenAI GPT-5 / Codex", AgentProvider::Codex, "gpt-5-codex", "缓存读 10%"),
+        ("xAI Grok 4.7 / 4.6", AgentProvider::Grok, "grok-4.7", ">200k 2×"),
         ("xAI Grok Fast", AgentProvider::Grok, "grok-fast", "极速低价"),
     ];
     let cards: Vec<Value> = sample_models
@@ -811,8 +848,17 @@ mod tests {
         assert!((grok_multi - 0.56).abs() < 0.001, "unexpected grok cost: {grok_multi}");
 
         let carbon = lookup_rate_card(&AgentProvider::Antigravity, Some("gemini-4-carbon"));
-        assert_eq!(carbon.input_per_m, 1.5);
-        assert_eq!(carbon.output_per_m, 7.5);
+        assert_eq!(carbon.input_per_m, 2.0);
+        assert_eq!(carbon.cached_input_per_m, 0.10);
+        assert_eq!(carbon.output_per_m, 10.0);
+
+        let hydro_cached = lookup_rate_card(&AgentProvider::Antigravity, Some("gemini-4-hydrogen"));
+        assert_eq!(hydro_cached.cached_input_per_m, 0.075);
+
+        let fable = lookup_rate_card(&AgentProvider::Claude, Some("claude-fable-5-2"));
+        assert_eq!(fable.input_per_m, 8.0);
+        assert_eq!(fable.cached_input_per_m, 0.20);
+        assert_eq!(fable.output_per_m, 40.0);
 
         let opus55 = lookup_rate_card(&AgentProvider::Claude, Some("claude-opus-5-5"));
         assert_eq!(opus55.input_per_m, 4.0);
@@ -826,11 +872,20 @@ mod tests {
         assert_eq!(gpt_mini.output_per_m, 2.0);
 
         let codex = lookup_rate_card(&AgentProvider::Codex, Some("gpt-6.1-sol"));
-        assert_eq!(codex.input_per_m, 1.25);
-        assert_eq!(codex.cached_input_per_m, 0.125);
+        assert_eq!(codex.input_per_m, 2.00);
+        assert_eq!(codex.cached_input_per_m, 0.10);
         assert_eq!(codex.output_per_m, 10.0);
 
-        // Legacy inflated Codex turn ($2.71 for 127k cached + 25.8k out) heals to ~$0.275
+        let sol56 = lookup_rate_card(&AgentProvider::Codex, Some("gpt-5.6-sol"));
+        assert_eq!(sol56.input_per_m, 4.00);
+        assert_eq!(sol56.cached_input_per_m, 0.40);
+        assert_eq!(sol56.output_per_m, 20.0);
+
+        let gpt54 = lookup_rate_card(&AgentProvider::Codex, Some("gpt-5.4"));
+        assert_eq!(gpt54.input_per_m, 2.50);
+        assert_eq!(gpt54.output_per_m, 15.0);
+
+        // Legacy inflated Codex turn ($2.71 for 127k cached + 25.8k out) heals to ~$0.272
         let healed = effective_turn_cost_usd(
             &AgentProvider::Codex,
             Some("gpt-6.1-sol"),

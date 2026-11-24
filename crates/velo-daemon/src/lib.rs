@@ -10343,7 +10343,7 @@ composer-2.5 - Composer 2.5
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, sid);
 
-        // Verify Fable 5.2 pricing: 100k input (80k cached @ $0.50/M + 20k uncached @ $5.00/M = $0.14) + 10k output @ $25/M ($0.25) = $0.39
+        // Verify Fable 5.2 official pricing: 100k input (80k cached @ $0.20/M = $0.016 + 20k uncached @ $8.00/M = $0.16) + 10k output @ $40/M ($0.40) = $0.576
         let cost = pricing::compute_cost_usd(
             &AgentProvider::Claude,
             Some("claude-fable-5-2"),
@@ -10352,7 +10352,7 @@ composer-2.5 - Composer 2.5
             0,
             10_000,
         );
-        assert!((cost - 0.39).abs() < 0.0001, "expected $0.39, got {}", cost);
+        assert!((cost - 0.576).abs() < 0.0001, "expected $0.576, got {}", cost);
 
         let _ = std::fs::remove_dir_all(&tmp);
         Ok(())
