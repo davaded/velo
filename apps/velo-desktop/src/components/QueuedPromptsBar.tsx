@@ -27,7 +27,7 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
   const visibleItems = collapsed ? items.slice(0, 1) : items;
 
   return (
-    <div className="mx-1.5 -mb-[1px] rounded-t-[14px] border border-b-0 border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/92 px-3 py-2 backdrop-blur-md">
+    <div className="v-popover-in mx-1.5 -mb-[1px] rounded-t-[14px] border border-b-0 border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/92 px-3 py-2 backdrop-blur-md">
       {/* Compact Header Strip */}
       <div className="flex items-center justify-between gap-2">
         <button
@@ -38,7 +38,7 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
           }`}
         >
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#fbbf24] animate-pulse" />
-          <span>待发队列 · {items.length}</span>
+          <span className="tabular-nums">待发队列 · {items.length}</span>
           {showCollapseToggle && (
             <span className="inline-flex items-center text-[var(--v-fg-muted)]">
               {collapsed ? (
@@ -55,7 +55,7 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
             type="button"
             onClick={onClearAll}
             title="清空全部待发队列"
-            className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[#f87171] cursor-pointer"
+            className="v-press inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[#f87171] cursor-pointer"
           >
             <Trash2 className="h-2.5 w-2.5" />
             <span>清空</span>
@@ -68,10 +68,10 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
         {visibleItems.map((q, idx) => (
           <div
             key={q.id}
-            className="group flex items-center justify-between gap-2 rounded-lg border border-transparent bg-[var(--v-bg-surface)]/85 px-2.5 py-1.5 text-[12px] text-[var(--v-fg-body)] transition-colors hover:border-[var(--v-border-subtle)] hover:bg-[var(--v-bg-surface)]"
+            className="velo-phase-morph group flex items-center justify-between gap-2 rounded-lg border border-transparent bg-[var(--v-bg-surface)]/85 px-2.5 py-1.5 text-[12px] text-[var(--v-fg-body)] transition-colors hover:border-[var(--v-border-subtle)] hover:bg-[var(--v-bg-surface)]"
           >
             <div className="flex min-w-0 flex-1 items-center gap-2" title={q.input}>
-              <span className="flex h-4 min-w-[16px] shrink-0 items-center justify-center rounded bg-[var(--v-bg-active)]/80 px-1 font-mono text-[10px] font-semibold text-[var(--v-fg-muted)]">
+              <span className="flex h-4 min-w-[16px] shrink-0 items-center justify-center rounded bg-[var(--v-bg-active)]/80 px-1 font-mono text-[10px] font-semibold text-[var(--v-fg-muted)] tabular-nums">
                 {idx + 1}
               </span>
               <span className="truncate leading-snug">{q.input}</span>
@@ -85,7 +85,7 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
                     disabled={idx === 0}
                     onClick={() => onReorder(q.id, "up")}
                     title="上移优先级"
-                    className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] disabled:opacity-25 cursor-pointer"
+                    className="v-press flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] disabled:opacity-25 cursor-pointer"
                   >
                     <ArrowUp className="h-3 w-3" />
                   </button>
@@ -94,7 +94,7 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
                     disabled={idx === items.length - 1}
                     onClick={() => onReorder(q.id, "down")}
                     title="下移优先级"
-                    className="flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] disabled:opacity-25 cursor-pointer"
+                    className="v-press flex h-5 w-5 items-center justify-center rounded text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] disabled:opacity-25 cursor-pointer"
                   >
                     <ArrowDown className="h-3 w-3" />
                   </button>
@@ -105,7 +105,7 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
                 type="button"
                 onClick={() => onRunNow(q.id)}
                 title="打断当前执行，立即插队运行这条"
-                className="inline-flex h-6 items-center gap-1 rounded-md border border-[#f59e0b]/30 bg-[#f59e0b]/8 px-2 text-[11px] font-medium text-[#d97706] dark:text-[#fbbf24] transition-colors hover:border-[#f59e0b]/55 hover:bg-[#f59e0b]/18 cursor-pointer"
+                className="v-press inline-flex h-6 items-center gap-1 rounded-md border border-[#f59e0b]/30 bg-[#f59e0b]/8 px-2 text-[11px] font-medium text-[#d97706] dark:text-[#fbbf24] hover:border-[#f59e0b]/55 hover:bg-[#f59e0b]/18 cursor-pointer"
               >
                 <Zap className="h-2.5 w-2.5" />
                 <span>插队</span>
@@ -116,7 +116,7 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
                   type="button"
                   onClick={() => onEditBack(q)}
                   title="撤回到输入框重新编辑"
-                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                  className="v-press flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                 >
                   <Pencil className="h-3 w-3" />
                 </button>
@@ -126,7 +126,7 @@ export const QueuedPromptsBar: React.FC<QueuedPromptsBarProps> = ({
                 type="button"
                 onClick={() => onRemove(q.id)}
                 title="移除此条排队"
-                className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[#f87171]/12 hover:text-[#f87171] cursor-pointer"
+                className="v-press flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[#f87171]/12 hover:text-[#f87171] cursor-pointer"
               >
                 <X className="h-3.5 w-3.5" />
               </button>

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { ChevronDown, ChevronUp, RefreshCw } from "lucide-react";
 import { EngineBrandGlyph } from "./ui/EngineBrandIcon";
+import { VeloNumberTicker } from "./ui/VeloMotionPrimitives";
 
 export interface QuotaWindowItem {
   id: string;
@@ -156,13 +157,13 @@ export const SidebarQuotaBar: React.FC<{
     >
       {/* Floating Detail Popover on Row Hover (All Windows & Exact Reset Countdowns) */}
       {hoveredCard && (
-        <div className="pointer-events-none absolute bottom-full left-2 right-2 z-30 mb-1.5 rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)]/95 p-2.5 shadow-xl backdrop-blur-md">
+        <div className="v-glass-popover v-popover-in pointer-events-none absolute bottom-full left-2 right-2 z-30 mb-1.5 rounded-2xl p-2.5">
           <div className="mb-2 flex items-center justify-between gap-2">
             <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--v-fg-primary)]">
               <EngineBrandGlyph engine={hoveredCard.provider} size={12} colored />
               <span>{hoveredCard.label}</span>
             </span>
-            <span className="font-mono text-[9.5px] text-[var(--v-fg-muted)]">
+            <span className="rounded-full bg-[var(--v-bg-active)] px-1.5 py-0.5 font-mono text-[9.5px] text-[var(--v-fg-muted)]">
               {hoveredCard.plan_badge}
             </span>
           </div>
@@ -178,7 +179,7 @@ export const SidebarQuotaBar: React.FC<{
                     <span className="truncate text-[var(--v-fg-secondary)]">{w.label}</span>
                     <span className="shrink-0 font-mono text-[10px] text-[var(--v-fg-primary)] tabular-nums">
                       {w.detail_text ? `${w.detail_text} · ` : ""}
-                      {Math.round(pct)}%
+                      <VeloNumberTicker value={Math.round(pct)} suffix="%" durationMs={260} />
                       {resetTxt ? (
                         <span className="ml-1 text-[var(--v-fg-muted)]">{resetTxt}</span>
                       ) : null}
@@ -186,8 +187,12 @@ export const SidebarQuotaBar: React.FC<{
                   </div>
                   <div className="h-[2.5px] w-full overflow-hidden rounded-full bg-[var(--v-bg-active)]">
                     <div
-                      style={{ width: `${Math.max(3, pct)}%`, backgroundColor: color }}
-                      className="h-full rounded-full opacity-85"
+                      style={{
+                        width: `${Math.max(3, pct)}%`,
+                        backgroundColor: color,
+                        transition: "width 280ms var(--ease-swift)",
+                      }}
+                      className="h-full rounded-full opacity-90"
                     />
                   </div>
                 </div>

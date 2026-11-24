@@ -1,7 +1,8 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Check, Copy, Search, Settings, Terminal, X } from "lucide-react";
 import type { ModelOption } from "../mockData";
 import { EngineBrandGlyph } from "./ui/EngineBrandIcon";
+import { VeloKbd } from "./ui/VeloMotionPrimitives";
 
 const ENGINE_SETUP_HINTS: Partial<Record<EngineTabKey, { cmd: string; note: string }>> = {
   claude: { cmd: "claude login", note: "安装 Claude Code CLI 并登录账号" },
@@ -179,6 +180,7 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
   const [selectedTab, setSelectedTab] = useState<EngineTabKey>(currentTab);
   const [query, setQuery] = useState<string>("");
   const [copiedCmd, setCopiedCmd] = useState<boolean>(false);
+  const [highlightIdx, setHighlightIdx] = useState<number>(0);
 
   const countsByTab = useMemo(() => {
     const counts: Record<EngineTabKey, number> = {
@@ -218,6 +220,11 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
     return modelCatalog.filter((m) => getEngineTabForModel(m) === selectedTab);
   }, [modelCatalog, selectedTab, trimmedQuery]);
 
+  useEffect(() => {
+    const curIdx = visibleModels.findIndex((m) => m.id === activeModelId);
+    setHighlightIdx(curIdx >= 0 ? curIdx : 0);
+  }, [selectedTab, trimmedQuery, visibleModels.length, activeModelId]);
+
   const activeTabMeta = ENGINE_TABS.find((t) => t.key === selectedTab) || ENGINE_TABS[0];
   const tabIsCrossEngine = isSessionBound && selectedTab !== currentTab;
 
@@ -231,26 +238,50 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
       />
       <div
         onClick={(e) => e.stopPropagation()}
-        className="absolute bottom-9 left-0 z-30 w-[420px] max-w-[calc(100vw-28px)] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-2 shadow-2xl"
+        className="v-glass-popover v-popover-in absolute bottom-9 left-0 z-30 w-[436px] max-w-[calc(100vw-28px)] rounded-2xl p-2"
       >
-        {/* 1. Search Input (searches across ALL 330+ models instantly) */}
-        <div className="mb-2 flex items-center gap-2 rounded-lg border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)] px-2.5 py-1.5">
+        {/* 1. Search Input (searches across ALL 330+ models instantly with ↑↓ / Enter) */}
+        <div className="mb-2 flex items-center gap-2 rounded-xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/80 px-2.5 py-1.5 transition-colors focus-within:border-[var(--v-border-strong)]">
           <Search className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)]" />
           <input
             autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={`搜索全部 ${modelCatalog.length} 个模型（如 opus / gpt / gemini / kimi）…`}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                onClose();
+                return;
+              }
+              if (visibleModels.length === 0) return;
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setHighlightIdx((i) => (i + 1) % visibleModels.length);
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setHighlightIdx((i) => (i - 1 + visibleModels.length) % visibleModels.length);
+              } else if (e.key === "Enter") {
+                e.preventDefault();
+                const target = visibleModels[Math.min(highlightIdx, visibleModels.length - 1)];
+                if (target && isModelAvailable(target, runtimes)) {
+                  const isHandoff = isSessionBound && target.agentKind !== activeAgentKind;
+                  onSelectModel(target, isHandoff);
+                }
+              }
+            }}
+            placeholder={`搜索全部 ${modelCatalog.length} 个模型（opus / gpt / gemini / kimi）…`}
             className="w-full bg-transparent text-[12px] text-[var(--v-fg-primary)] placeholder-[var(--v-fg-faint)] focus:outline-none"
           />
-          {query && (
+          {query ? (
             <button
               type="button"
               onClick={() => setQuery("")}
-              className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+              className="v-press text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
               <X className="h-3.5 w-3.5" />
             </button>
+          ) : (
+            <VeloKbd>Esc</VeloKbd>
           )}
         </div>
 
@@ -267,9 +298,9 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                   key={tab.key}
                   type="button"
                   onClick={() => setSelectedTab(tab.key)}
-                  className={`flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1 text-[11.5px] font-medium transition-colors cursor-pointer ${
+                  className={`v-press flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1 text-[11.5px] font-medium cursor-pointer ${
                     isSelected
-                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] ring-1 ring-[var(--v-border-strong)]"
+                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] ring-1 ring-[var(--v-border-strong)] shadow-2xs"
                       : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-body)]"
                   }`}
                 >
@@ -280,7 +311,7 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                     className={`shrink-0 ${avail ? "" : "opacity-40"}`}
                   />
                   <span>{tab.shortLabel}</span>
-                  <span className="font-mono text-[9.5px] opacity-60">{count}</span>
+                  <span className="font-mono text-[9.5px] opacity-60 tabular-nums">{count}</span>
                 </button>
               );
             })}
@@ -362,8 +393,9 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
               未找到匹配「{query}」的模型
             </div>
           ) : (
-            visibleModels.map((m) => {
+            visibleModels.map((m, idx) => {
               const isCurrent = activeModelId === m.id;
+              const isHighlighted = idx === highlightIdx;
               const isAcpFamily = String(m.family).startsWith("ACP");
               const canSelect = isModelAvailable(m, runtimes);
               const isCrossEngineHandoff =
@@ -377,15 +409,24 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                   key={m.id}
                   type="button"
                   disabled={!canSelect}
+                  onMouseEnter={() => setHighlightIdx(idx)}
                   onClick={() => onSelectModel(m, isCrossEngineHandoff)}
-                  className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors ${
+                  className={`v-press relative flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] ${
                     isCurrent
                       ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
+                      : isHighlighted && canSelect
+                      ? "bg-[var(--v-bg-hover)] text-[var(--v-fg-primary)] cursor-pointer"
                       : canSelect
                       ? "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
                       : "cursor-not-allowed text-[var(--v-fg-muted)] opacity-45"
                   }`}
                 >
+                  {isHighlighted && canSelect && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute left-0 top-1.5 bottom-1.5 w-[2px] rounded-full bg-[var(--accent-bright)]"
+                    />
+                  )}
                   <div className="min-w-0 pr-2">
                     <div className="flex items-center gap-1.5 font-medium">
                       {trimmedQuery && tabInfo && (
@@ -446,7 +487,7 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
               <button
                 type="button"
                 onClick={onBindCustomAcp}
-                className="rounded-md bg-[var(--v-bg-active)] px-2.5 py-1 text-[11px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                className="v-press rounded-md bg-[var(--v-bg-active)] px-2.5 py-1 text-[11px] font-medium text-[var(--v-fg-primary)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
               >
                 Bind
               </button>
@@ -454,16 +495,24 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
           </div>
         )}
 
-        {/* 6. Footer Settings Shortcut */}
-        <div className="mt-1.5 border-t border-[var(--v-border-subtle)] pt-1">
+        {/* 6. Footer Settings Shortcut + Keyboard Hints */}
+        <div className="mt-1.5 flex items-center justify-between gap-2 border-t border-[var(--v-border-subtle)] pt-1.5">
           <button
             type="button"
             onClick={onOpenSettings}
-            className="flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            className="v-press flex items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
           >
-            <span>管理本地 CLI 引擎、ACP 与 Worktree Hooks…</span>
             <Settings className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
+            <span>管理引擎与 Hooks…</span>
           </button>
+          <div className="flex items-center gap-1.5 pr-1 text-[10px] text-[var(--v-fg-faint)]">
+            <span className="inline-flex items-center gap-0.5">
+              <VeloKbd>↑↓</VeloKbd> 选择
+            </span>
+            <span className="inline-flex items-center gap-0.5">
+              <VeloKbd>↵</VeloKbd> 切换
+            </span>
+          </div>
         </div>
       </div>
     </>

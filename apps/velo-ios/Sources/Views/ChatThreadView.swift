@@ -967,6 +967,7 @@ public struct ChatThreadView: View {
                 Text("\(VeloFormatting.formatCompactTokens(s.tokensUsed)) tok\(ctxPct)\(costPart)")
                     .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    .contentTransition(.numericText())
                     .lineLimit(1)
             }
 
@@ -978,8 +979,10 @@ public struct ChatThreadView: View {
                     HStack(spacing: 3) {
                         Text("+\(s.insertions)")
                             .foregroundStyle(VeloTheme.emerald)
+                            .contentTransition(.numericText())
                         Text("−\(s.deletions)")
                             .foregroundStyle(VeloTheme.coral)
+                            .contentTransition(.numericText())
                     }
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .padding(.horizontal, 7)
@@ -1598,11 +1601,15 @@ public struct ChatThreadView: View {
                         }
 
                         Button {
+                            #if canImport(UIKit)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            #endif
                             Task { await store.stopSession(sessionId) }
                         } label: {
                             Image(systemName: "stop.fill")
                                 .font(.system(size: 12.5, weight: .bold))
                                 .foregroundStyle(.white)
+                                .contentTransition(.symbolEffect(.replace))
                                 .frame(width: 34, height: 34)
                                 .background(VeloTheme.coral, in: Circle())
                         }
@@ -1610,6 +1617,9 @@ public struct ChatThreadView: View {
                     }
                 } else {
                     Button {
+                        #if canImport(UIKit)
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        #endif
                         let rawTrimmed = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                         if rawTrimmed == "/rewind" || rawTrimmed == "/mcp" || rawTrimmed == "/fork" {
                             executeSlashQuickAction(rawTrimmed)
@@ -1640,6 +1650,7 @@ public struct ChatThreadView: View {
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 14.5, weight: .bold))
                                 .foregroundStyle(canSend ? .white : .secondary.opacity(0.55))
+                                .contentTransition(.symbolEffect(.replace))
                                 .frame(width: 34, height: 34)
                                 .background(
                                     canSend
@@ -1662,19 +1673,56 @@ public struct ChatThreadView: View {
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 11)
-        .background(
-            VeloTheme.cardSurface(colorScheme),
-            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
-        )
+        .background {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(VeloTheme.cardSurface(colorScheme).opacity(colorScheme == .dark ? 0.68 : 0.78))
+                )
+        }
         .overlay(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 1)
+                .stroke(
+                    composerFocused
+                        ? AnyShapeStyle(cat.accentColor.opacity(0.42))
+                        : AnyShapeStyle(VeloTheme.specularRim(colorScheme)),
+                    lineWidth: composerFocused ? 1.15 : 1
+                )
         )
+        .overlay {
+            if isSessionRunning {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { ctx in
+                    let angle = Angle.degrees(
+                        ctx.date.timeIntervalSinceReferenceDate
+                            .truncatingRemainder(dividingBy: 4.2) / 4.2 * 360.0
+                    )
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(
+                            AngularGradient(
+                                gradient: Gradient(stops: [
+                                    .init(color: .clear, location: 0.0),
+                                    .init(color: .clear, location: 0.78),
+                                    .init(color: cat.accentColor.opacity(0.45), location: 0.92),
+                                    .init(color: .clear, location: 1.0),
+                                ]),
+                                center: .center,
+                                angle: angle
+                            ),
+                            lineWidth: 1.35
+                        )
+                }
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
+        }
+        .animation(.spring(response: 0.30, dampingFraction: 0.84), value: isSessionRunning)
+        .animation(.spring(response: 0.24, dampingFraction: 0.85), value: composerFocused)
         .shadow(
-            color: Color.black.opacity(colorScheme == .dark ? 0.35 : 0.06),
-            radius: 12,
+            color: Color.black.opacity(colorScheme == .dark ? 0.38 : 0.08),
+            radius: 14,
             x: 0,
-            y: 4
+            y: 5
         )
         .padding(.horizontal, 12)
         .padding(.top, 6)

@@ -52,6 +52,16 @@ import {
 import { ChatOutlineRail, OutlineTurnSummary } from "./components/ChatOutlineRail";
 import { IsolatedComposerTextarea } from "./components/IsolatedComposerTextarea";
 import { SidebarQuotaBar } from "./components/SidebarQuotaBar";
+import { SettingsModal } from "./components/SettingsModal";
+import { CommandPaletteModal } from "./components/CommandPaletteModal";
+import {
+  VeloKbd,
+  VeloSegmentedControl,
+  VeloSpotlightCard,
+  VeloToastHost,
+  VeloToastItem,
+  VeloToastTone,
+} from "./components/ui/VeloMotionPrimitives";
 import { RemoteHostDto, RemoteHostsModal } from "./components/RemoteHostsModal";
 import {
   ExtensionsAndCheckpointsModal,
@@ -773,7 +783,29 @@ export function App() {
     );
   });
 
-  const [variant, setVariant] = useState<VariantId>("a");
+  const [variant, setVariant] = useState<VariantId>(() => {
+    const saved = safeStorageGet("velo.variant");
+    if (saved === "a" || saved === "b" || saved === "c") return saved;
+    return "b";
+  });
+  const [reduceMotion, setReduceMotion] = useState<boolean>(() => {
+    return safeStorageGet("velo.reduceMotion") === "true";
+  });
+  const [sendKeyMode, setSendKeyMode] = useState<"enter" | "cmd_enter">(() => {
+    const saved = safeStorageGet("velo.sendKeyMode");
+    return saved === "cmd_enter" ? "cmd_enter" : "enter";
+  });
+  const [toasts, setToasts] = useState<VeloToastItem[]>([]);
+  const [activeOutlineTurnKey, setActiveOutlineTurnKey] = useState<string | null>(null);
+
+  const pushToast = useCallback((message: string, tone: VeloToastTone = "info") => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setToasts((prev) => [...prev.slice(-2), { id, message, tone }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 2800);
+  }, []);
+
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     const saved = safeStorageGet("velo.themeMode");
     if (saved === "light" || saved === "dark" || saved === "system") return saved;
@@ -805,15 +837,20 @@ export function App() {
   useEffect(() => {
     safeStorageSet("velo.themeMode", themeMode);
     safeStorageSet("velo.tone", tone);
+    safeStorageSet("velo.variant", variant);
+    safeStorageSet("velo.reduceMotion", String(reduceMotion));
+    safeStorageSet("velo.sendKeyMode", sendKeyMode);
     document.documentElement.setAttribute("data-theme", resolvedTheme);
     document.documentElement.setAttribute("data-tone", tone);
+    document.documentElement.setAttribute("data-variant", variant);
+    document.documentElement.setAttribute("data-reduce-motion", String(reduceMotion));
 
     // Sync native macOS NSWindow appearance when running inside Velo.app
     const w = window as unknown as {
       webkit?: { messageHandlers?: { windowTheme?: { postMessage: (m: string) => void } } };
     };
     w.webkit?.messageHandlers?.windowTheme?.postMessage(themeMode);
-  }, [themeMode, tone, resolvedTheme]);
+  }, [themeMode, tone, variant, reduceMotion, sendKeyMode, resolvedTheme]);
 
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
     if (typeof window !== "undefined") {
@@ -1013,6 +1050,12 @@ export function App() {
   const [commitBoxOpen, setCommitBoxOpen] = useState<boolean>(false);
   const [commitMsg, setCommitMsg] = useState<string>("feat: checkpoint isolated worktree changes");
   const [gitActionNotice, setGitActionNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!gitActionNotice) return;
+    const isErr = /失败|错误|error|failed|denied/i.test(gitActionNotice);
+    const isOk = /成功|已|saved|committed|merged|copied/i.test(gitActionNotice);
+    pushToast(gitActionNotice, isErr ? "error" : isOk ? "success" : "info");
+  }, [gitActionNotice, pushToast]);
 
   // Inline Diff Line Review Comment State (Single + Batch Multi-Comment Dispatch)
   const [diffCommentIdx, setDiffCommentIdx] = useState<number | null>(null);
@@ -6565,31 +6608,16 @@ export function App() {
           </div>
 
           <div className="flex items-center gap-1">
-            <div
-              className="flex items-center rounded-md bg-[var(--v-bg-hover)] p-0.5"
-              title={`Theme: ${themeMode} (active: ${resolvedTheme})`}
-            >
-              {(
-                [
-                  { id: "system", icon: Monitor, tip: "跟随系统 (System)" },
-                  { id: "light", icon: Sun, tip: "浅色模式 (Light)" },
-                  { id: "dark", icon: Moon, tip: "深色模式 (Dark)" },
-                ] as const
-              ).map(({ id, icon: Icon, tip }) => (
-                <button
-                  key={id}
-                  onClick={() => setThemeMode(id)}
-                  title={tip}
-                  className={`flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                    themeMode === id
-                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
-                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
-                  }`}
-                >
-                  <Icon className="h-3.5 w-3.5" />
-                </button>
-              ))}
-            </div>
+            <VeloSegmentedControl
+              size="xs"
+              value={themeMode}
+              onChange={(id) => setThemeMode(id)}
+              options={[
+                { id: "system", icon: Monitor, title: "跟随系统 (System)" },
+                { id: "light", icon: Sun, title: "浅色模式 (Light)" },
+                { id: "dark", icon: Moon, title: "深色模式 (Dark)" },
+              ]}
+            />
 
             <button
               onClick={() => {
@@ -6597,7 +6625,7 @@ export function App() {
                 setActiveModal("settings");
               }}
               title="Appearance & Settings (⌘,)"
-              className="flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              className="v-press flex h-7 w-7 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
               <Settings className="h-4 w-4" />
             </button>
@@ -7234,7 +7262,11 @@ export function App() {
           <main className="relative flex flex-1 flex-col items-center overflow-hidden">
             <ChatOutlineRail
               turns={outlineTurns}
-              onJumpToTurn={handleJumpToTurn}
+              activeTurnKey={activeOutlineTurnKey}
+              onJumpToTurn={(key) => {
+                setActiveOutlineTurnKey(key);
+                handleJumpToTurn(key);
+              }}
               findOpen={chatFindOpen}
               findQuery={chatFindQuery}
               onChangeFindQuery={setChatFindQuery}
@@ -7290,6 +7322,28 @@ export function App() {
                 ) {
                   void loadOlderEventsForSession(activeSession.id);
                 }
+
+                // Lightweight viewport tracking for ChatOutlineRail active tick
+                const turnNodes = el.querySelectorAll<HTMLElement>("[data-turn-key]");
+                if (turnNodes.length > 0) {
+                  const containerTop = el.getBoundingClientRect().top + 96;
+                  let currentKey: string | null = null;
+                  for (let i = 0; i < turnNodes.length; i++) {
+                    const rect = turnNodes[i].getBoundingClientRect();
+                    if (rect.top <= containerTop) {
+                      currentKey = turnNodes[i].getAttribute("data-turn-key");
+                    } else {
+                      break;
+                    }
+                  }
+                  const resolvedKey =
+                    currentKey || turnNodes[0].getAttribute("data-turn-key");
+                  if (resolvedKey) {
+                    setActiveOutlineTurnKey((prev) =>
+                      prev === resolvedKey ? prev : resolvedKey
+                    );
+                  }
+                }
               }}
               className="velo-chat-scroll w-full flex-1 overflow-y-auto overflow-x-hidden px-3.5 py-4 sm:px-6 sm:py-6"
               data-testid="agent-chat-scroll"
@@ -7316,8 +7370,14 @@ export function App() {
                 )}
 
                 {activeEvents.length === 0 && (
-                  <div className="my-12 flex flex-col items-center justify-center gap-4 text-center">
-                    <div className="inline-flex items-center gap-2 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-3.5 py-1 text-[12px] text-[var(--v-fg-secondary)]">
+                  <div className="relative my-8 flex flex-col items-center justify-center gap-4 py-6 text-center">
+                    {/* Aceternity-inspired subtle radial-masked dot grid (strictly confined to empty state) */}
+                    <div
+                      aria-hidden="true"
+                      className="v-empty-dot-grid pointer-events-none absolute -inset-x-10 -inset-y-6 -z-0"
+                    />
+
+                    <div className="v-blur-fade-in relative z-10 inline-flex items-center gap-2 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)]/90 px-3.5 py-1 text-[12px] text-[var(--v-fg-secondary)] shadow-2xs">
                       <Folder className="h-3.5 w-3.5 text-[var(--v-fg-muted)]" />
                       <span className="font-medium text-[var(--v-fg-primary)]">
                         {activeRepo.name}
@@ -7340,7 +7400,10 @@ export function App() {
                       ).length;
 
                       return (
-                        <div className="w-full max-w-[540px] rounded-2xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)]/80 p-3.5 shadow-sm">
+                        <div
+                          className="v-blur-fade-in relative z-10 w-full max-w-[560px] rounded-2xl border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)]/85 p-3.5 shadow-sm"
+                          style={{ animationDelay: "50ms" }}
+                        >
                           <div className="mb-2 flex items-center justify-between px-0.5 text-[11px]">
                             <span className="font-medium text-[var(--v-fg-muted)]">
                               选择本次新会话的引擎与模型
@@ -7351,7 +7414,7 @@ export function App() {
                                 setEffortPickerOpen(false);
                                 setModelPickerOpen(true);
                               }}
-                              className="font-medium text-[#a78bfa] hover:underline cursor-pointer"
+                              className="v-press font-medium text-[var(--accent-bright)] hover:underline cursor-pointer"
                             >
                               搜索全部 {modelCatalog.length} 个模型 →
                             </button>
@@ -7378,19 +7441,19 @@ export function App() {
                                   type="button"
                                   disabled={!avail}
                                   onClick={() => void handleSelectSessionModel(defaultModel, false)}
-                                  className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[12px] font-medium transition-all ${
+                                  className={`v-press flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-[12px] font-medium ${
                                     isSel
                                       ? "border-[var(--v-border-strong)] bg-[var(--v-bg-active)] text-[var(--v-fg-primary)] shadow-2xs"
                                       : avail
-                                      ? "border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/50 text-[var(--v-fg-secondary)] hover:border-[var(--v-border-strong)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                      ? "border-[var(--v-border-subtle)] bg-[var(--v-bg-sidebar)]/55 text-[var(--v-fg-secondary)] hover:border-[var(--v-border-strong)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                                       : "cursor-not-allowed border-transparent text-[var(--v-fg-faint)] opacity-45"
                                   }`}
                                 >
-                                  <span
-                                    className="h-2 w-2 rounded-full"
-                                    style={{
-                                      backgroundColor: avail ? tab.dotColor : "var(--v-fg-faint)",
-                                    }}
+                                  <EngineBrandGlyph
+                                    engine={tab.key}
+                                    size={12.5}
+                                    colored={avail}
+                                    className={avail ? "shrink-0" : "shrink-0 opacity-45"}
                                   />
                                   <span>{tab.shortLabel}</span>
                                 </button>
@@ -7410,7 +7473,7 @@ export function App() {
                                     type="button"
                                     disabled={!avail}
                                     onClick={() => void handleSelectSessionModel(m, false)}
-                                    className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11.5px] transition-colors ${
+                                    className={`v-press inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11.5px] ${
                                       isSel
                                         ? "border-[#34d399]/50 bg-[#34d399]/12 font-medium text-[var(--v-fg-primary)]"
                                         : "border-[var(--v-border-subtle)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
@@ -7428,7 +7491,7 @@ export function App() {
                                     setEffortPickerOpen(false);
                                     setModelPickerOpen(true);
                                   }}
-                                  className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--v-border-strong)] px-2.5 py-1 text-[11px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                  className="v-press inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--v-border-strong)] px-2.5 py-1 text-[11px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                                 >
                                   <span>+{totalInEngine - featuredModels.length} 更多</span>
                                 </button>
@@ -7449,7 +7512,7 @@ export function App() {
                                     key={eff}
                                     type="button"
                                     onClick={() => handleSelectSessionEffort(eff)}
-                                    className={`rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors cursor-pointer ${
+                                    className={`v-press rounded-md px-2 py-0.5 text-[11px] font-medium cursor-pointer ${
                                       isSel
                                         ? "bg-[#8b5cf6]/20 text-[#a78bfa] ring-1 ring-[#8b5cf6]/40"
                                         : "text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
@@ -7465,6 +7528,53 @@ export function App() {
                       );
                     })()}
 
+                    {/* 2×2 Spotlight Quick-Start Actions */}
+                    <div
+                      className="v-blur-fade-in relative z-10 grid w-full max-w-[560px] grid-cols-2 gap-2"
+                      style={{ animationDelay: "100ms" }}
+                    >
+                      {[
+                        {
+                          title: "梳理仓库架构",
+                          desc: "快速总结核心模块与数据流",
+                          prompt: "请快速浏览当前仓库结构，梳理核心模块、入口文件与主要数据流。",
+                        },
+                        {
+                          title: "审查近期变更",
+                          desc: "检查未提交代码与潜在风险",
+                          prompt: "请检查当前仓库最近的 Git 变更，做一次简明的代码审查并指出潜在问题。",
+                        },
+                        {
+                          title: "排查并修复 Bug",
+                          desc: "定位根因并给出最小修改方案",
+                          prompt: "请帮我排查当前项目中的一个问题：先定位根因，再给出最小改动方案。",
+                        },
+                        {
+                          title: "补充自动化测试",
+                          desc: "覆盖核心逻辑与边界条件",
+                          prompt: "请为当前仓库最核心的业务逻辑补充高质量单元测试，并运行验证通过。",
+                        },
+                      ].map((card) => (
+                        <VeloSpotlightCard
+                          key={card.title}
+                          onClick={() => {
+                            draftsLatestRef.current[activeSession.id] = card.prompt;
+                            setPromptProgrammaticNonce((n) => n + 1);
+                            setHasComposerText(true);
+                            window.setTimeout(() => composerTextareaRef.current?.focus(), 20);
+                          }}
+                          className="px-3.5 py-2.5"
+                        >
+                          <div className="relative z-10 text-[12px] font-medium text-[var(--v-fg-primary)]">
+                            {card.title}
+                          </div>
+                          <div className="relative z-10 mt-0.5 text-[11px] text-[var(--v-fg-muted)]">
+                            {card.desc}
+                          </div>
+                        </VeloSpotlightCard>
+                      ))}
+                    </div>
+
                     <button
                       type="button"
                       onClick={() => {
@@ -7473,7 +7583,7 @@ export function App() {
                         setNewSetupCommand(repoHooks[activeRepo.path] || "");
                         setActiveModal("new-worktree");
                       }}
-                      className="text-[11.5px] text-[var(--v-fg-muted)] transition-colors hover:text-[var(--v-fg-primary)] cursor-pointer"
+                      className="v-press relative z-10 text-[11.5px] text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                     >
                       配置独立 Git Worktree · Committee 多模型竞速 · TDD 自动循环 →
                     </button>
@@ -7624,8 +7734,8 @@ export function App() {
                                           className="w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-[var(--v-fg-primary)] focus:outline-none"
                                         />
                                         <div className="mt-2 flex items-center justify-between border-t border-[var(--v-border-subtle)] pt-2">
-                                          <span className="text-[11px] text-[var(--v-fg-muted)]">
-                                            Enter 重新发送 · Esc 取消
+                                          <span className="inline-flex items-center gap-1.5 text-[11px] text-[var(--v-fg-muted)]">
+                                            <VeloKbd>↵</VeloKbd> 重新发送 · <VeloKbd>Esc</VeloKbd> 取消
                                           </span>
                                           <div className="flex items-center gap-2">
                                             <button
@@ -7633,14 +7743,14 @@ export function App() {
                                                 setEditingEventId(null);
                                                 setEditingText("");
                                               }}
-                                              className="rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                                              className="v-press rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                                             >
                                               取消
                                             </button>
                                             <button
                                               onClick={() => handleSaveAndResendEdit(ev)}
                                               disabled={!editingText.trim()}
-                                              className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] transition-opacity hover:opacity-90 disabled:opacity-40"
+                                              className="v-press rounded-lg bg-[var(--v-btn-bg)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90 disabled:opacity-40 cursor-pointer"
                                             >
                                               重新发送
                                             </button>
@@ -7657,19 +7767,15 @@ export function App() {
                                     className="group mt-2 mb-0.5 flex min-w-0 max-w-full flex-col items-end"
                                   >
                                     <div
-                                      onClick={() => {
+                                      onDoubleClick={() => {
                                         const selected = window.getSelection()?.toString() ?? "";
                                         if (selected.length > 0) return;
                                         if (!isSessionRunning) {
                                           handleStartEditMessage(ev);
                                         }
                                       }}
-                                      title={!isSessionRunning ? "点击可编辑并重新发送" : undefined}
-                                      className={`velo-selectable min-w-0 max-w-[82%] overflow-hidden whitespace-pre-wrap break-words rounded-2xl rounded-tr-[4px] bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-[1.48] text-[var(--v-fg-primary)] transition-colors ${
-                                        !isSessionRunning
-                                          ? "hover:brightness-105"
-                                          : ""
-                                      }`}
+                                      title={!isSessionRunning ? "双击或点下方编辑图标可修改并重发" : undefined}
+                                      className="velo-selectable min-w-0 max-w-[82%] overflow-hidden whitespace-pre-wrap break-words rounded-2xl rounded-tr-[4px] border border-[var(--v-border-subtle)]/70 bg-[var(--v-bg-bubble)] px-4 py-2.5 text-[13.5px] leading-[1.48] text-[var(--v-fg-primary)] transition-colors"
                                     >
                                       {ev.images && ev.images.length > 0 && (
                                         <div className="mb-2 flex flex-wrap gap-2">
@@ -7710,16 +7816,16 @@ export function App() {
                                     </div>
                                     <div
                                       data-testid="user-message-trailing-row"
-                                      className="mt-1 flex h-5 items-center justify-end gap-1.5 text-[var(--v-fg-muted)] opacity-0 transition-opacity group-hover:opacity-100"
+                                      className="mt-1 flex h-5 items-center justify-end gap-1 text-[var(--v-fg-muted)] opacity-0 translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0"
                                     >
-                                      <span className="mr-0.5 text-[12px] tabular-nums select-none">
+                                      <span className="mr-0.5 text-[11.5px] tabular-nums select-none">
                                         {ev.timestamp}
                                       </span>
                                       <button
                                         type="button"
                                         onClick={() => handleRewindUserMessage(ev)}
                                         title="回退到此消息并恢复到输入框"
-                                        className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                        className="v-press flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                                       >
                                         <Undo2 className="h-3.5 w-3.5" />
                                       </button>
@@ -7728,22 +7834,27 @@ export function App() {
                                           type="button"
                                           onClick={() => handleStartEditMessage(ev)}
                                           title="行内编辑并重发"
-                                          className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                          className="v-press flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                                         >
                                           <SquarePen className="h-3.5 w-3.5" />
                                         </button>
                                       )}
                                       <button
                                         type="button"
-                                        onClick={() => copyText(ev.id, ev.content)}
+                                        onClick={() => {
+                                          copyText(ev.id, ev.content);
+                                          pushToast("已复制消息内容", "success");
+                                        }}
                                         title="复制消息"
-                                        className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                                        className="v-press flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                                       >
-                                        {copiedKey === ev.id ? (
-                                          <Check className="h-3.5 w-3.5 text-[#34d399]" />
-                                        ) : (
-                                          <Copy className="h-3.5 w-3.5" />
-                                        )}
+                                        <span key={copiedKey === ev.id ? "ok" : "cp"} className="v-icon-morph">
+                                          {copiedKey === ev.id ? (
+                                            <Check className="h-3.5 w-3.5 text-[#34d399]" />
+                                          ) : (
+                                            <Copy className="h-3.5 w-3.5" />
+                                          )}
+                                        </span>
                                       </button>
                                     </div>
                                   </div>
@@ -8134,14 +8245,17 @@ export function App() {
               </div>
             </div>
 
-            {/* Floating "Jump to Latest Output" Pill when user scrolls up */}
+            {/* Floating "Jump to Latest Output" Frosted Pill when user scrolls up */}
             {showJumpToBottom && activeEvents.length > 0 && (
-              <div className="pointer-events-none z-20 -mt-9 mb-1 flex w-full justify-center">
+              <div className="pointer-events-none z-20 -mt-10 mb-1.5 flex w-full justify-center">
                 <button
                   type="button"
                   onClick={() => scrollChatToBottom(true)}
-                  className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-3 py-1 text-[11.5px] font-medium text-[var(--v-fg-primary)] shadow-lg transition-transform hover:scale-[1.02] cursor-pointer"
+                  className="v-glass-popover v-popover-in v-press pointer-events-auto inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-[11.5px] font-medium text-[var(--v-fg-primary)] cursor-pointer"
                 >
+                  {activeSession.status === "running" && (
+                    <span className="h-1.5 w-1.5 rounded-full bg-[#34d399] animate-pulse" />
+                  )}
                   <ArrowDown className="h-3.5 w-3.5 text-[#34d399]" />
                   <span>
                     {activeSession.status === "running" ? "回到最新实时输出" : "回到底部"}
@@ -8152,12 +8266,15 @@ export function App() {
 
             {/* ===============================================================
                 4. AUTHENTIC PASEO / CODEX / CLAUDE CODE COMPOSER DOCK
-                   - Pure natural language input (zero manual @file clutter)
-                   - Direct Model Picker (Claude Fable 5.2, Opus 5.5, GPT-6.1-Sol...)
-                   - Effort Picker (Low / Medium / High / Max) + Permission Mode
+                   - Floating Island + Engine-Aware 1px Border Beam while running
+                   - Frosted HeroUI Model / Effort / Slash / @ Popovers
                =============================================================== */}
-            <div className="w-full px-3 sm:px-6 pb-[max(0.85rem,env(safe-area-inset-bottom))] sm:pb-5 pt-1">
-              <div className="mx-auto max-w-[680px]">
+            <div className="relative w-full px-3 sm:px-6 pb-[max(0.85rem,env(safe-area-inset-bottom))] sm:pb-5 pt-1">
+              <div
+                aria-hidden="true"
+                className="v-composer-fade-veil pointer-events-none absolute -top-6 inset-x-0 h-6"
+              />
+              <div className="relative z-10 mx-auto max-w-[680px]">
                 {/* Live Bidirectional Permission Approval Card (`PreToolUse` / `velo_request_approval` / ACP) */}
                 {activePendingApproval && (
                   <BeautifulApprovalCard
@@ -8461,12 +8578,18 @@ export function App() {
                         type="button"
                         onMouseEnter={() => setSlashSelectedIdx(flatIdx)}
                         onClick={item.run}
-                        className={`block w-full overflow-hidden rounded-lg px-3 py-2 text-left transition-colors cursor-pointer ${
+                        className={`v-press relative block w-full overflow-hidden rounded-lg px-3 py-2 text-left cursor-pointer ${
                           isActive
                             ? "bg-[var(--v-bg-active)]"
-                            : "hover:bg-[var(--v-bg-active)]"
+                            : "hover:bg-[var(--v-bg-hover)]"
                         }`}
                       >
+                        {isActive && (
+                          <span
+                            aria-hidden="true"
+                            className="absolute left-0 top-2 bottom-2 w-[2px] rounded-full bg-[var(--accent-bright)]"
+                          />
+                        )}
                         <div className="flex w-full min-w-0 items-center justify-between gap-2">
                           <div className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12.5px] font-medium leading-snug text-[var(--v-fg-primary)]">
                             {item.cmd}
@@ -8485,7 +8608,7 @@ export function App() {
                   };
 
                   return (
-                    <div className="mb-2 max-h-[320px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-xl">
+                    <div className="v-glass-popover v-popover-in mb-2 max-h-[320px] overflow-y-auto rounded-2xl p-1.5">
                       {visibleSkills.length === 0 && visibleCommands.length === 0 ? (
                         <div className="flex items-center justify-between px-3 py-2 text-[12px] text-[var(--v-fg-muted)]">
                           <span>没有匹配的指令或本地 Skill</span>
@@ -8504,8 +8627,11 @@ export function App() {
                       ) : (
                         <>
                           {visibleSkills.length > 0 && (
-                            <div className="px-2 pb-1 pt-1 text-[10.5px] font-medium tracking-wide text-[var(--v-fg-faint)]">
-                              Skills
+                            <div className="flex items-center justify-between px-2 pb-1 pt-1 text-[10.5px] font-medium tracking-wide text-[var(--v-fg-faint)]">
+                              <span>Skills</span>
+                              <span className="inline-flex items-center gap-1 font-normal">
+                                <VeloKbd>↑↓</VeloKbd> <VeloKbd>↵</VeloKbd> <VeloKbd>Esc</VeloKbd>
+                              </span>
                             </div>
                           )}
                           {visibleSkills.map((it, i) => renderItem(it, i))}
@@ -8527,13 +8653,18 @@ export function App() {
                           )}
                           {visibleCommands.length > 0 && (
                             <div
-                              className={`px-2 pb-1 pt-1.5 text-[10.5px] font-medium tracking-wide text-[var(--v-fg-faint)] ${
+                              className={`flex items-center justify-between px-2 pb-1 pt-1.5 text-[10.5px] font-medium tracking-wide text-[var(--v-fg-faint)] ${
                                 visibleSkills.length > 0
                                   ? "mt-1 border-t border-[var(--v-border-subtle)]"
                                   : ""
                               }`}
                             >
-                              内置命令
+                              <span>内置命令</span>
+                              {visibleSkills.length === 0 && (
+                                <span className="inline-flex items-center gap-1 font-normal">
+                                  <VeloKbd>↑↓</VeloKbd> <VeloKbd>↵</VeloKbd> <VeloKbd>Esc</VeloKbd>
+                                </span>
+                              )}
                             </div>
                           )}
                           {visibleCommands.map((it, i) => renderItem(it, visibleSkills.length + i))}
@@ -8545,12 +8676,14 @@ export function App() {
 
                 {/* `@` Workspace File Mention Popover */}
                 {fileMentionQuery !== null && (
-                  <div className="mb-2 max-h-[240px] overflow-y-auto rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl">
+                  <div className="v-glass-popover v-popover-in mb-2 max-h-[248px] overflow-y-auto rounded-2xl p-1.5">
                     <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
                       <span>
                         引用工作区文件 {fileMentionQuery ? `· "${fileMentionQuery}"` : "· 最近变更优先"}
                       </span>
-                      <span className="font-mono text-[10px]">↑↓ 选择 · Enter 插入 · Esc 关闭</span>
+                      <span className="inline-flex items-center gap-1 text-[10px]">
+                        <VeloKbd>↑↓</VeloKbd> <VeloKbd>↵</VeloKbd> <VeloKbd>Esc</VeloKbd>
+                      </span>
                     </div>
                     {fileMentionResults.length === 0 ? (
                       <div className="px-2.5 py-2 text-[11.5px] text-[var(--v-fg-muted)]">
@@ -8565,12 +8698,18 @@ export function App() {
                             type="button"
                             onMouseEnter={() => setFileMentionIdx(idx)}
                             onClick={() => handleSelectFileMention(item)}
-                            className={`flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-1.5 text-left text-[12px] transition-colors cursor-pointer ${
+                            className={`v-press relative flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-1.5 text-left text-[12px] cursor-pointer ${
                               active
                                 ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
                                 : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
                             }`}
                           >
+                            {active && (
+                              <span
+                                aria-hidden="true"
+                                className="absolute left-0 top-1.5 bottom-1.5 w-[2px] rounded-full bg-[var(--accent-bright)]"
+                              />
+                            )}
                             <div className="flex min-w-0 items-center gap-2">
                               <FileCode2 className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)]" />
                               <span className="truncate font-mono font-medium">{item.name}</span>
@@ -8609,6 +8748,19 @@ export function App() {
                   onClearAll={() => void handleClearAllQueuedPrompts()}
                 />
 
+                {(() => {
+                  const composerRunning =
+                    activeSession.status === "running" ||
+                    activeSession.status === "waiting_approval";
+                  const engineTabMeta = ENGINE_TABS.find(
+                    (t) => t.key === getEngineTabForAgentKind(activeSession.agent_kind)
+                  );
+                  const beamColor =
+                    activeSession.status === "waiting_approval"
+                      ? "#fbbf24"
+                      : engineTabMeta?.dotColor || "#a78bfa";
+
+                  return (
                 <div
                   onDragOver={(e) => {
                     e.preventDefault();
@@ -8622,16 +8774,31 @@ export function App() {
                       handleUploadImageFiles(e.dataTransfer.files);
                     }
                   }}
-                  className={`${
+                  style={
+                    { "--v-beam-color": beamColor } as React.CSSProperties
+                  }
+                  className={`v-composer-shell ${
                     (activeSession.queued_prompts || []).length > 0
                       ? "rounded-b-[18px] rounded-t-[10px]"
                       : "rounded-[18px]"
-                  } border bg-[var(--v-bg-surface)] px-4 pb-2.5 pt-3 shadow-lg transition-colors focus-within:border-[var(--v-fg-muted)] ${
+                  } border px-4 pb-2.5 pt-3 ${
                     composerDragOver
-                      ? "border-[#34d399] ring-1 ring-[#34d399]/40"
+                      ? "border-[#34d399] ring-2 ring-[#34d399]/35"
                       : "border-[var(--v-border-strong)]"
                   }`}
                 >
+                  {/* Magic UI subtle 1px engine-colored running Border Beam */}
+                  <div
+                    aria-hidden="true"
+                    className={`v-composer-beam ${composerRunning ? "is-active" : ""}`}
+                  />
+
+                  {/* Full-cover Drag & Drop Halo */}
+                  {composerDragOver && (
+                    <div className="v-glass-popover pointer-events-none absolute inset-1.5 z-20 flex items-center justify-center rounded-[14px] border border-dashed border-[#34d399]/70 text-[12.5px] font-medium text-[#34d399]">
+                      松开以附加截图或本地文件
+                    </div>
+                  )}
                   {/* Hidden file input for any local file or image picker */}
                   <input
                     ref={fileInputRef}
@@ -8789,6 +8956,10 @@ export function App() {
                           }
                         }
                         if (e.key === "Enter" && !e.shiftKey) {
+                          const isCmdOrCtrl = e.metaKey || e.ctrlKey;
+                          if (sendKeyMode === "cmd_enter" && !isCmdOrCtrl) {
+                            return;
+                          }
                           e.preventDefault();
                           if (
                             activeSession.status === "running" ||
@@ -8813,7 +8984,7 @@ export function App() {
                           : `Ask ${
                               modelCatalog.find((m) => m.id === activeSession.model)?.label ||
                               activeSession.model_short
-                            } anything... (@ 引用文件 · / 技能 · 拖拽或 ⌘V 粘贴任意文件/截图)`
+                            } anything... (${sendKeyMode === "cmd_enter" ? "⌘↵ 发送 · " : ""}@ 引用文件 · / 技能 · ⌘V 贴图)`
                       }
                     />
 
@@ -8870,7 +9041,7 @@ export function App() {
                         />
                         <div
                           onClick={(e) => e.stopPropagation()}
-                          className="absolute bottom-9 left-[165px] z-30 w-[176px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-1.5 shadow-2xl"
+                          className="v-glass-popover v-popover-in absolute bottom-9 left-[165px] z-30 w-[184px] rounded-2xl p-1.5"
                         >
                           <div className="px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
                             思考 / 推理强度
@@ -8882,7 +9053,7 @@ export function App() {
                                 key={eff}
                                 type="button"
                                 onClick={() => handleSelectSessionEffort(eff)}
-                                className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] cursor-pointer ${
+                                className={`v-press flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-[12px] cursor-pointer ${
                                   active
                                     ? "bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
                                     : "text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)]"
@@ -8911,7 +9082,7 @@ export function App() {
                               setModelPickerOpen((o) => !o);
                             }}
                             title="切换引擎或模型（支持搜索与按厂商分类筛选）"
-                            className="flex items-center gap-1.5 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] transition-colors hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                            className="v-press flex items-center gap-1.5 rounded-full bg-[var(--v-bg-active)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
                           >
                             <EngineBrandGlyph
                               engine={activeSession.agent_kind}
@@ -8944,7 +9115,7 @@ export function App() {
                             setEffortPickerOpen((o) => !o);
                           }}
                           title="当前模型支持的思考 / 推理强度"
-                          className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-[11.5px] text-[var(--v-fg-muted)] transition-colors ${
+                          className={`v-press flex items-center gap-1 rounded-full px-2.5 py-1 text-[11.5px] text-[var(--v-fg-muted)] ${
                             activeSupportedEfforts.length > 1
                               ? "hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-body)] cursor-pointer"
                               : "opacity-65 cursor-default"
@@ -8963,7 +9134,7 @@ export function App() {
                       <button
                         onClick={handleToggleApprovalMode}
                         title="Click to cycle: Auto-edit → Ask permissions (live PreToolUse gate) → Bypass"
-                        className={`rounded-full px-2.5 py-1 text-[11.5px] transition-colors ${
+                        className={`v-press rounded-full px-2.5 py-1 text-[11.5px] cursor-pointer ${
                           activeSession.approval_mode === "ask_before_edit"
                             ? "bg-[#fbbf24]/15 font-medium text-[#fbbf24] hover:bg-[#fbbf24]/25"
                             : activeSession.approval_mode === "bypass"
@@ -8983,7 +9154,7 @@ export function App() {
                         type="button"
                         onClick={() => fileInputRef.current?.click()}
                         title="附加本地文件或图片（支持拖拽、⌘V 粘贴，或输入 @ 引用工作区文件）"
-                        className="flex h-6 w-6 items-center justify-center rounded-full text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+                        className="v-press flex h-6 w-6 items-center justify-center rounded-full text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-active)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                       >
                         <ImagePlus className="h-3.5 w-3.5" />
                       </button>
@@ -9013,9 +9184,10 @@ export function App() {
                                   )
                                 }
                                 title="加入队列：当前轮完成后自动执行 (Enter)"
-                                className="flex h-7 items-center gap-1 rounded-full bg-[#a78bfa]/18 px-2.5 text-[11.5px] font-medium text-[#a78bfa] transition-colors hover:bg-[#a78bfa]/28 cursor-pointer"
+                                className="v-press velo-phase-morph flex h-7 items-center gap-1 rounded-full bg-[#a78bfa]/18 px-2.5 text-[11.5px] font-medium text-[#a78bfa] hover:bg-[#a78bfa]/28 cursor-pointer"
                               >
                                 <span>排队</span>
+                                <VeloKbd className="!h-[15px] !min-w-[15px] !text-[9px]">↵</VeloKbd>
                               </button>
                               <button
                                 type="button"
@@ -9029,36 +9201,43 @@ export function App() {
                                   )
                                 }
                                 title="插队执行：立即打断当前执行并马上跑这条指令 (⌘Enter)"
-                                className="flex h-7 items-center gap-1 rounded-full bg-[#fbbf24]/20 px-2.5 text-[11.5px] font-semibold text-[#fbbf24] transition-colors hover:bg-[#fbbf24]/30 cursor-pointer"
+                                className="v-press velo-phase-morph flex h-7 items-center gap-1 rounded-full bg-[#fbbf24]/20 px-2.5 text-[11.5px] font-semibold text-[#fbbf24] hover:bg-[#fbbf24]/30 cursor-pointer"
                               >
-                                <span>插队执行</span>
+                                <span>插队</span>
+                                <VeloKbd className="!h-[15px] !min-w-[15px] !text-[9px]">⌘↵</VeloKbd>
                               </button>
                             </>
                           )}
                           <button
                             onClick={handleStopSession}
                             title="停止当前执行 (Stop)"
-                            className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] transition-all hover:opacity-90"
+                            className="v-press flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90"
                           >
-                            <span className="h-2.5 w-2.5 rounded-[2px] bg-current" />
+                            <span key="stop" className="v-icon-morph">
+                              <span className="h-2.5 w-2.5 rounded-[2.5px] bg-current" />
+                            </span>
                           </button>
                         </div>
                       ) : (
                         <button
                           onClick={() => handleSendPrompt()}
                           disabled={!hasComposerText && pendingAttachments.length === 0}
-                          className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
+                          className={`v-press flex h-7 w-7 items-center justify-center rounded-full ${
                             hasComposerText || pendingAttachments.length > 0
                               ? "bg-[var(--v-btn-bg)] text-[var(--v-btn-fg)] hover:opacity-90 cursor-pointer"
                               : "bg-[var(--v-bg-active)] text-[var(--v-fg-faint)] cursor-default"
                           }`}
                         >
-                          <ArrowUp className="h-4 w-4 stroke-[2.25]" />
+                          <span key="send" className="v-icon-morph">
+                            <ArrowUp className="h-4 w-4 stroke-[2.25]" />
+                          </span>
                         </button>
                       )}
                     </div>
                   </div>
                 </div>
+                  );
+                })()}
               </div>
             </div>
           </main>
@@ -9074,48 +9253,23 @@ export function App() {
                 : "w-0 border-l-0 opacity-0"
             }`}
           >
-            <div className="flex h-[42px] shrink-0 items-center justify-between border-b border-[var(--v-border-subtle)] px-3">
-              <div className="flex items-center gap-0.5 overflow-x-auto">
-                <button
-                  onClick={() => setDrawerTab("diff")}
-                  className={`shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
-                    drawerTab === "diff"
-                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
-                  }`}
-                >
-                  Changes ({activeDiffFiles.length})
-                </button>
-                <button
-                  onClick={() => setDrawerTab("pr")}
-                  className={`shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
-                    drawerTab === "pr"
-                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
-                  }`}
-                >
-                  PR
-                </button>
-                <button
-                  onClick={() => setDrawerTab("browser")}
-                  className={`shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
-                    drawerTab === "browser"
-                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
-                  }`}
-                >
-                  Preview
-                </button>
-                <button
-                  onClick={() => setDrawerTab("terminal")}
-                  className={`shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
-                    drawerTab === "terminal"
-                      ? "bg-[var(--v-bg-active)] text-[var(--v-fg-primary)]"
-                      : "text-[var(--v-fg-muted)] hover:text-[var(--v-fg-secondary)]"
-                  }`}
-                >
-                  Terminal
-                </button>
+            <div className="flex h-[42px] shrink-0 items-center justify-between gap-2 border-b border-[var(--v-border-subtle)] px-3">
+              <div className="min-w-0 overflow-x-auto">
+                <VeloSegmentedControl
+                  size="xs"
+                  value={drawerTab}
+                  onChange={(tab) => setDrawerTab(tab)}
+                  options={[
+                    {
+                      id: "diff",
+                      label: "Changes",
+                      badge: activeDiffFiles.length > 0 ? activeDiffFiles.length : undefined,
+                    },
+                    { id: "pr", label: "PR" },
+                    { id: "browser", label: "Preview" },
+                    { id: "terminal", label: "Terminal" },
+                  ]}
+                />
               </div>
 
               {/* One-Click Git Worktree Actions + Close */}
@@ -9125,7 +9279,7 @@ export function App() {
                     <button
                       onClick={() => refreshSessionDiffAndFiles(activeSession.id)}
                       title="Refresh live git diff from worktree"
-                      className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                      className="v-press flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                     >
                       <RefreshCw
                         className={`h-3.5 w-3.5 ${diffLoading ? "animate-spin" : ""}`}
@@ -9134,7 +9288,7 @@ export function App() {
                     <button
                       onClick={() => setCommitBoxOpen((v) => !v)}
                       title="Commit changes in isolated worktree"
-                      className="flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
+                      className="v-press flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
                     >
                       <GitCommitHorizontal className="h-3.5 w-3.5 text-[#34d399]" />
                       <span>Commit</span>
@@ -9142,7 +9296,7 @@ export function App() {
                     <button
                       onClick={handleMergeWorktree}
                       title="Check branch readiness & merge"
-                      className="flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)]"
+                      className="v-press flex items-center gap-1 rounded-md bg-[var(--v-bg-hover)] px-2 py-1 text-[11px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-active)] cursor-pointer"
                     >
                       <GitMerge className="h-3.5 w-3.5 text-[var(--v-fg-secondary)]" />
                       <span>Merge</span>
@@ -9152,7 +9306,7 @@ export function App() {
                 <button
                   onClick={() => setDrawerOpen(false)}
                   title="Close (Esc)"
-                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+                  className="v-press flex h-6 w-6 items-center justify-center rounded-md text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
                 >
                   <X className="h-3.5 w-3.5" />
                 </button>
@@ -9502,8 +9656,14 @@ export function App() {
         </div>
       </div>
 
+      {/* Global Unified Frosted Toast Stack */}
+      <VeloToastHost
+        toasts={toasts}
+        onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))}
+      />
+
       {/* =====================================================================
-          6. MODALS (Velo Hub Automations, New Thread, New Repo, Command, Pairing QR, Settings)
+          6. MODALS (Velo Hub Automations, Settings, Command Palette, New Thread, New Repo, Pairing QR)
          ===================================================================== */}
       {activeModal === "automations" && (
         <AutomationsModal
@@ -9520,14 +9680,125 @@ export function App() {
         />
       )}
 
-      {activeModal && activeModal !== "automations" && (
+      {activeModal === "settings" && (
+        <SettingsModal
+          onClose={() => setActiveModal(null)}
+          themeMode={themeMode}
+          resolvedTheme={resolvedTheme}
+          onChangeThemeMode={(mode) => {
+            setThemeMode(mode);
+            pushToast(
+              `主题已切换为 ${mode === "system" ? "跟随系统" : mode === "light" ? "浅色模式" : "深色模式"}`,
+              "info"
+            );
+          }}
+          tone={tone}
+          onChangeTone={(nextTone) => setTone(nextTone)}
+          variant={variant}
+          onChangeVariant={(nextVar) => {
+            setVariant(nextVar);
+            const label =
+              nextVar === "a"
+                ? "Sharp Matte"
+                : nextVar === "b"
+                ? "Frosted Glass"
+                : "Tactile Elevated";
+            pushToast(`表面材质已切换为 ${label}`, "info");
+          }}
+          reduceMotion={reduceMotion}
+          onChangeReduceMotion={(next) => setReduceMotion(next)}
+          sendKeyMode={sendKeyMode}
+          onChangeSendKeyMode={(next) => setSendKeyMode(next)}
+          autoCollapseSteps={autoCollapseSteps}
+          onChangeAutoCollapseSteps={(next) => {
+            setAutoCollapseSteps(next);
+            safeStorageSet("velo.autoCollapseSteps", String(next));
+          }}
+          runtimes={runtimes}
+          modelCatalog={modelCatalog}
+          onRefreshProviders={() => {
+            refreshSessions();
+            pushToast("正在重新扫描本机 CLI 与模型目录…", "info");
+          }}
+          onLaunchCliLogin={(providerId) => {
+            if (
+              !sendE2eeCommand({
+                cmd: "launch_cli_login",
+                provider: providerId,
+              })
+            ) {
+              fetch(`${daemonUrl}/api/providers/${encodeURIComponent(providerId)}/login`, {
+                method: "POST",
+              })
+                .then((r) => r.json())
+                .then((d) => {
+                  pushToast(String(d?.message || `已启动 ${providerId} 登录`), "success");
+                })
+                .catch(() => {
+                  pushToast(`无法唤起 ${providerId} 终端登录`, "error");
+                });
+            }
+          }}
+          activeRepoName={activeRepo.name}
+          activeRepoPath={activeRepo.path}
+          hookEditCmd={hookEditCmd}
+          onChangeHookEditCmd={setHookEditCmd}
+          onSaveHook={() => {
+            void handleSaveRepoHook(activeRepo.path, hookEditCmd.trim());
+            copyText("saved-hook", hookEditCmd.trim());
+            pushToast("Worktree Initialization Hook 已保存", "success");
+          }}
+          hookSaved={copiedKey === "saved-hook"}
+        />
+      )}
+
+      {activeModal === "command" && (
+        <CommandPaletteModal
+          sessions={sessions.map((s) => ({
+            id: s.id,
+            title: s.title,
+            branch_name: s.branch_name,
+            agent_kind: s.agent_kind,
+            status: s.status,
+            archived: s.archived,
+          }))}
+          activeSessionId={activeSession.id}
+          resolvedTheme={resolvedTheme}
+          onSelectSession={(id) => setActiveId(id)}
+          onNewThread={() => {
+            setTargetRepoIdForNewWt(activeRepo.id);
+            setNewModelId(activeSession.model);
+            setNewSetupCommand(repoHooks[activeRepo.path] || "");
+            setActiveModal("new-worktree");
+          }}
+          onToggleTheme={() =>
+            setThemeMode(resolvedTheme === "dark" ? "light" : "dark")
+          }
+          onOpenSettings={() => {
+            setHookEditCmd(repoHooks[activeRepo.path] || "");
+            setActiveModal("settings");
+          }}
+          onOpenDrawerTab={(tab) => {
+            setDrawerTab(tab);
+            setDrawerOpen(true);
+          }}
+          onOpenModelPicker={() => setModelPickerOpen(true)}
+          onOpenQrPair={() => setActiveModal("qr")}
+          onClose={() => setActiveModal(null)}
+        />
+      )}
+
+      {activeModal &&
+        activeModal !== "automations" &&
+        activeModal !== "settings" &&
+        activeModal !== "command" && (
         <div
           onClick={() => setActiveModal(null)}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs"
+          className="v-modal-backdrop-in fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs"
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[496px] rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] p-5 shadow-2xl"
+            className="v-glass-modal v-modal-in w-full max-w-[496px] rounded-2xl p-5"
           >
             {activeModal === "new-worktree" && (
               <div>
@@ -9868,252 +10139,6 @@ export function App() {
                     </div>
                   </div>
                 )}
-              </div>
-            )}
-
-            {activeModal === "command" && (
-              <div>
-                <div className="mb-3 flex items-center gap-2 border-b border-[var(--v-border-subtle)] pb-2.5">
-                  <Search className="h-4 w-4 text-[var(--v-fg-muted)]" />
-                  <input
-                    autoFocus
-                    value={cmdQuery}
-                    onChange={(e) => setCmdQuery(e.target.value)}
-                    placeholder="Search threads or run action..."
-                    className="w-full bg-transparent text-[13px] text-[var(--v-fg-primary)] focus:outline-none"
-                  />
-                </div>
-                <div className="max-h-[280px] space-y-1 overflow-y-auto text-[12.5px]">
-                  {sessions
-                    .filter(
-                      (s) =>
-                        s.title.toLowerCase().includes(cmdQuery.toLowerCase()) ||
-                        s.branch_name.toLowerCase().includes(cmdQuery.toLowerCase())
-                    )
-                    .map((s) => (
-                      <button
-                        key={s.id}
-                        onClick={() => {
-                          setActiveId(s.id);
-                          setActiveModal(null);
-                        }}
-                        className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left hover:bg-[var(--v-bg-active)]"
-                      >
-                        <span className="truncate text-[var(--v-fg-primary)]">{s.title}</span>
-                        <span className="font-mono text-[11px] text-[var(--v-fg-muted)]">
-                          {s.branch_name}
-                        </span>
-                      </button>
-                    ))}
-                </div>
-              </div>
-            )}
-
-            {activeModal === "settings" && (
-              <div>
-                <div className="mb-4 flex items-center justify-between">
-                  <h3 className="text-[14px] font-semibold text-[var(--v-fg-primary)]">
-                    Settings · 模型服务、Worktree Hooks 与外观
-                  </h3>
-                  <button
-                    onClick={() => setActiveModal(null)}
-                    className="text-[var(--v-fg-muted)] hover:text-[var(--v-fg-primary)]"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                </div>
-
-                <div className="max-h-[75vh] space-y-5 overflow-y-auto pr-1 text-[12.5px]">
-                  {/* Section 1: CLI & ACP Model Providers */}
-                  <div>
-                    <div className="mb-2 flex items-center justify-between">
-                      <label className="text-[11.5px] font-medium text-[var(--v-fg-secondary)]">
-                        CLI &amp; ACP Providers (Claude, Codex, Antigravity `agy`, Grok, Cursor, OpenCode, Copilot, Qwen)
-                      </label>
-                      <button
-                        onClick={refreshSessions}
-                        className="flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] text-[var(--v-fg-muted)] hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-                      >
-                        <RefreshCw className="h-3 w-3" />
-                        <span>Re-scan</span>
-                      </button>
-                    </div>
-
-                    <div className="space-y-2">
-                      {runtimes.map((rt) => {
-                        const unlockedModels = modelCatalog
-                          .filter((m) => m.runtimeId === rt.id)
-                          .map((m) => m.label);
-                        return (
-                          <div
-                            key={rt.id}
-                            className="rounded-xl border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-3.5 py-2.5"
-                          >
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-2 font-medium text-[var(--v-fg-primary)]">
-                                <span
-                                  className="h-2 w-2 rounded-full"
-                                  style={{
-                                    background: rt.available ? "#34d399" : "#71717a",
-                                  }}
-                                />
-                                <span>{rt.name}</span>
-                              </div>
-                              <span
-                                className={`rounded-full px-2 py-0.5 font-mono text-[10.5px] ${
-                                  rt.available
-                                    ? "bg-[#34d399]/15 text-[#34d399]"
-                                    : "bg-[var(--v-bg-active)] text-[var(--v-fg-muted)]"
-                                }`}
-                              >
-                                {rt.available ? "Connected" : "Not installed"}
-                              </span>
-                            </div>
-                            <div className="mt-1 truncate font-mono text-[11px] text-[var(--v-fg-muted)]">
-                              {rt.version || "CLI binary not detected in PATH"}
-                              {rt.binary_path ? ` · ${rt.binary_path}` : ""}
-                            </div>
-                            {unlockedModels.length > 0 && (
-                              <div className="mt-1.5 flex flex-wrap gap-1">
-                                {unlockedModels.map((mLabel) => (
-                                  <span
-                                    key={mLabel}
-                                    className="rounded-md bg-[var(--v-bg-surface)] px-2 py-0.5 text-[10.5px] text-[var(--v-fg-secondary)]"
-                                  >
-                                    {mLabel}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {/* Section 2: Worktree Setup Hooks & Smart Dependency Symlinking */}
-                  <div className="border-t border-[var(--v-border-subtle)] pt-4">
-                    <div className="mb-1 flex items-center justify-between">
-                      <label className="text-[11.5px] font-medium text-[var(--v-fg-secondary)]">
-                        Worktree Initialization Hook ({activeRepo.name})
-                      </label>
-                      <span className="font-mono text-[10.5px] text-[#34d399]">
-                        node_modules / .venv auto-symlinked
-                      </span>
-                    </div>
-                    <p className="mb-2 text-[11px] text-[var(--v-fg-muted)]">
-                      新建隔离 Worktree 时自动软链主仓库依赖，并优先执行下方命令或仓库内的{" "}
-                      <code className="font-mono">.velo/setup.sh</code> /{" "}
-                      <code className="font-mono">.worktreesetup</code>。
-                    </p>
-                    <div className="flex items-center gap-1.5">
-                      <input
-                        value={hookEditCmd}
-                        onChange={(e) => setHookEditCmd(e.target.value)}
-                        placeholder="e.g. cp ../../.env.local .env.local && pnpm build:proto"
-                        className="flex-1 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-sidebar)] px-2.5 py-1.5 font-mono text-[11.5px] text-[var(--v-fg-primary)] focus:outline-none"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void handleSaveRepoHook(activeRepo.path, hookEditCmd.trim());
-                          copyText("saved-hook", hookEditCmd.trim());
-                        }}
-                        className="rounded-lg bg-[var(--v-btn-bg)] px-3 py-1.5 text-[11.5px] font-medium text-[var(--v-btn-fg)] hover:opacity-90"
-                      >
-                        {copiedKey === "saved-hook" ? "Saved ✓" : "Save Hook"}
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Section 3: Appearance & Theme */}
-                  <div className="border-t border-[var(--v-border-subtle)] pt-4">
-                    <div className="mb-1.5 flex items-center justify-between">
-                      <label className="text-[11.5px] text-[var(--v-fg-secondary)]">
-                        主题模式 (Theme Mode)
-                      </label>
-                      <span className="font-mono text-[11px] text-[var(--v-fg-muted)]">
-                        当前生效: {resolvedTheme === "dark" ? "深色 (Dark)" : "浅色 (Light)"}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-1.5">
-                      {(
-                        [
-                          { id: "system", label: "跟随系统 (System)", icon: Monitor },
-                          { id: "light", label: "浅色 (Light)", icon: Sun },
-                          { id: "dark", label: "深色 (Dark)", icon: Moon },
-                        ] as const
-                      ).map(({ id, label, icon: Icon }) => (
-                        <button
-                          key={id}
-                          onClick={() => setThemeMode(id)}
-                          className={`flex items-center justify-center gap-1.5 rounded-lg border px-2.5 py-2 text-[12px] transition-colors ${
-                            themeMode === id
-                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
-                              : "border-[var(--v-border-strong)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]"
-                          }`}
-                        >
-                          <Icon className="h-3.5 w-3.5" />
-                          <span>{label}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="mb-1.5 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                      色彩基调 (Color Tone — 同时适配深浅色)
-                    </label>
-                    <div className="grid grid-cols-3 gap-1.5">
-                      {(
-                        [
-                          { id: "zinc", label: "Carbon Zinc" },
-                          { id: "claude", label: "Claude Warm" },
-                          { id: "paseo", label: "Forest" },
-                        ] as { id: ToneId; label: string }[]
-                      ).map((t) => (
-                        <button
-                          key={t.id}
-                          onClick={() => setTone(t.id)}
-                          className={`rounded-lg border px-3 py-2 text-center text-[12px] transition-colors ${
-                            tone === t.id
-                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
-                              : "border-[var(--v-border-strong)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]"
-                          }`}
-                        >
-                          {t.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="mb-1.5 block text-[11.5px] text-[var(--v-fg-secondary)]">
-                      表面材质 (Surface Material)
-                    </label>
-                    <div className="grid grid-cols-3 gap-1.5">
-                      {(
-                        [
-                          { id: "a", label: "A · Sharp Matte" },
-                          { id: "b", label: "B · Frosted Glass" },
-                          { id: "c", label: "C · Tactile 3D" },
-                        ] as { id: VariantId; label: string }[]
-                      ).map((v) => (
-                        <button
-                          key={v.id}
-                          onClick={() => setVariant(v.id)}
-                          className={`rounded-lg border px-2.5 py-2 text-center text-[11.5px] transition-colors ${
-                            variant === v.id
-                              ? "border-[var(--v-fg-primary)] bg-[var(--v-bg-active)] font-medium text-[var(--v-fg-primary)]"
-                              : "border-[var(--v-border-strong)] text-[var(--v-fg-secondary)] hover:bg-[var(--v-bg-hover)]"
-                          }`}
-                        >
-                          {v.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
               </div>
             )}
 

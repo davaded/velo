@@ -3,6 +3,7 @@ import {
   Bot,
   Brain,
   Check,
+  ChevronDown,
   ChevronRight,
   Copy,
   Eye,
@@ -15,9 +16,15 @@ import {
   Sparkles,
   SquareTerminal,
   TriangleAlert,
+  WrapText,
   Wrench,
   X,
 } from "lucide-react";
+import {
+  VeloKbd,
+  VeloNumberTicker,
+  highlightCodeLine,
+} from "./VeloMotionPrimitives";
 
 /**
  * ============================================================================
@@ -327,10 +334,12 @@ export const PaseoTurnFooter: React.FC<{
           type="button"
           onClick={handleCopy}
           title={copied ? "Copied" : "Copy response"}
-          className="-ml-1 flex h-6 w-6 items-center justify-center rounded-md transition-colors hover:bg-[var(--surface-2)] cursor-pointer"
+          className="v-press -ml-1 flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--surface-2)] cursor-pointer"
           style={{ color: copied ? "var(--status-success)" : "var(--fg-muted)" }}
         >
-          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          <span key={copied ? "ok" : "cp"} className="v-icon-morph">
+            {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          </span>
         </button>
       )}
       {onRetry && (
@@ -338,7 +347,7 @@ export const PaseoTurnFooter: React.FC<{
           type="button"
           onClick={onRetry}
           title="重试本轮 (Retry turn)"
-          className="flex h-6 w-6 items-center justify-center rounded-md transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
+          className="v-press flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
         >
           <RotateCcw className="h-3.5 w-3.5" style={{ color: "var(--fg-muted)" }} />
         </button>
@@ -348,7 +357,7 @@ export const PaseoTurnFooter: React.FC<{
           type="button"
           onClick={onFork}
           title="从此处克隆出新分支会话 (Fork session from this turn)"
-          className="flex h-6 w-6 items-center justify-center rounded-md transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
+          className="v-press flex h-6 w-6 items-center justify-center rounded-md hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
         >
           <GitFork className="h-3.5 w-3.5" style={{ color: "var(--fg-muted)" }} />
         </button>
@@ -370,7 +379,7 @@ export const PaseoTurnFooter: React.FC<{
           className="font-mono-code text-[11.5px] font-medium tabular-nums select-none text-[#a78bfa]"
           title="Output generation throughput (tokens/sec)"
         >
-          · ⚡ {computedTps.toFixed(1)} tok/s
+          · ⚡ <VeloNumberTicker value={computedTps} decimals={1} suffix=" tok/s" durationMs={320} />
         </span>
       )}
 
@@ -409,10 +418,14 @@ export const PaseoTurnFooter: React.FC<{
           type="button"
           onClick={onOpenDiff}
           title="Review worktree changes"
-          className="ml-1 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono-code text-[11.5px] tabular-nums transition-colors hover:bg-[var(--surface-2)] cursor-pointer"
+          className="v-press ml-1 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono-code text-[11.5px] tabular-nums hover:bg-[var(--surface-2)] cursor-pointer"
         >
-          <span style={{ color: "var(--status-success)" }}>+{ins}</span>
-          <span style={{ color: "var(--status-danger)" }}>−{del}</span>
+          <span style={{ color: "var(--status-success)" }}>
+            <VeloNumberTicker value={ins} prefix="+" durationMs={300} />
+          </span>
+          <span style={{ color: "var(--status-danger)" }}>
+            <VeloNumberTicker value={del} prefix="−" durationMs={300} />
+          </span>
         </button>
       )}
     </div>
@@ -2115,8 +2128,14 @@ export const PaseoExecutionTraceGroup: React.FC<{
 const PaseoCodeBlock: React.FC<{
   language: string;
   code: string;
-}> = ({ language, code }) => {
+}> = React.memo(({ language, code }) => {
   const [copied, setCopied] = useState(false);
+  const [wrapLines, setWrapLines] = useState(false);
+  const lines = useMemo(() => code.split("\n"), [code]);
+  const isLong = lines.length > 35;
+  const [collapsed, setCollapsed] = useState(false);
+
+  const visibleLines = collapsed ? lines.slice(0, 14) : lines;
 
   const handleCopyCode = async () => {
     try {
@@ -2130,51 +2149,105 @@ const PaseoCodeBlock: React.FC<{
 
   return (
     <div
-      className="my-2 overflow-hidden rounded-[8px] border"
+      className="group/code my-2.5 overflow-hidden rounded-[10px] border shadow-2xs"
       style={{
         borderColor: "var(--border-subtle)",
         backgroundColor: "var(--surface-0)",
       }}
     >
       <div
-        className="flex items-center justify-between border-b px-3 py-1.5 text-[11.5px]"
+        className="flex items-center justify-between gap-2 border-b px-3 py-1.5 text-[11px]"
         style={{
           borderColor: "var(--border-subtle)",
           backgroundColor: "var(--surface-1)",
           color: "var(--fg-muted)",
         }}
       >
-        <span className="font-mono-code lowercase select-none">
-          {language || "code"}
-        </span>
-        <button
-          type="button"
-          onClick={handleCopyCode}
-          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
-          style={{ color: copied ? "var(--status-success)" : "var(--fg-muted)" }}
-        >
-          {copied ? (
-            <>
-              <Check className="h-3 w-3" />
-              <span>Copied</span>
-            </>
-          ) : (
-            <>
-              <Copy className="h-3 w-3" />
-              <span>Copy</span>
-            </>
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="font-mono-code font-medium lowercase select-none text-[var(--v-fg-secondary)]">
+            {language || "code"}
+          </span>
+          <span className="font-mono-code text-[10px] tabular-nums opacity-65 select-none">
+            {lines.length} {lines.length === 1 ? "line" : "lines"}
+          </span>
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setWrapLines((w) => !w)}
+            title={wrapLines ? "取消自动换行" : "自动换行"}
+            className={`v-press inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] cursor-pointer ${
+              wrapLines
+                ? "bg-[var(--surface-3)] text-[var(--fg)]"
+                : "text-[var(--fg-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--fg)]"
+            }`}
+          >
+            <WrapText className="h-3 w-3" />
+          </button>
+          {isLong && (
+            <button
+              type="button"
+              onClick={() => setCollapsed((c) => !c)}
+              className="v-press inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10.5px] text-[var(--fg-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
+            >
+              <ChevronDown
+                className={`h-3 w-3 transition-transform duration-150 ${
+                  collapsed ? "-rotate-90" : ""
+                }`}
+              />
+              <span>{collapsed ? "展开" : "收起"}</span>
+            </button>
           )}
-        </button>
+          <button
+            type="button"
+            onClick={handleCopyCode}
+            className="v-press inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] hover:bg-[var(--surface-2)] hover:text-[var(--fg)] cursor-pointer"
+            style={{ color: copied ? "var(--status-success)" : "var(--fg-muted)" }}
+          >
+            <span key={copied ? "ok" : "cp"} className="v-icon-morph">
+              {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+            </span>
+            <span>{copied ? "Copied" : "Copy"}</span>
+          </button>
+        </div>
       </div>
-      <pre
-        className="overflow-x-auto whitespace-pre p-3 font-mono-code text-[12.5px] leading-[1.55]"
-        style={{ color: "var(--fg)" }}
-      >
-        <code>{code}</code>
-      </pre>
+      <div className="relative">
+        <pre
+          className={`overflow-x-auto p-3 font-mono-code text-[12.5px] leading-[1.58] ${
+            wrapLines ? "whitespace-pre-wrap break-words" : "whitespace-pre"
+          }`}
+          style={{ color: "var(--fg)" }}
+        >
+          <code>
+            {visibleLines.map((line, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && "\n"}
+                {highlightCodeLine(line, language)}
+              </React.Fragment>
+            ))}
+          </code>
+        </pre>
+        {collapsed && (
+          <div
+            className="flex items-end justify-center pb-2 pt-8 absolute inset-x-0 bottom-0"
+            style={{
+              background:
+                "linear-gradient(to bottom, transparent 0%, var(--surface-0) 78%)",
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setCollapsed(false)}
+              className="v-press rounded-full border border-[var(--v-border-strong)] bg-[var(--v-bg-surface)] px-3 py-0.5 text-[11px] font-medium text-[var(--v-fg-secondary)] hover:text-[var(--v-fg-primary)] cursor-pointer"
+            >
+              展开剩余 {lines.length - 14} 行
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
-};
+});
 
 type MdListItem = {
   depth: number;
@@ -2830,8 +2903,11 @@ export const PaseoMarkdown: React.FC<{
                 {block.rows.map((row, rowIdx) => (
                   <tr
                     key={rowIdx}
-                    className="border-b last:border-b-0"
-                    style={{ borderColor: "var(--border-subtle)" }}
+                    className="border-b last:border-b-0 transition-colors hover:bg-[var(--surface-2)]/60"
+                    style={{
+                      borderColor: "var(--border-subtle)",
+                      backgroundColor: rowIdx % 2 === 1 ? "var(--surface-1)" : "transparent",
+                    }}
                   >
                     {row.map((cell, cellIdx) => (
                       <td key={cellIdx} className="px-3 py-1.5 align-top">
@@ -2881,8 +2957,8 @@ export const PaseoMarkdown: React.FC<{
       {isStreaming && (
         <span
           aria-hidden="true"
-          className="velo-no-select inline-block h-[14px] w-[6px] translate-y-[2px] rounded-[1px] animate-pulse"
-          style={{ backgroundColor: "var(--fg-muted)" }}
+          className="velo-no-select v-caret-breath inline-block h-[14px] w-[2px] translate-y-[2.5px] rounded-full ml-0.5"
+          style={{ backgroundColor: "var(--accent-bright)" }}
         />
       )}
     </div>
@@ -2906,10 +2982,34 @@ export const BeautifulApprovalCard: React.FC<{
 }> = ({ toolName, commandPreview, reason, onApprove, onAlwaysAllow, onDeny }) => {
   const [resolved, setResolved] = useState<"approved" | "denied" | null>(null);
 
+  useEffect(() => {
+    if (resolved) return;
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (document.activeElement?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea") return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "Enter" || e.key === "y" || e.key === "Y") {
+        e.preventDefault();
+        setResolved("approved");
+        onApprove();
+      } else if ((e.key === "a" || e.key === "A") && onAlwaysAllow) {
+        e.preventDefault();
+        setResolved("approved");
+        onAlwaysAllow();
+      } else if (e.key === "Escape" || e.key === "n" || e.key === "N") {
+        e.preventDefault();
+        setResolved("denied");
+        onDeny();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [resolved, onApprove, onAlwaysAllow, onDeny]);
+
   if (resolved) {
     return (
       <div
-        className="mb-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-[7px] border text-[11.5px] font-mono-code"
+        className="velo-phase-morph mb-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-[8px] border text-[11.5px] font-mono-code"
         style={{
           backgroundColor: "var(--surface-1)",
           borderColor: "var(--border-subtle)",
@@ -2927,10 +3027,10 @@ export const BeautifulApprovalCard: React.FC<{
 
   return (
     <div
-      className="mb-2.5 rounded-[12px] border p-3.5 space-y-2.5 rare-specular-surface t-modal-scale"
+      className="mb-2.5 rounded-[14px] border p-3.5 space-y-2.5 rare-specular-surface t-modal-scale"
       style={{
         backgroundColor: "var(--surface-1)",
-        borderColor: "var(--status-warning)",
+        borderColor: "rgba(251, 191, 36, 0.45)",
       }}
     >
       <div className="flex items-center justify-between gap-2">
@@ -2946,7 +3046,7 @@ export const BeautifulApprovalCard: React.FC<{
         <span
           className="font-mono-code text-[10px] px-2 py-0.5 rounded-full shrink-0"
           style={{
-            backgroundColor: "rgba(192, 150, 100, 0.16)",
+            backgroundColor: "rgba(251, 191, 36, 0.14)",
             color: "var(--status-warning)",
           }}
         >
@@ -2961,7 +3061,7 @@ export const BeautifulApprovalCard: React.FC<{
       )}
 
       <pre
-        className="font-mono-code text-[11.5px] px-3 py-2 rounded-[6px] border overflow-x-auto"
+        className="font-mono-code text-[11.5px] px-3 py-2 rounded-[8px] border overflow-x-auto"
         style={{
           backgroundColor: "var(--surface-0)",
           borderColor: "var(--border-subtle)",
@@ -2978,14 +3078,15 @@ export const BeautifulApprovalCard: React.FC<{
             setResolved("denied");
             onDeny();
           }}
-          className="h-[27px] px-2.5 rounded-[6px] border text-[11.5px] flex items-center gap-1 cursor-pointer hover:bg-[var(--surface-2)]"
+          className="v-press h-[28px] px-2.5 rounded-[8px] border text-[11.5px] flex items-center gap-1.5 cursor-pointer hover:bg-[var(--surface-2)]"
           style={{
             borderColor: "var(--border-accent)",
             color: "var(--fg-muted)",
           }}
         >
           <X className="w-3 h-3" />
-          Deny
+          <span>Deny</span>
+          <VeloKbd>Esc</VeloKbd>
         </button>
         {onAlwaysAllow && (
           <button
@@ -2994,14 +3095,15 @@ export const BeautifulApprovalCard: React.FC<{
               setResolved("approved");
               onAlwaysAllow();
             }}
-            className="h-[27px] px-2.5 rounded-[6px] border text-[11.5px] font-medium flex items-center gap-1 cursor-pointer hover:bg-[var(--surface-2)]"
+            className="v-press h-[28px] px-2.5 rounded-[8px] border text-[11.5px] font-medium flex items-center gap-1.5 cursor-pointer hover:bg-[var(--surface-2)]"
             style={{
               borderColor: "var(--border-accent)",
               color: "var(--fg)",
             }}
           >
             <Check className="w-3 h-3" />
-            Always Allow in Session
+            <span>Always Allow</span>
+            <VeloKbd>A</VeloKbd>
           </button>
         )}
         <button
@@ -3010,14 +3112,15 @@ export const BeautifulApprovalCard: React.FC<{
             setResolved("approved");
             onApprove();
           }}
-          className="h-[27px] px-3 rounded-[6px] text-[11.5px] font-medium flex items-center gap-1 cursor-pointer rare-3d-button"
+          className="h-[28px] px-3 rounded-[8px] text-[11.5px] font-medium flex items-center gap-1.5 cursor-pointer rare-3d-button"
           style={{
             backgroundColor: "var(--accent)",
             color: "#ffffff",
           }}
         >
           <Check className="w-3 h-3" />
-          Allow Once
+          <span>Allow Once</span>
+          <VeloKbd className="!bg-white/15 !border-white/25 !text-white !shadow-none">↵</VeloKbd>
         </button>
       </div>
     </div>
@@ -3046,6 +3149,22 @@ export const BeautifulQuestionCard: React.FC<{
     }
   };
 
+  useEffect(() => {
+    if (options.length === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (document.activeElement?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea") return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const num = Number(e.key);
+      if (Number.isInteger(num) && num >= 1 && num <= Math.min(9, options.length)) {
+        e.preventDefault();
+        toggleOption(options[num - 1]);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [options, allowMultiple]);
+
   const handleConfirm = () => {
     const combined = [...selected];
     if (customAnswer.trim()) {
@@ -3057,10 +3176,10 @@ export const BeautifulQuestionCard: React.FC<{
 
   return (
     <div
-      className="mb-2.5 rounded-[12px] border p-3.5 space-y-2.5"
+      className="mb-2.5 rounded-[14px] border p-3.5 space-y-2.5 rare-specular-surface t-modal-scale"
       style={{
         backgroundColor: "var(--surface-1)",
-        borderColor: "var(--accent)",
+        borderColor: "rgba(139, 92, 246, 0.45)",
       }}
     >
       <div className="flex items-center justify-between gap-2">
@@ -3080,21 +3199,24 @@ export const BeautifulQuestionCard: React.FC<{
 
       {options.length > 0 && (
         <div className="grid grid-cols-1 gap-1.5">
-          {options.map((opt) => {
+          {options.map((opt, idx) => {
             const isChosen = selected.includes(opt);
             return (
               <button
                 key={opt}
                 type="button"
                 onClick={() => toggleOption(opt)}
-                className="flex items-center justify-between rounded-[8px] border px-3 py-1.5 text-left text-[12px] transition-colors cursor-pointer"
+                className="v-press flex items-center justify-between gap-2 rounded-[9px] border px-3 py-1.5 text-left text-[12px] cursor-pointer"
                 style={{
                   backgroundColor: isChosen ? "var(--surface-3)" : "var(--surface-0)",
                   borderColor: isChosen ? "var(--accent)" : "var(--border-subtle)",
                   color: "var(--fg)",
                 }}
               >
-                <span>{opt}</span>
+                <span className="flex items-center gap-2 min-w-0">
+                  {idx < 9 && <VeloKbd>{idx + 1}</VeloKbd>}
+                  <span className="truncate">{opt}</span>
+                </span>
                 {isChosen && (
                   <Check className="w-3.5 h-3.5 shrink-0" style={{ color: "var(--status-success)" }} />
                 )}
@@ -3119,7 +3241,7 @@ export const BeautifulQuestionCard: React.FC<{
               ? "Or type a custom answer..."
               : "Type your answer for the agent..."
           }
-          className="flex-1 rounded-[7px] border px-2.5 py-1.5 text-[12px] outline-none"
+          className="flex-1 rounded-[8px] border px-2.5 py-1.5 text-[12px] outline-none transition-colors focus:border-[var(--accent)]"
           style={{
             backgroundColor: "var(--surface-0)",
             borderColor: "var(--border-subtle)",
@@ -3130,7 +3252,7 @@ export const BeautifulQuestionCard: React.FC<{
           type="button"
           onClick={handleConfirm}
           disabled={selected.length === 0 && !customAnswer.trim()}
-          className="h-[30px] px-3 rounded-[7px] text-[11.5px] font-medium cursor-pointer disabled:opacity-40"
+          className="rare-3d-button h-[30px] px-3 rounded-[8px] text-[11.5px] font-medium cursor-pointer disabled:opacity-40"
           style={{
             backgroundColor: "var(--accent)",
             color: "#ffffff",
