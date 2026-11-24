@@ -229,70 +229,26 @@ export const PaseoTurnFooter: React.FC<{
 
   if (isRunning) {
     const effectivePhase: AgentStatusPhase = waitingLabel ? "waiting" : phase;
-    const liveSec = Math.max(0, Math.round(liveMs / 1000));
-    const formattedElapsed = formatPaseoDuration(liveMs);
-
-    let primaryStatus = statusLabel || "Working…";
-    let showTrailingClock = true;
-
-    if (waitingLabel) {
-      primaryStatus = waitingLabel;
-    } else if (effectivePhase === "thinking") {
-      if (statusLabel) {
-        primaryStatus = statusLabel;
-      } else if (liveSec >= 1) {
-        primaryStatus = `Thinking for ${formattedElapsed}…`;
-        showTrailingClock = false;
-      } else {
-        primaryStatus = "Thinking…";
-        showTrailingClock = false;
-      }
-    } else if (effectivePhase === "writing") {
-      primaryStatus = statusLabel || "Writing…";
-    } else if (effectivePhase === "tool") {
-      primaryStatus = statusLabel || "Working…";
-    } else {
-      primaryStatus = statusLabel || "Working…";
-    }
+    const primaryStatus = waitingLabel
+      ? waitingLabel
+      : statusLabel || (effectivePhase === "thinking" ? "Thinking" : "Working");
 
     return (
       <div
-        className="mt-2 flex min-h-[26px] items-center gap-2 select-none"
+        className="mt-1.5 flex min-h-[24px] items-center gap-1.5 select-none"
         data-testid="turn-footer"
       >
-        <PromptKitStatusIcon phase={effectivePhase} size={15} />
+        <PromptKitStatusIcon phase={effectivePhase} size={14} />
         <div
-          key={`${effectivePhase}-${statusLabel || ""}`}
-          className="velo-phase-morph flex min-w-0 items-center gap-1.5 text-[13px]"
+          key={`${effectivePhase}-${primaryStatus}`}
+          className="velo-phase-morph flex min-w-0 items-center gap-1.5 text-[13.5px]"
         >
           {waitingLabel ? (
-            <span className="font-medium" style={{ color: "var(--status-warning)" }}>
+            <span className="font-normal" style={{ color: "var(--status-warning)" }}>
               {primaryStatus}
             </span>
           ) : (
-            <TextShimmer className="font-medium truncate">{primaryStatus}</TextShimmer>
-          )}
-          {showTrailingClock && (
-            <>
-              <span className="text-[12px]" style={{ color: "var(--fg-extra-muted)" }}>
-                ·
-              </span>
-              <span
-                className="text-[12.5px] tabular-nums"
-                style={{ color: "var(--fg-extra-muted)" }}
-                data-testid="turn-working-elapsed"
-              >
-                {formattedElapsed}
-              </span>
-            </>
-          )}
-          {telemetry?.tps !== undefined && telemetry.tps > 0.5 && (
-            <span
-              className="ml-1 font-mono-code text-[11.5px] tabular-nums"
-              style={{ color: "var(--fg-extra-muted)" }}
-            >
-              · {telemetry.tps.toFixed(1)} tok/s
-            </span>
+            <TextShimmer className="font-normal truncate">{primaryStatus}</TextShimmer>
           )}
         </div>
       </div>
@@ -320,13 +276,23 @@ export const PaseoTurnFooter: React.FC<{
     telemetry?.tps && telemetry.tps >= 0.5 ? telemetry.tps : 0;
   const costUsd = telemetry?.costUsd || 0;
 
-  if (!assistantContent && !onRetry && !durationText && totalTok === 0) {
+  // Compact power-user telemetry tucked cleanly into tooltip instead of a noisy bottom dashboard
+  const telemetryTooltipParts: string[] = [];
+  if (computedTps > 0.5) telemetryTooltipParts.push(`${computedTps.toFixed(1)} tok/s`);
+  if (totalTok > 0) telemetryTooltipParts.push(`${formatCompactTokens(totalTok)} tok`);
+  if (cacheHitPct > 0) telemetryTooltipParts.push(`Cache ${cacheHitPct}%`);
+  if (costUsd > 0) {
+    telemetryTooltipParts.push(`$${costUsd < 0.01 ? costUsd.toFixed(4) : costUsd.toFixed(3)}`);
+  }
+  const telemetryTooltip = telemetryTooltipParts.join(" · ");
+
+  if (!assistantContent && !onRetry && !durationText && ins === 0 && del === 0) {
     return null;
   }
 
   return (
     <div
-      className="mt-1 flex min-h-[24px] flex-wrap items-center gap-1.5"
+      className="mt-1.5 flex min-h-[24px] flex-wrap items-center gap-1 opacity-70 transition-opacity duration-150 hover:opacity-100"
       data-testid="turn-footer"
     >
       {assistantContent && (
@@ -367,49 +333,11 @@ export const PaseoTurnFooter: React.FC<{
         <span
           onMouseEnter={() => canSwapTimestamp && setHoveredTiming(true)}
           onMouseLeave={() => setHoveredTiming(false)}
-          className="ml-0.5 text-[12.5px] tabular-nums select-none transition-colors"
-          style={{ color: "var(--fg-muted)" }}
+          title={telemetryTooltip || undefined}
+          className="ml-1 text-[12px] tabular-nums select-none transition-colors"
+          style={{ color: "var(--fg-extra-muted)" }}
         >
           {hoveredTiming && canSwapTimestamp ? completedAtLabel : durationText}
-        </span>
-      )}
-
-      {computedTps > 0.5 && (
-        <span
-          className="font-mono-code text-[11.5px] font-medium tabular-nums select-none text-[#a78bfa]"
-          title="Output generation throughput (tokens/sec)"
-        >
-          · ⚡ <VeloNumberTicker value={computedTps} decimals={1} suffix=" tok/s" durationMs={320} />
-        </span>
-      )}
-
-      {totalTok > 0 && (
-        <span
-          className="font-mono-code text-[11px] tabular-nums select-none"
-          style={{ color: "var(--fg-extra-muted)" }}
-          title={`Input: ${inTok.toLocaleString()} · Output: ${outTok.toLocaleString()}`}
-        >
-          · {formatCompactTokens(totalTok)} tok
-        </span>
-      )}
-
-      {cacheHitPct > 0 && (
-        <span
-          className="font-mono-code text-[11px] tabular-nums select-none"
-          style={{ color: "var(--status-success)" }}
-          title={`Prompt Cache Hit: ${cacheRead.toLocaleString()} / ${inTok.toLocaleString()} input tokens`}
-        >
-          · 缓存 {cacheHitPct}%
-        </span>
-      )}
-
-      {costUsd > 0 && (
-        <span
-          className="font-mono-code text-[11px] tabular-nums select-none"
-          style={{ color: "var(--fg-extra-muted)" }}
-          title="Estimated API cost for this turn"
-        >
-          · ${costUsd < 0.01 ? costUsd.toFixed(4) : costUsd.toFixed(3)}
         </span>
       )}
 
@@ -655,23 +583,25 @@ export function extractThinkingTokensFromPlaceholder(raw: string): number | null
  */
 export function extractThinkingHeadline(raw: string): string {
   if (!raw || isPlaceholderReasoningText(raw)) return "";
-  const lines = raw
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    if (line.startsWith("**") && line.endsWith("**") && line.length > 4) {
-      const inner = line.slice(2, -2).trim();
-      if (
-        inner.length > 0 &&
-        inner.length <= 52 &&
-        !inner.endsWith("…") &&
-        !FILLER_THINKING_LINES.has(inner.toLowerCase().replace(/[.!?,:…]+$/g, "").trim())
-      ) {
-        return inner;
-      }
+
+  // 1. Collect ALL native **Bold Headings** (handles Codex concatenating "**A** **B**" on one line)
+  const boldMatches: string[] = [];
+  const boldRe = /\*\*([^*\n]{2,64})\*\*/g;
+  let m: RegExpExecArray | null;
+  while ((m = boldRe.exec(raw)) !== null) {
+    const inner = m[1].trim().replace(/[.。:：…]+$/g, "").trim();
+    const norm = inner.toLowerCase();
+    if (
+      inner.length >= 2 &&
+      inner.length <= 58 &&
+      !/^reasoning completed\s*\(/i.test(norm) &&
+      !FILLER_THINKING_LINES.has(norm)
+    ) {
+      boldMatches.push(inner);
     }
+  }
+  if (boldMatches.length > 0) {
+    return boldMatches[boldMatches.length - 1];
   }
   return "";
 }
@@ -1869,6 +1799,162 @@ const CodexSummaryThinkingRow: React.FC<{
   );
 };
 
+function resolveInlineTraceSummary(
+  steps: PaseoTraceStepItem[],
+  isTurnRunning: boolean
+): {
+  icon: React.ComponentType<{ className?: string; strokeWidth?: number; style?: React.CSSProperties }>;
+  label: string;
+  activeVerb: string;
+  hasError: boolean;
+} {
+  let latestHeadline = "";
+  let activeVerb = "";
+  let activeKind: "edit" | "shell" | "read" | "search" | "mcp" | "other" | null = null;
+  let hasError = false;
+
+  let readCount = 0;
+  let searchCount = 0;
+  let editCount = 0;
+  let shellCount = 0;
+  let mcpCount = 0;
+  let otherCount = 0;
+  let totalThinkMs = 0;
+
+  let lastReadFile = "";
+  let lastEditFile = "";
+  let lastShellCmd = "";
+  let lastSearchQuery = "";
+  let lastMcpLabel = "";
+
+  for (const st of steps) {
+    if (st.kind === "thinking") {
+      if (st.durationMs) totalThinkMs += st.durationMs;
+      const h = extractThinkingHeadline(st.text || "");
+      if (h) latestHeadline = h;
+      continue;
+    }
+
+    if (st.isError) hasError = true;
+    const pres = resolvePaseoToolPresentation(st.toolName || "Tool", st.input, st.output);
+    if (pres.isInternalNoise) continue;
+
+    if (isTurnRunning && st.output === undefined) {
+      activeVerb = pres.workingVerb;
+      activeKind =
+        pres.kind === "edit" ||
+        pres.kind === "shell" ||
+        pres.kind === "read" ||
+        pres.kind === "search" ||
+        pres.kind === "mcp"
+          ? pres.kind
+          : "other";
+    }
+
+    if (pres.kind === "read") {
+      readCount++;
+      const base = pres.summary ? pres.summary.split("/").pop() || pres.summary : "";
+      if (base) lastReadFile = base;
+    } else if (pres.kind === "search") {
+      searchCount++;
+      if (pres.summary) lastSearchQuery = pres.summary.slice(0, 36);
+    } else if (pres.kind === "edit") {
+      editCount++;
+      const base = pres.summary ? pres.summary.split("/").pop() || pres.summary : "";
+      if (base) lastEditFile = base;
+    } else if (pres.kind === "shell") {
+      shellCount++;
+      const raw = (pres.command || pres.summary || "").split("\n")[0].trim();
+      if (raw) {
+        lastShellCmd = raw.length > 36 ? `${raw.slice(0, 34).trimEnd()}…` : raw;
+      }
+    } else if (pres.kind === "mcp") {
+      mcpCount++;
+      const srv = pres.mcpServer || pres.displayName || "MCP";
+      const act = pres.mcpAction ? ` · ${pres.mcpAction}` : "";
+      lastMcpLabel = `${srv}${act}`;
+    } else {
+      otherCount++;
+    }
+  }
+
+  const pickIcon = () => {
+    if (hasError) return TriangleAlert;
+    if (activeKind === "edit") return Pencil;
+    if (activeKind === "shell") return SquareTerminal;
+    if (activeKind === "read") return Eye;
+    if (activeKind === "search") return Search;
+    if (activeKind === "mcp") return Sparkles;
+
+    const hl = latestHeadline.toLowerCase();
+    if (
+      hl &&
+      /\b(check|inspect|search|find|investigat|analyz|look|explor|review|verify|audit)\w*/i.test(hl)
+    ) {
+      return Search;
+    }
+    if (editCount > 0) return Pencil;
+    if (searchCount > 0) return Search;
+    if (readCount > 0) return Eye;
+    if (shellCount > 0) return SquareTerminal;
+    if (mcpCount > 0) return Sparkles;
+    return Search;
+  };
+
+  // While running: prefer crisp semantic headline or active verb
+  if (isTurnRunning) {
+    const label = activeVerb
+      ? latestHeadline && activeKind !== "edit"
+        ? latestHeadline
+        : activeVerb
+      : latestHeadline || "Thinking";
+    return {
+      icon: pickIcon(),
+      label,
+      activeVerb: activeVerb || latestHeadline,
+      hasError,
+    };
+  }
+
+  // Completed: one calm natural phrase (prefer model's semantic headline when exploration/checking)
+  let label = "";
+  if (latestHeadline && editCount === 0) {
+    label = latestHeadline;
+  } else if (editCount === 1 && lastEditFile) {
+    label = `Edited ${lastEditFile}`;
+  } else if (editCount > 1) {
+    label = `Edited ${editCount} files`;
+  } else if (shellCount === 1 && lastShellCmd) {
+    label = `Ran ${lastShellCmd}`;
+  } else if (shellCount > 1) {
+    label = `Ran ${shellCount} commands`;
+  } else if (readCount > 0 && searchCount === 0) {
+    label = readCount === 1 && lastReadFile ? `Read ${lastReadFile}` : `Read ${readCount} files`;
+  } else if (searchCount > 0) {
+    label =
+      searchCount === 1 && lastSearchQuery
+        ? `Searched ${lastSearchQuery}`
+        : `Searched ${searchCount} queries`;
+  } else if (mcpCount > 0) {
+    label = mcpCount === 1 && lastMcpLabel ? lastMcpLabel : `${lastMcpLabel || "MCP"} ×${mcpCount}`;
+  } else if (otherCount > 0) {
+    label = otherCount === 1 ? "Used 1 tool" : `Used ${otherCount} tools`;
+  } else if (latestHeadline) {
+    label = latestHeadline;
+  } else if (totalThinkMs >= 1000) {
+    label = `Thought for ${formatPaseoDuration(totalThinkMs)}`;
+  } else {
+    label = "Thought";
+  }
+
+  return {
+    icon: pickIcon(),
+    label,
+    activeVerb: "",
+    hasError,
+  };
+}
+
 export const PaseoExecutionTraceGroup: React.FC<{
   steps: PaseoTraceStepItem[];
   provider?: string;
@@ -1879,21 +1965,20 @@ export const PaseoExecutionTraceGroup: React.FC<{
 }> = ({
   steps,
   provider,
-  startedAtMs,
   isTurnRunning = false,
   defaultExpanded = false,
   onOpenDiffForFile,
 }) => {
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
-  const [heldToolVerb, setHeldToolVerb] = useState<string>("");
+  const [heldLabel, setHeldLabel] = useState<string>("");
   const prevRunningRef = useRef<boolean>(isTurnRunning);
   const engineMode = resolveTraceEngineMode(provider);
 
-  // Smoothly collapse into one summary row when turn completes (if user enabled auto-collapse)
+  // Smoothly return to clean single-line state when turn completes
   useEffect(() => {
     if (prevRunningRef.current && !isTurnRunning) {
       setUserExpanded(null);
-      setHeldToolVerb("");
+      setHeldLabel("");
     }
     prevRunningRef.current = isTurnRunning;
   }, [isTurnRunning]);
@@ -1903,33 +1988,39 @@ export const PaseoExecutionTraceGroup: React.FC<{
     [steps, isTurnRunning, engineMode]
   );
 
-  const footprint = useMemo(
-    () =>
-      engineMode === "focus_footprint" && isTurnRunning
-        ? buildFocusFootprintData(steps, isTurnRunning)
-        : null,
-    [steps, isTurnRunning, engineMode]
+  const inlineSummary = useMemo(
+    () => resolveInlineTraceSummary(steps, isTurnRunning),
+    [steps, isTurnRunning]
   );
 
-  // 1.2s transition buffer so fast 0.2s tool calls don't flash frantically back to `Thinking…`
-  const rawActiveVerb = footprint?.activeToolVerb || "";
+  // 1.2s transition buffer so rapid 0.2s tool calls don't flash back to `Thinking`
+  const rawActiveLabel = isTurnRunning ? inlineSummary.activeVerb : "";
   useEffect(() => {
     if (!isTurnRunning) {
-      setHeldToolVerb("");
+      setHeldLabel("");
       return;
     }
-    if (rawActiveVerb) {
-      setHeldToolVerb(rawActiveVerb);
+    if (rawActiveLabel) {
+      setHeldLabel(rawActiveLabel);
       return;
     }
-    if (!heldToolVerb) return;
+    if (!heldLabel) return;
     const timer = window.setTimeout(() => {
-      setHeldToolVerb("");
+      setHeldLabel("");
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [rawActiveVerb, isTurnRunning, heldToolVerb]);
+  }, [rawActiveLabel, isTurnRunning, heldLabel]);
 
-  const completedSummary = useMemo(() => summarizeCompletedActivity(steps), [steps]);
+  if (flatRows.length === 0 && !isTurnRunning) {
+    return null;
+  }
+
+  const drawerOpen = userExpanded ?? defaultExpanded;
+  const ActionIcon = inlineSummary.icon;
+  const displayLabel =
+    isTurnRunning && !inlineSummary.activeVerb && heldLabel
+      ? heldLabel
+      : inlineSummary.label;
 
   const renderFlatRows = () => (
     <div className="space-y-0.5">
@@ -1982,139 +2073,58 @@ export const PaseoExecutionTraceGroup: React.FC<{
     </div>
   );
 
-  // 1. AGY / Cursor / Grok Running Mode: minimalist header + ChainOfThought semantic icon nodes
-  if (engineMode === "focus_footprint" && isTurnRunning && footprint) {
-    const drawerOpen = userExpanded ?? false;
-    const effectiveVerb = footprint.activeToolVerb || heldToolVerb;
-    const headerPhase: AgentStatusPhase = effectiveVerb ? "tool" : "thinking";
-    const headerLabel = effectiveVerb ? `${effectiveVerb}…` : "Thinking…";
-
-    return (
-      <div className="my-0.5 select-none">
-        <div
-          role="button"
-          tabIndex={0}
-          onClick={() => setUserExpanded((prev) => !(prev ?? false))}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              setUserExpanded((prev) => !(prev ?? false));
-            }
-          }}
-          className="-mx-2 flex items-center gap-2 rounded-[8px] px-2 py-1.5 text-[13px] transition-colors hover:bg-[var(--surface-1)] cursor-pointer"
-        >
-          <PromptKitStatusIcon phase={headerPhase} size={15} />
-          <TextShimmer className="min-w-0 flex-1 truncate font-medium">
-            {headerLabel}
-          </TextShimmer>
-          {startedAtMs !== undefined && <PaseoLiveElapsed startedAtMs={startedAtMs} />}
-          {footprint.visibleStepCount > 1 && (
-            <span
-              className="shrink-0 font-mono-code text-[11px] tabular-nums"
-              style={{ color: "var(--fg-extra-muted)" }}
-            >
-              {footprint.visibleStepCount} steps
-            </span>
-          )}
-          <ChevronRight
-            className="h-3.5 w-3.5 shrink-0 transition-transform duration-150"
-            style={{
-              color: "var(--fg-muted)",
-              transform: drawerOpen ? "rotate(90deg)" : "rotate(0deg)",
-            }}
-          />
-        </div>
-
-        {/* Default collapsed view: up to 3 ChainOfThought semantic icon nodes */}
-        {!drawerOpen && footprint.rows.length > 0 && (
-          <div
-            className="ml-[7px] mt-0.5 border-l pl-3 py-0.5 space-y-1"
-            style={{ borderColor: "var(--border-subtle)" }}
-          >
-            {footprint.rows.map((row) => {
-              const RowIcon = row.icon;
-              return (
-                <div
-                  key={row.category}
-                  className="flex items-center gap-2 text-[12px] leading-[1.45]"
-                >
-                  <span className="flex h-4 w-4 shrink-0 items-center justify-center">
-                    <RowIcon
-                      className={`h-3 w-3 ${row.isActive ? "velo-sparkle-breath" : ""}`}
-                      style={{
-                        color: row.isActive ? "var(--accent)" : "var(--fg-extra-muted)",
-                      }}
-                    />
-                  </span>
-                  <div
-                    className={`min-w-0 flex-1 truncate font-mono-code text-[11.5px] ${
-                      row.isActive ? "beautiful-shimmer-text" : ""
-                    }`}
-                    style={!row.isActive ? { color: "var(--fg-muted)" } : undefined}
-                  >
-                    {row.items.map((it, idx) => (
-                      <React.Fragment key={`${it.label}-${idx}`}>
-                        {idx > 0 && <span className="mx-1.5 opacity-40">·</span>}
-                        {it.fileArg && onOpenDiffForFile ? (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onOpenDiffForFile(it.fileArg);
-                            }}
-                            className="hover:underline hover:text-[var(--fg)] cursor-pointer"
-                          >
-                            {it.label}
-                          </button>
-                        ) : (
-                          <span>{it.label}</span>
-                        )}
-                        {it.count > 1 && <span className="ml-0.5 opacity-60">×{it.count}</span>}
-                      </React.Fragment>
-                    ))}
-                    {row.extraCount > 0 && (
-                      <span className="ml-1.5 opacity-55">+{row.extraCount}</span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* Expanded drawer: full chronological flat activity stream */}
-        {drawerOpen && flatRows.length > 0 && (
-          <PaseoIndentRail className="mt-1 py-0.5">{renderFlatRows()}</PaseoIndentRail>
-        )}
-      </div>
-    );
-  }
-
-  if (flatRows.length === 0) {
-    return null;
-  }
-
-  // 2. Claude / Codex Running Mode (or user set defaultExpanded): crisp flat / native summary stream
-  if (isTurnRunning || defaultExpanded) {
-    return renderFlatRows();
-  }
-
-  // 3. Completed with auto-collapse: calm single-line summary expanding into the flat list
-  const expanded = userExpanded ?? false;
-
   return (
-    <PaseoExpandableBadge
-      label={completedSummary.label}
-      secondaryLabel={completedSummary.secondaryLabel}
-      icon={Wrench}
-      isExpanded={expanded}
-      onToggle={() => setUserExpanded((prev) => !(prev ?? false))}
-      isLoading={false}
-      isError={completedSummary.hasError}
-      borderlessWhenExpanded
-    >
-      <PaseoIndentRail className="py-0.5">{renderFlatRows()}</PaseoIndentRail>
-    </PaseoExpandableBadge>
+    <div className="my-1 select-none">
+      <button
+        type="button"
+        onClick={() => setUserExpanded((prev) => !(prev ?? defaultExpanded))}
+        className="group/trace v-press inline-flex max-w-full items-center gap-1.5 py-0.5 text-left text-[13.5px] leading-[1.45] cursor-pointer"
+      >
+        <ActionIcon
+          strokeWidth={1.75}
+          className={`h-[14px] w-[14px] shrink-0 transition-colors ${
+            isTurnRunning ? "velo-sparkle-breath" : ""
+          }`}
+          style={{
+            color: inlineSummary.hasError
+              ? "var(--status-danger)"
+              : isTurnRunning
+              ? "var(--fg-muted)"
+              : "var(--fg-extra-muted)",
+          }}
+        />
+        <span
+          className={`truncate font-normal transition-colors group-hover/trace:text-[var(--fg)] ${
+            isTurnRunning ? "beautiful-shimmer-text" : ""
+          }`}
+          style={
+            !isTurnRunning
+              ? {
+                  color: inlineSummary.hasError
+                    ? "var(--status-danger)"
+                    : "var(--fg-muted)",
+                }
+              : undefined
+          }
+        >
+          {displayLabel}
+        </span>
+        <ChevronRight
+          strokeWidth={1.75}
+          className="h-[13px] w-[13px] shrink-0 opacity-60 transition-all duration-150 group-hover/trace:opacity-100"
+          style={{
+            color: "var(--fg-extra-muted)",
+            transform: drawerOpen ? "rotate(90deg)" : "rotate(0deg)",
+          }}
+        />
+      </button>
+
+      {drawerOpen && flatRows.length > 0 && (
+        <div className="velo-phase-morph ml-[20px] mt-1 mb-1 space-y-0.5">
+          {renderFlatRows()}
+        </div>
+      )}
+    </div>
   );
 };
 

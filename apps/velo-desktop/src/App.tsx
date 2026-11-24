@@ -7878,108 +7878,60 @@ export function App() {
                                 ) {
                                   endIdx++;
                                 }
-                                const useFocusGroupForSingle = Boolean(
-                                  isTurnRunning &&
-                                    endIdx === turn.items.length - 1 &&
-                                    isFocusFootprintProvider(activeSession.agent_kind)
-                                );
-                                if (endIdx > idx || useFocusGroupForSingle) {
-                                  const traceSteps: PaseoTraceStepItem[] = turn.items
-                                    .slice(idx, endIdx + 1)
-                                    .map((stepEv, relIdx) => {
-                                      const absIdx = idx + relIdx;
-                                      const isLastInTurn = absIdx === turn.items.length - 1;
-                                      if (stepEv.kind === "thinking") {
-                                        return {
-                                          id: stepEv.id,
-                                          kind: "thinking",
-                                          text: stepEv.content,
-                                          isStreamingThinking: Boolean(
-                                            stepEv.is_streaming_chunk &&
-                                              isTurnRunning &&
-                                              isLastInTurn
-                                          ),
-                                          startedAtMs:
-                                            stepEv.started_at_ms ??
-                                            (isLatestTurn
-                                              ? activeTurnTiming?.startedAtMs
-                                              : undefined),
-                                          durationMs: stepEv.duration_ms,
-                                        };
-                                      }
+                                const traceSteps: PaseoTraceStepItem[] = turn.items
+                                  .slice(idx, endIdx + 1)
+                                  .map((stepEv, relIdx) => {
+                                    const absIdx = idx + relIdx;
+                                    const isLastInTurn = absIdx === turn.items.length - 1;
+                                    if (stepEv.kind === "thinking") {
                                       return {
                                         id: stepEv.id,
-                                        kind: "tool_call",
-                                        toolName: stepEv.tool_name || "Tool",
-                                        input:
-                                          stepEv.tool_input ??
-                                          (stepEv.tool_args
-                                            ? { target: stepEv.tool_args }
-                                            : stepEv.content),
-                                        output:
-                                          stepEv.tool_output ??
-                                          (stepEv.tool_input === undefined
-                                            ? stepEv.content
+                                        kind: "thinking",
+                                        text: stepEv.content,
+                                        isStreamingThinking: Boolean(
+                                          stepEv.is_streaming_chunk &&
+                                            isTurnRunning &&
+                                            isLastInTurn
+                                        ),
+                                        startedAtMs:
+                                          stepEv.started_at_ms ??
+                                          (isLatestTurn
+                                            ? activeTurnTiming?.startedAtMs
                                             : undefined),
-                                        isError: stepEv.tool_is_error,
-                                        fileArg: stepEv.tool_args,
+                                        durationMs: stepEv.duration_ms,
                                       };
-                                    });
-                                  return (
-                                    <PaseoExecutionTraceGroup
-                                      key={`trace-${turn.key}-${idx}-${autoCollapseSteps ? "c" : "e"}`}
-                                      steps={traceSteps}
-                                      provider={activeSession.agent_kind}
-                                      startedAtMs={
-                                        isLatestTurn ? activeTurnTiming?.startedAtMs : undefined
-                                      }
-                                      isTurnRunning={Boolean(
-                                        isTurnRunning && endIdx === turn.items.length - 1
-                                      )}
-                                      defaultExpanded={!autoCollapseSteps}
-                                      onOpenDiffForFile={openDiffForFile}
-                                    />
-                                  );
-                                }
-
-                                if (ev.kind === "thinking") {
-                                  const isStreamingThinking = Boolean(
-                                    ev.is_streaming_chunk && isTurnRunning && isLastTurnItem
-                                  );
-                                  return (
-                                    <BeautifulThinkingBlock
-                                      key={ev.id}
-                                      text={ev.content}
-                                      isStreaming={isStreamingThinking}
-                                      startedAtMs={
-                                        ev.started_at_ms ??
-                                        (isLatestTurn ? activeTurnTiming?.startedAtMs : undefined)
-                                      }
-                                      durationMs={ev.duration_ms}
-                                      defaultExpanded={false}
-                                      showLivePreview={
-                                        (activeSession.agent_kind || "claude").toLowerCase() ===
-                                        "claude"
-                                      }
-                                    />
-                                  );
-                                }
-
-                                const toolInput =
-                                  ev.tool_input ??
-                                  (ev.tool_args ? { target: ev.tool_args } : ev.content);
-                                const toolOutput =
-                                  ev.tool_output ??
-                                  (ev.tool_input === undefined ? ev.content : undefined);
+                                    }
+                                    return {
+                                      id: stepEv.id,
+                                      kind: "tool_call",
+                                      toolName: stepEv.tool_name || "Tool",
+                                      input:
+                                        stepEv.tool_input ??
+                                        (stepEv.tool_args
+                                          ? { target: stepEv.tool_args }
+                                          : stepEv.content),
+                                      output:
+                                        stepEv.tool_output ??
+                                        (stepEv.tool_input === undefined
+                                          ? stepEv.content
+                                          : undefined),
+                                      isError: stepEv.tool_is_error,
+                                      fileArg: stepEv.tool_args,
+                                    };
+                                  });
                                 return (
-                                  <BeautifulToolCallCard
-                                    key={ev.id}
-                                    toolName={ev.tool_name || "Tool"}
-                                    input={toolInput}
-                                    output={toolOutput}
-                                    isError={ev.tool_is_error}
-                                    isActive={Boolean(isTurnRunning && isLastTurnItem)}
-                                    onOpenDiffTab={() => openDiffForFile(ev.tool_args)}
+                                  <PaseoExecutionTraceGroup
+                                    key={`trace-${turn.key}-${idx}-${autoCollapseSteps ? "c" : "e"}`}
+                                    steps={traceSteps}
+                                    provider={activeSession.agent_kind}
+                                    startedAtMs={
+                                      isLatestTurn ? activeTurnTiming?.startedAtMs : undefined
+                                    }
+                                    isTurnRunning={Boolean(
+                                      isTurnRunning && endIdx === turn.items.length - 1
+                                    )}
+                                    defaultExpanded={!autoCollapseSteps}
+                                    onOpenDiffForFile={openDiffForFile}
                                   />
                                 );
                               }
@@ -8171,10 +8123,11 @@ export function App() {
                             {!(
                               isTurnRunning &&
                               !waitingLabel &&
-                              isFocusFootprintProvider(activeSession.agent_kind) &&
                               lastTurnItem &&
                               (lastTurnItem.kind === "thinking" ||
-                                lastTurnItem.kind === "tool_call")
+                                lastTurnItem.kind === "tool_call" ||
+                                (lastTurnItem.kind === "assistant" &&
+                                  Boolean(lastTurnItem.is_streaming_chunk)))
                             ) && (
                             <PaseoTurnFooter
                               isRunning={isTurnRunning}

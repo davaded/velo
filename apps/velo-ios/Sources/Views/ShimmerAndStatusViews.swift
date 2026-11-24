@@ -846,6 +846,56 @@ public struct ExecutionTraceGroupView: View {
         }
     }
 
+    private func extractInlineHeadline(from raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "" }
+        let pattern = #"\*\*([^*\n]{2,64})\*\*"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return "" }
+        let ns = trimmed as NSString
+        let matches = regex.matches(in: trimmed, range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            if m.numberOfRanges >= 2 {
+                let candidate = ns.substring(with: m.range(at: 1))
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.init(charactersIn: ".。:：…")))
+                let lower = candidate.lowercased()
+                if candidate.count >= 2 && candidate.count <= 58 && !lower.hasPrefix("reasoning completed") {
+                    return candidate
+                }
+            }
+        }
+        return ""
+    }
+
+    private func inlineSummary(rows: [VeloFlatActivityRow], summary: (label: String, secondary: String?, hasError: Bool), fp: VeloFocusFootprintData) -> (icon: String, label: String, activeVerb: String, hasError: Bool) {
+        var latestHeadline = ""
+        for it in items {
+            if case .thinking = it.kind {
+                let h = extractInlineHeadline(from: it.content)
+                if !h.isEmpty { latestHeadline = h }
+            }
+        }
+
+        let hasError = summary.hasError || fp.hasError
+        let activeVerb = fp.activeToolVerb
+        let icon: String = {
+            if hasError { return "exclamationmark.triangle" }
+            if let firstRow = fp.rows.first {
+                return firstRow.iconName
+            }
+            return "magnifyingglass"
+        }()
+
+        if isTurnRunning {
+            let liveLabel = !activeVerb.isEmpty
+                ? (!latestHeadline.isEmpty ? latestHeadline : activeVerb)
+                : (!latestHeadline.isEmpty ? latestHeadline : "Thinking")
+            return (icon, liveLabel, activeVerb.isEmpty ? latestHeadline : activeVerb, hasError)
+        }
+
+        let completedLabel = !latestHeadline.isEmpty ? latestHeadline : summary.label
+        return (icon, completedLabel, "", hasError)
+    }
+
     public var body: some View {
         let engineMode = VeloTraceEngineMode.resolve(provider)
         let rows = VeloActivityStreamBuilder.build(
@@ -854,50 +904,51 @@ public struct ExecutionTraceGroupView: View {
             hideNoise: engineMode == .focusFootprint
         )
         let summary = VeloActivityStreamBuilder.summarizeCompleted(items)
-        let expanded = userExpanded ?? false
+        let fp = VeloActivityStreamBuilder.buildFocusFootprint(items, isTurnRunning: isTurnRunning)
+        let info = inlineSummary(rows: rows, summary: summary, fp: fp)
+        let expanded = userExpanded ?? defaultExpanded
 
-        if engineMode == .focusFootprint && isTurnRunning {
-            let fp = VeloActivityStreamBuilder.buildFocusFootprint(items, isTurnRunning: isTurnRunning)
-            let effectiveVerb = fp.activeToolVerb.isEmpty ? heldVerb : fp.activeToolVerb
-            let headerPhase: AgentLivePhase = effectiveVerb.isEmpty ? .thinking : .tool(verb: effectiveVerb)
-            let headerLabel = effectiveVerb.isEmpty ? "Thinking…" : "\(effectiveVerb)…"
+        if rows.isEmpty && !isTurnRunning {
+            EmptyView()
+        } else {
+            let displayLabel = (isTurnRunning && info.activeVerb.isEmpty && !heldVerb.isEmpty)
+                ? heldVerb
+                : info.label
 
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 6) {
                 Button {
+                    #if canImport(UIKit)
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
+                    #endif
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
                         userExpanded = !expanded
                     }
                 } label: {
-                    HStack(spacing: 7) {
-                        OrbitalStatusIcon(phase: headerPhase)
-                            .frame(width: 15)
-                        ShimmerTextView(headerLabel, font: .system(size: 12.5, weight: .medium))
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        if let origin = turnStartedAt {
-                            TimelineView(.periodic(from: .now, by: 1.0)) { ctx in
-                                let sec = max(0, Int(ctx.date.timeIntervalSince(origin)))
-                                Text(VeloFormatting.formatDuration(ms: sec * 1000))
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.tertiary)
-                            }
+                    HStack(spacing: 6) {
+                        Image(systemName: info.icon)
+                            .font(.system(size: 13, weight: .regular))
+                            .foregroundStyle(info.hasError ? VeloTheme.coral : Color.secondary.opacity(0.78))
+
+                        if isTurnRunning {
+                            ShimmerTextView(displayLabel, font: .system(size: 13.5, weight: .regular))
+                                .lineLimit(1)
+                        } else {
+                            Text(displayLabel)
+                                .font(.system(size: 13.5, weight: .regular))
+                                .foregroundStyle(info.hasError ? VeloTheme.coral : .secondary)
+                                .lineLimit(1)
                         }
-                        if fp.visibleStepCount > 1 {
-                            Text("\(fp.visibleStepCount) steps")
-                                .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                        }
+
                         Image(systemName: "chevron.right")
-                            .font(.system(size: 9.5, weight: .bold))
-                            .foregroundStyle(.tertiary)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Color.secondary.opacity(0.55))
                             .rotationEffect(.degrees(expanded ? 90 : 0))
                     }
-                    .padding(.vertical, 3.5)
+                    .padding(.vertical, 3)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .onChange(of: fp.activeToolVerb) { _, newVerb in
+                .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
+                .onChange(of: info.activeVerb) { _, newVerb in
                     verbDecayTask?.cancel()
                     if !newVerb.isEmpty {
                         heldVerb = newVerb
@@ -919,116 +970,17 @@ public struct ExecutionTraceGroupView: View {
                         }
                     }
                 }
-
-                if !expanded && !fp.rows.isEmpty {
-                    IndentRailContainer {
-                        VStack(alignment: .leading, spacing: 3.5) {
-                            ForEach(fp.rows) { row in
-                                HStack(alignment: .center, spacing: 7) {
-                                    Image(systemName: row.iconName)
-                                        .font(.system(size: 10.5, weight: .medium))
-                                        .foregroundStyle(
-                                            row.isActive ? VeloTheme.accentVioletSoft : Color.secondary.opacity(0.65)
-                                        )
-                                        .frame(width: 14)
-                                    let joined = row.items.map { it in
-                                        it.count > 1 ? "\(it.label) ×\(it.count)" : it.label
-                                    }.joined(separator: " · ") + (row.extraCount > 0 ? " +\(row.extraCount)" : "")
-                                    if row.isActive {
-                                        ShimmerTextView(joined, font: .system(size: 11.5, design: .monospaced))
-                                            .lineLimit(1)
-                                    } else {
-                                        Text(joined)
-                                            .font(.system(size: 11.5, design: .monospaced))
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                }
-                            }
-                        }
-                        .padding(.vertical, 1)
-                    }
-                } else if expanded && !rows.isEmpty {
-                    IndentRailContainer {
-                        flatActivityList(rows, engineMode: engineMode)
-                            .padding(.vertical, 2)
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-            }
-        } else if rows.isEmpty {
-            EmptyView()
-        } else if isTurnRunning || defaultExpanded {
-            flatActivityList(rows, engineMode: engineMode)
-                .onChange(of: isTurnRunning) { wasRunning, nowRunning in
-                    if wasRunning && !nowRunning {
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
-                            userExpanded = nil
-                        }
-                    }
-                }
-        } else {
-            VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
-                        userExpanded = !expanded
-                    }
-                } label: {
-                    HStack(spacing: 7) {
-                        Image(
-                            systemName: summary.hasError
-                                ? "exclamationmark.triangle.fill"
-                                : "wrench.and.screwdriver"
-                        )
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(summary.hasError ? VeloTheme.coral : .secondary)
-                        .frame(width: 15)
-
-                        Text(summary.label)
-                            .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-
-                        if let sec = summary.secondary {
-                            Text(sec)
-                                .font(.system(size: 11.5))
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                        }
-
-                        Spacer(minLength: 4)
-
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9.5, weight: .bold))
-                            .foregroundStyle(.tertiary)
-                            .rotationEffect(.degrees(expanded ? 90 : 0))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(
-                        VeloTheme.elevatedSurface(colorScheme).opacity(0.55),
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7)
-                    )
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
                 .onChange(of: defaultExpanded) { _, _ in
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.84)) {
                         userExpanded = nil
                     }
                 }
 
-                if expanded {
-                    IndentRailContainer {
-                        flatActivityList(rows, engineMode: engineMode)
-                            .padding(.vertical, 2)
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                if expanded && !rows.isEmpty {
+                    flatActivityList(rows, engineMode: engineMode)
+                        .padding(.leading, 18)
+                        .padding(.vertical, 2)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
         }
