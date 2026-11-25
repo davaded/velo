@@ -1030,7 +1030,8 @@ public final class VeloStore: ObservableObject {
         images: [String] = [],
         approvalMode: String = "auto_edit",
         truncateToUserTurn: Int? = nil,
-        executionMode: String? = nil
+        executionMode: String? = nil,
+        contextRefs: [VeloMeshContextRef] = []
     ) async {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty || !images.isEmpty else { return }
@@ -1096,6 +1097,9 @@ public final class VeloStore: ObservableObject {
                     ]
                     if let skillPath {
                         queueBody["skill_path"] = skillPath
+                    }
+                    if !contextRefs.isEmpty {
+                        queueBody["context_refs"] = contextRefs.map(\.jsonObject)
                     }
                     req.httpBody = try? JSONSerialization.data(withJSONObject: queueBody)
                     let localId = curQ.last?.id
@@ -1230,6 +1234,9 @@ public final class VeloStore: ObservableObject {
             if let skillPath {
                 body["skill_path"] = skillPath
             }
+            if !contextRefs.isEmpty {
+                body["context_refs"] = contextRefs.map(\.jsonObject)
+            }
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             do {
                 let (data, resp) = try await URLSession.shared.data(for: req)
@@ -1266,10 +1273,32 @@ public final class VeloStore: ObservableObject {
             if let skillPath {
                 payload["skill_path"] = skillPath
             }
+            if !contextRefs.isEmpty {
+                payload["context_refs"] = contextRefs.map(\.jsonObject)
+            }
             sendEncryptedCommand(payload)
         case .none:
             appendLocalErrorEvent(sessionId: sessionId, rawError: "当前未连接主机")
             finalizeSessionTurnLocally(sessionId)
+        }
+    }
+
+    public func cancelMeshInvocation(_ invocationId: String) async {
+        switch connectionConfig {
+        case .direct(let baseURL):
+            guard let encoded = invocationId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+                  let url = URL(string: "\(baseURL)/api/mesh/invocations/\(encoded)/cancel")
+            else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            _ = try? await URLSession.shared.data(for: req)
+        case .e2eeRelay:
+            sendEncryptedCommand([
+                "cmd": "cancel_mesh_invocation",
+                "invocation_id": invocationId,
+            ])
+        case .none:
+            break
         }
     }
 
@@ -3658,10 +3687,33 @@ public final class VeloStore: ObservableObject {
         let nowLabel = Self.shortTimeString(from: serverDate)
 
         switch evType {
+        case "mesh_invocation_updated":
+            if let invDict = evObj["invocation"] as? [String: Any],
+               let inv = VeloMeshInvocation.from(dict: invDict)
+            {
+                let itemId = "mesh-\(inv.id)"
+                let nextItem = TimelineEventItem(
+                    id: itemId,
+                    sessionId: sid,
+                    timestamp: nowLabel,
+                    content: inv.prompt,
+                    kind: .meshInvocation(inv)
+                )
+                var list = eventsBySession[sid] ?? []
+                if let idx = list.firstIndex(where: { $0.id == itemId }) {
+                    list[idx] = nextItem
+                } else {
+                    list.append(nextItem)
+                }
+                eventsBySession[sid] = list
+            }
+
         case "user_message":
             let text = (evObj["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let imgs = (evObj["images"] as? [String]) ?? []
             let clientMsgId = (evObj["client_msg_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let sourceSessionId = (evObj["source_session_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let sourceLabel = (evObj["source_label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty || !imgs.isEmpty else { return }
             if !sessions.contains(where: { $0.id == sid }) {
                 Task { await refreshSessionsAndActiveEvents() }
@@ -3714,7 +3766,9 @@ public final class VeloStore: ObservableObject {
                         timestamp: nowLabel,
                         content: text,
                         kind: .user(images: imgs),
-                        clientMsgId: clientMsgId
+                        clientMsgId: clientMsgId,
+                        sourceSessionId: (sourceSessionId?.isEmpty == false) ? sourceSessionId : nil,
+                        sourceLabel: (sourceLabel?.isEmpty == false) ? sourceLabel : nil
                     )
                 )
                 eventsBySession[sid] = list
@@ -4411,6 +4465,17 @@ public final class VeloStore: ObservableObject {
                     mutated = true
                 }
 
+            case .meshInvocation:
+                if let idx = next.firstIndex(where: { $0.id == item.id }) {
+                    if next[idx] != item {
+                        next[idx] = item
+                        mutated = true
+                    }
+                } else {
+                    next.append(item)
+                    mutated = true
+                }
+
             case .error:
                 let dup = next.last.map { cur in
                     if case .error = cur.kind { return cur.content == item.content }
@@ -4481,10 +4546,31 @@ public final class VeloStore: ObservableObject {
             let (tsMs, tsLabel) = parseTs(ev["timestamp"])
 
             switch evType {
+            case "mesh_invocation_updated":
+                if let invDict = ev["invocation"] as? [String: Any],
+                   let inv = VeloMeshInvocation.from(dict: invDict)
+                {
+                    let itemId = "mesh-\(inv.id)"
+                    let nextItem = TimelineEventItem(
+                        id: itemId,
+                        sessionId: sessionId,
+                        timestamp: tsLabel,
+                        content: inv.prompt,
+                        kind: .meshInvocation(inv)
+                    )
+                    if let idx = out.firstIndex(where: { $0.id == itemId }) {
+                        out[idx] = nextItem
+                    } else {
+                        out.append(nextItem)
+                    }
+                }
+
             case "user_message":
                 let text = ((ev["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let imgs = (ev["images"] as? [String]) ?? []
                 let cid = (ev["client_msg_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let srcSid = (ev["source_session_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let srcLabel = (ev["source_label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !text.isEmpty || !imgs.isEmpty {
                     out.append(
                         TimelineEventItem(
@@ -4493,7 +4579,9 @@ public final class VeloStore: ObservableObject {
                             timestamp: tsLabel,
                             content: text,
                             kind: .user(images: imgs),
-                            clientMsgId: (cid != nil && !cid!.isEmpty) ? cid : nil
+                            clientMsgId: (cid != nil && !cid!.isEmpty) ? cid : nil,
+                            sourceSessionId: (srcSid != nil && !srcSid!.isEmpty) ? srcSid : nil,
+                            sourceLabel: (srcLabel != nil && !srcLabel!.isEmpty) ? srcLabel : nil
                         )
                     )
                     activeUserIdx = out.count - 1

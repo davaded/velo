@@ -1083,6 +1083,8 @@ fn load_antigravity_cli_session(
                         text: u_txt.chars().take(1800).collect(),
                         images: Vec::new(),
                         client_msg_id: None,
+                        source_session_id: None,
+                        source_label: None,
                         timestamp: dt,
                     });
                 }
@@ -1174,6 +1176,8 @@ fn parse_full_claude_session(
                             text: txt,
                             images: Vec::new(),
                             client_msg_id: None,
+                            source_session_id: None,
+                            source_label: None,
                             timestamp: ts,
                         });
                     }
@@ -1333,6 +1337,8 @@ fn parse_full_codex_session(
                                 text: txt,
                                 images: Vec::new(),
                                 client_msg_id: None,
+                                source_session_id: None,
+                                source_label: None,
                                 timestamp: ts,
                             });
                         }

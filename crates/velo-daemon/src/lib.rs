@@ -38,6 +38,7 @@ pub mod checkpoints;
 pub mod cli_sessions;
 pub mod extensions;
 pub mod hosts;
+pub mod mesh;
 pub mod pr;
 pub mod pricing;
 pub mod push;
@@ -132,6 +133,7 @@ fn event_timestamp_ms(ev: &AgentEvent) -> i64 {
         | AgentEvent::BrowserCommand { timestamp, .. }
         | AgentEvent::SetupHookOutput { timestamp, .. }
         | AgentEvent::DiffUpdated { timestamp, .. }
+        | AgentEvent::MeshInvocationUpdated { timestamp, .. }
         | AgentEvent::Error { timestamp, .. } => timestamp.timestamp_millis(),
     }
 }
@@ -1062,6 +1064,7 @@ pub struct SequencedAgentEvent {
 #[derive(Clone)]
 pub struct DaemonState {
     pub inner: Arc<RwLock<DaemonInner>>,
+    pub mesh: Arc<RwLock<mesh::MeshRuntime>>,
     pub db: storage::VeloSqliteStore,
     pub agent_event_tx: broadcast::Sender<AgentEvent>,
     pub event_tx: broadcast::Sender<SequencedAgentEvent>,
@@ -1181,6 +1184,7 @@ impl DaemonState {
         let (agent_event_tx, _) = broadcast::channel(4096);
         let (event_tx, _) = broadcast::channel(4096);
         let (snapshot_tx, _) = broadcast::channel(128);
+        let mesh_runtime = mesh::MeshRuntime::load(&db);
         let state = Self {
             inner: Arc::new(RwLock::new(DaemonInner {
                 sessions,
@@ -1202,6 +1206,7 @@ impl DaemonState {
                 client_presences: HashMap::new(),
                 monitor_version: 1,
             })),
+            mesh: Arc::new(RwLock::new(mesh_runtime)),
             db,
             agent_event_tx,
             event_tx,
@@ -2120,6 +2125,9 @@ impl DaemonState {
                                     mode: None,
                                     skill_path: queued_item.skill_path,
                                     client_msg_id: None,
+                                    context_refs: Vec::new(),
+                                    source_session_id: None,
+                                    source_label: None,
                                 },
                             )
                             .await;
@@ -2499,6 +2507,8 @@ impl DaemonState {
             message: Some("Session stopped by user".to_string()),
             timestamp: Utc::now(),
         });
+        // Cascade Kill Switch: abort any active cross-session child invocations spawned by this session
+        let _ = self.mesh_cancel_descendants_of(id).await;
     }
 
     fn spawn_cron_scheduler(&self) {
@@ -2793,6 +2803,8 @@ impl DaemonState {
                 text: prompt.clone(),
                 images: images.clone(),
                 client_msg_id,
+                source_session_id: parent_session_id,
+                source_label: None,
                 timestamp: now,
             })
         } else {
@@ -3089,6 +3101,22 @@ pub fn build_router(state: DaemonState) -> Router {
         )
         .route("/api/committee", post(committee_handler))
         .route("/api/loop", post(loop_handler))
+        .route(
+            "/api/mesh/settings",
+            get(get_mesh_settings_handler).put(put_mesh_settings_handler),
+        )
+        .route("/api/mesh/invocations", get(list_mesh_invocations_handler))
+        .route(
+            "/api/mesh/sessions/{id}/summary",
+            get(mesh_session_summary_handler),
+        )
+        .route("/api/mesh/ask", post(mesh_ask_handler))
+        .route("/api/mesh/spawn", post(mesh_spawn_handler))
+        .route("/api/mesh/wait", post(mesh_wait_handler))
+        .route(
+            "/api/mesh/invocations/{id}/cancel",
+            post(mesh_cancel_invocation_handler),
+        )
         .route(
             "/mcp",
             post(mcp_jsonrpc_handler).get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
@@ -5544,6 +5572,7 @@ fn clone_events_for_new_session(events: &[AgentEvent], new_id: Uuid) -> Vec<Agen
             | AgentEvent::SetupHookOutput { session_id, .. }
             | AgentEvent::PtyOutput { session_id, .. }
             | AgentEvent::DiffUpdated { session_id, .. }
+            | AgentEvent::MeshInvocationUpdated { session_id, .. }
             | AgentEvent::Error { session_id, .. } => {
                 *session_id = new_id;
             }
@@ -5801,6 +5830,8 @@ impl DaemonState {
             text: req.input.clone(),
             images: req.images.clone(),
             client_msg_id: req.client_msg_id.clone(),
+            source_session_id: req.source_session_id,
+            source_label: req.source_label.clone(),
             timestamp: Utc::now(),
         };
         {
@@ -5830,8 +5861,14 @@ impl DaemonState {
             event: user_ev,
         });
 
-        let model_input =
+        let mesh_ref_prefix = self.expand_mesh_context_refs(&req.context_refs).await;
+        let base_model_input =
             extensions::skill_turn_prompt(&req.input, req.skill_path.as_deref());
+        let model_input = if let Some(ref_block) = mesh_ref_prefix {
+            format!("{}\n\n{}", ref_block, base_model_input)
+        } else {
+            base_model_input
+        };
         let effective_prompt = if resume_session_id.is_some() {
             model_input.clone()
         } else if let Some(history) = prior_transcript.as_ref() {
@@ -6138,6 +6175,9 @@ impl DaemonState {
                         mode: None,
                         skill_path: None,
                         client_msg_id: None,
+                        context_refs: Vec::new(),
+                        source_session_id: None,
+                        source_label: None,
                     },
                 )
                 .await?;
@@ -6250,6 +6290,9 @@ impl DaemonState {
                 mode: Some("steer".to_string()),
                 skill_path: item.skill_path,
                 client_msg_id: None,
+                context_refs: Vec::new(),
+                source_session_id: None,
+                source_label: None,
             },
         )
         .await
@@ -6777,6 +6820,9 @@ impl DaemonState {
                         mode: None,
                         skill_path: None,
                         client_msg_id: None,
+                        context_refs: Vec::new(),
+                        source_session_id: None,
+                        source_label: None,
                     },
                 )
                 .await;
@@ -7169,6 +7215,8 @@ impl DaemonState {
             text: prompt.to_string(),
             images: Vec::new(),
             client_msg_id: None,
+            source_session_id: None,
+            source_label: None,
             timestamp: now,
         };
 
@@ -9277,94 +9325,99 @@ pub async fn handle_mcp_request_for_session(
             "id": id,
             "result": {}
         }),
-        "tools/list" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "tools": [
-                    {
-                        "name": "velo_list_sessions",
-                        "description": "List all parallel coding agent sessions and their Git worktree diff stats",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {}
-                        }
-                    },
-                    {
-                        "name": "velo_spawn_agent",
-                        "description": "Spawn a new coding agent (claude, codex, agy, opencode, acp:...) inside an isolated Git worktree",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "provider": { "type": "string", "description": "claude, codex, agy, opencode, or acp:<cmd>" },
-                                "prompt": { "type": "string", "description": "Task instructions" },
-                                "repo_path": { "type": "string", "description": "Repository root path" },
-                                "branch": { "type": "string", "description": "Branch name" }
-                            },
-                            "required": ["provider", "prompt", "repo_path"]
-                        }
-                    },
-                    {
-                        "name": "velo_get_diff",
-                        "description": "Get the live unified git diff for a session's isolated worktree",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "session_id": { "type": "string", "description": "Session UUID (optional if bound)" }
-                            }
-                        }
-                    },
-                    {
-                        "name": "velo_ask_user",
-                        "description": "Ask the human user a clarifying multiple-choice or freeform question in the Velo UI and wait for their answer",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "question": { "type": "string", "description": "Clear question to show the user" },
-                                "options": { "type": "array", "items": { "type": "string" }, "description": "Suggested choices" },
-                                "allow_multiple": { "type": "boolean", "description": "Whether user can pick multiple options" }
-                            },
-                            "required": ["question"]
-                        }
-                    },
-                    {
-                        "name": "velo_request_approval",
-                        "description": "Request interactive human approval in Velo UI before executing a sensitive command or file edit",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "tool_name": { "type": "string", "description": "Tool or action name (e.g. Bash, Edit)" },
-                                "command_preview": { "type": "string", "description": "Exact command or file path to preview" },
-                                "reason": { "type": "string", "description": "Why this action is needed" }
-                            },
-                            "required": ["tool_name", "command_preview"]
-                        }
-                    },
-                    {
-                        "name": "velo_browser_open",
-                        "description": "Open or navigate Velo's built-in workspace Browser Preview drawer to a local dev server URL",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "url": { "type": "string", "description": "Target URL (e.g. http://localhost:5173)" }
-                            },
-                            "required": ["url"]
-                        }
-                    },
-                    {
-                        "name": "velo_browser_inspect",
-                        "description": "Fetch & inspect a local dev server URL (HTTP status, <title>, runtime/Vite error overlays, HTML excerpt) to verify frontend changes",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "url": { "type": "string", "description": "Target URL (e.g. http://localhost:5173)" }
-                            },
-                            "required": ["url"]
+        "tools/list" => {
+            let mut tools = vec![
+                json!({
+                    "name": "velo_list_sessions",
+                    "description": "List all parallel coding agent sessions across all folders and their Git diff stats",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project": { "type": "string", "description": "Optional project folder substring filter" }
                         }
                     }
-                ]
-            }
-        }),
+                }),
+                json!({
+                    "name": "velo_spawn_agent",
+                    "description": "Spawn a new coding agent (claude, codex, agy, cursor, grok, opencode) in any folder (alias of velo_spawn_session with wait=false by default)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "provider": { "type": "string", "description": "claude, codex, agy, cursor, grok, opencode, or acp:<cmd>" },
+                            "prompt": { "type": "string", "description": "Task instructions" },
+                            "repo_path": { "type": "string", "description": "Repository root path" },
+                            "branch": { "type": "string", "description": "Branch name" },
+                            "wait": { "type": "boolean", "description": "Wait for completion and return summary (default false)" }
+                        },
+                        "required": ["provider", "prompt", "repo_path"]
+                    }
+                }),
+                json!({
+                    "name": "velo_get_diff",
+                    "description": "Get the live unified git diff for a session's isolated worktree",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string", "description": "Session UUID (optional if bound)" }
+                        }
+                    }
+                }),
+                json!({
+                    "name": "velo_ask_user",
+                    "description": "Ask the human user a clarifying multiple-choice or freeform question in the Velo UI and wait for their answer",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string", "description": "Clear question to show the user" },
+                            "options": { "type": "array", "items": { "type": "string" }, "description": "Suggested choices" },
+                            "allow_multiple": { "type": "boolean", "description": "Whether user can pick multiple options" }
+                        },
+                        "required": ["question"]
+                    }
+                }),
+                json!({
+                    "name": "velo_request_approval",
+                    "description": "Request interactive human approval in Velo UI before executing a sensitive command or file edit",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tool_name": { "type": "string", "description": "Tool or action name (e.g. Bash, Edit)" },
+                            "command_preview": { "type": "string", "description": "Exact command or file path to preview" },
+                            "reason": { "type": "string", "description": "Why this action is needed" }
+                        },
+                        "required": ["tool_name", "command_preview"]
+                    }
+                }),
+                json!({
+                    "name": "velo_browser_open",
+                    "description": "Open or navigate Velo's built-in workspace Browser Preview drawer to a local dev server URL",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "url": { "type": "string", "description": "Target URL (e.g. http://localhost:5173)" }
+                        },
+                        "required": ["url"]
+                    }
+                }),
+                json!({
+                    "name": "velo_browser_inspect",
+                    "description": "Fetch & inspect a local dev server URL (HTTP status, <title>, runtime/Vite error overlays, HTML excerpt) to verify frontend changes",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "url": { "type": "string", "description": "Target URL (e.g. http://localhost:5173)" }
+                        },
+                        "required": ["url"]
+                    }
+                }),
+            ];
+            tools.extend(DaemonState::mesh_mcp_tool_definitions());
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "tools": tools }
+            })
+        }
         "tools/call" => {
             let tool_name = payload
                 .pointer("/params/name")
@@ -9384,8 +9437,24 @@ pub async fn handle_mcp_request_for_session(
 
             match tool_name {
                 "velo_list_sessions" => {
+                    let proj_filter = args
+                        .get("project")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty());
                     let guard = state.inner.read().await;
-                    let list: Vec<&SessionInfo> = guard.sessions.values().collect();
+                    let mut list: Vec<&SessionInfo> = guard
+                        .sessions
+                        .values()
+                        .filter(|s| {
+                            !s.archived
+                                && proj_filter.as_ref().map_or(true, |pf| {
+                                    s.repo_root.to_lowercase().contains(pf)
+                                        || s.name.to_lowercase().contains(pf)
+                                })
+                        })
+                        .collect();
+                    list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                     let text = serde_json::to_string_pretty(&list).unwrap_or_default();
                     json!({
                         "jsonrpc": "2.0",
@@ -9395,11 +9464,94 @@ pub async fn handle_mcp_request_for_session(
                         }
                     })
                 }
-                "velo_spawn_agent" => {
-                    let provider_str = args
+                "velo_read_session" => {
+                    let Some(sid) = resolve_sid() else {
+                        return json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "isError": true, "content": [{ "type": "text", "text": "Missing or invalid session_id" }] }
+                        });
+                    };
+                    let last_turns = args
+                        .get("last_turns")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(6) as usize;
+                    let include_diff = args
+                        .get("include_diff")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    match state
+                        .mesh_read_session_summary(sid, last_turns, include_diff)
+                        .await
+                    {
+                        Ok(pkt) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": pkt.summary_markdown }]
+                            }
+                        }),
+                        Err(e) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "isError": true, "content": [{ "type": "text", "text": e.to_string() }] }
+                        }),
+                    }
+                }
+                "velo_ask_session" => {
+                    let target_id = args
+                        .get("target_session_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s.trim()).ok());
+                    let Some(target_session_id) = target_id else {
+                        return json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "isError": true, "content": [{ "type": "text", "text": "Missing or invalid target_session_id UUID" }] }
+                        });
+                    };
+                    let prompt = args
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let delivery = args
+                        .get("delivery")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let timeout_sec = args.get("timeout_sec").and_then(|v| v.as_u64());
+                    match state
+                        .mesh_ask_session(mesh::MeshAskParams {
+                            caller_session_id: default_session_id,
+                            target_session_id,
+                            prompt,
+                            wait,
+                            delivery,
+                            timeout_sec,
+                        })
+                        .await
+                    {
+                        Ok(inv) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&inv).unwrap_or_default() }]
+                            }
+                        }),
+                        Err(e) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "isError": true, "content": [{ "type": "text", "text": e.to_string() }] }
+                        }),
+                    }
+                }
+                "velo_spawn_session" | "velo_spawn_agent" => {
+                    let is_legacy_alias = tool_name == "velo_spawn_agent";
+                    let provider = args
                         .get("provider")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("claude");
+                        .map(|s| s.to_string());
                     let prompt = args
                         .get("prompt")
                         .and_then(|v| v.as_str())
@@ -9414,30 +9566,48 @@ pub async fn handle_mcp_request_for_session(
                         .get("branch")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-
-                    let use_worktree = branch.is_some();
-                    let req = CreateSessionRequest {
-                        name: None,
-                        provider: AgentProvider::from_str_loose(provider_str),
-                        prompt,
-                        repo_path,
-                        branch,
-                        use_pty: false,
-                        parent_session_id: default_session_id,
-                        model: None,
-                        effort: None,
-                        images: Vec::new(),
-                        approval_mode: None,
-                        setup_command: None,
-                        use_worktree,
-                        client_msg_id: None,
-                    };
-                    match state.create_session(req).await {
-                        Ok(s) => json!({
+                    let model = args
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let effort = args
+                        .get("effort")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let name = args
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let use_worktree = args
+                        .get("use_worktree")
+                        .and_then(|v| v.as_bool())
+                        .or_else(|| if is_legacy_alias { Some(branch.is_some()) } else { None });
+                    let wait = args
+                        .get("wait")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(!is_legacy_alias);
+                    let timeout_sec = args.get("timeout_sec").and_then(|v| v.as_u64());
+                    match state
+                        .mesh_spawn_session(mesh::MeshSpawnParams {
+                            caller_session_id: default_session_id,
+                            repo_path,
+                            provider,
+                            model,
+                            effort,
+                            prompt,
+                            name,
+                            branch,
+                            use_worktree,
+                            wait,
+                            timeout_sec,
+                        })
+                        .await
+                    {
+                        Ok(inv) => json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": {
-                                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&s).unwrap_or_default() }]
+                                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&inv).unwrap_or_default() }]
                             }
                         }),
                         Err(e) => json!({
@@ -9449,6 +9619,31 @@ pub async fn handle_mcp_request_for_session(
                             }
                         }),
                     }
+                }
+                "velo_wait_invocations" => {
+                    let ids: Vec<String> = args
+                        .get("invocation_ids")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let timeout_sec = args.get("timeout_sec").and_then(|v| v.as_u64());
+                    let results = state
+                        .mesh_wait_invocations(mesh::MeshWaitParams {
+                            invocation_ids: ids,
+                            timeout_sec,
+                        })
+                        .await;
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&results).unwrap_or_default() }]
+                        }
+                    })
                 }
                 "velo_get_diff" => {
                     if let Some(sid) = resolve_sid() {
@@ -9612,6 +9807,113 @@ pub async fn handle_mcp_request_for_session(
 #[derive(Debug, Default, serde::Deserialize)]
 struct McpQuery {
     session_id: Option<Uuid>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct MeshInvocationsQuery {
+    session_id: Option<Uuid>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct MeshSummaryQuery {
+    last_turns: Option<usize>,
+    include_diff: Option<bool>,
+}
+
+async fn get_mesh_settings_handler(State(state): State<DaemonState>) -> impl IntoResponse {
+    Json(state.get_mesh_settings().await)
+}
+
+async fn put_mesh_settings_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<velo_protocol::MeshSettings>,
+) -> impl IntoResponse {
+    match state.update_mesh_settings(req).await {
+        Ok(cfg) => (StatusCode::OK, Json(json!(cfg))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_mesh_invocations_handler(
+    State(state): State<DaemonState>,
+    Query(q): Query<MeshInvocationsQuery>,
+) -> impl IntoResponse {
+    let items = state.list_mesh_invocations(q.session_id).await;
+    Json(json!({ "invocations": items }))
+}
+
+async fn mesh_session_summary_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<Uuid>,
+    Query(q): Query<MeshSummaryQuery>,
+) -> impl IntoResponse {
+    let last_turns = q.last_turns.unwrap_or(6);
+    let include_diff = q.include_diff.unwrap_or(true);
+    match state
+        .mesh_read_session_summary(id, last_turns, include_diff)
+        .await
+    {
+        Ok(pkt) => (StatusCode::OK, Json(json!(pkt))).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn mesh_ask_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<mesh::MeshAskParams>,
+) -> impl IntoResponse {
+    match state.mesh_ask_session(req).await {
+        Ok(inv) => (StatusCode::OK, Json(json!(inv))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn mesh_spawn_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<mesh::MeshSpawnParams>,
+) -> impl IntoResponse {
+    match state.mesh_spawn_session(req).await {
+        Ok(inv) => (StatusCode::OK, Json(json!(inv))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn mesh_wait_handler(
+    State(state): State<DaemonState>,
+    Json(req): Json<mesh::MeshWaitParams>,
+) -> impl IntoResponse {
+    let results = state.mesh_wait_invocations(req).await;
+    (StatusCode::OK, Json(json!({ "invocations": results }))).into_response()
+}
+
+async fn mesh_cancel_invocation_handler(
+    State(state): State<DaemonState>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.mesh_cancel_invocation(&id).await {
+        Ok(inv) => (StatusCode::OK, Json(json!(inv))).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn mcp_jsonrpc_handler(
@@ -9930,6 +10232,7 @@ composer-2.5 - Composer 2.5
                 client_presences: HashMap::new(),
                 monitor_version: 1,
             })),
+            mesh: Arc::new(RwLock::new(mesh::MeshRuntime::default())),
             db,
             agent_event_tx,
             event_tx,
@@ -10106,6 +10409,8 @@ composer-2.5 - Composer 2.5
                 text: "Analyze CUA state and fix TPS".to_string(),
                 images: Vec::new(),
                 client_msg_id: None,
+                source_session_id: None,
+                source_label: None,
                 timestamp: ms(0),
             },
             AgentEvent::UsageUpdated {
@@ -10201,6 +10506,8 @@ composer-2.5 - Composer 2.5
                 text: "Quick AGY check".to_string(),
                 images: Vec::new(),
                 client_msg_id: None,
+                source_session_id: None,
+                source_label: None,
                 timestamp: ms(90_000),
             },
             AgentEvent::ThinkingDelta {
@@ -10534,6 +10841,7 @@ composer-2.5 - Composer 2.5
                 client_presences: HashMap::new(),
                 monitor_version: 1,
             })),
+            mesh: Arc::new(RwLock::new(mesh::MeshRuntime::default())),
             db,
             agent_event_tx,
             event_tx,
@@ -10586,6 +10894,8 @@ composer-2.5 - Composer 2.5
                 text: "Turn 1 prompt".to_string(),
                 images: vec![],
                 client_msg_id: None,
+                source_session_id: None,
+                source_label: None,
                 timestamp: now,
             },
             AgentEvent::MessageDelta {
@@ -10598,6 +10908,8 @@ composer-2.5 - Composer 2.5
                 text: "Turn 2 target prompt".to_string(),
                 images: vec![],
                 client_msg_id: None,
+                source_session_id: None,
+                source_label: None,
                 timestamp: now,
             },
             AgentEvent::ProviderSessionBound {
@@ -10615,6 +10927,8 @@ composer-2.5 - Composer 2.5
                 text: "Turn 3 should be excluded".to_string(),
                 images: vec![],
                 client_msg_id: None,
+                source_session_id: None,
+                source_label: None,
                 timestamp: now,
             },
             AgentEvent::MessageDelta {

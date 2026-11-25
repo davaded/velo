@@ -204,6 +204,62 @@ enum Commands {
         #[arg(long)]
         device: Option<String>,
     },
+
+    /// Cross-session / cross-folder Velo Mesh CLI (fallback for any engine or terminal script)
+    Mesh {
+        #[command(subcommand)]
+        action: MeshCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MeshCommands {
+    /// List active sessions across all folders
+    List {
+        /// Optional project name substring filter
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// Read another session's compact summary, recent turns & optional diff (Mode A)
+    Read {
+        /// Session UUID, prefix, or exact name
+        session: String,
+        #[arg(long, default_value_t = 6)]
+        turns: usize,
+        #[arg(long, default_value_t = true)]
+        diff: bool,
+    },
+    /// Send a task to another existing session across folders/engines (Mode B)
+    Ask {
+        /// Target session UUID, prefix, or exact name
+        session: String,
+        /// Instructions or question for the target session
+        prompt: String,
+        /// Return immediately with invocation_id instead of waiting
+        #[arg(long)]
+        no_wait: bool,
+        /// Busy behavior: `queue` (default) or `steer`
+        #[arg(long, default_value = "queue")]
+        delivery: String,
+    },
+    /// Spawn a new session in any folder with a chosen AI engine (Mode B)
+    Spawn {
+        /// Target repository directory path
+        repo: PathBuf,
+        /// Instructions for the new session
+        prompt: String,
+        /// AI engine: claude, codex, agy, cursor, grok, opencode
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Return immediately with invocation_id instead of waiting
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Wait for one or more async invocation IDs to complete
+    Wait {
+        /// Invocation IDs (e.g. inv-...)
+        invocation_ids: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -665,6 +721,82 @@ async fn main() -> Result<()> {
                 bail!("iOS installation exited with status {}", status);
             }
         }
+        Commands::Mesh { action } => {
+            let caller_sid = env::var("VELO_SESSION_ID").ok();
+            match action {
+                MeshCommands::List { project } => {
+                    let sessions: Vec<SessionInfo> = http_get_json(addr, "/api/sessions").await?;
+                    let filter = project.map(|p| p.to_lowercase());
+                    let filtered: Vec<SessionInfo> = sessions
+                        .into_iter()
+                        .filter(|s| {
+                            !s.archived
+                                && filter.as_ref().map_or(true, |f| {
+                                    s.repo_root.to_lowercase().contains(f)
+                                        || s.name.to_lowercase().contains(f)
+                                })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&filtered)?);
+                }
+                MeshCommands::Read {
+                    session,
+                    turns,
+                    diff,
+                } => {
+                    let target = resolve_session(addr, &session).await?;
+                    let path = format!(
+                        "/api/mesh/sessions/{}/summary?last_turns={}&include_diff={}",
+                        target.id, turns, diff
+                    );
+                    let pkt: Value = http_get_json(addr, &path).await?;
+                    if let Some(md) = pkt.get("summary_markdown").and_then(|v| v.as_str()) {
+                        println!("{}", md);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&pkt)?);
+                    }
+                }
+                MeshCommands::Ask {
+                    session,
+                    prompt,
+                    no_wait,
+                    delivery,
+                } => {
+                    let target = resolve_session(addr, &session).await?;
+                    let body = serde_json::json!({
+                        "caller_session_id": caller_sid,
+                        "target_session_id": target.id,
+                        "prompt": prompt,
+                        "wait": !no_wait,
+                        "delivery": delivery,
+                    });
+                    let res: Value = http_post_json(addr, "/api/mesh/ask", &body).await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                MeshCommands::Spawn {
+                    repo,
+                    prompt,
+                    agent,
+                    no_wait,
+                } => {
+                    let abs = repo.canonicalize().unwrap_or(repo);
+                    let body = serde_json::json!({
+                        "caller_session_id": caller_sid,
+                        "repo_path": abs.to_string_lossy(),
+                        "provider": agent,
+                        "prompt": prompt,
+                        "wait": !no_wait,
+                    });
+                    let res: Value = http_post_json(addr, "/api/mesh/spawn", &body).await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                MeshCommands::Wait { invocation_ids } => {
+                    let body = serde_json::json!({ "invocation_ids": invocation_ids });
+                    let res: Value = http_post_json(addr, "/api/mesh/wait", &body).await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -781,6 +913,15 @@ fn print_agent_event(ev: &AgentEvent) {
             println!(
                 "📊 [diff updated] {} files (+{} -{})",
                 stats.files_changed, stats.insertions, stats.deletions
+            );
+        }
+        AgentEvent::MeshInvocationUpdated { invocation, .. } => {
+            println!(
+                "🕸️  [mesh {:?}] {} -> {} ({:?})",
+                invocation.kind,
+                invocation.caller_session_name,
+                invocation.callee_session_name,
+                invocation.status
             );
         }
         AgentEvent::Error { error, .. } => {

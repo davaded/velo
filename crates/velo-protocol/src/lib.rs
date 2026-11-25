@@ -241,6 +241,10 @@ pub enum AgentEvent {
         images: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_session_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_label: Option<String>,
         timestamp: DateTime<Utc>,
     },
     ProviderSessionBound {
@@ -370,6 +374,11 @@ pub enum AgentEvent {
         stats: GitDiffStats,
         timestamp: DateTime<Utc>,
     },
+    MeshInvocationUpdated {
+        session_id: Uuid,
+        invocation: MeshInvocationInfo,
+        timestamp: DateTime<Utc>,
+    },
     Error {
         session_id: Uuid,
         error: String,
@@ -400,9 +409,114 @@ impl AgentEvent {
             | Self::SetupHookOutput { session_id, .. }
             | Self::PtyOutput { session_id, .. }
             | Self::DiffUpdated { session_id, .. }
+            | Self::MeshInvocationUpdated { session_id, .. }
             | Self::Error { session_id, .. } => *session_id,
         }
     }
+}
+
+/// Cross-folder / cross-session Mesh permission policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshPermissionPolicy {
+    SmartApproval,
+    WorkspaceAuto,
+    AlwaysAsk,
+}
+
+impl Default for MeshPermissionPolicy {
+    fn default() -> Self {
+        Self::SmartApproval
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshSettings {
+    #[serde(default)]
+    pub policy: MeshPermissionPolicy,
+    #[serde(default = "default_mesh_max_depth")]
+    pub max_depth: u32,
+    #[serde(default = "default_mesh_max_room_hops")]
+    pub max_room_hops: u32,
+}
+
+pub fn default_mesh_max_depth() -> u32 {
+    3
+}
+
+pub fn default_mesh_max_room_hops() -> u32 {
+    12
+}
+
+impl Default for MeshSettings {
+    fn default() -> Self {
+        Self {
+            policy: MeshPermissionPolicy::SmartApproval,
+            max_depth: default_mesh_max_depth(),
+            max_room_hops: default_mesh_max_room_hops(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshInvocationKind {
+    Read,
+    Ask,
+    Spawn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshInvocationStatus {
+    PendingApproval,
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+/// Persisted and live-streamed record of a cross-session / cross-folder Mesh invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshInvocationInfo {
+    pub id: String,
+    pub caller_session_id: Uuid,
+    pub caller_session_name: String,
+    pub caller_provider: String,
+    pub caller_repo_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callee_session_id: Option<Uuid>,
+    pub callee_session_name: String,
+    pub callee_provider: String,
+    pub callee_repo_root: String,
+    pub root_invocation_id: String,
+    pub depth: u32,
+    #[serde(default)]
+    pub call_chain: Vec<Uuid>,
+    pub kind: MeshInvocationKind,
+    pub prompt: String,
+    pub status: MeshInvocationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_stats: Option<GitDiffStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Structured `@` reference attached to a prompt from Mac / iOS composer (Mode A).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshContextRef {
+    /// `"session"` | `"workspace"` | `"room"`
+    pub kind: String,
+    pub target_id: String,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// Request payload to spin up a new isolated worktree & coding agent session.
@@ -469,6 +583,14 @@ pub struct SessionInputRequest {
     /// Client-generated optimistic message correlation ID for deterministic deduplication.
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    /// Optional Mode-A `@` context references (sessions / workspaces / rooms) to inject compact summaries for.
+    #[serde(default)]
+    pub context_refs: Vec<MeshContextRef>,
+    /// Internal origin marker when this input was dispatched by another session via Velo Mesh.
+    #[serde(default)]
+    pub source_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_label: Option<String>,
 }
 
 /// Client-to-daemon WebSocket command envelope.

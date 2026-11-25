@@ -115,6 +115,8 @@ fn compact_event_for_relay(ev: &AgentEvent, max_tool_output_chars: usize) -> Age
             text,
             images,
             client_msg_id,
+            source_session_id,
+            source_label,
             timestamp,
         } => AgentEvent::UserMessage {
             session_id: *session_id,
@@ -126,6 +128,8 @@ fn compact_event_for_relay(ev: &AgentEvent, max_tool_output_chars: usize) -> Age
                 .cloned()
                 .collect(),
             client_msg_id: client_msg_id.clone(),
+            source_session_id: *source_session_id,
+            source_label: source_label.clone(),
             timestamp: *timestamp,
         },
         other => other.clone(),
@@ -1000,6 +1004,11 @@ async fn run_supervised_e2ee_bridge(
                                                 .get("client_msg_id")
                                                 .and_then(|v| v.as_str())
                                                 .map(|s| s.to_string());
+                                            let context_refs: Vec<velo_protocol::MeshContextRef> =
+                                                cmd_val
+                                                    .get("context_refs")
+                                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                                    .unwrap_or_default();
                                             if let Err(err) = state
                                                 .dispatch_session_input(
                                                     sid,
@@ -1015,6 +1024,9 @@ async fn run_supervised_e2ee_bridge(
                                                         mode,
                                                         skill_path,
                                                         client_msg_id,
+                                                        context_refs,
+                                                        source_session_id: None,
+                                                        source_label: None,
                                                     },
                                                 )
                                                 .await
@@ -2278,6 +2290,63 @@ async fn run_supervised_e2ee_bridge(
                                                 let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
                                             }
                                         }
+                                    }
+                                }
+                                "get_mesh_settings" => {
+                                    let cfg = state.get_mesh_settings().await;
+                                    let resp = json!({
+                                        "type": "mesh_settings_snapshot",
+                                        "settings": cfg,
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &resp,
+                                        &active_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "set_mesh_settings" => {
+                                    if let Some(raw_cfg) = cmd_val.get("settings") {
+                                        if let Ok(parsed) = serde_json::from_value::<velo_protocol::MeshSettings>(raw_cfg.clone()) {
+                                            if let Ok(updated) = state.update_mesh_settings(parsed).await {
+                                                let resp = json!({
+                                                    "type": "mesh_settings_snapshot",
+                                                    "settings": updated,
+                                                });
+                                                if let Some(frame_txt) = send_sealed_with_key(
+                                                    &resp,
+                                                    &active_key_hex,
+                                                    &mut out_nonce,
+                                                ) {
+                                                    let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "list_mesh_invocations" => {
+                                    let sid = cmd_val
+                                        .get("session_id")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| Uuid::parse_str(s).ok());
+                                    let items = state.list_mesh_invocations(sid).await;
+                                    let resp = json!({
+                                        "type": "mesh_invocations_snapshot",
+                                        "session_id": sid,
+                                        "invocations": items,
+                                    });
+                                    if let Some(frame_txt) = send_sealed_with_key(
+                                        &resp,
+                                        &active_key_hex,
+                                        &mut out_nonce,
+                                    ) {
+                                        let _ = writer.send(WsMsg::Text(frame_txt.into())).await;
+                                    }
+                                }
+                                "cancel_mesh_invocation" => {
+                                    if let Some(inv_id) = cmd_val.get("invocation_id").and_then(|v| v.as_str()) {
+                                        let _ = state.mesh_cancel_invocation(inv_id).await;
                                     }
                                 }
                                 "rewind_checkpoint" => {

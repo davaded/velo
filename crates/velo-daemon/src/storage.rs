@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
-use velo_protocol::{AgentEvent, SessionInfo, SessionStatus};
+use velo_protocol::{AgentEvent, MeshInvocationInfo, SessionInfo, SessionStatus};
 
 #[derive(Clone)]
 pub struct VeloSqliteStore {
@@ -126,6 +126,18 @@ fn extract_event_metadata(ev: &AgentEvent) -> (&'static str, i64, String) {
         AgentEvent::DiffUpdated { timestamp, .. } => {
             ("diff_updated", timestamp.timestamp_millis(), String::new())
         }
+        AgentEvent::MeshInvocationUpdated {
+            invocation,
+            timestamp,
+            ..
+        } => (
+            "mesh_invocation_updated",
+            timestamp.timestamp_millis(),
+            format!(
+                "{} -> {} {}",
+                invocation.caller_session_name, invocation.callee_session_name, invocation.prompt
+            ),
+        ),
         AgentEvent::ProviderSessionBound { timestamp, .. } => (
             "provider_session_bound",
             timestamp.timestamp_millis(),
@@ -195,7 +207,23 @@ impl VeloSqliteStore {
              CREATE TABLE IF NOT EXISTS kv_meta (
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS session_invocations (
+                 id TEXT PRIMARY KEY,
+                 caller_session_id TEXT NOT NULL,
+                 callee_session_id TEXT,
+                 root_invocation_id TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 json_blob TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_invocations_caller
+                 ON session_invocations(caller_session_id, created_at_ms);
+             CREATE INDEX IF NOT EXISTS idx_invocations_callee
+                 ON session_invocations(callee_session_id, created_at_ms);
+             CREATE INDEX IF NOT EXISTS idx_invocations_root
+                 ON session_invocations(root_invocation_id);",
         )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -806,6 +834,75 @@ impl VeloSqliteStore {
         }
 
         Ok(hits)
+    }
+
+    pub fn get_kv(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.lock_conn();
+        let val = conn
+            .query_row("SELECT value FROM kv_meta WHERE key = ?1", params![key], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?;
+        Ok(val)
+    }
+
+    pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO kv_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_invocation(&self, inv: &MeshInvocationInfo) -> Result<()> {
+        let conn = self.lock_conn();
+        let blob = serde_json::to_string(inv)?;
+        let status_str = serde_json::to_value(inv.status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "running".to_string());
+        let updated_ms = inv
+            .completed_at
+            .unwrap_or(inv.created_at)
+            .timestamp_millis();
+        conn.execute(
+            "INSERT INTO session_invocations
+                (id, caller_session_id, callee_session_id, root_invocation_id, status, created_at_ms, updated_at_ms, json_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                callee_session_id = excluded.callee_session_id,
+                status = excluded.status,
+                updated_at_ms = excluded.updated_at_ms,
+                json_blob = excluded.json_blob",
+            params![
+                inv.id,
+                inv.caller_session_id.to_string(),
+                inv.callee_session_id.map(|u| u.to_string()),
+                inv.root_invocation_id,
+                status_str,
+                inv.created_at.timestamp_millis(),
+                updated_ms,
+                blob
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_invocations(&self, limit: usize) -> Result<Vec<MeshInvocationInfo>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT json_blob FROM session_invocations ORDER BY created_at_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for blob in rows.flatten() {
+            if let Ok(inv) = serde_json::from_str::<MeshInvocationInfo>(&blob) {
+                out.push(inv);
+            }
+        }
+        Ok(out)
     }
 }
 

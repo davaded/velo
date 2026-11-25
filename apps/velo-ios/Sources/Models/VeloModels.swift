@@ -725,6 +725,77 @@ public enum AgentLivePhase: Equatable, Sendable {
     case waiting(label: String)
 }
 
+public struct VeloMeshContextRef: Identifiable, Codable, Equatable, Sendable {
+    public var kind: String // "session" | "workspace" | "room"
+    public var targetId: String
+    public var label: String
+
+    public var id: String { "\(kind):\(targetId)" }
+
+    public init(kind: String, targetId: String, label: String) {
+        self.kind = kind
+        self.targetId = targetId
+        self.label = label
+    }
+
+    public var jsonObject: [String: Any] {
+        ["kind": kind, "target_id": targetId, "label": label]
+    }
+}
+
+public struct VeloMeshInvocation: Identifiable, Codable, Equatable, Sendable {
+    public var id: String
+    public var callerSessionId: String
+    public var callerSessionName: String
+    public var callerProvider: String
+    public var callerRepoRoot: String
+    public var calleeSessionId: String?
+    public var calleeSessionName: String
+    public var calleeProvider: String
+    public var calleeRepoRoot: String
+    public var depth: Int
+    public var kind: String
+    public var prompt: String
+    public var status: String
+    public var resultSummary: String?
+    public var insertions: Int
+    public var deletions: Int
+    public var error: String?
+
+    public var targetFolderName: String {
+        let name = URL(fileURLWithPath: calleeRepoRoot).lastPathComponent
+        return name.isEmpty ? "workspace" : name
+    }
+
+    public var isActive: Bool {
+        status == "pending_approval" || status == "queued" || status == "running"
+    }
+
+    public static func from(dict: [String: Any]) -> VeloMeshInvocation? {
+        guard let id = dict["id"] as? String, !id.isEmpty else { return nil }
+        let diff = dict["diff_stats"] as? [String: Any]
+        return VeloMeshInvocation(
+            id: id,
+            callerSessionId: (dict["caller_session_id"] as? String) ?? "",
+            callerSessionName: (dict["caller_session_name"] as? String) ?? "Session",
+            callerProvider: (dict["caller_provider"] as? String) ?? "claude",
+            callerRepoRoot: (dict["caller_repo_root"] as? String) ?? "",
+            calleeSessionId: dict["callee_session_id"] as? String,
+            calleeSessionName: (dict["callee_session_name"] as? String) ?? "Target",
+            calleeProvider: (dict["callee_provider"] as? String) ?? "claude",
+            calleeRepoRoot: (dict["callee_repo_root"] as? String) ?? "",
+            depth: VeloSessionItem.intValue(dict["depth"]) ?? 1,
+            kind: (dict["kind"] as? String) ?? "ask",
+            prompt: (dict["prompt"] as? String) ?? "",
+            status: (dict["status"] as? String) ?? "running",
+            resultSummary: dict["result_summary"] as? String,
+            insertions: VeloSessionItem.intValue(diff?["insertions"]) ?? 0,
+            deletions: VeloSessionItem.intValue(diff?["deletions"]) ?? 0,
+            error: dict["error"] as? String
+        )
+    }
+}
+
 public enum TimelineEventKind: Codable, Equatable, Sendable {
     case user(images: [String])
     case thinking(startedAt: Date?, durationMs: Int?, isStreaming: Bool)
@@ -737,6 +808,7 @@ public enum TimelineEventKind: Codable, Equatable, Sendable {
         isError: Bool
     )
     case assistant(isStreaming: Bool)
+    case meshInvocation(VeloMeshInvocation)
     case error(
         isAuthRequired: Bool,
         provider: String,
@@ -796,6 +868,8 @@ public struct TimelineEventItem: Identifiable, Codable, Equatable, Sendable {
     public var subagentRole: String? = nil
     public var subagentPrompt: String? = nil
     public var clientMsgId: String? = nil
+    public var sourceSessionId: String? = nil
+    public var sourceLabel: String? = nil
 }
 
 public enum VeloInlineDiffExtractor {

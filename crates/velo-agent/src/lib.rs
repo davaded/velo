@@ -1698,6 +1698,17 @@ impl AgentSpawner {
             }
         };
         cmd.env("PATH", aug_path);
+        cmd.env("VELO_SESSION_ID", session_id.to_string());
+        if let Some(base) = daemon_http_base.filter(|b| !b.trim().is_empty()) {
+            let clean = base.trim_end_matches('/');
+            cmd.env("VELO_DAEMON_URL", clean);
+            if let Some(host_port) = clean
+                .strip_prefix("http://")
+                .or_else(|| clean.strip_prefix("https://"))
+            {
+                cmd.env("VELO_ADDR", host_port);
+            }
+        }
         apply_proxy_env_tokio(&mut cmd);
         cmd
     }

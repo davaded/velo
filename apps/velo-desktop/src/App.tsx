@@ -63,6 +63,8 @@ import {
   VeloToastTone,
 } from "./components/ui/VeloMotionPrimitives";
 import { RemoteHostDto, RemoteHostsModal } from "./components/RemoteHostsModal";
+import { MeshInvocationCard } from "./components/MeshInvocationCard";
+import type { MeshContextRefDto, MeshInvocationDto } from "./mockData";
 import {
   ExtensionsAndCheckpointsModal,
   SkillEntryDto,
@@ -348,6 +350,14 @@ function reconstructEventsFromHistory(
         typeof ev.client_msg_id === "string" && ev.client_msg_id.trim()
           ? ev.client_msg_id.trim()
           : undefined;
+      const sourceLabel =
+        typeof ev.source_label === "string" && ev.source_label.trim()
+          ? ev.source_label.trim()
+          : undefined;
+      const sourceSessionId =
+        typeof ev.source_session_id === "string" && ev.source_session_id.trim()
+          ? ev.source_session_id.trim()
+          : undefined;
       if (text || imgs.length > 0) {
         reconstructed.push({
           id: clientMsgId ? `u-hist-${clientMsgId}` : `u-hist-${i}`,
@@ -357,10 +367,29 @@ function reconstructEventsFromHistory(
           content: text,
           images: imgs.length > 0 ? imgs : undefined,
           client_msg_id: clientMsgId,
+          source_label: sourceLabel,
+          source_session_id: sourceSessionId,
         });
         activeHistUserIdx = reconstructed.length - 1;
         activeHistStartMs = tsMs;
         lastStepMs = tsMs;
+      }
+    } else if (evType === "mesh_invocation_updated" && ev.invocation && typeof ev.invocation === "object") {
+      const inv = ev.invocation as MeshInvocationDto;
+      const invEvId = `mesh-${inv.id}`;
+      const existingIdx = reconstructed.findIndex((item) => item.id === invEvId);
+      const nextItem: AgentEvent = {
+        id: invEvId,
+        session_id: sid,
+        timestamp: ts,
+        kind: "mesh_invocation",
+        content: inv.prompt || "",
+        mesh_invocation: inv,
+      };
+      if (existingIdx >= 0) {
+        reconstructed[existingIdx] = nextItem;
+      } else {
+        reconstructed.push(nextItem);
       }
     } else if (evType === "status_changed") {
       const st = String(ev.status ?? "");
@@ -1501,6 +1530,31 @@ export function App() {
       setHasComposerText(nextHas);
     }
   }, [activeSession.id]);
+
+  const [meshRefsBySession, setMeshRefsBySession] = useState<Record<string, MeshContextRefDto[]>>({});
+  const pendingMeshRefs = useMemo(
+    () => meshRefsBySession[activeSession.id] ?? [],
+    [meshRefsBySession, activeSession.id]
+  );
+  const setPendingMeshRefs = useCallback(
+    (
+      updater: MeshContextRefDto[] | ((prev: MeshContextRefDto[]) => MeshContextRefDto[]),
+      targetSid?: string
+    ) => {
+      const sid = targetSid || activeSessionIdRef.current || "draft-empty";
+      setMeshRefsBySession((prev) => {
+        const cur = prev[sid] ?? [];
+        const nextList = typeof updater === "function" ? updater(cur) : updater;
+        if (nextList.length === 0) {
+          const copy = { ...prev };
+          delete copy[sid];
+          return copy;
+        }
+        return { ...prev, [sid]: nextList };
+      });
+    },
+    []
+  );
 
   const pendingAttachments = useMemo(
     () => attachmentsBySession[activeSession.id] ?? [],
@@ -2745,6 +2799,32 @@ export function App() {
         flushPendingStreamChunks(sid);
       }
 
+      if (evType === "mesh_invocation_updated" && evObj.invocation && typeof evObj.invocation === "object") {
+        const inv = evObj.invocation as MeshInvocationDto;
+        const invEvId = `mesh-${inv.id}`;
+        setEventsBySession((prev) => {
+          const list = prev[sid] || [];
+          const nextItem: AgentEvent = {
+            id: invEvId,
+            session_id: sid,
+            timestamp: now,
+            kind: "mesh_invocation",
+            content: inv.prompt || "",
+            mesh_invocation: inv,
+            seq: frameSeq,
+          };
+          const existingIdx = list.findIndex((item) => item.id === invEvId);
+          if (existingIdx >= 0) {
+            const copy = [...list];
+            copy[existingIdx] = nextItem;
+            return { ...prev, [sid]: copy };
+          }
+          return { ...prev, [sid]: [...list, nextItem] };
+        });
+        scrollChatToBottom(false);
+        return;
+      }
+
       if (evType === "user_message") {
         delete ttftRecordedBySessionRef.current[sid];
         const text = String(evObj.text ?? "").trim();
@@ -2752,6 +2832,14 @@ export function App() {
         const clientMsgId =
           typeof evObj.client_msg_id === "string" && evObj.client_msg_id.trim()
             ? evObj.client_msg_id.trim()
+            : undefined;
+        const sourceLabel =
+          typeof evObj.source_label === "string" && evObj.source_label.trim()
+            ? evObj.source_label.trim()
+            : undefined;
+        const sourceSessionId =
+          typeof evObj.source_session_id === "string" && evObj.source_session_id.trim()
+            ? evObj.source_session_id.trim()
             : undefined;
         if (!text && imgs.length === 0) return;
         const parsedTs =
@@ -2826,6 +2914,8 @@ export function App() {
                 content: text,
                 images: imgs.length > 0 ? imgs : undefined,
                 client_msg_id: clientMsgId,
+                source_label: sourceLabel,
+                source_session_id: sourceSessionId,
                 seq: frameSeq,
               },
             ],
@@ -4075,6 +4165,7 @@ export function App() {
       overrideImages !== undefined
         ? []
         : pendingAttachments.filter((a) => a.isImage === false);
+    const attachedMeshRefs = overrideImages !== undefined ? [] : pendingMeshRefs;
     const rawTyped = (
       customText ??
       (draftsLatestRef.current[activeSession.id] ?? "")
@@ -4102,6 +4193,7 @@ export function App() {
       setFileMentionQuery(null);
       if (overrideImages === undefined) {
         setPendingAttachments([]);
+        setPendingMeshRefs([]);
       }
     }
 
@@ -4191,6 +4283,7 @@ export function App() {
             images: attachedPaths,
             mode: "queue",
             skill_path: skillPath ?? null,
+            context_refs: attachedMeshRefs,
           }),
         });
         if (qRes.ok) {
@@ -4506,6 +4599,7 @@ export function App() {
           mode: executionMode ?? null,
           skill_path: skillPath ?? null,
           client_msg_id: clientMsgId,
+          context_refs: attachedMeshRefs,
         }),
       });
 
@@ -7786,6 +7880,21 @@ export function App() {
                                     data-testid="user-message"
                                     className="group mt-2 mb-0.5 flex min-w-0 max-w-full flex-col items-end"
                                   >
+                                    {ev.source_label && (
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          if (ev.source_session_id) {
+                                            setActiveId(ev.source_session_id);
+                                            syncSessionEventsFromDaemon(ev.source_session_id);
+                                          }
+                                        }}
+                                        className="mb-1 inline-flex items-center gap-1 rounded-full border border-[var(--v-border-subtle)] bg-[var(--v-bg-surface)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--v-fg-secondary)] hover:border-[var(--v-border-strong)] cursor-pointer"
+                                      >
+                                        <span>🕸️</span>
+                                        <span>{ev.source_label}</span>
+                                      </button>
+                                    )}
                                     <div
                                       onDoubleClick={() => {
                                         const selected = window.getSelection()?.toString() ?? "";
@@ -7883,6 +7992,24 @@ export function App() {
 
                             {/* 2. Chronological Agent Turn Items (Consecutive Thinking + MCP/Tools grouped into collapsible Trace) */}
                             {turn.items.map((ev, idx) => {
+                              if (ev.kind === "mesh_invocation" && ev.mesh_invocation) {
+                                return (
+                                  <MeshInvocationCard
+                                    key={ev.id}
+                                    invocation={ev.mesh_invocation}
+                                    onJumpToSession={(targetSid) => {
+                                      setActiveId(targetSid);
+                                      syncSessionEventsFromDaemon(targetSid);
+                                    }}
+                                    onCancel={(invId) => {
+                                      void fetch(
+                                        `${daemonUrl}/api/mesh/invocations/${encodeURIComponent(invId)}/cancel`,
+                                        { method: "POST" }
+                                      ).catch(() => {});
+                                    }}
+                                  />
+                                );
+                              }
                               const isLastTurnItem = idx === turn.items.length - 1;
                               const isProcessStep = (item: AgentEvent) =>
                                 item.kind === "thinking" || item.kind === "tool_call";
@@ -8647,9 +8774,103 @@ export function App() {
                   );
                 })()}
 
-                {/* `@` Workspace File Mention Popover */}
-                {fileMentionQuery !== null && (
-                  <div className="v-glass-popover v-popover-in mb-2 max-h-[248px] overflow-y-auto rounded-2xl p-1.5">
+                {/* `@` Cross-Session / Workspace & File Mention Popover (Velo Mesh Mode A) */}
+                {fileMentionQuery !== null && (() => {
+                  const qLower = fileMentionQuery.trim().toLowerCase();
+                  const meshSessionHits = sessions
+                    .filter(
+                      (s) =>
+                        s.id !== activeSession.id &&
+                        !s.archived &&
+                        (!qLower ||
+                          s.title.toLowerCase().includes(qLower) ||
+                          s.project_path.toLowerCase().includes(qLower) ||
+                          s.branch_name.toLowerCase().includes(qLower))
+                    )
+                    .slice(0, 6);
+                  const meshRepoHits = repos
+                    .filter(
+                      (r) =>
+                        !qLower ||
+                        r.name.toLowerCase().includes(qLower) ||
+                        r.path.toLowerCase().includes(qLower)
+                    )
+                    .slice(0, 4);
+                  const addMeshRef = (ref: MeshContextRefDto) => {
+                    const originSid = activeSessionIdRef.current;
+                    setPendingMeshRefs((prev) => {
+                      if (prev.some((x) => x.kind === ref.kind && x.target_id === ref.target_id)) {
+                        return prev;
+                      }
+                      return [...prev, ref];
+                    }, originSid);
+                    setPrompt((cur) => cur.replace(/(^|\s)@[^\s@]*$/, "$1"), originSid);
+                    setFileMentionQuery(null);
+                  };
+                  return (
+                  <div className="v-glass-popover v-popover-in mb-2 max-h-[290px] overflow-y-auto rounded-2xl p-1.5">
+                    {(meshSessionHits.length > 0 || meshRepoHits.length > 0) && (
+                      <div className="mb-1.5 border-b border-[var(--v-border-subtle)] pb-1.5">
+                        <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
+                          <span>引用跨会话 / 项目上下文 (Velo Mesh)</span>
+                          <span className="font-mono text-[10px]">只读零唤醒</span>
+                        </div>
+                        {meshSessionHits.map((ms) => {
+                          const projName = ms.project_path.split("/").filter(Boolean).pop() || "workspace";
+                          return (
+                            <button
+                              key={`mesh-s-${ms.id}`}
+                              type="button"
+                              onClick={() =>
+                                addMeshRef({
+                                  kind: "session",
+                                  target_id: ms.id,
+                                  label: `${projName} · ${ms.title}`,
+                                })
+                              }
+                              className="v-press flex w-full items-center justify-between gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                            >
+                              <div className="flex min-w-0 items-center gap-2">
+                                <EngineBrandGlyph engine={ms.agent_kind} size={14} />
+                                <span className="truncate font-medium text-[var(--v-fg-primary)]">
+                                  {ms.title}
+                                </span>
+                              </div>
+                              <span className="shrink-0 rounded bg-[var(--v-bg-hover)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--v-fg-muted)]">
+                                {projName}
+                              </span>
+                            </button>
+                          );
+                        })}
+                        {meshRepoHits.map((mr) => (
+                          <button
+                            key={`mesh-w-${mr.path}`}
+                            type="button"
+                            onClick={() =>
+                              addMeshRef({
+                                kind: "workspace",
+                                target_id: mr.path,
+                                label: `项目 · ${mr.name}`,
+                              })
+                            }
+                            className="v-press flex w-full items-center justify-between gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-[var(--v-fg-body)] hover:bg-[var(--v-bg-hover)] cursor-pointer"
+                          >
+                            <div className="flex min-w-0 items-center gap-2">
+                              <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--v-fg-muted)]" />
+                              <span className="truncate font-medium text-[var(--v-fg-primary)]">
+                                {mr.name}
+                              </span>
+                              <span className="truncate font-mono text-[10.5px] text-[var(--v-fg-muted)]">
+                                {mr.path}
+                              </span>
+                            </div>
+                            <span className="shrink-0 font-mono text-[10px] text-[var(--v-fg-muted)]">
+                              文件夹
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     <div className="flex items-center justify-between px-2.5 py-1 text-[10.5px] font-medium text-[var(--v-fg-muted)]">
                       <span>
                         引用工作区文件 {fileMentionQuery ? `· "${fileMentionQuery}"` : "· 最近变更优先"}
@@ -8709,7 +8930,8 @@ export function App() {
                       })
                     )}
                   </div>
-                )}
+                  );
+                })()}
 
                 {/* Docked Neutral Frosted Queue Tray (Right above Composer Card) */}
                 <QueuedPromptsBar
@@ -8786,9 +9008,32 @@ export function App() {
                     }}
                   />
 
-                  {/* Pending Multimodal Image & File Attachments Strip (Per-Session Isolated) */}
-                  {(pendingAttachments.length > 0 || uploadingAttachment) && (
+                  {/* Pending Multimodal Image, File & Velo Mesh `@` Context Refs Strip */}
+                  {(pendingAttachments.length > 0 || pendingMeshRefs.length > 0 || uploadingAttachment) && (
                     <div className="mb-2.5 flex flex-wrap items-center gap-2">
+                      {pendingMeshRefs.map((refItem, refIdx) => (
+                        <div
+                          key={`mref-${refItem.kind}-${refItem.target_id}`}
+                          className="inline-flex max-w-[260px] items-center gap-1.5 rounded-lg border border-[var(--v-border-strong)] bg-[var(--v-bg-hover)] px-2.5 py-1 text-[11.5px] text-[var(--v-fg-primary)]"
+                        >
+                          <span className="text-[11px] opacity-80">
+                            {refItem.kind === "workspace" ? "📁" : "@"}
+                          </span>
+                          <span className="truncate font-medium">
+                            {refItem.label || refItem.target_id}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setPendingMeshRefs((prev) => prev.filter((_, i) => i !== refIdx))
+                            }
+                            title="移除跨会话引用"
+                            className="ml-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded text-[var(--v-fg-muted)] hover:text-[#f87171] cursor-pointer"
+                          >
+                            <X className="h-2.5 w-2.5" />
+                          </button>
+                        </div>
+                      ))}
                       {pendingAttachments.map((att, attIdx) =>
                         att.isImage !== false ? (
                           <div

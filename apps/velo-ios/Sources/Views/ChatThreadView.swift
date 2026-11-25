@@ -43,6 +43,8 @@ public struct ChatThreadView: View {
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var pendingImages: [PendingComposerImage] = []
     @State private var pendingFiles: [PendingComposerFile] = []
+    @State private var pendingMeshRefs: [VeloMeshContextRef] = []
+    @State private var showMeshMentionSheet: Bool = false
     @State private var showFileImporter: Bool = false
     @State private var forkDraft: ForkLaunchDraft? = nil
     @State private var annotatingImageId: UUID? = nil
@@ -304,6 +306,13 @@ public struct ChatThreadView: View {
             )
         ) {
             annotatorSheetView
+        }
+        .sheet(isPresented: $showMeshMentionSheet) {
+            VeloMeshMentionSheet(
+                store: store,
+                currentSessionId: sessionId,
+                selectedRefs: $pendingMeshRefs
+            )
         }
         .onChange(of: pickerItems) { _, newItems in
             guard !newItems.isEmpty else { return }
@@ -661,7 +670,8 @@ public struct ChatThreadView: View {
                 await store.requestMacCLILogin(provider: provider)
             },
             onRetry: retryTurnClosure(turn: turn, userTurnOrdinal: userTurnOrdinal),
-            onFork: forkTurnClosure(turn: turn, userTurnOrdinal: userTurnOrdinal)
+            onFork: forkTurnClosure(turn: turn, userTurnOrdinal: userTurnOrdinal),
+            onSwitchSession: onSwitchedSession
         )
         .id(turn.id)
     }
@@ -674,7 +684,7 @@ public struct ChatThreadView: View {
         let shouldScroll: Bool = {
             if !store.autoCollapseSteps { return true }
             switch lastEv.kind {
-            case .user, .assistant, .error:
+            case .user, .assistant, .meshInvocation, .error:
                 return true
             case .thinking, .toolCall:
                 return false
@@ -1429,6 +1439,39 @@ public struct ChatThreadView: View {
                 }
             }
 
+            if !pendingMeshRefs.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(pendingMeshRefs) { refItem in
+                            HStack(spacing: 5) {
+                                Image(systemName: refItem.kind == "workspace" ? "folder" : "at")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(refItem.label)
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Button {
+                                    withAnimation(VeloMotion.snappy) {
+                                        pendingMeshRefs.removeAll { $0.id == refItem.id }
+                                    }
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(tokens.elevated, in: Capsule())
+                            .overlay(Capsule().stroke(tokens.divider, lineWidth: 0.7))
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+            }
+
             TextField("向 \(cat.shortBadge) 发送指令或附图…", text: $draftPrompt, axis: .vertical)
                 .lineLimit(1...5)
                 .focused($composerFocused)
@@ -1464,6 +1507,21 @@ public struct ChatThreadView: View {
                 .buttonStyle(VeloPressableButtonStyle())
                 .disabled(pendingFiles.count >= 4)
                 .accessibilityLabel("附加本地文件")
+
+                // Velo Mesh Mode A: Reference Another Session or Workspace (`@`)
+                Button {
+                    VeloHaptics.tap()
+                    composerFocused = false
+                    showMeshMentionSheet = true
+                } label: {
+                    Image(systemName: "at")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(pendingMeshRefs.isEmpty ? Color.secondary : tokens.accentForeground)
+                        .frame(width: 31, height: 31)
+                        .background(pendingMeshRefs.isEmpty ? tokens.elevated : tokens.accent, in: Circle())
+                }
+                .buttonStyle(VeloPressableButtonStyle())
+                .accessibilityLabel("引用其他会话或项目上下文")
 
                 if UIPasteboard.general.hasImages && pendingImages.count < 4 {
                     Button {
@@ -1553,9 +1611,11 @@ public struct ChatThreadView: View {
                             Button {
                                 let toSend = composeFinalPrompt()
                                 let attached = uploadedPaths
+                                let meshRefs = pendingMeshRefs
                                 draftPrompt = ""
                                 pendingImages.removeAll()
                                 pendingFiles.removeAll()
+                                pendingMeshRefs.removeAll()
                                 composerFocused = false
                                 Task {
                                     await store.sendPrompt(
@@ -1564,7 +1624,8 @@ public struct ChatThreadView: View {
                                         model: selectedModelId,
                                         effort: selectedEffort,
                                         images: attached,
-                                        executionMode: "queue"
+                                        executionMode: "queue",
+                                        contextRefs: meshRefs
                                     )
                                 }
                             } label: {
@@ -1580,9 +1641,11 @@ public struct ChatThreadView: View {
                             Button {
                                 let toSend = composeFinalPrompt()
                                 let attached = uploadedPaths
+                                let meshRefs = pendingMeshRefs
                                 draftPrompt = ""
                                 pendingImages.removeAll()
                                 pendingFiles.removeAll()
+                                pendingMeshRefs.removeAll()
                                 composerFocused = false
                                 Task {
                                     await store.sendPrompt(
@@ -1591,7 +1654,8 @@ public struct ChatThreadView: View {
                                         model: selectedModelId,
                                         effort: selectedEffort,
                                         images: attached,
-                                        executionMode: "steer"
+                                        executionMode: "steer",
+                                        contextRefs: meshRefs
                                     )
                                 }
                             } label: {
@@ -1632,9 +1696,11 @@ public struct ChatThreadView: View {
                         }
                         let toSend = composeFinalPrompt()
                         let attached = uploadedPaths
+                        let meshRefs = pendingMeshRefs
                         draftPrompt = ""
                         pendingImages.removeAll()
                         pendingFiles.removeAll()
+                        pendingMeshRefs.removeAll()
                         composerFocused = false
                         Task {
                             await store.sendPrompt(
@@ -1642,7 +1708,8 @@ public struct ChatThreadView: View {
                                 text: toSend,
                                 model: selectedModelId,
                                 effort: selectedEffort,
-                                images: attached
+                                images: attached,
+                                contextRefs: meshRefs
                             )
                         }
                     } label: {
@@ -1911,6 +1978,7 @@ private struct TurnBlockView: View {
     let onRequestMacLogin: (String) async -> Bool
     let onRetry: (() -> Void)?
     let onFork: (() -> Void)?
+    let onSwitchSession: ((String) -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -2031,6 +2099,26 @@ private struct TurnBlockView: View {
                 let shouldShowText = !cleanUserText.isEmpty && !(cleanUserText == "请查看附图" && !userImages.isEmpty)
 
                 VStack(alignment: .trailing, spacing: 7) {
+                    if let srcLabel = userEv.sourceLabel, !srcLabel.isEmpty {
+                        Button {
+                            if let srcSid = userEv.sourceSessionId, !srcSid.isEmpty {
+                                VeloHaptics.tap()
+                                onSwitchSession?(srcSid)
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.triangle.branch")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                Text(srcLabel)
+                                    .font(.system(size: 10.5, weight: .medium))
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3.5)
+                            .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
                     if !parsedFilesAndBody.files.isEmpty {
                         HStack {
                             Spacer(minLength: 42)
@@ -2167,6 +2255,19 @@ private struct TurnBlockView: View {
                                 StreamingCursorDot()
                             }
                         }
+
+                    case .meshInvocation(let inv):
+                        VeloMeshInvocationCardView(
+                            invocation: inv,
+                            onJumpToSession: { targetSid in
+                                VeloHaptics.tap()
+                                onSwitchSession?(targetSid)
+                            },
+                            onCancel: { invId in
+                                VeloHaptics.warning()
+                                Task { await store.cancelMeshInvocation(invId) }
+                            }
+                        )
 
                     case .error(let isAuthRequired, let provider, let loginCommand, let authURL):
                         AgentErrorBannerView(

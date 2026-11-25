@@ -14,6 +14,7 @@
 		3D1D5B782183B9D7E501EA24 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = E7494E1C76CB80854A3CFA09 /* Assets.xcassets */; };
 		43C9F9C5CA2C460BEB9DF8A0 /* VeloModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B23793B28F46BDB8C60A104 /* VeloModels.swift */; };
 		50FFA3CFDF1E34DD3EA7133E /* ShimmerAndStatusViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = E13A632532CFAE5CC49E17CB /* ShimmerAndStatusViews.swift */; };
+		52C70D7BFD6835E20EC0B58A /* VeloMeshViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000ED97D5C3A839C6A081D03 /* VeloMeshViews.swift */; };
 		66FFAD59E86DAA8A5D79E025 /* ChatThreadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D828B8E5BF84F0E2643BE12B /* ChatThreadView.swift */; };
 		767F27888C59D51418FB6A3E /* VeloCliSessionsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71E30A64F2D5609BA9178BD4 /* VeloCliSessionsSheet.swift */; };
 		8B43636C1DD169FBE665CA6C /* VeloLiveActivityExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FEF16B141B3999FF30C8FA64 /* VeloLiveActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -55,6 +56,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		000ED97D5C3A839C6A081D03 /* VeloMeshViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloMeshViews.swift; sourceTree = "<group>"; };
 		14C8D1BD1B3B97824D03CE80 /* VeloDesignPrimitives.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloDesignPrimitives.swift; sourceTree = "<group>"; };
 		1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootSessionsView.swift; sourceTree = "<group>"; };
 		2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloImageAnnotatorSheet.swift; sourceTree = "<group>"; };
@@ -101,6 +103,7 @@
 				14C8D1BD1B3B97824D03CE80 /* VeloDesignPrimitives.swift */,
 				5B395313F2BB29A1BBB02080 /* VeloExtensionsAndCheckpointsSheet.swift */,
 				2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */,
+				000ED97D5C3A839C6A081D03 /* VeloMeshViews.swift */,
 				65545A09614BDAE26A8F7653 /* VeloRemoteHostsSheet.swift */,
 			);
 			path = Views;
@@ -288,6 +291,7 @@
 				1AA085EC7F1192220BCBBD17 /* VeloExtensionsAndCheckpointsSheet.swift in Sources */,
 				B77B9C130A452EF84106382D /* VeloImageAnnotatorSheet.swift in Sources */,
 				B9E4D72382735CFC1DFE9F31 /* VeloLiveActivityManager.swift in Sources */,
+				52C70D7BFD6835E20EC0B58A /* VeloMeshViews.swift in Sources */,
 				C4B831DBDF9BB144D624EEE3 /* VeloMobileApp.swift in Sources */,
 				43C9F9C5CA2C460BEB9DF8A0 /* VeloModels.swift in Sources */,
 				3C2C377806E4507B74A17A15 /* VeloRemoteHostsSheet.swift in Sources */,

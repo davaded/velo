@@ -408,14 +408,58 @@ export interface VeloSession {
   updated_at: string;
 }
 
+export interface MeshContextRefDto {
+  kind: "session" | "workspace" | "room";
+  target_id: string;
+  label?: string;
+}
+
+export interface MeshInvocationDto {
+  id: string;
+  caller_session_id: string;
+  caller_session_name: string;
+  caller_provider: string;
+  caller_repo_root: string;
+  callee_session_id?: string | null;
+  callee_session_name: string;
+  callee_provider: string;
+  callee_repo_root: string;
+  root_invocation_id: string;
+  depth: number;
+  call_chain?: string[];
+  kind: "read" | "ask" | "spawn";
+  prompt: string;
+  status:
+    | "pending_approval"
+    | "queued"
+    | "running"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "timed_out";
+  result_summary?: string | null;
+  diff_stats?: {
+    files_changed: number;
+    insertions: number;
+    deletions: number;
+    modified_files: string[];
+  } | null;
+  error?: string | null;
+  created_at: string;
+  completed_at?: string | null;
+}
+
 export interface AgentEvent {
   id: string;
   session_id: string;
   timestamp: string;
-  kind: "user" | "thinking" | "tool_call" | "assistant";
+  kind: "user" | "thinking" | "tool_call" | "assistant" | "mesh_invocation";
   content: string;
   images?: string[];
   client_msg_id?: string;
+  source_session_id?: string;
+  source_label?: string;
+  mesh_invocation?: MeshInvocationDto;
   seq?: number;
   is_streaming_chunk?: boolean;
   tool_name?: string;
