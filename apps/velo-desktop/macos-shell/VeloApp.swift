@@ -341,6 +341,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.name == "windowDrag", let event = NSApp.currentEvent {
             window.performDrag(with: event)
+        } else if message.name == "windowZoom" {
+            window.performZoom(nil)
         } else if message.name == "windowTheme", let mode = message.body as? String {
             switch mode {
             case "light":
@@ -352,6 +354,70 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             default:
                 window.appearance = nil
             }
+        }
+    }
+
+    // Align native macOS traffic lights symmetrically (14px inset, vertically centered in 40px header)
+    // without attaching an NSToolbar that would steal clicks from WKWebView top-bar buttons.
+    private func layoutTrafficLights() {
+        guard let window = window else { return }
+        if window.styleMask.contains(.fullScreen) { return }
+        let types: [NSWindow.ButtonType] = [.closeButton, .miniaturizeButton, .zoomButton]
+        let leftInset: CGFloat = 14.0
+        let pitch: CGFloat = 20.0
+        let headerCenterY: CGFloat = 20.0
+
+        for (index, buttonType) in types.enumerated() {
+            guard let btn = window.standardWindowButton(buttonType),
+                  let container = btn.superview
+            else { continue }
+            var f = btn.frame
+            f.origin.x = leftInset + CGFloat(index) * pitch
+            if container.isFlipped {
+                f.origin.y = round(headerCenterY - f.size.height / 2.0)
+            } else {
+                f.origin.y = round(container.bounds.height - headerCenterY - f.size.height / 2.0)
+            }
+            btn.setFrameOrigin(f.origin)
+        }
+    }
+
+    private func syncFullscreenState(_ isFullScreen: Bool) {
+        let jsVal = isFullScreen ? "true" : "false"
+        evalWebJS("""
+            window.__VELO_FULLSCREEN__ = \(jsVal);
+            window.dispatchEvent(new CustomEvent('velo-fullscreen-change', { detail: \(jsVal) }));
+        """)
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        layoutTrafficLights()
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        layoutTrafficLights()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        layoutTrafficLights()
+    }
+
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        syncFullscreenState(true)
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        syncFullscreenState(true)
+    }
+
+    func windowWillExitFullScreen(_ notification: Notification) {
+        syncFullscreenState(false)
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        syncFullscreenState(false)
+        DispatchQueue.main.async { [weak self] in
+            self?.layoutTrafficLights()
         }
     }
 
@@ -388,13 +454,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
         let contentController = WKUserContentController()
         contentController.add(self, name: "windowDrag")
+        contentController.add(self, name: "windowZoom")
         contentController.add(self, name: "windowTheme")
         let scriptSource = """
         window.__VELO_MACOS_APP__ = true;
+        window.__VELO_FULLSCREEN__ = false;
         window.addEventListener('mousedown', function(e) {
           if (e.button !== 0) return;
           if (e.target && e.target.closest && e.target.closest('button, input, textarea, a, select')) return;
           if (e.target && e.target.closest && e.target.closest('[data-tauri-drag-region]')) {
+            if (e.detail === 2) {
+              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.windowZoom) {
+                window.webkit.messageHandlers.windowZoom.postMessage('zoom');
+              }
+              return;
+            }
             if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.windowDrag) {
               window.webkit.messageHandlers.windowDrag.postMessage('drag');
             }
@@ -420,6 +494,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         }
 
         window.makeKeyAndOrderFront(nil)
+        layoutTrafficLights()
+        DispatchQueue.main.async { [weak self] in
+            self?.layoutTrafficLights()
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 

@@ -782,6 +782,18 @@ export function App() {
       window.location.search.includes("desktop=1")
     );
   });
+  const [isMacFullScreen, setIsMacFullScreen] = useState<boolean>(() => {
+    const w = window as unknown as Record<string, unknown>;
+    return Boolean(w.__VELO_FULLSCREEN__);
+  });
+  useEffect(() => {
+    const onFsChange = (e: Event) => {
+      const ce = e as CustomEvent<boolean>;
+      setIsMacFullScreen(Boolean(ce.detail));
+    };
+    window.addEventListener("velo-fullscreen-change", onFsChange);
+    return () => window.removeEventListener("velo-fullscreen-change", onFsChange);
+  }, []);
 
   const [variant, setVariant] = useState<VariantId>(() => {
     const saved = safeStorageGet("velo.variant");
@@ -6031,32 +6043,19 @@ export function App() {
         }`}
       >
         <div className="flex flex-1 flex-col overflow-hidden">
-          {/* Top Window Bar + Sidebar Toggle (Draggable for macOS Tauri Overlay Titlebar) */}
+          {/* Top Window Bar (40px native-aligned with macOS traffic lights; toggle sits cleanly on right edge) */}
           <div
             data-tauri-drag-region
-            className={`flex h-[42px] shrink-0 items-center justify-between pr-3 ${
-              isMacDesktop ? "pl-[78px]" : "pl-3"
+            className={`flex h-[40px] shrink-0 items-center justify-end px-2.5 ${
+              isMacDesktop && !isMacFullScreen ? "pl-[78px]" : "pl-2.5"
             }`}
           >
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setSidebarOpen(false)}
-                title="Hide sidebar (⌘B)"
-                className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
-              >
-                <PanelLeft className="h-4 w-4" />
-              </button>
-              <span className="text-[13px] font-semibold tracking-tight text-[var(--v-fg-primary)]">
-                Velo
-              </span>
-            </div>
-
             <button
-              onClick={() => handleQuickNewThread()}
-              title="New thread (⌘N)"
-              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-secondary)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)]"
+              onClick={() => setSidebarOpen(false)}
+              title="隐藏侧边栏 (⌘B)"
+              className="v-press flex h-7 w-7 items-center justify-center rounded-md text-[var(--v-fg-muted)] transition-colors hover:bg-[var(--v-bg-hover)] hover:text-[var(--v-fg-primary)] cursor-pointer"
             >
-              <SquarePen className="h-4 w-4" />
+              <PanelLeft className="h-4 w-4" />
             </button>
           </div>
 
@@ -6658,11 +6657,11 @@ export function App() {
           2. MAIN WORKSPACE AREA (Clean Header + Natural Conversation + Docked Composer)
          ===================================================================== */}
       <div className="flex flex-1 flex-col overflow-hidden bg-[var(--v-bg-canvas)]">
-        {/* Clean Minimal Workspace Header (42px, container-query responsive so narrow windows never squish or wrap) */}
+        {/* Clean Minimal Workspace Header (40px aligned with macOS traffic lights, auto-collapses left inset in fullscreen) */}
         <header
           data-tauri-drag-region
-          className={`@container flex h-[42px] shrink-0 items-center justify-between gap-2 border-b border-[var(--v-border-subtle)] pr-3 ${
-            isMacDesktop && !sidebarOpen ? "pl-[78px]" : "pl-3.5"
+          className={`@container flex h-[40px] shrink-0 items-center justify-between gap-2 border-b border-[var(--v-border-subtle)] pr-3 transition-[padding] duration-150 ${
+            isMacDesktop && !sidebarOpen && !isMacFullScreen ? "pl-[78px]" : "pl-3.5"
           }`}
         >
           <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">

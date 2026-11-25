@@ -10671,18 +10671,19 @@ composer-2.5 - Composer 2.5
         assert!(forked_evs.iter().all(|e| e.session_id() == forked.id));
 
         // 3. Cross-engine handoff of that forked session preserves BOTH the title AND cloned conversation events!
+        // Uses a POSIX built-in (`true`) so this test runs deterministically in CI without external agent CLIs.
         let handed = state
             .handoff_session(
                 forked.id,
                 HandoffSessionRequest {
-                    target_provider: AgentProvider::Antigravity,
+                    target_provider: AgentProvider::Custom("true".to_string()),
                     model: Some("gemini-4-neon".to_string()),
                     effort: Some("high".to_string()),
                     additional_instructions: None,
                 },
             )
             .await?;
-        assert_eq!(handed.name, "Fork · 先帮我部署到商店吧 · AGY");
+        assert_eq!(handed.name, "Fork · 先帮我部署到商店吧 · Agent");
         assert_eq!(handed.repo_root, ws_path);
         let handed_evs = {
             let g = state.inner.read().await;
