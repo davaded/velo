@@ -1,50 +1,150 @@
-# ⚡ Velo
+<div align="center">
+  <img src="docs/assets/velo-icon.png" alt="Velo" width="84" height="84" />
+  <h1>Velo</h1>
+  <p>
+    <strong>Run parallel AI coding agents in isolated Git worktrees —<br/>and control every session from your Mac or iPhone over zero-trust E2EE.</strong>
+  </p>
 
-**Local-First Multi-Agent Coding Workspace & Zero-Trust Blind E2EE Mobile Companion**
+  <p>
+    <a href="https://github.com/davaded/velo/actions/workflows/ci.yml"><img src="https://github.com/davaded/velo/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <a href="https://github.com/davaded/velo/releases"><img src="https://img.shields.io/github/v/release/davaded/velo?display_name=tag&sort=semver" alt="Release" /></a>
+    <a href="https://github.com/davaded/velo/stargazers"><img src="https://img.shields.io/github/stars/davaded/velo?style=flat" alt="Stars" /></a>
+    <img src="https://img.shields.io/badge/macOS_14%2B_%7C_iOS_17%2B-Native-111113" alt="Platforms" />
+    <a href="#license"><img src="https://img.shields.io/badge/License-MIT%20%2F%20Apache--2.0-blue" alt="License" /></a>
+  </p>
 
-[![Rust](https://img.shields.io/badge/Rust-2024%20Edition-orange?logo=rust)](https://www.rust-lang.org/)
-[![React](https://img.shields.io/badge/React-19%20%2B%20Tailwind%20v4-61DAFB?logo=react)](https://react.dev/)
-[![macOS](https://img.shields.io/badge/macOS-Native%20WKWebView-000000?logo=apple)](./scripts/build-macos-app.sh)
-[![iOS](https://img.shields.io/badge/iOS%2017%2B-SwiftUI%20%2B%20ActivityKit-0A84FF?logo=swift)](./apps/velo-ios)
-[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+  <p>
+    <strong>English</strong> · <a href="./README.zh-CN.md">简体中文</a>
+  </p>
 
-Velo is a blazing-fast, local-first control plane for orchestrating parallel AI coding agents across isolated Git worktrees—paired with a native macOS `WKWebView` desktop app (`Velo.app`) and an end-to-end encrypted SwiftUI iOS companion (`VeloMobile`).
-
----
-
-## ✨ Highlights
-
-### 🤖 Multi-Engine Orchestration & Worktree Isolation
-- **Unified Native Drivers**: Run **Claude Code**, **OpenAI Codex (`app-server`)**, **Google Antigravity (`agy` ACP)**, **Cursor Agent CLI**, **xAI Grok CLI**, and custom ACP/PTY runtimes side-by-side.
-- **Git Worktree Automation**: Provision isolated worktrees per thread with automatic `.env` / dependency syncing and unified diff inspection (including untracked text files, empty-HEAD repos, and committed feature branches).
-- **Composable Agent Workflows**: Built-in **Context Handoff** across engines, **Architect Advisor** diff review, parallel **Committee** racing, self-healing **TDD Verification Loops**, and a stdio **MCP Server** (`velo mcp`).
-
-### 🧭 Calm, Engine-Aware Execution UX
-- **Minimalist Interleaved Action Stream**: Chronological prose interleaved with borderless inline status lines (`✦ Thinking · 14s >`, `🔍 Checking branch ancestry · 8s >`) across Desktop and iOS, keeping focus on reasoning and results.
-- **Native macOS Desktop Craft**: Three switchable surface materials (*Flat Matte*, *Frosted Glass*, *Elevated Specular*), Light/Dark/System themes + Tone presets, `⌘K` Command Palette, Master-Detail Settings (`⌘,`), keyboard-first approval (`Enter` / `A` / `Esc`) and question (`1–9`) cards, queued prompts bar, and clickable `file://` editor links.
-
-### 📊 Subscription Quotas, Real-Time Telemetry & Official API Billing
-- **Live Subscription Quota Windows**: Tracks real-time `5h / 7d / 30d` rate-limit windows (Antigravity & Cursor) with a recessed sidebar telemetry card, opaque portal breakdown popover, and full modal view.
-- **Server-Side Telemetry & Billing Engine**: Authoritative `tok/s` measurement (excluding CLI cold-boot, prefill TTFT, and tool-execution pauses), prompt cache hit rate, cumulative-snapshot deduplication, and per-model API-equivalent cost breakdowns with hot-reloadable overrides at `~/.velo/pricing.json`.
-
-### 🔐 Zero-Trust Blind E2EE Mobile Companion (`VeloMobile`)
-- **2-Second QR Pairing**: `X25519` ECDH + forward-secret ephemeral ratchet + `ChaCha20-Poly1305` AEAD with exponential-backoff reconnection. The relay (`velo-relay`) routes opaque ciphertext frames and never sees prompts, code, or screenshots.
-- **Tiered Encrypted Attachments**: Send and inspect screenshots between Mac and iOS (`800px` instant preview + `2200px` pinch-to-zoom HD) directly through the blind E2EE tunnel—no third-party cloud storage.
-- **Mobile Git, PRs & Zero-Plaintext Wakeup Push**: Inspect unified diffs, Commit & Push, open/merge GitHub PRs with CI status, track Live Activities, and receive zero-plaintext lock-screen notifications via Bark or Webhook.
-
-### 🗄️ Resilient Local Storage
-- **SQLite WAL Persistence (`~/.velo/velo.db`)**: `O(1)` incremental event writes, WAL startup truncation, cursor pagination for 1,000+ step threads, rotating daemon logs, and instant cross-workspace full-text search.
+  <p>
+    <a href="#why-velo">Why Velo</a> ·
+    <a href="#supported-engines">Engines</a> ·
+    <a href="#quick-start">Quick Start</a> ·
+    <a href="#workflows">Workflows</a> ·
+    <a href="#security-model">Security</a> ·
+    <a href="#architecture">Architecture</a>
+  </p>
+</div>
 
 ---
 
-## 🏗️ Architecture
+## Why Velo?
+
+Most coding-agent UIs force a trade-off: stay locked into a single vendor, juggle messy terminal tabs on one Git branch, or hand your source code to a cloud proxy just to check progress from your phone.
+
+Velo takes a **local-first, zero-trust** approach:
+
+- **Bring your own subscriptions** — No token markups and no cloud middleware. Velo drives the coding CLIs already authenticated on your Mac (**Claude Code**, **Codex**, **Antigravity**, **Cursor**, **Grok**, or any ACP/PTY agent).
+- **True parallelism without branch chaos** — Every thread runs in an isolated Git worktree (with `.env` synced automatically), paired with unified diff review, one-click commits, and GitHub PR creation.
+- **Walk away from your desk, stay in control** — Pair your iPhone in 2 seconds via QR code. Approve tool calls, inspect HD screenshots and diffs, watch iOS Live Activities, and receive zero-plaintext lock-screen wakeups while the relay sees only `ChaCha20-Poly1305` ciphertext.
+- **Calm, native craft** — A Rust daemon (`tokio` + `axum` + SQLite WAL) powers a lightweight macOS `WKWebView` app and a native SwiftUI iOS app, complete with minimalist inline execution traces (`✦ Thinking · 14s >`), live subscription quota windows (`5h / 7d / 30d`), and transparent API-equivalent billing.
+
+---
+
+## Supported Engines
+
+| Engine | Runtime / Protocol | Live Quotas | Worktree & Diff | Mobile E2EE |
+| :--- | :--- | :---: | :---: | :---: |
+| **Claude Code** | Native streaming CLI | — | ✅ | ✅ |
+| **OpenAI Codex** | `codex app-server` | — | ✅ | ✅ |
+| **Google Antigravity** | `agy` ACP | ✅ `5h` / `7d` | ✅ | ✅ |
+| **Cursor Agent** | `cursor-agent` CLI | ✅ `30d` | ✅ | ✅ |
+| **xAI Grok** | Grok CLI | — | ✅ | ✅ |
+| **Custom Agents** | Generic ACP / `portable-pty` | — | ✅ | ✅ |
+
+---
+
+## Quick Start
+
+### Option 1 — Download macOS App (Apple Silicon)
+
+Grab the latest prebuilt `Velo-macOS-arm64.dmg` from [GitHub Releases](https://github.com/davaded/velo/releases), drag **Velo.app** to `/Applications`, and launch.
+
+### Option 2 — Build from Source
+
+**Prerequisites:** macOS 14+, Rust (edition 2024), Node.js 22+ & `pnpm 9+`, and at least one authenticated coding CLI (`claude`, `codex`, `agy`, `cursor-agent`, or `grok`).
+
+```bash
+git clone https://github.com/davaded/velo.git
+cd velo
+
+# Build React UI, release Rust daemon/CLI, and native macOS WKWebView bundle,
+# install to /Applications/Velo.app, and sync the macOS LaunchAgent (~/.velo)
+./scripts/build-macos-app.sh
+open /Applications/Velo.app
+```
+
+### Option 3 — Pair the Native iOS Companion (`VeloMobile`)
+
+Requires Xcode 16+ and [XcodeGen](https://github.com/yonaskolb/XcodeGen).
+
+```bash
+# Run in iOS Simulator
+./scripts/run-ios-simulator.sh
+
+# Or build, sign, and wirelessly install to your paired iPhone
+./scripts/install-ios-device.sh
+```
+
+Click **Pair Mobile** in `Velo.app` (or run `velo pair`) and scan the QR code from `VeloMobile`. Works over LAN or any self-hosted blind relay.
+
+---
+
+## Workflows
+
+### Desktop & Mobile Experience
+- **Minimalist Execution Stream**: Clean interleaved prose and single-line live trace indicators (`✦ Thinking · 14s >`, `🔍 Checking branch ancestry · 8s >`) without noisy nested boxes.
+- **Keyboard-First Productivity**: `⌘K` Command Palette, `⌘,` Master-Detail Settings, `Enter` / `A` / `Esc` approval shortcuts, `1–9` quick-select questions, queued prompts, clickable `file://` editor links, and 3 surface materials (*Flat Matte*, *Frosted Glass*, *Elevated Specular*).
+- **Real Telemetry & Honest Billing**: Live `tok/s` (excluding cold-boot, prefill TTFT, and tool wait), prompt cache hit rate, cumulative-snapshot deduplication, real-time `5h / 7d / 30d` subscription quota cards, and per-model API-equivalent cost breakdowns.
+
+### Multi-Agent CLI Orchestration
+Every desktop capability is backed by the `velo` CLI and an embedded stdio **MCP server**:
+
+```bash
+# Run an agent in an isolated Git worktree
+velo run "Add integration tests for OAuth refresh" --agent codex
+
+# Hand off a worktree and conversation context to another engine
+velo handoff <session-id> --to claude
+
+# Spin up an independent reviewer agent on an active diff
+velo advisor <session-id> --agent codex
+
+# Race multiple engines in parallel worktrees on the same task
+velo committee "Refactor SQL query planner" --agents claude,codex
+
+# Run a self-healing TDD loop until tests pass
+velo loop "Fix flaky checkout tests" --check "cargo test" --agent claude
+
+# Expose Velo orchestration tools over stdio MCP
+velo mcp
+```
+
+---
+
+## Security Model
+
+Velo's remote mobile control is built as a **zero-trust blind relay**:
+
+| Layer | Design |
+| :--- | :--- |
+| **Key Exchange** | Out-of-band QR code (`X25519` ECDH + forward-secret ephemeral ratchet) |
+| **Frame Encryption** | Every RPC message, diff, and image is sealed with `ChaCha20-Poly1305` AEAD before leaving your Mac or iPhone |
+| **Blind Relay** | `velo-relay` (or the Cloudflare Durable Object worker) forwards opaque ciphertext frames only—it never sees keys, prompts, source code, or screenshots |
+| **Encrypted Attachments** | Screenshots travel directly over the E2EE channel in tiered resolutions (`800px` preview + `2200px` pinch-to-zoom HD) with zero third-party cloud storage |
+| **Blind Push Wakeups** | Optional Bark / Webhook notifications send zero-plaintext wakeup signals (`velo://session/…`) so push providers never see conversation titles or content |
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart LR
     subgraph Clients["Clients"]
         Mac["Velo.app\n(macOS WKWebView + React 19)"]
         iOS["VeloMobile\n(iOS 17+ SwiftUI + ActivityKit)"]
-        CLI["velo CLI / MCP Server"]
+        CLI["velo CLI & MCP Server"]
     end
 
     subgraph Transport["Transport"]
@@ -53,9 +153,9 @@ flowchart LR
     end
 
     subgraph Core["velo-daemon (Rust · Tokio · Axum)"]
-        Supervisor["Session Supervisor & Telemetry / Pricing Engine"]
-        DB[("~/.velo/velo.db\n(SQLite WAL)")]
-        WT["velo-worktree\n(Git Worktree & Diff Engine)"]
+        Supervisor["Session Supervisor · Telemetry · Pricing · Quotas"]
+        DB[("~/.velo/velo.db\n(SQLite WAL + FTS)")]
+        WT["velo-worktree\n(Git Worktrees & Diffs)"]
         Agents["velo-agent\n(Claude · Codex · AGY · Cursor · Grok · PTY)"]
     end
 
@@ -69,102 +169,55 @@ flowchart LR
 
 ---
 
-## 📦 Workspace Layout
+## Reference & Self-Hosting
 
-| Path | Description |
-| :--- | :--- |
-| `crates/velo-protocol` | Unified `AgentEvent` stream protocol, session DTOs, and WebSocket/RPC envelopes |
-| `crates/velo-worktree` | Git worktree provisioning, `.env` / `node_modules` syncing, and unified diff engine |
-| `crates/velo-agent` | Native streaming drivers for Claude, Codex `app-server`, ACP (`agy`), Cursor, Grok, and `portable-pty` |
-| `crates/velo-daemon` | Axum control plane, SQLite WAL store, TPS/pricing/quota engines, Git/PR automation, blind push, and E2EE bridge |
-| `crates/velo-relay` | Standalone zero-trust blind WebSocket relay server and QR pairing ticket generator |
-| `crates/velo-cli` | Single-binary `velo` CLI with embedded daemon, MCP server, and macOS `LaunchAgent` manager |
-| `apps/velo-desktop` | React 19 + Tailwind CSS v4 desktop UI and native Swift `WKWebView` macOS shell (`Velo.app`) |
-| `apps/velo-ios` | Native iOS 17+ SwiftUI companion (`XcodeGen` project + WidgetKit Live Activities) |
-| `deploy/cloudflare-blind-relay` | Cloudflare Workers Durable Object deployment for a serverless zero-trust blind relay |
-| `scripts/` | Build, iOS deploy/simulator, and Cloudflare/VPS relay deployment automation scripts |
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-- **macOS 14+** (for `Velo.app` and `LaunchAgent` integration)
-- **Rust** toolchain (`cargo`, edition 2024)
-- **Node.js 20+** & **pnpm** (for `apps/velo-desktop`)
-- **Xcode 16+** & **XcodeGen** (optional, for `apps/velo-ios`)
-- At least one installed coding agent CLI (`claude`, `codex`, `agy`, `cursor-agent`, or `grok`)
-
-### 1. Build & Install macOS Desktop App (`Velo.app`)
-Builds the React UI, release Rust daemon/CLI, and native Swift `WKWebView` wrapper, installs into `/Applications/Velo.app`, and syncs the background macOS `LaunchAgent` (`~/.velo`):
+<details>
+<summary><strong>Full CLI Reference</strong></summary>
 
 ```bash
-./scripts/build-macos-app.sh
-open /Applications/Velo.app
+velo up [--foreground]                # Start background daemon on 127.0.0.1:6767
+velo status                           # Check daemon health and workspace summary
+velo service <install|status|restart|uninstall>  # Manage macOS LaunchAgent
+velo ps                               # List sessions and Git worktree states
+velo logs <session> [--follow]        # Stream structured session events
+velo diff <session>                   # Inspect live unified diff for a worktree
+velo stop <session>                   # Stop a running session
+velo pair [--relay <url>]             # Print E2EE pairing ticket & terminal QR
+velo relay [--listen 0.0.0.0:6768]    # Run a local blind E2EE WebSocket relay
+velo ios [--device <udid>]            # Build, sign & wirelessly install VeloMobile
 ```
 
-### 2. CLI & Background Daemon
-```bash
-cargo build --release -p velo-cli
+</details>
 
-# Start daemon (or manage always-on macOS LaunchAgent)
-./target/release/velo up
-./target/release/velo service install   # status | restart | uninstall
-
-# Orchestrate sessions from the terminal
-./target/release/velo run "Add integration tests for auth" --agent codex
-./target/release/velo ps
-./target/release/velo diff <session-id>
-./target/release/velo logs <session-id> --follow
-
-# Multi-agent workflows
-./target/release/velo handoff <session-id> --to claude
-./target/release/velo advisor <session-id> --agent codex
-./target/release/velo committee "Refactor parser" --agents claude,codex
-./target/release/velo loop "Fix failing tests" --check "cargo test" --agent claude
-
-# Expose Velo as a stdio MCP server
-./target/release/velo mcp
-```
-
-### 3. Build & Pair Native iOS Companion (`VeloMobile`)
-```bash
-# Run on iOS Simulator
-./scripts/run-ios-simulator.sh
-
-# Or build, sign, and wirelessly install onto your paired iPhone
-./scripts/install-ios-device.sh
-# (equivalent: ./target/release/velo ios)
-```
-Then open **Pair Mobile** in `Velo.app` (or run `velo pair`) and scan the **E2EE QR Code** from `VeloMobile`.
-
-### 4. Deploy Your Own Zero-Trust Blind Relay (Optional)
-For remote access outside your LAN, deploy the blind ciphertext relay to Cloudflare Workers or any VPS:
+<details>
+<summary><strong>Self-Hosted Blind Relay Deployment (Cloudflare Workers / VPS)</strong></summary>
 
 ```bash
-# Option A: Cloudflare Workers (Durable Objects)
+# Option A: Serverless Cloudflare Workers (Durable Objects)
 ./scripts/deploy-cloudflare-relay.sh
 
-# Option B: Self-hosted Linux VPS (systemd + velo-relay)
+# Option B: Linux VPS with systemd + velo-relay
 ./scripts/deploy-vps-relay.sh
 
-# Option C: Run locally
-./target/release/velo relay --listen 0.0.0.0:6768
+# Option C: Local / Tailscale relay
+velo relay --listen 0.0.0.0:6768
 ```
 
----
+</details>
 
-## ⚙️ Configuration & Local Data
+<details>
+<summary><strong>Local Data & Hot-Reloadable Custom Pricing (<code>~/.velo/pricing.json</code>)</strong></summary>
 
-All local state stays strictly on your machine under `~/.velo/`:
+All state is stored locally under `~/.velo/`:
 
 | Path | Purpose |
 | :--- | :--- |
-| `~/.velo/velo.db` | SQLite WAL database (sessions, events, usage metrics, FTS search index) |
-| `~/.velo/pricing.json` | Optional custom per-model API pricing overrides (hot-reloaded automatically on save) |
-| `~/.velo/logs/` | Rotating daemon stdout/stderr logs |
+| `~/.velo/velo.db` | SQLite WAL store (sessions, incremental events, usage metrics, FTS search) |
+| `~/.velo/pricing.json` | Optional per-model USD / 1M token overrides (hot-reloaded on save) |
+| `~/.velo/logs/` | Rotating daemon logs |
 
-Example `~/.velo/pricing.json` override:
+Example `~/.velo/pricing.json`:
+
 ```json
 {
   "my-custom-model": {
@@ -176,23 +229,45 @@ Example `~/.velo/pricing.json` override:
 }
 ```
 
----
+</details>
 
-## 🧪 Development & Testing
+<details>
+<summary><strong>Workspace Layout & Development Commands</strong></summary>
+
+| Path | Responsibility |
+| :--- | :--- |
+| `crates/velo-protocol` | Unified `AgentEvent` protocol, session DTOs, and RPC envelopes |
+| `crates/velo-worktree` | Git worktree provisioning, `.env` syncing, and unified diff engine |
+| `crates/velo-agent` | Native streaming drivers for Claude, Codex, AGY, Cursor, Grok, and PTY |
+| `crates/velo-daemon` | Axum control plane, SQLite WAL, telemetry/pricing/quotas, PR automation, E2EE bridge |
+| `crates/velo-relay` | Zero-trust blind WebSocket relay and QR pairing generator |
+| `crates/velo-cli` | Single-binary `velo` CLI, MCP server, and macOS `LaunchAgent` manager |
+| `apps/velo-desktop` | React 19 + Tailwind CSS v4 UI + native Swift `WKWebView` shell |
+| `apps/velo-ios` | Native iOS 17+ SwiftUI app and WidgetKit Live Activities |
+| `deploy/cloudflare-blind-relay` | Cloudflare Workers Durable Object blind relay |
 
 ```bash
-# Run Rust workspace unit tests
-cargo test -p velo-agent -p velo-daemon -p velo-worktree
+# Run all Rust workspace tests
+cargo test --workspace
 
-# Desktop frontend dev server & type-check
-cd apps/velo-desktop
-pnpm install
-pnpm dev       # Vite HMR against local velo-daemon on :6767
-pnpm build     # tsc && vite build
+# Desktop UI dev server with HMR against local daemon (:6767)
+cd apps/velo-desktop && pnpm install && pnpm dev
+
+# Type-check & production build
+cd apps/velo-desktop && pnpm build
 ```
+
+</details>
 
 ---
 
-## 📄 License
+## Contributing
 
-Licensed under either of **Apache License, Version 2.0** or **MIT License** at your option.
+Contributions, issues, and feature ideas are welcome!
+
+- For human contributors, run `cargo test --workspace` and `pnpm build` in `apps/velo-desktop` before opening a PR.
+- For AI coding assistants working in this repository, see [AGENTS.md](./AGENTS.md) for exact build commands, workspace rules, and WKWebView performance guardrails.
+
+## License
+
+Dual-licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT License](https://opensource.org/licenses/MIT) at your option.
