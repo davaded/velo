@@ -30,6 +30,7 @@ public struct ChatThreadView: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject private var appearance = VeloAppearanceSettings.shared
     @State private var draftPrompt: String = ""
     @State private var selectedModelId: String = "claude-fable-5-2"
     @State private var selectedEffort: String = "medium"
@@ -1005,46 +1006,45 @@ public struct ChatThreadView: View {
         }
     }
 
+    private var tokens: VeloPaletteTokens {
+        VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
+    }
+
     private var emptyThreadHero: some View {
         let cat = session?.engineCategory ?? activeModelOption.category
-        return ZStack {
-            VeloDotGridBackground(accent: cat.accentColor)
-                .frame(height: 280)
+        return VStack(spacing: 13) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(tokens.surface)
+                    .frame(width: 64, height: 64)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(tokens.border, lineWidth: 0.9)
+                    )
+                VeloBrandIcon(category: cat, size: 28, colored: true)
+            }
 
-            VStack(spacing: 13) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .fill(VeloTheme.cardSurface(colorScheme))
-                        .frame(width: 64, height: 64)
-                        .veloSurface(cornerRadius: 20, aura: cat.accentColor)
-                        .veloBorderBeam(active: true, accent: cat.accentColor, cornerRadius: 20, lineWidth: 1.15, duration: 4.6)
-                    Image(systemName: cat.iconName)
-                        .font(.system(size: 25, weight: .semibold))
-                        .foregroundStyle(cat.accentColor)
-                }
+            Text(activeModelOption.cleanTitle)
+                .font(.system(size: 17, weight: .bold))
 
-                Text(activeModelOption.cleanTitle)
-                    .font(.system(size: 17, weight: .bold))
-
-                if session?.parentSessionId != nil {
-                    Text("已从前序会话无缝接力。输入下一条指令，\(cat.title) 将自动携带前序上下文与文件变更继续处理。")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .lineSpacing(3)
-                        .padding(.horizontal, 24)
-                } else {
-                    Text("当前绑定 \(cat.title) 引擎，归属项目 `\(session?.projectName ?? "velo")`。在下方输入指令即可开始。")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .lineSpacing(3)
-                        .padding(.horizontal, 24)
-                }
+            if session?.parentSessionId != nil {
+                Text("已从前序会话无缝接力。输入下一条指令，\(cat.title) 将自动携带前序上下文与文件变更继续处理。")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .padding(.horizontal, 24)
+            } else {
+                Text("当前绑定 \(cat.title) 引擎，归属项目 `\(session?.projectName ?? "velo")`。在下方输入指令即可开始。")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .padding(.horizontal, 24)
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.top, 36)
+        .padding(.top, 56)
     }
 
     private var latestTurnLooksLikePlan: Bool {
@@ -1097,16 +1097,15 @@ public struct ChatThreadView: View {
                     .padding(.horizontal, 12.5)
                     .padding(.vertical, 7.5)
                     .background(VeloTheme.emerald, in: Capsule())
-                    .overlay(VeloShimmerSweepOverlay(cornerRadius: 999, period: 3.2))
                 }
                 .buttonStyle(VeloPressableButtonStyle(scale: 0.96))
             }
             .padding(.horizontal, 13)
             .padding(.vertical, 10.5)
-            .veloSurface(cornerRadius: 15, aura: VeloTheme.emerald)
+            .veloSurface(cornerRadius: 15)
             .overlay(
                 RoundedRectangle(cornerRadius: 15, style: .continuous)
-                    .stroke(VeloTheme.emerald.opacity(0.35), lineWidth: 0.9)
+                    .stroke(VeloTheme.emerald.opacity(0.32), lineWidth: 0.85)
             )
         }
     }
@@ -1484,13 +1483,11 @@ public struct ChatThreadView: View {
 
                 // Categorized Model & Handoff Sheet Trigger
                 Button {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    VeloHaptics.tap()
                     showModelSheet = true
                 } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: cat.iconName)
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(cat.accentColor)
+                    HStack(spacing: 5.5) {
+                        VeloBrandIcon(category: cat, size: 13, colored: true)
 
                         Text(activeModelOption.cleanTitle)
                             .font(.system(size: 11.5, weight: .semibold))
@@ -1501,12 +1498,12 @@ public struct ChatThreadView: View {
                             .font(.system(size: 8.5, weight: .bold))
                             .foregroundStyle(.tertiary)
                     }
-                    .padding(.horizontal, 9)
+                    .padding(.horizontal, 9.5)
                     .padding(.vertical, 6)
-                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                    .background(tokens.elevated, in: Capsule())
                     .overlay(
                         Capsule()
-                            .stroke(cat.accentColor.opacity(0.28), lineWidth: 0.75)
+                            .stroke(tokens.divider, lineWidth: 0.75)
                     )
                 }
                 .buttonStyle(VeloPressableButtonStyle())
@@ -1651,25 +1648,17 @@ public struct ChatThreadView: View {
                     } label: {
                         if isUploadingAny {
                             ProgressView()
-                                .tint(VeloTheme.accentVioletSoft)
+                                .tint(tokens.accentText)
                                 .frame(width: 34, height: 34)
-                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
+                                .background(tokens.elevated, in: Circle())
                         } else {
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 14.5, weight: .bold))
-                                .foregroundStyle(canSend ? .white : .secondary.opacity(0.55))
+                                .foregroundStyle(canSend ? tokens.accentForeground : Color.secondary.opacity(0.55))
                                 .contentTransition(.symbolEffect(.replace))
                                 .frame(width: 34, height: 34)
                                 .background(
-                                    canSend
-                                        ? AnyShapeStyle(
-                                            LinearGradient(
-                                                colors: [VeloTheme.accentViolet, cat.accentColor],
-                                                startPoint: .topLeading,
-                                                endPoint: .bottomTrailing
-                                            )
-                                        )
-                                        : AnyShapeStyle(VeloTheme.elevatedSurface(colorScheme)),
+                                    canSend ? tokens.accent : tokens.elevated,
                                     in: Circle()
                                 )
                         }
@@ -1686,35 +1675,20 @@ public struct ChatThreadView: View {
                 .fill(.ultraThinMaterial)
                 .overlay(
                     RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .fill(VeloTheme.cardSurface(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.82))
+                        .fill(tokens.surface.opacity(colorScheme == .dark ? 0.78 : 0.86))
                 )
         }
         .overlay(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .stroke(
                     composerFocused
-                        ? AnyShapeStyle(cat.accentColor.opacity(0.48))
-                        : AnyShapeStyle(VeloTheme.specularRim(colorScheme)),
-                    lineWidth: composerFocused ? 1.2 : 0.95
+                        ? tokens.accent.opacity(0.45)
+                        : (isSessionRunning ? VeloTheme.emerald.opacity(0.42) : tokens.border),
+                    lineWidth: composerFocused ? 1.15 : 0.85
                 )
         )
-        .veloBorderBeam(
-            active: isSessionRunning,
-            accent: cat.accentColor,
-            cornerRadius: 22,
-            lineWidth: 1.35,
-            duration: 3.6
-        )
-        .animation(VeloMotion.smooth, value: isSessionRunning)
+        .animation(VeloMotion.snappy, value: isSessionRunning)
         .animation(VeloMotion.snappy, value: composerFocused)
-        .shadow(
-            color: composerFocused
-                ? cat.accentColor.opacity(colorScheme == .dark ? 0.22 : 0.14)
-                : Color.black.opacity(colorScheme == .dark ? 0.36 : 0.08),
-            radius: composerFocused ? 18 : 13,
-            x: 0,
-            y: 5
-        )
         .padding(.horizontal, 12)
         .padding(.top, 6)
         .padding(.bottom, 8)
@@ -1734,6 +1708,11 @@ private struct ModelAndHandoffSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var appearance = VeloAppearanceSettings.shared
+
+    private var tokens: VeloPaletteTokens {
+        VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
+    }
 
     private var currentCategory: VeloEngineCategory {
         session?.engineCategory ?? .claude
@@ -1749,7 +1728,7 @@ private struct ModelAndHandoffSheet: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                VeloTheme.canvas(colorScheme)
+                tokens.canvas
                     .ignoresSafeArea()
 
                 ScrollView {
@@ -1767,7 +1746,7 @@ private struct ModelAndHandoffSheet: View {
                                     ForEach(currentModelEfforts, id: \.self) { lv in
                                         let isSel = (currentModelOpt?.alignedEffort(from: selectedEffort) ?? selectedEffort) == lv
                                         Button {
-                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                            VeloHaptics.selection()
                                             selectedEffort = lv
                                             if let curOpt = currentModelOpt {
                                                 onSelectInPlace(curOpt, lv)
@@ -1775,16 +1754,16 @@ private struct ModelAndHandoffSheet: View {
                                         } label: {
                                             Text(lv.uppercased())
                                                 .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                                .foregroundStyle(isSel ? .white : .secondary)
+                                                .foregroundStyle(isSel ? tokens.accentForeground : .secondary)
                                                 .frame(maxWidth: .infinity)
                                                 .padding(.vertical, 8)
                                                 .background(
-                                                    isSel ? currentCategory.accentColor : VeloTheme.cardSurface(colorScheme),
+                                                    isSel ? tokens.accent : tokens.surface,
                                                     in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                                                 )
                                                 .overlay(
                                                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: isSel ? 0 : 0.8)
+                                                        .stroke(tokens.divider, lineWidth: isSel ? 0 : 0.8)
                                                 )
                                         }
                                         .buttonStyle(VeloPressableButtonStyle())
@@ -1807,7 +1786,7 @@ private struct ModelAndHandoffSheet: View {
                                     if requiresHandoff {
                                         Text("携上下文新建会话 ↗")
                                             .font(.system(size: 11, weight: .semibold))
-                                            .foregroundStyle(VeloTheme.accentVioletSoft)
+                                            .foregroundStyle(tokens.accentText)
                                     } else if isSameEngine && isEngineBound {
                                         Text("当前绑定引擎 · 无损切换")
                                             .font(.system(size: 11, weight: .semibold))
@@ -1831,7 +1810,7 @@ private struct ModelAndHandoffSheet: View {
                                     ForEach(group.models) { m in
                                         let isCurrent = m.id == selectedModelId && !requiresHandoff
                                         Button {
-                                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                            VeloHaptics.medium()
                                             let eff = m.alignedEffort(from: selectedEffort)
                                             dismiss()
                                             if requiresHandoff {
@@ -1841,6 +1820,12 @@ private struct ModelAndHandoffSheet: View {
                                             }
                                         } label: {
                                             HStack(spacing: 10) {
+                                                ZStack {
+                                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                        .fill(tokens.elevated)
+                                                        .frame(width: 30, height: 30)
+                                                    VeloBrandIcon(category: group.category, size: 15, colored: true)
+                                                }
                                                 VStack(alignment: .leading, spacing: 2.5) {
                                                     HStack(spacing: 6) {
                                                         Text(m.cleanTitle)
@@ -1849,10 +1834,10 @@ private struct ModelAndHandoffSheet: View {
                                                         if m.isDefault {
                                                             Text("默认")
                                                                 .font(.system(size: 9.5, weight: .bold))
-                                                                .foregroundStyle(group.category.accentColor)
+                                                                .foregroundStyle(tokens.accentText)
                                                                 .padding(.horizontal, 5.5)
                                                                 .padding(.vertical, 1.5)
-                                                                .background(group.category.accentColor.opacity(0.14), in: Capsule())
+                                                                .background(tokens.accentSoft, in: Capsule())
                                                         }
                                                     }
                                                     Text(m.cleanSubtitle)
@@ -1870,26 +1855,22 @@ private struct ModelAndHandoffSheet: View {
                                                 } else if requiresHandoff {
                                                     Text("↗ 接力")
                                                         .font(.system(size: 11.5, weight: .semibold))
-                                                        .foregroundStyle(VeloTheme.accentVioletSoft)
+                                                        .foregroundStyle(tokens.accentText)
                                                         .padding(.horizontal, 8)
                                                         .padding(.vertical, 4)
-                                                        .background(VeloTheme.accentViolet.opacity(0.13), in: Capsule())
+                                                        .background(tokens.accentSoft, in: Capsule())
                                                 }
                                             }
-                                            .padding(.horizontal, 13)
+                                            .padding(.horizontal, 12)
                                             .padding(.vertical, 10)
                                             .background(
-                                                isCurrent
-                                                    ? group.category.accentColor.opacity(0.1)
-                                                    : VeloTheme.cardSurface(colorScheme),
+                                                isCurrent ? tokens.elevated : tokens.surface,
                                                 in: RoundedRectangle(cornerRadius: 13, style: .continuous)
                                             )
                                             .overlay(
                                                 RoundedRectangle(cornerRadius: 13, style: .continuous)
                                                     .stroke(
-                                                        isCurrent
-                                                            ? group.category.accentColor.opacity(0.5)
-                                                            : VeloTheme.hairline(colorScheme),
+                                                        isCurrent ? tokens.accent.opacity(0.55) : tokens.divider,
                                                         lineWidth: isCurrent ? 1.15 : 0.8
                                                     )
                                             )
@@ -3017,9 +2998,11 @@ private struct FencedCodeCardView: View {
     let language: String
     let code: String
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var appearance = VeloAppearanceSettings.shared
     @State private var copied = false
     @State private var wrapLines = false
     @State private var expanded = false
+    @State private var highlightedCode: AttributedString? = nil
 
     private static let collapseLineThreshold = 28
 
@@ -3039,18 +3022,16 @@ private struct FencedCodeCardView: View {
     }
 
     var body: some View {
+        let tokens = VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
         let totalLines = codeLines.count
-        let highlighted = VeloCodeSyntaxHighlighter.highlight(
-            displayedCode,
-            language: language,
-            colorScheme: colorScheme
-        )
+        let highlighted = highlightedCode ?? AttributedString(displayedCode)
+        let highlightKey = "\(colorScheme == .dark)|\(language)|\(displayedCode.hashValue)|\(displayedCode.count)"
 
         VStack(alignment: .leading, spacing: 0) {
             // Header: Language + Line count + Wrap toggle + Copy↔Check morph
             HStack(spacing: 7) {
                 Circle()
-                    .fill(VeloTheme.accentVioletSoft.opacity(0.8))
+                    .fill(tokens.accentText.opacity(0.75))
                     .frame(width: 6, height: 6)
 
                 Text(language.isEmpty ? "code" : language.lowercased())
@@ -3062,7 +3043,7 @@ private struct FencedCodeCardView: View {
                     .foregroundStyle(.tertiary)
                     .padding(.horizontal, 5.5)
                     .padding(.vertical, 1.5)
-                    .background(VeloTheme.elevatedSurface(colorScheme).opacity(0.8), in: Capsule())
+                    .background(tokens.elevated, in: Capsule())
 
                 Spacer()
 
@@ -3074,10 +3055,10 @@ private struct FencedCodeCardView: View {
                 } label: {
                     Image(systemName: wrapLines ? "text.alignleft" : "arrow.right.to.line")
                         .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(wrapLines ? VeloTheme.accentVioletSoft : .secondary)
+                        .foregroundStyle(wrapLines ? tokens.accentText : .secondary)
                         .frame(width: 24, height: 22)
                         .background(
-                            wrapLines ? VeloTheme.accentViolet.opacity(0.14) : VeloTheme.elevatedSurface(colorScheme),
+                            wrapLines ? tokens.accentSoft : tokens.elevated,
                             in: Capsule()
                         )
                 }
@@ -3087,7 +3068,7 @@ private struct FencedCodeCardView: View {
                 Button {
                     UIPasteboard.general.string = code
                     VeloHaptics.success()
-                    withAnimation(VeloMotion.bouncy) {
+                    withAnimation(VeloMotion.snappy) {
                         copied = true
                     }
                     Task {
@@ -3108,7 +3089,7 @@ private struct FencedCodeCardView: View {
                     .padding(.horizontal, 7.5)
                     .padding(.vertical, 3.5)
                     .background(
-                        copied ? VeloTheme.emerald.opacity(0.14) : VeloTheme.elevatedSurface(colorScheme),
+                        copied ? VeloTheme.emerald.opacity(0.14) : tokens.elevated,
                         in: Capsule()
                     )
                 }
@@ -3116,10 +3097,10 @@ private struct FencedCodeCardView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 7.5)
-            .background(VeloTheme.codeHeader(colorScheme))
+            .background(tokens.codeHeader)
 
             Rectangle()
-                .fill(VeloTheme.hairline(colorScheme))
+                .fill(tokens.divider)
                 .frame(height: 0.75)
 
             Group {
@@ -3154,23 +3135,30 @@ private struct FencedCodeCardView: View {
                         Text(expanded ? "收起代码" : "展开全部 \(totalLines) 行")
                             .font(.system(size: 11.5, weight: .semibold))
                     }
-                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                    .foregroundStyle(tokens.accentText)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
-                    .background(VeloTheme.codeHeader(colorScheme).opacity(0.75))
+                    .background(tokens.codeHeader)
                 }
                 .buttonStyle(.plain)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            VeloTheme.codeSurface(colorScheme),
+            tokens.codeBg,
             in: RoundedRectangle(cornerRadius: 14, style: .continuous)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.9)
+                .stroke(tokens.divider, lineWidth: 0.85)
         )
+        .task(id: highlightKey) {
+            highlightedCode = await VeloCodeSyntaxHighlighter.highlightAsync(
+                displayedCode,
+                language: language,
+                isDark: colorScheme == .dark
+            )
+        }
     }
 }
 
@@ -3492,14 +3480,16 @@ private struct ApprovalPromptCard: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
                     .background(VeloTheme.emerald, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                    .overlay(VeloShimmerSweepOverlay(cornerRadius: 11, period: 3.0))
                 }
                 .buttonStyle(VeloPressableButtonStyle(scale: 0.965))
             }
         }
         .padding(14)
-        .veloSurface(cornerRadius: 16, aura: VeloTheme.amber)
-        .veloBorderBeam(active: true, accent: VeloTheme.amber, cornerRadius: 16, lineWidth: 1.35, duration: 2.6)
+        .veloSurface(cornerRadius: 16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(VeloTheme.amber.opacity(0.45), lineWidth: 1.0)
+        )
         .transition(.opacity.combined(with: .scale(scale: 0.96)).combined(with: .move(edge: .bottom)))
     }
 }
@@ -3508,13 +3498,15 @@ private struct QuestionPromptCard: View {
     let prompt: PendingQuestionPrompt
     let onSubmit: ([String]) -> Void
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var appearance = VeloAppearanceSettings.shared
 
     var body: some View {
+        let tokens = VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 7) {
                 Image(systemName: "questionmark.bubble.fill")
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                    .foregroundStyle(tokens.accentText)
                 Text(prompt.question)
                     .font(.system(size: 14, weight: .semibold))
             }
@@ -3527,9 +3519,9 @@ private struct QuestionPromptCard: View {
                     HStack(spacing: 9) {
                         Text("\(idx + 1)")
                             .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                            .foregroundStyle(VeloTheme.accentVioletSoft)
+                            .foregroundStyle(tokens.accentText)
                             .frame(width: 20, height: 20)
-                            .background(VeloTheme.accentViolet.opacity(0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .background(tokens.accentSoft, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                         Text(opt)
                             .font(.system(size: 13.5, weight: .medium))
                             .foregroundStyle(.primary)
@@ -3540,18 +3532,21 @@ private struct QuestionPromptCard: View {
                             .foregroundStyle(.tertiary)
                     }
                     .padding(11)
-                    .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .background(tokens.elevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.75)
+                            .stroke(tokens.divider, lineWidth: 0.75)
                     )
                 }
                 .buttonStyle(VeloPressableButtonStyle(scale: 0.975))
             }
         }
         .padding(14)
-        .veloSurface(cornerRadius: 16, aura: VeloTheme.accentViolet)
-        .veloBorderBeam(active: true, accent: VeloTheme.accentVioletSoft, cornerRadius: 16, lineWidth: 1.2, duration: 3.6)
+        .veloSurface(cornerRadius: 16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(tokens.border, lineWidth: 0.95)
+        )
         .transition(.opacity.combined(with: .scale(scale: 0.96)).combined(with: .move(edge: .bottom)))
     }
 }

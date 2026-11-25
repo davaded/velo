@@ -67,8 +67,7 @@ export function resolveEngineBrandMeta(engine?: string | null): EngineBrandMeta 
 }
 
 /**
- * Offline, zero-dependency official-style vector marks inspired by `lobehub/lobe-icons`.
- * Crisp at 12px–20px on Retina displays in both monochrome (unselected) and illuminated brand color (selected).
+ * Official vendor vector marks from `lobehub/lobe-icons` (offline, zero-dependency).
  */
 export const EngineBrandGlyph: React.FC<{
   engine?: string | null;
@@ -81,168 +80,77 @@ export const EngineBrandGlyph: React.FC<{
 
   switch (meta.key) {
     case "claude":
-      // Anthropic Claude 12-ray starburst mark
       return (
-        <svg
-          width={size}
-          height={size}
-          viewBox="0 0 24 24"
-          fill="none"
-          className={className}
-          aria-hidden="true"
-        >
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
           <path
-            d="M12 2.2L13.35 8.35L17.9 3.9L15.1 9.55L21.3 8.9L16.1 12.1L21.7 15.1L15.4 14.55L18.1 20.1L13.45 15.75L12 21.8L10.55 15.75L5.9 20.1L8.6 14.55L2.3 15.1L7.9 12.1L2.7 8.9L8.9 9.55L6.1 3.9L10.65 8.35L12 2.2Z"
+            d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"
             fill={colored ? meta.color : "currentColor"}
           />
         </svg>
       );
 
     case "codex":
-      // OpenAI 6-petal interlocking blossom mark
       return (
-        <svg
-          width={size}
-          height={size}
-          viewBox="0 0 24 24"
-          fill="none"
-          className={className}
-          aria-hidden="true"
-        >
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
           <path
-            d="M21.2 10.1a5.4 5.4 0 0 0-.47-4.46 5.5 5.5 0 0 0-5.91-2.64 5.42 5.42 0 0 0-4.08-1.82 5.5 5.5 0 0 0-5.24 3.8 5.42 5.42 0 0 0-3.62 2.63 5.5 5.5 0 0 0 .68 6.45 5.4 5.4 0 0 0 .47 4.46 5.5 5.5 0 0 0 5.91 2.64 5.42 5.42 0 0 0 4.08 1.82 5.5 5.5 0 0 0 5.24-3.8 5.42 5.42 0 0 0 3.62-2.63 5.5 5.5 0 0 0-.68-6.45ZM13.02 21.1a4.08 4.08 0 0 1-2.62-.95l.13-.07 4.35-2.51a.72.72 0 0 0 .36-.62v-6.13l1.84 1.06a.07.07 0 0 1 .04.05v5.08a4.1 4.1 0 0 1-4.1 4.09Zm-8.81-3.76a4.07 4.07 0 0 1-.49-2.74l.13.08 4.35 2.51a.7.7 0 0 0 .71 0l5.31-3.07v2.12a.07.07 0 0 1-.03.06l-4.4 2.54a4.1 4.1 0 0 1-5.58-1.5Zm-1.15-9.5A4.08 4.08 0 0 1 5.2 6.04v5.18a.7.7 0 0 0 .35.61l5.31 3.06-1.84 1.06a.07.07 0 0 1-.07 0l-4.4-2.54a4.1 4.1 0 0 1-1.49-5.57Zm15.1 3.51-5.31-3.07 1.84-1.06a.07.07 0 0 1 .07 0l4.4 2.54a4.1 4.1 0 0 1-.64 7.39v-5.19a.7.7 0 0 0-.36-.61Zm1.83-2.75-.13-.08-4.35-2.51a.7.7 0 0 0-.71 0L9.5 9.08V6.96a.07.07 0 0 1 .03-.06l4.4-2.54a4.1 4.1 0 0 1 6.06 4.24ZM8.48 12.66 6.64 11.6a.07.07 0 0 1-.04-.05V6.47a4.1 4.1 0 0 1 6.72-3.14l-.13.07-4.35 2.51a.72.72 0 0 0-.36.62v6.13Zm1-2.16 2.36-1.36 2.36 1.36v2.72l-2.36 1.36-2.36-1.36V10.5Z"
+            fillRule="evenodd"
+            d="M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z"
             fill={colored ? meta.color : "currentColor"}
           />
         </svg>
       );
 
     case "agy":
-      // Google Gemini / Antigravity smooth 4-point spark mark
       return (
-        <svg
-          width={size}
-          height={size}
-          viewBox="0 0 24 24"
-          fill="none"
-          className={className}
-          aria-hidden="true"
-        >
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
           {colored && (
             <defs>
-              <linearGradient id={gradId} x1="3" y1="3" x2="21" y2="21" gradientUnits="userSpaceOnUse">
-                <stop offset="0%" stopColor="#4E86F8" />
-                <stop offset="55%" stopColor="#7C6BF5" />
-                <stop offset="100%" stopColor="#B56CE2" />
+              <linearGradient id={gradId} x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stopColor="#3186FF" />
+                <stop offset="55%" stopColor="#5B93FA" />
+                <stop offset="100%" stopColor="#7C6BF5" />
               </linearGradient>
             </defs>
           )}
           <path
-            d="M12 2C12.35 7.45 16.55 11.65 22 12C16.55 12.35 12.35 16.55 12 22C11.65 16.55 7.45 12.35 2 12C7.45 11.65 11.65 7.45 12 2Z"
+            d="M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z"
             fill={colored ? `url(#${gradId})` : "currentColor"}
           />
         </svg>
       );
 
     case "cursor":
-      // Cursor isometric 3D cube/prism mark
       return (
-        <svg
-          width={size}
-          height={size}
-          viewBox="0 0 24 24"
-          fill="none"
-          className={className}
-          aria-hidden="true"
-        >
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
           <path
-            d="M12 2.25L20.5 7.15V16.85L12 21.75L3.5 16.85V7.15L12 2.25Z"
-            stroke={colored ? meta.color : "currentColor"}
-            strokeWidth="1.75"
-            strokeLinejoin="round"
-            fill={colored ? "rgba(167, 139, 250, 0.16)" : "none"}
-          />
-          <path
-            d="M12 2.25L20.5 7.15L12 12L3.5 7.15L12 2.25Z"
+            fillRule="evenodd"
+            d="M22.106 5.68L12.5.135a.998.998 0 00-.998 0L1.893 5.68a.84.84 0 00-.419.726v11.186c0 .3.16.577.42.727l9.607 5.547a.999.999 0 00.998 0l9.608-5.547a.84.84 0 00.42-.727V6.407a.84.84 0 00-.42-.726zm-.603 1.176L12.228 22.92c-.063.108-.228.064-.228-.061V12.34a.59.59 0 00-.295-.51l-9.11-5.26c-.107-.062-.063-.228.062-.228h18.55c.264 0 .428.286.296.514z"
             fill={colored ? meta.color : "currentColor"}
-            fillOpacity={colored ? 0.35 : 0.22}
-          />
-          <path
-            d="M12 12V21.75M12 12L20.5 7.15M12 12L3.5 7.15"
-            stroke={colored ? meta.color : "currentColor"}
-            strokeWidth="1.6"
-            strokeLinecap="round"
-            strokeLinejoin="round"
           />
         </svg>
       );
 
     case "grok":
-      // xAI Grok orbital slash mark
       return (
-        <svg
-          width={size}
-          height={size}
-          viewBox="0 0 24 24"
-          fill="none"
-          className={className}
-          aria-hidden="true"
-        >
-          <circle
-            cx="12"
-            cy="12"
-            r="7.5"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeOpacity={colored ? 0.92 : 0.85}
-          />
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
           <path
-            d="M5.5 18.5L18.5 5.5"
-            stroke="currentColor"
-            strokeWidth="2.2"
-            strokeLinecap="round"
+            fillRule="evenodd"
+            d="M9.27 15.29l7.978-5.897c.391-.29.95-.177 1.137.272.98 2.369.542 5.215-1.41 7.169-1.951 1.954-4.667 2.382-7.149 1.406l-2.711 1.257c3.889 2.661 8.611 2.003 11.562-.953 2.341-2.344 3.066-5.539 2.388-8.42l.006.007c-.983-4.232.242-5.924 2.75-9.383.06-.082.12-.164.179-.248l-3.301 3.305v-.01L9.267 15.292M7.623 16.723c-2.792-2.67-2.31-6.801.071-9.184 1.761-1.763 4.647-2.483 7.166-1.425l2.705-1.25a7.808 7.808 0 00-1.829-1A8.975 8.975 0 005.984 5.83c-2.533 2.536-3.33 6.436-1.962 9.764 1.022 2.487-.653 4.246-2.34 6.022-.599.63-1.199 1.259-1.682 1.925l7.62-6.815"
+            fill="currentColor"
           />
         </svg>
       );
 
     default:
-      // Generic ACP / Terminal mark
       return (
-        <svg
-          width={size}
-          height={size}
-          viewBox="0 0 24 24"
-          fill="none"
-          className={className}
-          aria-hidden="true"
-        >
-          <rect
-            x="3.5"
-            y="4.5"
-            width="17"
-            height="15"
-            rx="3.5"
-            stroke={colored ? meta.color : "currentColor"}
-            strokeWidth="1.8"
-          />
-          <path
-            d="M8 10L11 12.5L8 15M13 15H16"
-            stroke={colored ? meta.color : "currentColor"}
-            strokeWidth="1.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className} aria-hidden="true">
+          <rect x="3.5" y="4.5" width="17" height="15" rx="3.5" stroke={colored ? meta.color : "currentColor"} strokeWidth="1.8" />
+          <path d="M8 10L11 12.5L8 15M13 15H16" stroke={colored ? meta.color : "currentColor"} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       );
   }
 };
 
-/**
- * Bare, refined engine mark for sidebar thread rows:
- * - Zero heavy box/border around the icon (matches the calm matte monochrome sidebar & composer pill).
- * - Unselected: quiet low-contrast monochrome glyph; gently brightens on hover.
- * - Selected: cleanly illuminates in official brand color.
- * - Live status (running / waiting / unread) is decoupled via clean spinner or subtle corner dot.
- */
 export const EngineSessionBadge: React.FC<{
   engine?: string | null;
   selected?: boolean;

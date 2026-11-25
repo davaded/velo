@@ -16,6 +16,11 @@ public struct VeloAnalyticsHubSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var appearance = VeloAppearanceSettings.shared
+
+    private var tokens: VeloPaletteTokens {
+        VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
+    }
 
     @State private var selectedTab: HubTab
     @State private var searchQuery: String = ""
@@ -163,16 +168,13 @@ public struct VeloAnalyticsHubSheet: View {
                 }
 
                 ForEach(Array(subscriptionCards.enumerated()), id: \.element.id) { idx, card in
-                    let accent = VeloQuotaPalette.accent(for: card.provider)
                     VStack(alignment: .leading, spacing: 11) {
                         HStack(spacing: 9) {
                             ZStack {
                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(accent.opacity(0.14))
+                                    .fill(tokens.elevated)
                                     .frame(width: 28, height: 28)
-                                Image(systemName: VeloQuotaPalette.icon(for: card.provider))
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(accent)
+                                VeloBrandIcon(provider: card.provider, size: 15, colored: true)
                             }
                             Text(card.label)
                                 .font(.system(size: 14, weight: .bold))
@@ -182,16 +184,17 @@ public struct VeloAnalyticsHubSheet: View {
                                 .foregroundStyle(.secondary)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 3)
-                                .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                                .background(tokens.elevated, in: Capsule())
                         }
 
                         Rectangle()
-                            .fill(VeloTheme.hairline(colorScheme))
+                            .fill(tokens.divider)
                             .frame(height: 0.7)
 
                         VStack(alignment: .leading, spacing: 10) {
                             ForEach(card.windows) { w in
                                 let rem = max(0, min(100, w.remainingPercent))
+                                let barColor = VeloQuotaPalette.ringColor(for: card.provider, status: w.status, tokens: tokens, isFirst: idx == 0)
                                 VStack(alignment: .leading, spacing: 5) {
                                     HStack {
                                         Text(w.label)
@@ -207,9 +210,9 @@ public struct VeloAnalyticsHubSheet: View {
                                     GeometryReader { geo in
                                         ZStack(alignment: .leading) {
                                             Capsule()
-                                                .fill(VeloTheme.elevatedSurface(colorScheme))
+                                                .fill(tokens.elevated)
                                             Capsule()
-                                                .fill(VeloQuotaPalette.gradient(for: card.provider, status: w.status))
+                                                .fill(barColor)
                                                 .frame(width: max(6, geo.size.width * CGFloat(rem / 100.0)))
                                                 .animation(VeloMotion.smooth, value: rem)
                                         }
@@ -237,8 +240,7 @@ public struct VeloAnalyticsHubSheet: View {
                         }
                     }
                     .padding(14)
-                    .veloSurface(cornerRadius: 16, aura: accent)
-                    .veloStaggerAppear(index: idx)
+                    .veloSurface(cornerRadius: 16)
                 }
 
                 if !otherCards.isEmpty {
@@ -246,9 +248,7 @@ public struct VeloAnalyticsHubSheet: View {
                         HStack(spacing: 8) {
                             ForEach(otherCards) { card in
                                 HStack(spacing: 6) {
-                                    Image(systemName: VeloQuotaPalette.icon(for: card.provider))
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundStyle(card.mode == "api_key" ? VeloQuotaPalette.accent(for: card.provider) : .secondary)
+                                    VeloBrandIcon(provider: card.provider, size: 13, colored: card.mode == "api_key")
                                     Text(card.label)
                                         .font(.system(size: 11.5, weight: .semibold))
                                         .foregroundStyle(.primary)
@@ -352,11 +352,12 @@ public struct VeloAnalyticsHubSheet: View {
 
                 ForEach(a.byProvider) { b in
                     HStack(spacing: 10) {
-                        Image(systemName: VeloQuotaPalette.icon(for: b.key))
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(VeloQuotaPalette.accent(for: b.key))
-                            .frame(width: 26, height: 26)
-                            .background(VeloQuotaPalette.accent(for: b.key).opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(tokens.elevated)
+                                .frame(width: 28, height: 28)
+                            VeloBrandIcon(provider: b.key, size: 15, colored: true)
+                        }
                         VStack(alignment: .leading, spacing: 2.5) {
                             Text(b.label)
                                 .font(.system(size: 13.5, weight: .bold, design: .monospaced))
@@ -372,7 +373,7 @@ public struct VeloAnalyticsHubSheet: View {
                             if b.avgTps > 0 {
                                 Text(String(format: "%.1f tok/s", b.avgTps))
                                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(VeloTheme.accentVioletSoft)
+                                    .foregroundStyle(tokens.accentText)
                                     .contentTransition(.numericText())
                             }
                         }
@@ -601,10 +602,10 @@ public struct VeloAnalyticsHubSheet: View {
             } label: {
                 Label("保存配置", systemImage: "checkmark")
                     .font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(tokens.accentForeground)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 11)
-                    .background(VeloTheme.accentViolet, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .background(tokens.accent, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
             .buttonStyle(VeloPressableButtonStyle())
         }
@@ -677,10 +678,10 @@ public struct VeloAnalyticsHubSheet: View {
                 } label: {
                     Text("确认启用")
                         .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(tokens.accentForeground)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
-                        .background(VeloTheme.accentViolet, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .background(tokens.accent, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
                 .disabled(newAutoNatural.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }

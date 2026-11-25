@@ -2,25 +2,33 @@ import PhotosUI
 import SwiftUI
 import UIKit
 
+// MARK: - Root 3-Tab Native iOS Architecture (Monochrome Editorial + 120fps Pure Solid Lists)
+
 public struct RootSessionsView: View {
+    public enum AppTab: Hashable {
+        case sessions
+        case insights
+        case control
+    }
+
     @ObservedObject var store: VeloStore
+    @ObservedObject private var appearance = VeloAppearanceSettings.shared
     @Environment(\.colorScheme) private var colorScheme
 
+    @State private var selectedTab: AppTab = .sessions
+    @State private var navigationPath: [String] = []
     @State private var showPairSheet = false
-    @State private var showNewThreadSheet = false
+    @State private var showNewTray = false
+    @State private var prefillRepoForNewSession: String?
     @State private var showCliImportSheet = false
     @State private var showRemoteHostsSheet = false
     @State private var showAppearanceSheet = false
+    @State private var showAnalyticsModal = false
+    @State private var analyticsModalTab: VeloAnalyticsHubSheet.HubTab = .search
+
+    // Home list states
     @State private var showArchivedSection = false
-    @State private var showAnalyticsHub = false
-    @State private var quotaCollapsed: Bool = UserDefaults.standard.bool(forKey: "velo.ios.quotaCollapsed.v1")
-    @State private var analyticsInitialTab: VeloAnalyticsHubSheet.HubTab = .analytics
-    @State private var prefillRepoForNewSession: String?
-    @State private var selectedEngineFilter: VeloEngineCategory?
-    @Namespace private var engineFilterNS
-    /// Persistent per-workspace folder state ("open" | "closed") keyed by canonical path.
     @State private var repoFolderState: [String: String] = RootSessionsView.loadFolderState()
-    @State private var navigationPath: [String] = []
     @State private var renamingSessionId: String?
     @State private var renameDraftTitle: String = ""
     @State private var relocatingFolderOldPath: String?
@@ -28,17 +36,22 @@ public struct RootSessionsView: View {
     @State private var relocateDraftPath: String = ""
     @State private var pendingDeleteSessionId: String?
     @State private var pendingDeleteSessionTitle: String = ""
+    @Namespace private var heroZoomNS
 
     public init(store: VeloStore) {
         self.store = store
     }
 
-    private var filteredSessions: [VeloSessionItem] {
-        let activeOnly = store.sessions.filter { !$0.isArchived }
-        guard let filter = selectedEngineFilter else {
-            return activeOnly
-        }
-        return activeOnly.filter { $0.engineCategory == filter }
+    private var tokens: VeloPaletteTokens {
+        VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
+    }
+
+    private var activeSessions: [VeloSessionItem] {
+        store.sessions.filter { !$0.isArchived }
+    }
+
+    private var liveSessions: [VeloSessionItem] {
+        activeSessions.filter { $0.status == .running || $0.status == .waitingApproval }
     }
 
     private var archivedSessions: [VeloSessionItem] {
@@ -48,24 +61,16 @@ public struct RootSessionsView: View {
     private var groupedByProject: [(repoRoot: String, projectName: String, sessions: [VeloSessionItem])] {
         var order: [String] = []
         var bucket: [String: [VeloSessionItem]] = [:]
-        for s in filteredSessions {
+        for s in activeSessions {
             let root = VeloFormatting.canonicalWorkspacePath(s.repoRoot)
-            if bucket[root] == nil {
-                order.append(root)
-            }
+            if bucket[root] == nil { order.append(root) }
             bucket[root, default: []].append(s)
         }
-        // Include synced daemon workspaces when viewing all engines so iOS & Desktop folders match 1:1
-        if selectedEngineFilter == nil {
-            for rawWs in store.workspaces {
-                let root = VeloFormatting.canonicalWorkspacePath(rawWs)
-                guard !root.isEmpty,
-                      !root.hasSuffix("/.velo/workspace"),
-                      bucket[root] == nil
-                else { continue }
-                order.append(root)
-                bucket[root] = []
-            }
+        for rawWs in store.workspaces {
+            let root = VeloFormatting.canonicalWorkspacePath(rawWs)
+            guard !root.isEmpty, !root.hasSuffix("/.velo/workspace"), bucket[root] == nil else { continue }
+            order.append(root)
+            bucket[root] = []
         }
         return order.map { root in
             let list = bucket[root] ?? []
@@ -100,253 +105,174 @@ public struct RootSessionsView: View {
         return repoRoot != defaultExpandedRepoRoot
     }
 
-    private var runningCount: Int {
-        store.sessions.filter { $0.status == .running || $0.status == .waitingApproval }.count
-    }
-
     public var body: some View {
-        NavigationStack(path: $navigationPath) {
-            ZStack(alignment: .bottom) {
-                VeloTheme.canvas(colorScheme)
-                    .ignoresSafeArea()
+        ZStack {
+            TabView(selection: $selectedTab) {
+                sessionsTab
+                    .tabItem {
+                        Label("会话", systemImage: "bubble.left.and.bubble.right")
+                    }
+                    .tag(AppTab.sessions)
 
-                if store.connectionConfig == nil {
-                    unpairedWelcomeState
-                } else if store.sessions.isEmpty && store.workspaces.isEmpty {
-                    emptyConnectedState
+                insightsTab
+                    .tabItem {
+                        Label("配额账单", systemImage: "chart.pie")
+                    }
+                    .tag(AppTab.insights)
+
+                controlTab
+                    .tabItem {
+                        Label("控制中心", systemImage: "slider.horizontal.3")
+                    }
+                    .tag(AppTab.control)
+            }
+            .tint(tokens.accentText)
+
+            // Family-Style Dynamic Morphing New-Session Tray (Zero 5-Step Form Friction!)
+            if showNewTray {
+                FamilyNewSessionTray(
+                    store: store,
+                    initialRepoPath: prefillRepoForNewSession,
+                    onDismiss: {
+                        withAnimation(VeloMotion.crisp) {
+                            showNewTray = false
+                        }
+                    },
+                    onCreated: { createdId in
+                        withAnimation(VeloMotion.crisp) {
+                            showNewTray = false
+                        }
+                        if let createdId {
+                            selectedTab = .sessions
+                            navigationPath = [createdId]
+                        }
+                    }
+                )
+                .zIndex(50)
+            }
+        }
+        .onChange(of: selectedTab) { _, _ in
+            VeloHaptics.selection()
+        }
+        .onChange(of: store.deepLinkTargetSessionId) { _, targetSid in
+            guard let targetSid, !targetSid.isEmpty else { return }
+            store.deepLinkTargetSessionId = nil
+            selectedTab = .sessions
+            if navigationPath.last != targetSid {
+                navigationPath = [targetSid]
+            }
+        }
+        .onChange(of: store.latestCreatedOrHandoffSessionId) { _, newSid in
+            guard let newSid, !newSid.isEmpty else { return }
+            selectedTab = .sessions
+            if navigationPath.last != newSid {
+                if navigationPath.isEmpty {
+                    navigationPath = [newSid]
                 } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 14) {
-                            // 1. Live Specular Connection Status Card
-                            connectionStatusCard
-
-                            // 1b. Compact 5h / 7d Subscription Quota Balance Strip (only when real subscription windows exist)
-                            if store.quotaCards.contains(where: { $0.mode == "subscription" && !$0.windows.isEmpty }) {
-                                compactQuotaStrip
-                            }
-
-                            // 2. Categorized Engine Filter Strip
-                            engineFilterStrip
-
-                            // 3. Project-Grouped Collapsible Session Cards
-                            if groupedByProject.isEmpty {
-                                VStack(spacing: 10) {
-                                    Image(systemName: "line.3.horizontal.decrease.circle")
-                                        .font(.system(size: 28, weight: .light))
-                                        .foregroundStyle(.secondary)
-                                    Text("当前引擎分类下暂无会话")
-                                        .font(.system(size: 14, weight: .medium))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 48)
-                            } else {
-                                HStack {
-                                    Text("WORKSPACES")
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .tracking(0.6)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    let anyOpen = groupedByProject.contains { !isFolderCollapsed($0.repoRoot) }
-                                    Button {
-                                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                                            var next = repoFolderState
-                                            let target = anyOpen ? "closed" : "open"
-                                            for g in groupedByProject {
-                                                next[g.repoRoot] = target
-                                            }
-                                            repoFolderState = next
-                                            saveFolderState(next)
-                                        }
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: anyOpen ? "rectangle.compress.vertical" : "rectangle.expand.vertical")
-                                                .font(.system(size: 11, weight: .medium))
-                                            Text(anyOpen ? "全部收起" : "全部展开")
-                                                .font(.system(size: 11.5, weight: .medium))
-                                        }
-                                        .foregroundStyle(.secondary)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                                .padding(.horizontal, 2)
-
-                                ForEach(groupedByProject, id: \.repoRoot) { group in
-                                    projectSectionView(group: group)
-                                }
-                            }
-
-                            // 4. Collapsible Archived Sessions Drawer
-                            if !archivedSessions.isEmpty {
-                                archivedDrawerView
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 8)
-                        .padding(.bottom, 96)
-                    }
-                    .refreshable {
-                        if !store.isConnected && store.connectionConfig != nil {
-                            store.connect()
-                        }
-                        await store.refreshSessionsAndActiveEvents()
-                        await store.fetchQuotas()
-                    }
-                }
-
-                // Floating Specular New Session Button
-                if store.connectionConfig != nil {
-                    floatingNewSessionBar
+                    navigationPath[navigationPath.count - 1] = newSid
                 }
             }
+            store.latestCreatedOrHandoffSessionId = nil
+        }
+        .sheet(isPresented: $showPairSheet) {
+            PairingSheetView(store: store)
+        }
+        .sheet(isPresented: $showCliImportSheet) {
+            VeloCliSessionsSheet(store: store) { importedSid in
+                selectedTab = .sessions
+                navigationPath = [importedSid]
+            }
+        }
+        .sheet(isPresented: $showRemoteHostsSheet) {
+            VeloRemoteHostsSheet(store: store) {
+                showPairSheet = true
+            }
+        }
+        .sheet(isPresented: $showAppearanceSheet) {
+            VeloAppearanceSettingsSheet()
+        }
+        .sheet(isPresented: $showAnalyticsModal) {
+            VeloAnalyticsHubSheet(store: store, initialTab: analyticsModalTab) { targetSid in
+                store.activeSessionId = targetSid
+                Task { await store.loadEventsForSession(targetSid) }
+                selectedTab = .sessions
+                navigationPath = [targetSid]
+            }
+        }
+    }
+
+    // MARK: - TAB 1: Sessions Home (Flighty Live Hero + Things 3 / Linear 120fps Inset List)
+
+    private var sessionsTab: some View {
+        NavigationStack(path: $navigationPath) {
+            Group {
+                if store.connectionConfig == nil {
+                    unpairedWelcomeView
+                } else if store.sessions.isEmpty && store.workspaces.isEmpty {
+                    emptyConnectedView
+                } else {
+                    sessionsListContent
+                }
+            }
+            .background(tokens.canvas.ignoresSafeArea())
             .navigationTitle("Velo")
             .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    HStack(spacing: 10) {
+                        if store.connectionConfig != nil {
+                            Button {
+                                VeloHaptics.tap()
+                                selectedTab = .control
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Circle()
+                                        .fill(store.isConnected ? VeloTheme.emerald : VeloTheme.amber)
+                                        .frame(width: 7, height: 7)
+                                    Text(store.isConnected ? "Mac 在线" : "重连中")
+                                        .font(.system(size: 11.5, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(tokens.elevated, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                VeloHaptics.tap()
+                                prefillRepoForNewSession = nil
+                                withAnimation(VeloMotion.crisp) {
+                                    showNewTray = true
+                                }
+                            } label: {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundStyle(tokens.accentForeground)
+                                    .frame(width: 30, height: 30)
+                                    .background(tokens.accent, in: Circle())
+                            }
+                            .buttonStyle(VeloPressableButtonStyle(scale: 0.94))
+                            .accessibilityLabel("新建对话")
+                        }
+                    }
+                }
+            }
             .navigationDestination(for: String.self) { sessionId in
-                ChatThreadView(store: store, sessionId: sessionId) { handoffNewId in
-                    // Replace or push cleanly to the newly handed-off session
+                let dest = ChatThreadView(store: store, sessionId: sessionId) { handoffNewId in
                     if !navigationPath.isEmpty {
                         navigationPath[navigationPath.count - 1] = handoffNewId
                     } else {
                         navigationPath.append(handoffNewId)
                     }
                 }
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        VeloHaptics.tap()
-                        showPairSheet = true
-                    } label: {
-                        HStack(spacing: 5) {
-                            VeloPulseBeacon(
-                                color: store.isConnected ? VeloTheme.emerald : VeloTheme.amber,
-                                active: store.isConnected,
-                                size: 6.5
-                            )
-                            Image(systemName: "qrcode.viewfinder")
-                                .font(.system(size: 14, weight: .semibold))
-                        }
-                        .padding(.leading, 4)
-                        .padding(.trailing, 9)
-                        .padding(.vertical, 3.5)
-                        .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
-                        .overlay(Capsule().stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7))
-                    }
-                    .buttonStyle(VeloPressableButtonStyle())
-                }
-
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 8) {
-                        Button {
-                            VeloHaptics.tap()
-                            analyticsInitialTab = .search
-                            showAnalyticsHub = true
-                        } label: {
-                            Image(systemName: "magnifyingglass")
-                                .font(.system(size: 13.5, weight: .semibold))
-                                .foregroundStyle(.primary)
-                                .frame(width: 31, height: 31)
-                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
-                                .overlay(Circle().stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7))
-                        }
-                        .buttonStyle(VeloPressableButtonStyle())
-                        .disabled(store.connectionConfig == nil)
-                        .accessibilityLabel("全局搜索")
-
-                        Button {
-                            VeloHaptics.tap()
-                            analyticsInitialTab = .analytics
-                            showAnalyticsHub = true
-                        } label: {
-                            Image(systemName: "chart.bar.xaxis")
-                                .font(.system(size: 13.5, weight: .semibold))
-                                .foregroundStyle(.primary)
-                                .frame(width: 31, height: 31)
-                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
-                                .overlay(Circle().stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7))
-                        }
-                        .buttonStyle(VeloPressableButtonStyle())
-                        .disabled(store.connectionConfig == nil)
-                        .accessibilityLabel("配额与账单")
-
-                        Menu {
-                            Button {
-                                showAppearanceSheet = true
-                            } label: {
-                                Label("外观与材质", systemImage: "paintbrush")
-                            }
-
-                            if store.connectionConfig != nil {
-                                Button {
-                                    showCliImportSheet = true
-                                } label: {
-                                    Label("接管 Mac 终端会话", systemImage: "apple.terminal")
-                                }
-                            }
-
-                            Button {
-                                showRemoteHostsSheet = true
-                            } label: {
-                                Label("多机与远端 SSH 主机", systemImage: "server.rack")
-                            }
-
-                            Divider()
-
-                            Button {
-                                showPairSheet = true
-                            } label: {
-                                Label("重新扫码配对 Mac", systemImage: "qrcode.viewfinder")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(.primary)
-                                .frame(width: 31, height: 31)
-                                .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
-                                .overlay(Circle().stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7))
-                        }
-                        .accessibilityLabel("更多选项")
-                    }
-                }
-            }
-            .onChange(of: store.deepLinkTargetSessionId) { _, targetSid in
-                guard let targetSid, !targetSid.isEmpty else { return }
-                store.deepLinkTargetSessionId = nil
-                if navigationPath.last != targetSid {
-                    navigationPath = [targetSid]
-                }
-            }
-            .sheet(isPresented: $showCliImportSheet) {
-                VeloCliSessionsSheet(store: store) { importedSid in
-                    navigationPath = [importedSid]
-                }
-            }
-            .sheet(isPresented: $showRemoteHostsSheet) {
-                VeloRemoteHostsSheet(store: store) {
-                    showPairSheet = true
-                }
-            }
-            .sheet(isPresented: $showAppearanceSheet) {
-                VeloAppearanceSettingsSheet()
-            }
-            .sheet(isPresented: $showAnalyticsHub) {
-                VeloAnalyticsHubSheet(store: store, initialTab: analyticsInitialTab) { targetSid in
-                    store.activeSessionId = targetSid
-                    Task { await store.loadEventsForSession(targetSid) }
-                    navigationPath = [targetSid]
-                }
-            }
-            .sheet(isPresented: $showPairSheet) {
-                PairingSheetView(store: store)
-            }
-            .sheet(isPresented: $showNewThreadSheet) {
-                NewSessionSheetView(
-                    store: store,
-                    initialRepoPath: prefillRepoForNewSession
-                ) { createdId in
-                    if let createdId {
-                        navigationPath = [createdId]
-                    }
+                if #available(iOS 18.0, *),
+                   !appearance.reduceMotion,
+                   liveSessions.contains(where: { $0.id == sessionId })
+                {
+                    dest.navigationTransition(.zoom(sourceID: "hero-\(sessionId)", in: heroZoomNS))
+                } else {
+                    dest
                 }
             }
             .alert(
@@ -357,9 +283,7 @@ public struct RootSessionsView: View {
                 )
             ) {
                 TextField("输入会话名称", text: $renameDraftTitle)
-                Button("取消", role: .cancel) {
-                    renamingSessionId = nil
-                }
+                Button("取消", role: .cancel) { renamingSessionId = nil }
                 Button("保存") {
                     if let sid = renamingSessionId {
                         let newName = renameDraftTitle
@@ -403,8 +327,6 @@ public struct RootSessionsView: View {
                         }
                     }
                 }
-            } message: {
-                Text("将同步更新 Mac 守护进程的目录映射关系")
             }
             .alert(
                 "删除会话？",
@@ -413,9 +335,7 @@ public struct RootSessionsView: View {
                     set: { if !$0 { pendingDeleteSessionId = nil } }
                 )
             ) {
-                Button("取消", role: .cancel) {
-                    pendingDeleteSessionId = nil
-                }
+                Button("取消", role: .cancel) { pendingDeleteSessionId = nil }
                 Button("永久删除", role: .destructive) {
                     if let sid = pendingDeleteSessionId {
                         pendingDeleteSessionId = nil
@@ -423,226 +343,135 @@ public struct RootSessionsView: View {
                     }
                 }
             } message: {
-                Text("将永久删除「\(pendingDeleteSessionTitle)」，对话记录会一起清掉。此操作无法撤销。")
-            }
-            .onChange(of: store.latestCreatedOrHandoffSessionId) { _, newSid in
-                guard let newSid, !newSid.isEmpty else { return }
-                if navigationPath.last != newSid {
-                    if navigationPath.isEmpty {
-                        navigationPath = [newSid]
-                    } else {
-                        navigationPath[navigationPath.count - 1] = newSid
-                    }
-                }
-                store.latestCreatedOrHandoffSessionId = nil
+                Text("将永久删除「\(pendingDeleteSessionTitle)」，对话记录会一起清掉。")
             }
         }
     }
 
-    // MARK: - Subviews
-
-    private var compactQuotaStrip: some View {
-        let activeCards = store.quotaCards.filter { $0.mode == "subscription" && !$0.windows.isEmpty }
-
-        return VStack(alignment: .leading, spacing: 7) {
-            // Section header with quick collapse toggle
-            HStack {
-                Button {
-                    VeloHaptics.tap()
-                    analyticsInitialTab = .analytics
-                    showAnalyticsHub = true
-                } label: {
-                    HStack(spacing: 4) {
-                        Text("配额")
-                            .font(.system(size: 11, weight: .semibold))
-                            .tracking(0.5)
-                            .foregroundStyle(.secondary)
-                        Image(systemName: "arrow.up.right")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(.tertiary)
+    private var sessionsListContent: some View {
+        List {
+            // 1. Flighty-Style LIVE HERO SECTION (Only visible when running / waiting approval!)
+            if !liveSessions.isEmpty {
+                Section {
+                    ForEach(liveSessions) { session in
+                        liveHeroRow(for: session)
+                            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
                     }
+                } header: {
+                    Text("正在进行 · \(liveSessions.count)")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .textCase(nil)
                 }
-                .buttonStyle(.plain)
-
-                Spacer()
-
-                Button {
-                    VeloHaptics.tap()
-                    withAnimation(VeloMotion.snappy) {
-                        quotaCollapsed.toggle()
-                        UserDefaults.standard.set(quotaCollapsed, forKey: "velo.ios.quotaCollapsed.v1")
-                    }
-                } label: {
-                    Image(systemName: quotaCollapsed ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                        .frame(width: 24, height: 20)
-                }
-                .buttonStyle(.plain)
             }
-            .padding(.horizontal, 2)
 
-            if quotaCollapsed {
-                HStack(spacing: 8) {
-                    ForEach(activeCards) { card in
-                        if let wPrimary = card.windows.first(where: { $0.id == "5h" }) ?? card.windows.first {
-                            let rem = max(0, min(100, Int(wPrimary.remainingPercent.rounded())))
+            // 2. Things 3 / Linear Pure-Solid Inset Grouped Project Sections (120fps UITableView Backing!)
+            ForEach(groupedByProject, id: \.repoRoot) { group in
+                let collapsed = isFolderCollapsed(group.repoRoot)
+                Section {
+                    if !collapsed {
+                        if group.sessions.isEmpty {
                             Button {
                                 VeloHaptics.tap()
-                                analyticsInitialTab = .analytics
-                                showAnalyticsHub = true
+                                prefillRepoForNewSession = group.repoRoot
+                                withAnimation(VeloMotion.crisp) {
+                                    showNewTray = true
+                                }
                             } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: VeloQuotaPalette.icon(for: card.provider))
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundStyle(VeloQuotaPalette.accent(for: card.provider))
-                                    Text(VeloQuotaPalette.compactTag(for: card.provider, fallback: card.label))
-                                        .font(.system(size: 11.5, weight: .semibold))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                    Spacer(minLength: 2)
-                                    Text("\(rem)%")
-                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                        .foregroundStyle(VeloQuotaPalette.pctColor(for: wPrimary.status))
-                                        .contentTransition(.numericText())
+                                HStack(spacing: 8) {
+                                    Image(systemName: "plus.circle")
+                                        .font(.system(size: 13))
+                                    Text("暂无会话 · 轻点在此项目新建")
+                                        .font(.system(size: 13))
                                 }
-                                .padding(.horizontal, 11)
-                                .padding(.vertical, 8)
-                                .veloSurface(cornerRadius: 12)
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 4)
                             }
-                            .buttonStyle(VeloPressableButtonStyle(scale: 0.98))
-                        }
-                    }
-                }
-                .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
-            } else {
-                Button {
-                    VeloHaptics.tap()
-                    analyticsInitialTab = .analytics
-                    showAnalyticsHub = true
-                } label: {
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(activeCards.enumerated()), id: \.element.id) { idx, card in
-                            if let wPrimary = card.windows.first(where: { $0.id == "5h" }) ?? card.windows.first {
-                                let rem = max(0, min(100, wPrimary.remainingPercent))
-                                let w7d = card.windows.first(where: { $0.id == "7d" })
-                                let subLeft: String = {
-                                    if let dt = wPrimary.detailText, !dt.isEmpty {
-                                        return dt.replacingOccurrences(of: "/", with: " / ")
-                                    }
-                                    if let w7d {
-                                        return "5h · 7d \(Int(w7d.remainingPercent.rounded()))%"
-                                    }
-                                    return wPrimary.label
-                                }()
-
-                                if idx > 0 {
-                                    Rectangle()
-                                        .fill(VeloTheme.hairline(colorScheme))
-                                        .frame(height: 0.7)
-                                        .padding(.horizontal, 13)
+                            .listRowBackground(tokens.surface)
+                        } else {
+                            ForEach(group.sessions) { session in
+                                NavigationLink(value: session.id) {
+                                    SessionInsetRow(
+                                        session: session,
+                                        isUnread: store.unreadSessionIds.contains(session.id),
+                                        tokens: tokens
+                                    )
                                 }
-
-                                VStack(alignment: .leading, spacing: 6) {
-                                    // Tier 1: Brand Icon + Provider Name + Hero %
-                                    HStack(spacing: 7) {
-                                        Image(systemName: VeloQuotaPalette.icon(for: card.provider))
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .foregroundStyle(VeloQuotaPalette.accent(for: card.provider))
-                                        Text(VeloQuotaPalette.shortName(for: card.provider, fallback: card.label))
-                                            .font(.system(size: 12.5, weight: .semibold))
-                                            .foregroundStyle(.primary)
-                                        Spacer(minLength: 6)
-                                        Text("\(Int(rem.rounded()))%")
-                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                            .foregroundStyle(VeloQuotaPalette.pctColor(for: wPrimary.status))
-                                            .contentTransition(.numericText())
+                                .listRowBackground(tokens.surface)
+                                .listRowSeparatorTint(tokens.divider)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    Button(role: .destructive) {
+                                        VeloHaptics.warning()
+                                        pendingDeleteSessionTitle = session.title
+                                        pendingDeleteSessionId = session.id
+                                    } label: {
+                                        Label("删除", systemImage: "trash")
                                     }
 
-                                    // Tier 2: Crisp 4.5pt Two-Stop Gradient Track
-                                    GeometryReader { geo in
-                                        ZStack(alignment: .leading) {
-                                            Capsule()
-                                                .fill(VeloTheme.elevatedSurface(colorScheme))
-                                            Capsule()
-                                                .fill(VeloQuotaPalette.gradient(for: card.provider, status: wPrimary.status))
-                                                .frame(width: max(6, geo.size.width * CGFloat(rem / 100.0)))
-                                                .animation(VeloMotion.smooth, value: rem)
-                                        }
+                                    Button {
+                                        VeloHaptics.tap()
+                                        Task { await store.archiveSession(session.id, archived: true) }
+                                    } label: {
+                                        Label("归档", systemImage: "archivebox")
                                     }
-                                    .frame(height: 4.5)
+                                    .tint(Color(hex: 0x52525B))
+                                }
+                                .contextMenu {
+                                    Button {
+                                        renameDraftTitle = session.title
+                                        renamingSessionId = session.id
+                                    } label: {
+                                        Label("重命名会话", systemImage: "pencil")
+                                    }
 
-                                    // Tier 3: Quiet Telemetry Subline (Spend/7d + Clock Reset)
-                                    HStack(spacing: 6) {
-                                        Text(subLeft)
-                                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                        Spacer(minLength: 4)
-                                        if !wPrimary.resetCountdownLabel.isEmpty {
-                                            HStack(spacing: 3) {
-                                                Image(systemName: "clock")
-                                                    .font(.system(size: 9.5, weight: .medium))
-                                                Text(wPrimary.resetCountdownLabel)
-                                                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                                            }
-                                            .foregroundStyle(.tertiary)
-                                            .lineLimit(1)
-                                        }
+                                    Button {
+                                        relocateDraftPath = session.repoRoot
+                                        relocatingFolderOldPath = nil
+                                        relocatingSessionId = session.id
+                                    } label: {
+                                        Label("修改归属目录", systemImage: "folder.badge.gearshape")
+                                    }
+
+                                    Button {
+                                        Task { await store.archiveSession(session.id, archived: true) }
+                                    } label: {
+                                        Label("归档会话", systemImage: "archivebox")
+                                    }
+
+                                    Button(role: .destructive) {
+                                        pendingDeleteSessionTitle = session.title
+                                        pendingDeleteSessionId = session.id
+                                    } label: {
+                                        Label("永久删除", systemImage: "trash")
                                     }
                                 }
-                                .padding(.horizontal, 13)
-                                .padding(.vertical, 10)
                             }
                         }
                     }
-                    .veloSurface(cornerRadius: 15)
-                }
-                .buttonStyle(VeloPressableButtonStyle(scale: 0.99))
-                .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
-            }
-        }
-    }
-
-    private var archivedDrawerView: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    showArchivedSection.toggle()
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "archivebox")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text("已归档会话 (\(archivedSessions.count))")
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                        .rotationEffect(.degrees(showArchivedSection ? 90 : 0))
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(VeloTheme.cardSurface(colorScheme).opacity(0.6), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            }
-            .buttonStyle(.plain)
-
-            if showArchivedSection {
-                ForEach(archivedSessions) { arch in
-                    HStack(spacing: 10) {
-                        NavigationLink(value: arch.id) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(arch.title)
-                                    .font(.system(size: 13.5, weight: .medium))
-                                    .foregroundStyle(.primary)
-                                    .lineLimit(1)
-                                Text("\(arch.projectName) · \(arch.branchName)")
-                                    .font(.system(size: 11, design: .monospaced))
+                } header: {
+                    HStack(spacing: 6) {
+                        Button {
+                            VeloHaptics.selection()
+                            withAnimation(VeloMotion.crisp) {
+                                var next = repoFolderState
+                                next[group.repoRoot] = collapsed ? "open" : "closed"
+                                repoFolderState = next
+                                saveFolderState(next)
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundStyle(.tertiary)
+                                    .rotationEffect(.degrees(collapsed ? 0 : 90))
+                                Text(group.projectName)
+                                    .font(.system(size: 12.5, weight: .semibold))
                                     .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                                Text("\(group.sessions.count)")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
                             }
                         }
                         .buttonStyle(.plain)
@@ -650,617 +479,777 @@ public struct RootSessionsView: View {
                         Spacer()
 
                         Button {
-                            Task { await store.archiveSession(arch.id, archived: false) }
+                            VeloHaptics.tap()
+                            prefillRepoForNewSession = group.repoRoot
+                            withAnimation(VeloMotion.crisp) {
+                                showNewTray = true
+                            }
                         } label: {
-                            Image(systemName: "tray.and.arrow.up")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(VeloTheme.emerald)
-                                .padding(7)
-                                .background(VeloTheme.emerald.opacity(0.13), in: Circle())
+                            Image(systemName: "plus")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(4)
                         }
                         .buttonStyle(.plain)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .textCase(nil)
                 }
             }
-        }
-        .padding(.top, 4)
-    }
 
-    private var connectionStatusCard: some View {
-        Button {
-            VeloHaptics.tap()
-            showPairSheet = true
-        } label: {
-            HStack(spacing: 9) {
-                VeloPulseBeacon(
-                    color: store.isConnected ? VeloTheme.emerald : VeloTheme.amber,
-                    active: store.isConnected,
-                    size: 7.5
-                )
-
-                VStack(alignment: .leading, spacing: 1.5) {
-                    HStack(spacing: 6) {
-                        Text(store.isConnected ? "Mac 在线" : "正在重连 Mac…")
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .foregroundStyle(.primary)
-
-                        if store.connectionConfig?.isEncryptedRelay == true {
-                            HStack(spacing: 3) {
-                                Image(systemName: "lock.fill")
-                                    .font(.system(size: 8.5, weight: .bold))
-                                Text(store.isForwardSecretRatcheted ? "E2EE" : "加密")
-                                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+            // 3. Collapsible Archived Sessions
+            if !archivedSessions.isEmpty {
+                Section {
+                    if showArchivedSection {
+                        ForEach(archivedSessions) { arch in
+                            NavigationLink(value: arch.id) {
+                                HStack(spacing: 10) {
+                                    VeloBrandIcon(provider: arch.agentKind, size: 15, colored: false)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(arch.title)
+                                            .font(.system(size: 14, weight: .medium))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                        Text("\(arch.projectName) · \(arch.branchName)")
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundStyle(.tertiary)
+                                            .lineLimit(1)
+                                    }
+                                }
                             }
-                            .foregroundStyle(VeloTheme.emerald)
-                            .padding(.horizontal, 5.5)
-                            .padding(.vertical, 1.5)
-                            .background(VeloTheme.emerald.opacity(0.13), in: Capsule())
+                            .listRowBackground(tokens.surface)
+                            .swipeActions(edge: .trailing) {
+                                Button {
+                                    Task { await store.archiveSession(arch.id, archived: false) }
+                                } label: {
+                                    Label("恢复", systemImage: "tray.and.arrow.up")
+                                }
+                                .tint(VeloTheme.emerald)
+                            }
                         }
                     }
-
-                    Text(store.connectionConfig?.displayTitle ?? "")
-                        .font(.system(size: 10.5, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                Spacer(minLength: 4)
-
-                if runningCount > 0 {
-                    HStack(spacing: 5) {
-                        OrbitalStatusIcon(phase: .working)
-                        Text("\(runningCount) 运行中")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(VeloTheme.accentVioletSoft)
-                            .contentTransition(.numericText())
-                    }
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 4.5)
-                    .background(VeloTheme.accentViolet.opacity(0.14), in: Capsule())
-                } else {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9.5)
-            .veloSurface(
-                cornerRadius: 15,
-                aura: store.isConnected ? VeloTheme.emerald : VeloTheme.amber
-            )
-        }
-        .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
-    }
-
-    private var engineFilterStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                filterCapsule(
-                    title: "全部",
-                    icon: "square.grid.2x2.fill",
-                    count: store.sessions.filter { !$0.isArchived }.count,
-                    accent: VeloTheme.accentVioletSoft,
-                    isSelected: selectedEngineFilter == nil
-                ) {
-                    VeloHaptics.selection()
-                    withAnimation(VeloMotion.snappy) {
-                        selectedEngineFilter = nil
-                    }
-                }
-
-                ForEach(VeloEngineCategory.primaryCategories) { cat in
-                    let count = store.sessions.filter { !$0.isArchived && $0.engineCategory == cat }.count
-                    filterCapsule(
-                        title: cat.shortBadge,
-                        icon: cat.iconName,
-                        count: count,
-                        accent: cat.accentColor,
-                        isSelected: selectedEngineFilter == cat
-                    ) {
-                        VeloHaptics.selection()
-                        withAnimation(VeloMotion.snappy) {
-                            selectedEngineFilter = (selectedEngineFilter == cat) ? nil : cat
+                } header: {
+                    Button {
+                        withAnimation(VeloMotion.crisp) {
+                            showArchivedSection.toggle()
                         }
-                    }
-                }
-            }
-            .padding(3)
-            .background(VeloTheme.cardSurface(colorScheme).opacity(0.75), in: Capsule())
-            .overlay(Capsule().stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.75))
-            .padding(.vertical, 1)
-        }
-    }
-
-    private func filterCapsule(
-        title: String,
-        icon: String,
-        count: Int,
-        accent: Color,
-        isSelected: Bool,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 4.5) {
-                Image(systemName: icon)
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(isSelected ? accent : .secondary)
-                Text(title)
-                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
-                    .foregroundStyle(isSelected ? .primary : .secondary)
-                if count > 0 {
-                    Text("\(count)")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundStyle(isSelected ? accent : Color.secondary.opacity(0.55))
-                        .contentTransition(.numericText())
-                }
-            }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 6.5)
-            .background {
-                if isSelected {
-                    Capsule()
-                        .fill(VeloTheme.elevatedSurface(colorScheme))
-                        .overlay(
-                            Capsule()
-                                .fill(accent.opacity(0.14))
-                        )
-                        .overlay(
-                            Capsule()
-                                .stroke(accent.opacity(0.45), lineWidth: 0.9)
-                        )
-                        .matchedGeometryEffect(id: "engineFilterHighlight", in: engineFilterNS)
-                }
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func projectSectionView(
-        group: (repoRoot: String, projectName: String, sessions: [VeloSessionItem])
-    ) -> some View {
-        let isCollapsed = isFolderCollapsed(group.repoRoot)
-        let shortPath = VeloFormatting.shortenHomePath(group.repoRoot)
-
-        return VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 8) {
-                Button {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                        var next = repoFolderState
-                        next[group.repoRoot] = isCollapsed ? "open" : "closed"
-                        repoFolderState = next
-                        saveFolderState(next)
-                    }
-                } label: {
-                    HStack(spacing: 7) {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.tertiary)
-                            .rotationEffect(.degrees(isCollapsed ? 0 : 90))
-
-                        Image(systemName: "folder.fill")
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .foregroundStyle(VeloTheme.accentVioletSoft)
-
-                        Text(group.projectName)
-                            .font(.system(size: 13.5, weight: .bold))
-                            .foregroundStyle(.primary)
-
-                        Text(shortPath)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-
-                        Text("\(group.sessions.count)")
-                            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1.5)
-                            .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
-                    }
-                }
-                .buttonStyle(.plain)
-                .contextMenu {
-                    Button {
-                        relocateDraftPath = group.repoRoot
-                        relocatingSessionId = nil
-                        relocatingFolderOldPath = group.repoRoot
                     } label: {
-                        Label("修改文件夹归属路径", systemImage: "folder.badge.gearshape")
-                    }
-
-                    Button {
-                        prefillRepoForNewSession = group.repoRoot
-                        showNewThreadSheet = true
-                    } label: {
-                        Label("在此文件夹新建对话", systemImage: "plus.bubble")
-                    }
-
-                    Button(role: .destructive) {
-                        Task { await store.removeWorkspaceFolder(group.repoRoot) }
-                    } label: {
-                        Label("移除文件夹及旗下会话", systemImage: "trash")
-                    }
-                }
-
-                Spacer(minLength: 4)
-
-                Button {
-                    prefillRepoForNewSession = group.repoRoot
-                    showNewThreadSheet = true
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 11.5, weight: .bold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 24, height: 24)
-                        .background(VeloTheme.elevatedSurface(colorScheme), in: Circle())
-                }
-                .buttonStyle(VeloPressableButtonStyle())
-            }
-            .padding(.horizontal, 4)
-
-            if !isCollapsed {
-                if group.sessions.isEmpty {
-                    Button {
-                        prefillRepoForNewSession = group.repoRoot
-                        showNewThreadSheet = true
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "plus.circle")
-                                .font(.system(size: 12, weight: .medium))
-                            Text("此目录暂无会话 · 点击新建")
-                                .font(.system(size: 12.5))
-                            Spacer()
+                        HStack(spacing: 5) {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9.5, weight: .bold))
+                                .rotationEffect(.degrees(showArchivedSection ? 90 : 0))
+                            Text("已归档 (\(archivedSessions.count))")
+                                .font(.system(size: 12, weight: .semibold))
                         }
                         .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            VeloTheme.cardSurface(colorScheme).opacity(0.65),
-                            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                                .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.7)
-                        )
+                        .textCase(nil)
                     }
-                    .buttonStyle(VeloPressableButtonStyle(scale: 0.99))
-                } else {
-                    VStack(spacing: 8) {
-                        ForEach(Array(group.sessions.enumerated()), id: \.element.id) { idx, session in
-                            NavigationLink(value: session.id) {
-                                SessionCardView(
-                                    session: session,
-                                    isUnread: store.unreadSessionIds.contains(session.id)
-                                )
-                            }
-                            .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
-                            .veloStaggerAppear(index: idx)
-                            .contextMenu {
-                                Button {
-                                    renameDraftTitle = session.title
-                                    renamingSessionId = session.id
-                                } label: {
-                                    Label("重命名会话", systemImage: "pencil")
-                                }
-
-                                Button {
-                                    relocateDraftPath = session.repoRoot
-                                    relocatingFolderOldPath = nil
-                                    relocatingSessionId = session.id
-                                } label: {
-                                    Label("修改归属目录路径", systemImage: "folder.badge.gearshape")
-                                }
-
-                                Button {
-                                    navigationPath.append(session.id)
-                                } label: {
-                                    Label("进入对话", systemImage: "bubble.left.and.bubble.right")
-                                }
-
-                                Button {
-                                    Task { await store.archiveSession(session.id, archived: true) }
-                                } label: {
-                                    Label("归档会话 (保留代码与历史)", systemImage: "archivebox")
-                                }
-
-                                Button(role: .destructive) {
-                                    pendingDeleteSessionTitle = session.title
-                                    pendingDeleteSessionId = session.id
-                                } label: {
-                                    Label("永久删除会话", systemImage: "trash")
-                                }
-                            }
-                        }
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .buttonStyle(.plain)
                 }
             }
         }
-    }
-
-    private var floatingNewSessionBar: some View {
-        HStack {
-            Spacer()
-            Button {
-                VeloHaptics.medium()
-                prefillRepoForNewSession = nil
-                showNewThreadSheet = true
-            } label: {
-                HStack(spacing: 7.5) {
-                    ZStack {
-                        Circle()
-                            .fill(Color.white.opacity(0.22))
-                            .frame(width: 24, height: 24)
-                        Image(systemName: "plus")
-                            .font(.system(size: 12.5, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                    Text("新建对话")
-                        .font(.system(size: 14.5, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
-                .padding(.leading, 10)
-                .padding(.trailing, 17)
-                .padding(.vertical, 10)
-                .background(
-                    LinearGradient(
-                        colors: [
-                            VeloTheme.accentViolet,
-                            Color(red: 0.39, green: 0.25, blue: 0.92),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    in: Capsule()
-                )
-                .overlay(VeloShimmerSweepOverlay(cornerRadius: 999, period: 3.8))
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.28), lineWidth: 0.9)
-                )
-                .shadow(color: VeloTheme.accentViolet.opacity(0.42), radius: 16, x: 0, y: 7)
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(tokens.canvas)
+        .refreshable {
+            if !store.isConnected && store.connectionConfig != nil {
+                store.connect()
             }
-            .buttonStyle(VeloPressableButtonStyle(scale: 0.955))
-        }
-        .padding(.horizontal, 20)
-        .padding(.bottom, 14)
-    }
-
-    private var unpairedWelcomeState: some View {
-        ZStack {
-            VeloDotGridBackground(accent: VeloTheme.accentViolet)
-
-            VStack(spacing: 22) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 26, style: .continuous)
-                        .fill(VeloTheme.cardSurface(colorScheme))
-                        .frame(width: 88, height: 88)
-                        .veloSurface(cornerRadius: 26, aura: VeloTheme.accentViolet)
-                        .veloBorderBeam(active: true, accent: VeloTheme.accentVioletSoft, cornerRadius: 26, lineWidth: 1.2, duration: 4.5)
-                    Text("V")
-                        .font(.system(size: 40, weight: .heavy, design: .rounded))
-                        .foregroundStyle(
-                            LinearGradient(
-                                colors: [.primary, VeloTheme.accentVioletSoft],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                }
-
-                VStack(spacing: 8) {
-                    Text("Velo Mobile")
-                        .font(.system(size: 25, weight: .bold))
-                        .tracking(-0.3)
-
-                    Text("扫一下 Mac 端二维码，离开电脑也能随时在手机上遥控 Claude、Codex、Antigravity 与 Cursor 写代码。")
-                        .font(.system(size: 14))
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .lineSpacing(3.5)
-                        .padding(.horizontal, 32)
-                }
-
-                Button {
-                    VeloHaptics.medium()
-                    showPairSheet = true
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "qrcode.viewfinder")
-                            .font(.system(size: 15, weight: .semibold))
-                        Text("扫码配对 Mac")
-                    }
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 26)
-                    .padding(.vertical, 13)
-                    .background(
-                        LinearGradient(
-                            colors: [VeloTheme.accentViolet, Color(red: 0.40, green: 0.26, blue: 0.92)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        in: Capsule()
-                    )
-                    .overlay(VeloShimmerSweepOverlay(cornerRadius: 999, period: 3.0))
-                    .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 0.9))
-                    .shadow(color: VeloTheme.accentViolet.opacity(0.38), radius: 14, x: 0, y: 6)
-                }
-                .buttonStyle(VeloPressableButtonStyle(scale: 0.96))
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            await store.refreshSessionsAndActiveEvents()
+            await store.fetchQuotas()
         }
     }
 
-    private var emptyConnectedState: some View {
-        ZStack {
-            VeloDotGridBackground(accent: VeloTheme.emerald)
-
-            VStack(spacing: 16) {
-                connectionStatusCard
-                    .padding(.horizontal, 16)
-
-                Spacer()
-
-                ZStack {
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .fill(VeloTheme.cardSurface(colorScheme))
-                        .frame(width: 72, height: 72)
-                        .veloSurface(cornerRadius: 22, aura: VeloTheme.accentViolet)
-                    Image(systemName: "sparkles.rectangle.stack.fill")
-                        .font(.system(size: 27, weight: .semibold))
-                        .foregroundStyle(VeloTheme.accentVioletSoft)
-                }
-
-                Text("暂无活跃对话")
-                    .font(.system(size: 18, weight: .bold))
-
-                Text(store.isConnected ? "点右下角「新建对话」，选择引擎和项目目录即可开始。" : (store.connectionError ?? "正在连接 Mac 守护进程…"))
-                    .font(.system(size: 13.5))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 36)
-
-                Spacer()
-            }
-            .padding(.top, 8)
-        }
-    }
-}
-
-// MARK: - Calm Obsidian & Specular Session Card (Magic UI Border Beam + Aceternity Aura)
-
-private struct SessionCardView: View {
-    let session: VeloSessionItem
-    var isUnread: Bool = false
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        let cat = session.engineCategory
-        let isRunning = session.status == .running
+    @ViewBuilder
+    private func liveHeroRow(for session: VeloSessionItem) -> some View {
         let isWaiting = session.status == .waitingApproval
-        let activeAccent = isWaiting ? VeloTheme.amber : cat.accentColor
+        let pendingApproval = store.pendingApprovals[session.id]
 
-        VStack(alignment: .leading, spacing: 8) {
-            // Row 1: Live Indicator + Engine Glyph + Crisp Readable Title + Timestamp
+        let cardBody = VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 7) {
-                if isRunning {
-                    OrbitalStatusIcon(phase: .working)
-                } else if isWaiting {
-                    OrbitalStatusIcon(phase: .waiting(label: ""))
-                } else if isUnread {
-                    Circle()
-                        .fill(Color(red: 0.22, green: 0.74, blue: 0.97))
-                        .frame(width: 7.5, height: 7.5)
-                        .shadow(color: Color(red: 0.22, green: 0.74, blue: 0.97).opacity(0.65), radius: 3)
-                }
+                VeloBrandIcon(provider: session.agentKind, size: 15, colored: true)
 
-                EngineBadgePill(category: cat, compact: true)
-
-                Text(session.title)
-                    .font(.system(size: 14.5, weight: .semibold))
-                    .foregroundStyle(.primary)
+                Text(isWaiting ? "等待审批 · \(session.projectName)" : "\(session.engineCategory.shortBadge) · \(session.projectName)")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(isWaiting ? VeloTheme.amber : tokens.accentText)
                     .lineLimit(1)
 
-                Spacer(minLength: 4)
-
-                Text(session.updatedAtLabel)
-                    .font(.system(size: 11, weight: .medium).monospacedDigit())
-                    .foregroundStyle(.tertiary)
-            }
-
-            // Row 2: Calm Metadata (Model · Branch + Conditional Diff Pill)
-            HStack(spacing: 6) {
-                Text(session.modelShort)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                Text("·")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.quaternary)
-
-                HStack(spacing: 3) {
-                    Image(systemName: session.isIsolatedWorktree ? "arrow.triangle.branch" : "folder")
-                        .font(.system(size: 9.5, weight: .medium))
-                    Text(session.branchName)
-                        .font(.system(size: 11, design: .monospaced))
-                        .lineLimit(1)
-                }
-                .foregroundStyle(session.isIsolatedWorktree ? VeloTheme.accentVioletSoft : .secondary)
-
-                if session.parentSessionId != nil {
-                    Text("↗")
-                        .font(.system(size: 10.5, weight: .bold))
-                        .foregroundStyle(VeloTheme.accentVioletSoft)
-                }
-
-                Spacer(minLength: 4)
+                Spacer()
 
                 if isWaiting {
-                    Text("待审批")
+                    Text("待确认")
                         .font(.system(size: 10.5, weight: .bold))
                         .foregroundStyle(VeloTheme.amber)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 2)
                         .background(VeloTheme.amber.opacity(0.15), in: Capsule())
-                } else if session.insertions > 0 || session.deletions > 0 {
-                    HStack(spacing: 3) {
-                        Text("+\(session.insertions)")
-                            .foregroundStyle(VeloTheme.emerald)
-                            .contentTransition(.numericText())
-                        Text("−\(session.deletions)")
-                            .foregroundStyle(VeloTheme.coral)
-                            .contentTransition(.numericText())
+                } else {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(VeloTheme.emerald)
+                            .frame(width: 6, height: 6)
+                        Text("运行中")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
                     }
-                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                    .padding(.horizontal, 6.5)
-                    .padding(.vertical, 2)
-                    .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
+                }
+            }
+
+            Text(session.title)
+                .font(.system(size: 15.5, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+
+            if isWaiting, let approval = pendingApproval {
+                Text(approval.commandPreview)
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 7)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(tokens.codeBg, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+                HStack(spacing: 8) {
+                    Button {
+                        VeloHaptics.warning()
+                        Task { await store.resolveApproval(sessionId: session.id, requestId: approval.id, approve: false) }
+                    } label: {
+                        Text("拒绝")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(tokens.elevated, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+
+                    Button {
+                        VeloHaptics.success()
+                        Task { await store.resolveApproval(sessionId: session.id, requestId: approval.id, approve: true) }
+                    } label: {
+                        Text("允许执行")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(tokens.accentForeground)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(tokens.accent, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Text("\(session.modelShort) · \(session.branchName)")
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    if session.insertions > 0 || session.deletions > 0 {
+                        HStack(spacing: 3) {
+                            Text("+\(session.insertions)").foregroundStyle(VeloTheme.emerald)
+                            Text("−\(session.deletions)").foregroundStyle(VeloTheme.coral)
+                        }
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .contentTransition(.numericText())
+                    }
                 }
             }
         }
-        .padding(.horizontal, 13.5)
-        .padding(.vertical, 11.5)
-        .veloSurface(
-            cornerRadius: 16,
-            aura: (isRunning || isWaiting) ? activeAccent : nil
+        .padding(14)
+        .background {
+            let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+            ZStack {
+                shape.fill(tokens.surface)
+                shape.fill(
+                    RadialGradient(
+                        colors: [
+                            (isWaiting ? VeloTheme.amber.opacity(colorScheme == .dark ? 0.14 : 0.09) : tokens.heroTint),
+                            Color.clear,
+                        ],
+                        center: .topLeading,
+                        startRadius: 8,
+                        endRadius: 210
+                    )
+                )
+            }
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(isWaiting ? VeloTheme.amber.opacity(0.38) : tokens.border, lineWidth: 0.9)
         )
-        .veloBorderBeam(
-            active: isRunning || isWaiting,
-            accent: activeAccent,
-            cornerRadius: 16,
-            lineWidth: 1.2,
-            duration: isWaiting ? 2.4 : 3.8
-        )
+        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .onTapGesture {
+            VeloHaptics.tap()
+            navigationPath.append(session.id)
+        }
+
+        if #available(iOS 18.0, *), !appearance.reduceMotion {
+            cardBody.matchedTransitionSource(id: "hero-\(session.id)", in: heroZoomNS)
+        } else {
+            cardBody
+        }
+    }
+
+    private var unpairedWelcomeView: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(tokens.surface)
+                    .frame(width: 82, height: 82)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                            .stroke(tokens.border, lineWidth: 0.9)
+                    )
+                Text("V")
+                    .font(.system(size: 38, weight: .heavy, design: .rounded))
+                    .foregroundStyle(.primary)
+            }
+
+            VStack(spacing: 8) {
+                Text("Velo")
+                    .font(.system(size: 26, weight: .bold))
+                Text("扫一下 Mac 端二维码，离开电脑也能随时遥控 Claude、Codex、Antigravity 与 Cursor。")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3.5)
+                    .padding(.horizontal, 36)
+            }
+
+            HStack(spacing: 16) {
+                VeloBrandIcon(provider: "claude", size: 20, colored: true)
+                VeloBrandIcon(provider: "codex", size: 20, colored: true)
+                VeloBrandIcon(provider: "antigravity", size: 20, colored: true)
+                VeloBrandIcon(provider: "cursor", size: 20, colored: true)
+                VeloBrandIcon(provider: "grok", size: 20, colored: true)
+            }
+            .padding(.vertical, 6)
+
+            Button {
+                VeloHaptics.medium()
+                showPairSheet = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "qrcode.viewfinder")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("扫码配对 Mac")
+                }
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(tokens.accentForeground)
+                .padding(.horizontal, 28)
+                .padding(.vertical, 13.5)
+                .background(tokens.accent, in: Capsule())
+            }
+            .buttonStyle(VeloPressableButtonStyle(scale: 0.96))
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyConnectedView: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            HStack(spacing: 14) {
+                VeloBrandIcon(provider: "claude", size: 20, colored: true)
+                VeloBrandIcon(provider: "codex", size: 20, colored: true)
+                VeloBrandIcon(provider: "antigravity", size: 20, colored: true)
+                VeloBrandIcon(provider: "cursor", size: 20, colored: true)
+            }
+            Text("还没有对话")
+                .font(.system(size: 18, weight: .bold))
+            Text("点右上角「+」新建对话，直接选项目和模型开聊。")
+                .font(.system(size: 13.5))
+                .foregroundStyle(.secondary)
+            Button {
+                VeloHaptics.medium()
+                prefillRepoForNewSession = nil
+                withAnimation(VeloMotion.crisp) { showNewTray = true }
+            } label: {
+                Text("新建对话")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(tokens.accentForeground)
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 11)
+                    .background(tokens.accent, in: Capsule())
+            }
+            .buttonStyle(VeloPressableButtonStyle())
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - TAB 2: Copilot Money-Style Ring Quotas & Transparent Billing
+
+    private var insightsTab: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    // 1. Dual Ring Quota Grid
+                    let subCards = store.quotaCards.filter { $0.mode == "subscription" && !$0.windows.isEmpty }
+                    let otherCards = store.quotaCards.filter { $0.mode != "subscription" || $0.windows.isEmpty }
+
+                    if !subCards.isEmpty {
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+                            ForEach(Array(subCards.enumerated()), id: \.element.id) { idx, card in
+                                if let wPrimary = card.windows.first(where: { $0.id == "5h" }) ?? card.windows.first {
+                                    let w7d = card.windows.first(where: { $0.id == "7d" })
+                                    let ringColor = VeloQuotaPalette.ringColor(
+                                        for: card.provider,
+                                        status: wPrimary.status,
+                                        tokens: tokens,
+                                        isFirst: idx == 0
+                                    )
+                                    let caption = wPrimary.id == "5h" ? "5h 剩余" : (wPrimary.id == "30d" ? "月度剩余" : "剩余")
+                                    let metaLine: String = {
+                                        if let dt = wPrimary.detailText, !dt.isEmpty {
+                                            return dt.replacingOccurrences(of: " / ", with: "/")
+                                        }
+                                        if let w7d {
+                                            return "7d \(Int(w7d.remainingPercent.rounded()))%"
+                                        }
+                                        return card.planBadge
+                                    }()
+
+                                    VStack(spacing: 10) {
+                                        VeloQuotaRingView(
+                                            remainingPercent: wPrimary.remainingPercent,
+                                            ringColor: ringColor,
+                                            centerCaption: caption,
+                                            size: 84
+                                        )
+
+                                        VStack(spacing: 3) {
+                                            HStack(spacing: 5) {
+                                                VeloBrandIcon(provider: card.provider, size: 13.5, colored: true)
+                                                Text(VeloQuotaPalette.shortName(for: card.provider, fallback: card.label))
+                                                    .font(.system(size: 13, weight: .semibold))
+                                                    .lineLimit(1)
+                                            }
+                                            Text(
+                                                wPrimary.resetCountdownLabel.isEmpty
+                                                    ? metaLine
+                                                    : "\(metaLine) · \(wPrimary.resetCountdownLabel)"
+                                            )
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 16)
+                                    .padding(.horizontal, 10)
+                                    .veloSurface(cornerRadius: 20)
+                                }
+                            }
+                        }
+
+                        // Detailed Window Rows (e.g. Gemini 5h/7d + Claude/GPT 5h/7d)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("窗口明细")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4)
+
+                            VStack(spacing: 0) {
+                                ForEach(Array(subCards.enumerated()), id: \.element.id) { cIdx, card in
+                                    ForEach(Array(card.windows.enumerated()), id: \.element.id) { wIdx, w in
+                                        if cIdx > 0 || wIdx > 0 {
+                                            Rectangle()
+                                                .fill(tokens.divider)
+                                                .frame(height: 0.7)
+                                                .padding(.leading, 40)
+                                        }
+                                        HStack(spacing: 10) {
+                                            VeloBrandIcon(provider: card.provider, size: 15, colored: true)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(w.label)
+                                                    .font(.system(size: 13.5, weight: .medium))
+                                                    .foregroundStyle(.primary)
+                                                if let dt = w.detailText, !dt.isEmpty {
+                                                    Text(dt)
+                                                        .font(.system(size: 11, design: .monospaced))
+                                                        .foregroundStyle(.secondary)
+                                                } else if !w.resetCountdownLabel.isEmpty {
+                                                    Text("\(w.resetCountdownLabel) 后重置")
+                                                        .font(.system(size: 11, design: .monospaced))
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                            }
+                                            Spacer()
+                                            Text("\(Int(max(0, min(100, w.remainingPercent)).rounded()))%")
+                                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                                .foregroundStyle(VeloQuotaPalette.pctColor(for: w.status))
+                                                .contentTransition(.numericText())
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 11)
+                                    }
+                                }
+                            }
+                            .veloSurface(cornerRadius: 16)
+                        }
+                    }
+
+                    if !otherCards.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(otherCards) { card in
+                                    HStack(spacing: 6) {
+                                        VeloBrandIcon(provider: card.provider, size: 13, colored: card.mode == "api_key")
+                                        Text(card.label)
+                                            .font(.system(size: 12, weight: .semibold))
+                                        Text(card.planBadge)
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.horizontal, 11)
+                                    .padding(.vertical, 7)
+                                    .veloSurface(cornerRadius: 12)
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. Total API-Equivalent Summary Card
+                    if let a = store.usageAnalytics {
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack(alignment: .firstTextBaseline) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("API 等效折算总额")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                    Text(VeloFormatting.formatUsd(a.totalCostUsd))
+                                        .font(.system(size: 28, weight: .bold, design: .monospaced))
+                                        .contentTransition(.numericText())
+                                }
+                                Spacer()
+                                VStack(alignment: .trailing, spacing: 3) {
+                                    Text("今日 \(VeloFormatting.formatUsd(a.todayCostUsd))")
+                                        .font(.system(size: 12.5, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(VeloTheme.emerald)
+                                        .contentTransition(.numericText())
+                                    Text("订阅制不额外扣费")
+                                        .font(.system(size: 10.5))
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+
+                            Rectangle()
+                                .fill(tokens.divider)
+                                .frame(height: 0.7)
+
+                            HStack {
+                                statColumn(value: VeloFormatting.formatCompactTokens(a.totalTokens), label: "总 Token")
+                                Spacer()
+                                statColumn(value: String(format: "%.1f%%", a.cacheHitPct), label: "缓存命中")
+                                Spacer()
+                                statColumn(value: a.avgTps > 0 ? String(format: "%.1f", a.avgTps) : "—", label: "均速 tok/s")
+                            }
+                        }
+                        .padding(16)
+                        .veloSurface(cornerRadius: 20)
+
+                        // 3. Per-Model Breakdown Inset List
+                        if !a.byModel.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("按模型 API 等效账单")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 4)
+
+                                VStack(spacing: 0) {
+                                    ForEach(Array(a.byModel.enumerated()), id: \.element.id) { idx, m in
+                                        if idx > 0 {
+                                            Rectangle()
+                                                .fill(tokens.divider)
+                                                .frame(height: 0.7)
+                                                .padding(.leading, 42)
+                                        }
+                                        HStack(spacing: 10) {
+                                            VeloBrandIcon(provider: m.provider, size: 16, colored: true)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(m.model)
+                                                    .font(.system(size: 13.5, weight: .semibold))
+                                                    .lineLimit(1)
+                                                Text("\(m.turnsCount) 轮 · 缓 \(VeloFormatting.formatCompactTokens(m.cacheReadTokens)) · 出 \(VeloFormatting.formatCompactTokens(m.outputTokens))")
+                                                    .font(.system(size: 11, design: .monospaced))
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
+                                            Spacer()
+                                            Text(VeloFormatting.formatUsd(m.costUsd))
+                                                .font(.system(size: 13.5, weight: .semibold, design: .monospaced))
+                                                .contentTransition(.numericText())
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 11)
+                                    }
+                                }
+                                .veloSurface(cornerRadius: 16)
+                            }
+                        }
+                    } else if store.connectionConfig != nil {
+                        ProgressView("正在同步账单与配额…")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 48)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 32)
+            }
+            .background(tokens.canvas.ignoresSafeArea())
+            .navigationTitle("配额与账单")
+            .navigationBarTitleDisplayMode(.large)
+            .refreshable {
+                await store.fetchQuotas()
+                await store.fetchUsageAnalytics()
+            }
+            .task {
+                if store.connectionConfig != nil {
+                    await store.fetchQuotas()
+                    await store.fetchUsageAnalytics()
+                }
+            }
+        }
+    }
+
+    private func statColumn(value: String, label: String) -> some View {
+        VStack(spacing: 2) {
+            Text(value)
+                .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.primary)
+                .contentTransition(.numericText())
+            Text(label)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - TAB 3: Control Center (Clean Native iOS Inset Grouped List)
+
+    private var controlTab: some View {
+        NavigationStack {
+            List {
+                // Connection Status Section
+                Section {
+                    Button {
+                        VeloHaptics.tap()
+                        showPairSheet = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                    .fill(tokens.elevated)
+                                    .frame(width: 40, height: 40)
+                                Image(systemName: store.isConnected ? "desktopcomputer" : "qrcode.viewfinder")
+                                    .font(.system(size: 17, weight: .semibold))
+                                    .foregroundStyle(store.isConnected ? VeloTheme.emerald : .primary)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(store.connectionConfig == nil ? "尚未配对 Mac" : (store.isConnected ? "Mac 已连接" : "正在重连 Mac…"))
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                Text(store.connectionConfig?.displayTitle ?? "轻点扫描 Mac 端二维码配对")
+                                    .font(.system(size: 11.5, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .listRowBackground(tokens.surface)
+                }
+
+                // Remote Capabilities Section
+                Section("远程工具") {
+                    controlRow(icon: "magnifyingglass", title: "全局搜索历史对话") {
+                        analyticsModalTab = .search
+                        showAnalyticsModal = true
+                    }
+                    .disabled(store.connectionConfig == nil)
+
+                    controlRow(icon: "apple.terminal", title: "接管 Mac 终端会话") {
+                        showCliImportSheet = true
+                    }
+                    .disabled(store.connectionConfig == nil)
+
+                    controlRow(icon: "server.rack", title: "多机与远端 SSH 主机") {
+                        showRemoteHostsSheet = true
+                    }
+
+                    controlRow(icon: "calendar.badge.clock", title: "定时任务与自动化") {
+                        analyticsModalTab = .automations
+                        showAnalyticsModal = true
+                    }
+                    .disabled(store.connectionConfig == nil)
+
+                    controlRow(icon: "bell.badge", title: "锁屏唤醒推送（Bark / Webhook）") {
+                        analyticsModalTab = .push
+                        showAnalyticsModal = true
+                    }
+                    .disabled(store.connectionConfig == nil)
+                }
+
+                // Appearance Section
+                Section("外观与偏好") {
+                    controlRow(
+                        icon: "paintbrush",
+                        title: "外观与配色",
+                        trailing: "\(appearance.palette.title) · \(appearance.themeMode.title)"
+                    ) {
+                        showAppearanceSheet = true
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(tokens.canvas)
+            .navigationTitle("控制中心")
+            .navigationBarTitleDisplayMode(.large)
+        }
+    }
+
+    private func controlRow(
+        icon: String,
+        title: String,
+        trailing: String? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            VeloHaptics.tap()
+            action()
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .frame(width: 24)
+                Text(title)
+                    .font(.system(size: 15))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let trailing {
+                    Text(trailing)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .listRowBackground(tokens.surface)
+        .listRowSeparatorTint(tokens.divider)
     }
 }
 
-// MARK: - Categorized New Session Sheet (Engine -> Filtered Models -> Effort -> In-Place Repo)
+// MARK: - Things 3 / Linear Crisp 120fps Inset Session Row (Official Vendor SVG!)
 
-private struct NewSessionSheetView: View {
+private struct SessionInsetRow: View {
+    let session: VeloSessionItem
+    let isUnread: Bool
+    let tokens: VeloPaletteTokens
+
+    var body: some View {
+        HStack(spacing: 11) {
+            ZStack(alignment: .bottomTrailing) {
+                VeloBrandIcon(
+                    provider: session.agentKind,
+                    size: 17,
+                    colored: true
+                )
+                .frame(width: 22, height: 22)
+
+                if isUnread {
+                    Circle()
+                        .fill(Color(hex: 0x38BDF8))
+                        .frame(width: 6.5, height: 6.5)
+                        .overlay(Circle().stroke(tokens.surface, lineWidth: 1.2))
+                        .offset(x: 2, y: 2)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(session.title)
+                        .font(.system(size: 14.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(session.updatedAtLabel)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+
+                HStack(spacing: 5) {
+                    Text(session.modelShort)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Text("·")
+                        .foregroundStyle(.quaternary)
+                    Text(session.branchName)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 4)
+
+                    if session.insertions > 0 || session.deletions > 0 {
+                        HStack(spacing: 2.5) {
+                            Text("+\(session.insertions)").foregroundStyle(VeloTheme.emerald)
+                            Text("−\(session.deletions)").foregroundStyle(VeloTheme.coral)
+                        }
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+// MARK: - Family Dynamic Morphing New-Session Tray (Replaces Legacy 5-Step Form!)
+
+private struct FamilyNewSessionTray: View {
+    private enum TrayStep {
+        case prompt
+        case model
+        case project
+    }
+
     @ObservedObject var store: VeloStore
+    @ObservedObject private var appearance = VeloAppearanceSettings.shared
     var initialRepoPath: String?
+    var onDismiss: () -> Void
     var onCreated: (String?) -> Void
 
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @FocusState private var promptFocused: Bool
 
+    @State private var step: TrayStep = .prompt
     @State private var selectedCategory: VeloEngineCategory = .claude
     @State private var selectedModelId: String = "claude-fable-5-2"
     @State private var effort: String = "medium"
-    @State private var repoPath: String = "~/workspace"
+    @State private var repoPath: String = "~/.velo/workspace"
     @State private var useWorktree: Bool = false
     @State private var branch: String = ""
-    @State private var customTitle: String = ""
     @State private var prompt: String = ""
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var pendingImages: [PendingComposerImage] = []
     @State private var isCreating: Bool = false
+
+    private var tokens: VeloPaletteTokens {
+        VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
+    }
 
     private var categoryModels: [VeloModelOption] {
         let matched = store.models.filter { $0.category == selectedCategory }
@@ -1289,332 +1278,117 @@ private struct NewSessionSheetView: View {
                 result.append(canon)
             }
         }
-        if result.isEmpty {
-            result.append("~/workspace")
-        }
         return result
     }
 
+    private var repoDisplayName: String {
+        if repoPath == "~/.velo/workspace" || repoPath.hasSuffix("/.velo/workspace") {
+            return "快速对话"
+        }
+        let name = URL(fileURLWithPath: repoPath).lastPathComponent
+        return name.isEmpty ? "项目" : name
+    }
+
     var body: some View {
-        NavigationStack {
-            ZStack {
-                VeloTheme.canvas(colorScheme)
-                    .ignoresSafeArea()
+        ZStack(alignment: .bottom) {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    promptFocused = false
+                    onDismiss()
+                }
+                .transition(.opacity)
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
-                        // 1. Engine Category Cards
-                        VStack(alignment: .leading, spacing: 9) {
-                            sectionHeader("1. 选择对话引擎", subtitle: "单会话绑定单一引擎，彻底告别跨引擎串台")
-
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 9) {
-                                    ForEach(VeloEngineCategory.primaryCategories) { cat in
-                                        let isSelected = selectedCategory == cat
-                                        let count = store.models.filter { $0.category == cat }.count
-                                        Button {
-                                            selectEngineCategory(cat)
-                                        } label: {
-                                            VStack(alignment: .leading, spacing: 8) {
-                                                HStack {
-                                                    ZStack {
-                                                        Circle()
-                                                            .fill(cat.accentColor.opacity(0.18))
-                                                            .frame(width: 28, height: 28)
-                                                        Image(systemName: cat.iconName)
-                                                            .font(.system(size: 13, weight: .semibold))
-                                                            .foregroundStyle(cat.accentColor)
-                                                    }
-                                                    Spacer()
-                                                    if isSelected {
-                                                        Image(systemName: "checkmark.circle.fill")
-                                                            .font(.system(size: 14))
-                                                            .foregroundStyle(cat.accentColor)
-                                                    }
-                                                }
-
-                                                VStack(alignment: .leading, spacing: 2) {
-                                                    Text(cat.vendor)
-                                                        .font(.system(size: 10.5, weight: .semibold))
-                                                        .foregroundStyle(.secondary)
-                                                    Text(cat.title)
-                                                        .font(.system(size: 13.5, weight: .bold))
-                                                        .foregroundStyle(.primary)
-                                                        .lineLimit(1)
-                                                    Text("\(max(1, count)) 个模型")
-                                                        .font(.system(size: 10.5))
-                                                        .foregroundStyle(.tertiary)
-                                                }
-                                            }
-                                            .padding(12)
-                                            .frame(width: 132, alignment: .leading)
-                                            .background(
-                                                isSelected
-                                                    ? cat.accentColor.opacity(0.11)
-                                                    : VeloTheme.cardSurface(colorScheme),
-                                                in: RoundedRectangle(cornerRadius: 15, style: .continuous)
-                                            )
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 15, style: .continuous)
-                                                    .stroke(
-                                                        isSelected
-                                                            ? cat.accentColor.opacity(0.65)
-                                                            : VeloTheme.hairline(colorScheme),
-                                                        lineWidth: isSelected ? 1.4 : 0.85
-                                                    )
-                                            )
-                                        }
-                                        .buttonStyle(VeloPressableButtonStyle())
-                                    }
-                                }
-                                .padding(.vertical, 2)
+            VStack(alignment: .leading, spacing: 14) {
+                // Morphing Header (Family Values: dual Back/Close affordance)
+                HStack(spacing: 10) {
+                    if step != .prompt {
+                        Button {
+                            VeloHaptics.selection()
+                            withAnimation(VeloMotion.crisp) {
+                                step = .prompt
                             }
+                        } label: {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 28, height: 28)
+                                .background(tokens.elevated, in: Circle())
                         }
-
-                        // 2. Filtered Models inside Selected Engine
-                        VStack(alignment: .leading, spacing: 9) {
-                            sectionHeader("2. 选择 \(selectedCategory.title) 模型", subtitle: "同引擎内后续可随时无损切换模型")
-
-                            VStack(spacing: 7) {
-                                ForEach(categoryModels) { m in
-                                    let isSelected = m.id == selectedModelOption.id
-                                    Button {
-                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                        withAnimation(.snappy(duration: 0.2)) {
-                                            selectedModelId = m.id
-                                        }
-                                    } label: {
-                                        HStack(spacing: 10) {
-                                            VStack(alignment: .leading, spacing: 3) {
-                                                HStack(spacing: 6) {
-                                                    Text(m.cleanTitle)
-                                                        .font(.system(size: 14, weight: .semibold))
-                                                        .foregroundStyle(.primary)
-                                                    if m.isDefault {
-                                                        Text("默认")
-                                                            .font(.system(size: 10, weight: .bold))
-                                                            .foregroundStyle(selectedCategory.accentColor)
-                                                            .padding(.horizontal, 6)
-                                                            .padding(.vertical, 1.5)
-                                                            .background(selectedCategory.accentColor.opacity(0.14), in: Capsule())
-                                                    }
-                                                }
-                                                Text(m.cleanSubtitle)
-                                                    .font(.system(size: 11.5))
-                                                    .foregroundStyle(.secondary)
-                                                    .lineLimit(1)
-                                            }
-                                            Spacer()
-                                            Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
-                                                .font(.system(size: 16, weight: .semibold))
-                                                .foregroundStyle(isSelected ? selectedCategory.accentColor : Color.secondary.opacity(0.4))
-                                        }
-                                        .padding(.horizontal, 13)
-                                        .padding(.vertical, 10.5)
-                                        .background(
-                                            isSelected
-                                                ? selectedCategory.accentColor.opacity(0.09)
-                                                : VeloTheme.cardSurface(colorScheme),
-                                            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                                                .stroke(
-                                                    isSelected
-                                                        ? selectedCategory.accentColor.opacity(0.5)
-                                                        : VeloTheme.hairline(colorScheme),
-                                                    lineWidth: isSelected ? 1.15 : 0.8
-                                                )
-                                        )
-                                    }
-                                    .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
-                                }
-                            }
-                        }
-
-                        // 3. Effort Capsules
-                        VStack(alignment: .leading, spacing: 9) {
-                            sectionHeader("3. 推理强度 (Effort)", subtitle: nil)
-
-                            HStack(spacing: 8) {
-                                ForEach(selectedCategory.supportedEfforts, id: \.self) { lv in
-                                    let isSel = effort == lv
-                                    Button {
-                                        withAnimation(.snappy(duration: 0.18)) {
-                                            effort = lv
-                                        }
-                                    } label: {
-                                        Text(lv.uppercased())
-                                            .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                            .foregroundStyle(isSel ? .white : .secondary)
-                                            .frame(maxWidth: .infinity)
-                                            .padding(.vertical, 9)
-                                            .background(
-                                                isSel ? selectedCategory.accentColor : VeloTheme.cardSurface(colorScheme),
-                                                in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                            )
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                                    .stroke(VeloTheme.hairline(colorScheme), lineWidth: isSel ? 0 : 0.8)
-                                            )
-                                    }
-                                    .buttonStyle(VeloPressableButtonStyle())
-                                }
-                            }
-                        }
-
-                        // 4. Project Ownership & Optional Git Worktree
-                        VStack(alignment: .leading, spacing: 9) {
-                            sectionHeader("4. 所属项目目录", subtitle: "默认直接在真实项目目录运行，或点「快速对话」零目录直接开聊")
-
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 6) {
-                                    let quickPath = "~/.velo/workspace"
-                                    let isQuick = repoPath == quickPath
-                                    Button {
-                                        repoPath = quickPath
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "bolt.fill")
-                                                .font(.system(size: 10.5))
-                                            Text("快速对话（默认空间）")
-                                                .font(.system(size: 12, weight: .semibold))
-                                        }
-                                        .foregroundStyle(isQuick ? VeloTheme.emerald : .secondary)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 6)
-                                        .background(
-                                            isQuick ? VeloTheme.emerald.opacity(0.14) : VeloTheme.cardSurface(colorScheme),
-                                            in: Capsule()
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-
-                                    ForEach(recentRepos.filter { $0 != quickPath }, id: \.self) { rp in
-                                        let name = URL(fileURLWithPath: rp).lastPathComponent
-                                        let isCur = repoPath == rp
-                                        Button {
-                                            repoPath = rp
-                                        } label: {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "folder.fill")
-                                                    .font(.system(size: 10.5))
-                                                Text(name)
-                                                    .font(.system(size: 12, weight: .semibold))
-                                            }
-                                            .foregroundStyle(isCur ? VeloTheme.accentVioletSoft : .secondary)
-                                            .padding(.horizontal, 10)
-                                            .padding(.vertical, 6)
-                                            .background(
-                                                isCur ? VeloTheme.accentViolet.opacity(0.14) : VeloTheme.cardSurface(colorScheme),
-                                                in: Capsule()
-                                            )
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-
-                            VStack(spacing: 10) {
-                                TextField("项目路径", text: $repoPath)
-                                    .font(.system(size: 13, design: .monospaced))
-                                    .textInputAutocapitalization(.never)
-                                    .autocorrectionDisabled()
-                                    .padding(11)
-                                    .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-                                Toggle(isOn: $useWorktree.animation(.snappy(duration: 0.2))) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("创建隔离 Git Worktree 副本")
-                                            .font(.system(size: 13.5, weight: .semibold))
-                                        Text("仅在需要多 Agent 同时改同一仓库互不干扰时开启")
-                                            .font(.system(size: 11.5))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                .tint(VeloTheme.accentViolet)
-
-                                if useWorktree {
-                                    TextField("新分支名称（留空自动生成）", text: $branch)
-                                        .font(.system(size: 13, design: .monospaced))
-                                        .textInputAutocapitalization(.never)
-                                        .autocorrectionDisabled()
-                                        .padding(11)
-                                        .background(VeloTheme.elevatedSurface(colorScheme), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                }
-                            }
-                            .padding(13)
-                            .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
-                            )
-                        }
-
-                        // 5. Optional Session Title & Initial Task Prompt
-                        initialPromptSection
+                        .buttonStyle(.plain)
+                        .transition(.opacity.combined(with: .scale(scale: 0.85)))
                     }
-                    .padding(16)
+
+                    Text(step == .prompt ? "新建对话" : (step == .model ? "选择引擎与模型" : "选择项目目录"))
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.primary)
+
+                    Spacer()
+
+                    Button {
+                        promptFocused = false
+                        onDismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 28, height: 28)
+                            .background(tokens.elevated, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                // Dynamic Morphing Step Body
+                switch step {
+                case .prompt:
+                    promptStepView
+                        .transition(.opacity.combined(with: .move(edge: .leading)))
+                case .model:
+                    modelStepView
+                        .transition(.opacity.combined(with: .move(edge: .trailing)))
+                case .project:
+                    projectStepView
+                        .transition(.opacity.combined(with: .move(edge: .trailing)))
                 }
             }
-            .navigationTitle("新建对话")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    confirmToolbarButton
-                }
+            .padding(18)
+            .background(tokens.surface, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .stroke(tokens.border, lineWidth: 0.9)
+            )
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .animation(VeloMotion.crisp, value: step)
+            .animation(VeloMotion.crisp, value: useWorktree)
+        }
+        .onAppear {
+            initializeDefaults()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                promptFocused = true
             }
-            .onChange(of: pickerItems) { _, newItems in
-                handlePickedItems(newItems)
-            }
-            .onAppear {
-                handleOnAppear()
-            }
+        }
+        .onChange(of: pickerItems) { _, newItems in
+            handlePickedItems(newItems)
         }
     }
 
-    private func selectEngineCategory(_ cat: VeloEngineCategory) {
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        let defModel: VeloModelOption? = {
-            if let m = store.models.first(where: { $0.category == cat && $0.isDefault }) { return m }
-            if let m = store.models.first(where: { $0.category == cat }) { return m }
-            return VeloModelOption.defaults.first(where: { $0.category == cat })
-        }()
-        withAnimation(.spring(response: 0.26, dampingFraction: 0.8)) {
-            selectedCategory = cat
-            if let defModel {
-                selectedModelId = defModel.id
-            }
-            if !cat.supportedEfforts.contains(effort) {
-                effort = cat.supportedEfforts.contains("high") ? "high" : "medium"
-            }
-        }
-    }
+    private var promptStepView: some View {
+        let uploadedPaths = pendingImages.compactMap(\.uploadedPath)
+        let isUploadingAny = pendingImages.contains(where: \.isUploading)
+        let hasPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !uploadedPaths.isEmpty
 
-    private var initialPromptSection: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            sectionHeader("5. 会话名称与首条消息（选填）", subtitle: "名称留空将按首条消息自动命名；消息留空将创建干净会话")
-
-            TextField("会话名称（选填，例如：修复登录鉴权）", text: $customTitle)
-                .font(.system(size: 14))
+        return VStack(alignment: .leading, spacing: 12) {
+            TextField("直接描述你要改什么，留空也可进入空白对话…", text: $prompt, axis: .vertical)
+                .focused($promptFocused)
+                .lineLimit(2...5)
+                .font(.system(size: 15))
                 .padding(12)
-                .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .background(tokens.canvas, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
-                )
-
-            TextField("输入任务需求，或留空直接进入对话…", text: $prompt, axis: .vertical)
-                .lineLimit(3...6)
-                .font(.system(size: 14.5))
-                .padding(13)
-                .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
+                    RoundedRectangle(cornerRadius: 15, style: .continuous)
+                        .stroke(tokens.divider, lineWidth: 0.8)
                 )
 
             if !pendingImages.isEmpty {
@@ -1625,24 +1399,14 @@ private struct NewSessionSheetView: View {
                                 Image(uiImage: item.preview)
                                     .resizable()
                                     .scaledToFill()
-                                    .frame(width: 60, height: 60)
+                                    .frame(width: 54, height: 54)
                                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                    .overlay {
-                                        if item.isUploading {
-                                            ZStack {
-                                                Color.black.opacity(0.35)
-                                                ProgressView().tint(.white).scaleEffect(0.75)
-                                            }
-                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                        }
-                                    }
                                 Button {
                                     pendingImages.removeAll { $0.id == item.id }
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
-                                        .font(.system(size: 16))
-                                        .symbolRenderingMode(.palette)
-                                        .foregroundStyle(.white, Color.black.opacity(0.72))
+                                        .font(.system(size: 15))
+                                        .foregroundStyle(.white, Color.black.opacity(0.75))
                                 }
                                 .offset(x: 4, y: -4)
                             }
@@ -1653,94 +1417,322 @@ private struct NewSessionSheetView: View {
                 }
             }
 
-            PhotosPicker(
-                selection: $pickerItems,
-                maxSelectionCount: max(1, 4 - pendingImages.count),
-                matching: .images
-            ) {
-                HStack(spacing: 6) {
-                    Image(systemName: "photo.on.rectangle.angled")
-                        .font(.system(size: 12.5, weight: .semibold))
-                    Text("添加截图 / 参考图（自动压缩加密直传）")
-                        .font(.system(size: 12.5, weight: .medium))
+            // Inline Context Pills (Tap -> Morph Tray In-Place!)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    Button {
+                        VeloHaptics.selection()
+                        promptFocused = false
+                        withAnimation(VeloMotion.crisp) { step = .project }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "folder")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text(repoDisplayName)
+                                .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 10.5)
+                        .padding(.vertical, 7)
+                        .background(tokens.elevated, in: Capsule())
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+
+                    Button {
+                        VeloHaptics.selection()
+                        promptFocused = false
+                        withAnimation(VeloMotion.crisp) { step = .model }
+                    } label: {
+                        HStack(spacing: 5.5) {
+                            VeloBrandIcon(category: selectedCategory, size: 13, colored: true)
+                            Text(selectedModelOption.cleanTitle)
+                                .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 10.5)
+                        .padding(.vertical, 7)
+                        .background(tokens.elevated, in: Capsule())
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+
+                    Button {
+                        VeloHaptics.selection()
+                        withAnimation(VeloMotion.crisp) { useWorktree.toggle() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 10.5, weight: .semibold))
+                            Text("Worktree")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundStyle(useWorktree ? tokens.accentForeground : .secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(useWorktree ? tokens.accent : tokens.elevated, in: Capsule())
+                    }
+                    .buttonStyle(VeloPressableButtonStyle())
+
+                    PhotosPicker(
+                        selection: $pickerItems,
+                        maxSelectionCount: max(1, 4 - pendingImages.count),
+                        matching: .images
+                    ) {
+                        Image(systemName: "photo")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 31, height: 31)
+                            .background(tokens.elevated, in: Circle())
+                    }
+                    .disabled(pendingImages.count >= 4)
                 }
-                .foregroundStyle(VeloTheme.accentVioletSoft)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(VeloTheme.accentViolet.opacity(0.11), in: Capsule())
             }
-            .disabled(pendingImages.count >= 4)
-        }
-    }
 
-    private var confirmToolbarButton: some View {
-        let uploadedPaths = pendingImages.compactMap(\.uploadedPath)
-        let isUploadingAny = pendingImages.contains(where: \.isUploading)
-        let hasPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !uploadedPaths.isEmpty
-        let label = isCreating ? "创建中…" : (hasPrompt ? "立即启动" : "进入对话")
-        let isDisabled = isCreating || isUploadingAny || repoPath.trimmingCharacters(in: .whitespaces).isEmpty
-        return Button(label) {
-            isCreating = true
-            Task {
-                await store.addWorkspace(repoPath)
-                let cleanCustomTitle = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                let createdId = await store.createNewSession(
-                    title: cleanCustomTitle.isEmpty ? nil : cleanCustomTitle,
-                    prompt: prompt,
-                    repoPath: repoPath,
-                    branch: (useWorktree && !branch.isEmpty) ? branch : nil,
-                    modelOption: selectedModelOption,
-                    effort: effort,
-                    images: uploadedPaths,
-                    useWorktree: useWorktree
-                )
-                isCreating = false
-                dismiss()
-                onCreated(createdId)
+            if useWorktree {
+                TextField("分支名（留空自动生成）", text: $branch)
+                    .font(.system(size: 13, design: .monospaced))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .padding(10)
+                    .background(tokens.canvas, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
             }
-        }
-        .fontWeight(.semibold)
-        .disabled(isDisabled)
-    }
 
-    private func handlePickedItems(_ newItems: [PhotosPickerItem]) {
-        guard !newItems.isEmpty else { return }
-        let picked = newItems
-        pickerItems = []
-        Task {
-            for (i, item) in picked.enumerated() {
-                guard pendingImages.count < 4,
-                      let rawData = try? await item.loadTransferable(type: Data.self),
-                      let rawImg = UIImage(data: rawData),
-                      let compressed = VeloAttachmentCache.compressForAgentUpload(rawImg)
-                else { continue }
-                let fname = "init-\(Int(Date().timeIntervalSince1970))-\(i).jpg"
-                let entry = PendingComposerImage(
-                    preview: compressed.preview,
-                    jpegData: compressed.jpegData,
-                    filename: fname
-                )
-                let eid = entry.id
-                pendingImages.append(entry)
+            Button {
+                VeloHaptics.medium()
+                promptFocused = false
+                isCreating = true
                 Task {
-                    let savedPath = await store.uploadAttachment(
-                        jpegData: compressed.jpegData,
-                        preview: compressed.preview,
-                        filename: fname
+                    await store.addWorkspace(repoPath)
+                    let createdId = await store.createNewSession(
+                        title: nil,
+                        prompt: prompt,
+                        repoPath: repoPath,
+                        branch: (useWorktree && !branch.isEmpty) ? branch : nil,
+                        modelOption: selectedModelOption,
+                        effort: effort,
+                        images: uploadedPaths,
+                        useWorktree: useWorktree
                     )
-                    if let idx = pendingImages.firstIndex(where: { $0.id == eid }) {
-                        if let savedPath {
-                            pendingImages[idx].uploadedPath = savedPath
-                        } else {
-                            pendingImages[idx].uploadFailed = true
+                    isCreating = false
+                    onCreated(createdId)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    if isCreating {
+                        ProgressView().tint(tokens.accentForeground).scaleEffect(0.8)
+                    }
+                    Text(isCreating ? "正在启动…" : (hasPrompt ? "立即开始" : "进入空白对话"))
+                        .font(.system(size: 14.5, weight: .semibold))
+                }
+                .foregroundStyle(tokens.accentForeground)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12.5)
+                .background(tokens.accent, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+            }
+            .buttonStyle(VeloPressableButtonStyle(scale: 0.975))
+            .disabled(isCreating || isUploadingAny || repoPath.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+    }
+
+    private var modelStepView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Engine Switcher Pills with Official SVGs
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    ForEach(VeloEngineCategory.primaryCategories) { cat in
+                        let sel = selectedCategory == cat
+                        Button {
+                            VeloHaptics.selection()
+                            withAnimation(VeloMotion.snappy) {
+                                selectedCategory = cat
+                                let defModel = store.models.first(where: { $0.category == cat && $0.isDefault })
+                                    ?? store.models.first(where: { $0.category == cat })
+                                    ?? VeloModelOption.defaults.first(where: { $0.category == cat })
+                                if let defModel { selectedModelId = defModel.id }
+                                if !cat.supportedEfforts.contains(effort) {
+                                    effort = cat.supportedEfforts.contains("high") ? "high" : "medium"
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 5.5) {
+                                VeloBrandIcon(category: cat, size: 13, colored: true)
+                                Text(cat.shortBadge)
+                                    .font(.system(size: 12.5, weight: sel ? .semibold : .medium))
+                            }
+                            .foregroundStyle(sel ? tokens.accentForeground : .primary)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 7)
+                            .background(sel ? tokens.accent : tokens.elevated, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            // Models List inside Selected Engine
+            ScrollView {
+                VStack(spacing: 6) {
+                    ForEach(categoryModels) { m in
+                        let isSel = m.id == selectedModelOption.id
+                        Button {
+                            VeloHaptics.selection()
+                            selectedModelId = m.id
+                            withAnimation(VeloMotion.crisp) { step = .prompt }
+                        } label: {
+                            HStack(spacing: 10) {
+                                VeloBrandIcon(category: selectedCategory, size: 16, colored: true)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(m.cleanTitle)
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .foregroundStyle(.primary)
+                                    Text(m.cleanSubtitle)
+                                        .font(.system(size: 11.5))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                if isSel {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 13, weight: .bold))
+                                        .foregroundStyle(tokens.accentText)
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(
+                                isSel ? tokens.accentSoft : tokens.canvas,
+                                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                    .stroke(isSel ? tokens.border : tokens.divider, lineWidth: 0.8)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(maxHeight: 240)
+
+            // Compact Effort Selector
+            HStack(spacing: 6) {
+                Text("推理")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                ForEach(selectedCategory.supportedEfforts, id: \.self) { lv in
+                    let active = effort == lv
+                    Button {
+                        VeloHaptics.selection()
+                        effort = lv
+                    } label: {
+                        Text(lv.uppercased())
+                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                            .foregroundStyle(active ? tokens.accentForeground : .secondary)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(active ? tokens.accent : tokens.elevated, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private var projectStepView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ScrollView {
+                VStack(spacing: 6) {
+                    let quickPath = "~/.velo/workspace"
+                    projectRow(
+                        icon: "bolt",
+                        title: "快速对话",
+                        subtitle: "不绑定代码仓库，随时开聊",
+                        selected: repoPath == quickPath
+                    ) {
+                        repoPath = quickPath
+                        withAnimation(VeloMotion.crisp) { step = .prompt }
+                    }
+
+                    ForEach(recentRepos, id: \.self) { rp in
+                        let name = URL(fileURLWithPath: rp).lastPathComponent
+                        projectRow(
+                            icon: "folder",
+                            title: name.isEmpty ? rp : name,
+                            subtitle: VeloFormatting.shortenHomePath(rp),
+                            selected: repoPath == rp
+                        ) {
+                            repoPath = rp
+                            withAnimation(VeloMotion.crisp) { step = .prompt }
                         }
                     }
                 }
             }
+            .frame(maxHeight: 220)
+
+            TextField("或手动输入 Mac 目录路径…", text: $repoPath)
+                .font(.system(size: 12.5, design: .monospaced))
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .padding(10)
+                .background(tokens.canvas, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         }
     }
 
-    private func handleOnAppear() {
+    private func projectRow(
+        icon: String,
+        title: String,
+        subtitle: String,
+        selected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            VeloHaptics.selection()
+            action()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(tokens.accentText)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                selected ? tokens.accentSoft : tokens.canvas,
+                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .stroke(selected ? tokens.border : tokens.divider, lineWidth: 0.8)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func initializeDefaults() {
         if let initRepo = initialRepoPath, !initRepo.isEmpty {
             repoPath = initRepo
         } else if let activeRepo = store.sessions.first?.repoRoot, !activeRepo.isEmpty {
@@ -1759,15 +1751,31 @@ private struct NewSessionSheetView: View {
         }
     }
 
-    private func sectionHeader(_ title: String, subtitle: String?) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.system(size: 13, weight: .bold))
-                .foregroundStyle(.primary)
-            if let subtitle {
-                Text(subtitle)
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
+    private func handlePickedItems(_ newItems: [PhotosPickerItem]) {
+        guard !newItems.isEmpty else { return }
+        let picked = newItems
+        pickerItems = []
+        Task {
+            for (i, item) in picked.enumerated() {
+                guard pendingImages.count < 4,
+                      let rawData = try? await item.loadTransferable(type: Data.self),
+                      let rawImg = UIImage(data: rawData),
+                      let compressed = VeloAttachmentCache.compressForAgentUpload(rawImg)
+                else { continue }
+                let fname = "init-\(Int(Date().timeIntervalSince1970))-\(i).jpg"
+                let entry = PendingComposerImage(preview: compressed.preview, jpegData: compressed.jpegData, filename: fname)
+                let eid = entry.id
+                pendingImages.append(entry)
+                Task {
+                    let savedPath = await store.uploadAttachment(jpegData: compressed.jpegData, preview: compressed.preview, filename: fname)
+                    if let idx = pendingImages.firstIndex(where: { $0.id == eid }) {
+                        if let savedPath {
+                            pendingImages[idx].uploadedPath = savedPath
+                        } else {
+                            pendingImages[idx].uploadFailed = true
+                        }
+                    }
+                }
             }
         }
     }

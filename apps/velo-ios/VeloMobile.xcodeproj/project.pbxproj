@@ -18,6 +18,7 @@
 		767F27888C59D51418FB6A3E /* VeloCliSessionsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71E30A64F2D5609BA9178BD4 /* VeloCliSessionsSheet.swift */; };
 		8B43636C1DD169FBE665CA6C /* VeloLiveActivityExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FEF16B141B3999FF30C8FA64 /* VeloLiveActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		97D055905EB279BECD30AE6E /* RootSessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */; };
+		A080C9F3D0E12CE2A4DCDEBB /* VeloDesignPrimitives.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14C8D1BD1B3B97824D03CE80 /* VeloDesignPrimitives.swift */; };
 		B6D84F598B9090DF91FEE791 /* VeloSessionActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3F6064556E00520D2601592 /* VeloSessionActivityAttributes.swift */; };
 		B77B9C130A452EF84106382D /* VeloImageAnnotatorSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */; };
 		B87DE1091DB0CCCA2E33F72E /* VeloLiveActivityBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DE87A57ED7EFAC041356DA9 /* VeloLiveActivityBundle.swift */; };
@@ -54,6 +55,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		14C8D1BD1B3B97824D03CE80 /* VeloDesignPrimitives.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloDesignPrimitives.swift; sourceTree = "<group>"; };
 		1C71553634E9FA4CA2B4525F /* RootSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootSessionsView.swift; sourceTree = "<group>"; };
 		2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloImageAnnotatorSheet.swift; sourceTree = "<group>"; };
 		462F9866663BE7A0C6ADA9C5 /* VeloAttachmentCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VeloAttachmentCache.swift; sourceTree = "<group>"; };
@@ -96,6 +98,7 @@
 				E13A632532CFAE5CC49E17CB /* ShimmerAndStatusViews.swift */,
 				6171078B0E084192FA3073FE /* VeloAnalyticsHubSheet.swift */,
 				71E30A64F2D5609BA9178BD4 /* VeloCliSessionsSheet.swift */,
+				14C8D1BD1B3B97824D03CE80 /* VeloDesignPrimitives.swift */,
 				5B395313F2BB29A1BBB02080 /* VeloExtensionsAndCheckpointsSheet.swift */,
 				2D1CE398F3DA30868DAE085F /* VeloImageAnnotatorSheet.swift */,
 				65545A09614BDAE26A8F7653 /* VeloRemoteHostsSheet.swift */,
@@ -281,6 +284,7 @@
 				1614DE9B4C27CEA23D4D58F8 /* VeloAnalyticsHubSheet.swift in Sources */,
 				C8B327742DD8C80D4FFDDCCB /* VeloAttachmentCache.swift in Sources */,
 				767F27888C59D51418FB6A3E /* VeloCliSessionsSheet.swift in Sources */,
+				A080C9F3D0E12CE2A4DCDEBB /* VeloDesignPrimitives.swift in Sources */,
 				1AA085EC7F1192220BCBBD17 /* VeloExtensionsAndCheckpointsSheet.swift in Sources */,
 				B77B9C130A452EF84106382D /* VeloImageAnnotatorSheet.swift in Sources */,
 				B9E4D72382735CFC1DFE9F31 /* VeloLiveActivityManager.swift in Sources */,

@@ -108,46 +108,39 @@ public enum VeloTheme {
     public static let coral = Color(red: 0.973, green: 0.443, blue: 0.443) // #F87171
     public static let amber = Color(red: 0.984, green: 0.749, blue: 0.141) // #FBBF24
 
+    @MainActor
     public static func canvas(_ scheme: ColorScheme) -> Color {
-        scheme == .dark
-            ? Color(red: 0.028, green: 0.031, blue: 0.043) // #07080B Deep Obsidian
-            : Color(red: 0.962, green: 0.966, blue: 0.978) // #F5F6FA Editorial Light
+        VeloPaletteTokens.resolve(VeloAppearanceSettings.shared.palette, scheme: scheme).canvas
     }
 
+    @MainActor
     public static func cardSurface(_ scheme: ColorScheme) -> Color {
-        scheme == .dark
-            ? Color(red: 0.064, green: 0.070, blue: 0.094) // #101218 Crisp Obsidian Card
-            : Color.white
+        VeloPaletteTokens.resolve(VeloAppearanceSettings.shared.palette, scheme: scheme).surface
     }
 
+    @MainActor
     public static func elevatedSurface(_ scheme: ColorScheme) -> Color {
-        scheme == .dark
-            ? Color(red: 0.096, green: 0.105, blue: 0.141) // #181B24 Elevated Control
-            : Color(red: 0.935, green: 0.944, blue: 0.966) // #EEF1F6
+        VeloPaletteTokens.resolve(VeloAppearanceSettings.shared.palette, scheme: scheme).elevated
     }
 
+    @MainActor
     public static func codeSurface(_ scheme: ColorScheme) -> Color {
-        scheme == .dark
-            ? Color(red: 0.043, green: 0.047, blue: 0.067) // #0B0C11 Code Bed
-            : Color(red: 0.955, green: 0.961, blue: 0.976)
+        VeloPaletteTokens.resolve(VeloAppearanceSettings.shared.palette, scheme: scheme).codeBg
     }
 
+    @MainActor
     public static func codeHeader(_ scheme: ColorScheme) -> Color {
-        scheme == .dark
-            ? Color(red: 0.078, green: 0.084, blue: 0.114)
-            : Color(red: 0.922, green: 0.931, blue: 0.955)
+        VeloPaletteTokens.resolve(VeloAppearanceSettings.shared.palette, scheme: scheme).codeHeader
     }
 
+    @MainActor
     public static func userBubble(_ scheme: ColorScheme) -> Color {
-        scheme == .dark
-            ? Color(red: 0.128, green: 0.133, blue: 0.178)
-            : Color(red: 0.922, green: 0.929, blue: 0.961)
+        VeloPaletteTokens.resolve(VeloAppearanceSettings.shared.palette, scheme: scheme).userBubble
     }
 
+    @MainActor
     public static func hairline(_ scheme: ColorScheme) -> Color {
-        scheme == .dark
-            ? Color.white.opacity(0.085)
-            : Color.black.opacity(0.075)
+        VeloPaletteTokens.resolve(VeloAppearanceSettings.shared.palette, scheme: scheme).divider
     }
 
     public static func specularRim(_ scheme: ColorScheme) -> LinearGradient {

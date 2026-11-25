@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-// MARK: - 1. Global Appearance & Material Preferences (Synced with Desktop Philosophy)
+// MARK: - 1. Global Theme & Curated Palette Preferences (Default: A · Monochrome Editorial)
 
 public enum VeloThemePreference: String, CaseIterable, Identifiable {
     case system
@@ -35,26 +35,38 @@ public enum VeloThemePreference: String, CaseIterable, Identifiable {
     }
 }
 
-public enum VeloMaterialStyle: String, CaseIterable, Identifiable {
-    case matte
-    case frosted
-    case specular
+public enum VeloColorPalette: String, CaseIterable, Identifiable {
+    case monochrome  // A · 极简黑白 (Default)
+    case warm        // B · 暖沙陶土
+    case titanium    // C · 深空钛蓝
+    case sage        // D · 墨绿森林
 
     public var id: String { rawValue }
 
     public var title: String {
         switch self {
-        case .matte: return "纯平哑光"
-        case .frosted: return "磨砂玻璃"
-        case .specular: return "高光浮层"
+        case .monochrome: return "极简黑白"
+        case .warm: return "暖沙陶土"
+        case .titanium: return "深空钛蓝"
+        case .sage: return "墨绿森林"
         }
     }
 
     public var subtitle: String {
         switch self {
-        case .matte: return "克制无反光，专注高对比阅读"
-        case .frosted: return "原生毛玻璃质感与细腻折光边"
-        case .specular: return "深邃微光晕与柔和流体高光"
+        case .monochrome: return "炭黑底 + 象牙白主按钮，最克制耐看"
+        case .warm: return "暖黑咖啡 + 陶土橙，长读护眼"
+        case .titanium: return "深蓝灰钛金属 + 低饱和冰川靛"
+        case .sage: return "深松炭黑 + 柔和鼠尾草绿"
+        }
+    }
+
+    public var swatchColors: [Color] {
+        switch self {
+        case .monochrome: return [Color(hex: 0x09090B), Color(hex: 0x27272A), Color(hex: 0xF4F4F5)]
+        case .warm: return [Color(hex: 0x131210), Color(hex: 0xD97757), Color(hex: 0xF5F2EB)]
+        case .titanium: return [Color(hex: 0x080A0F), Color(hex: 0x8294FF), Color(hex: 0x64C2D4)]
+        case .sage: return [Color(hex: 0x090C0B), Color(hex: 0x47C98F), Color(hex: 0xF2F5F3)]
         }
     }
 }
@@ -64,17 +76,17 @@ public final class VeloAppearanceSettings: ObservableObject {
     public static let shared = VeloAppearanceSettings()
 
     private enum Keys {
-        static let theme = "velo.ios.appearance.theme.v1"
-        static let material = "velo.ios.appearance.material.v1"
-        static let reduceMotion = "velo.ios.appearance.reduceMotion.v1"
+        static let theme = "velo.ios.appearance.theme.v2"
+        static let palette = "velo.ios.appearance.palette.v2"
+        static let reduceMotion = "velo.ios.appearance.reduceMotion.v2"
     }
 
     @Published public var themeMode: VeloThemePreference {
         didSet { UserDefaults.standard.set(themeMode.rawValue, forKey: Keys.theme) }
     }
 
-    @Published public var materialStyle: VeloMaterialStyle {
-        didSet { UserDefaults.standard.set(materialStyle.rawValue, forKey: Keys.material) }
+    @Published public var palette: VeloColorPalette {
+        didSet { UserDefaults.standard.set(palette.rawValue, forKey: Keys.palette) }
     }
 
     @Published public var reduceMotion: Bool {
@@ -89,24 +101,212 @@ public final class VeloAppearanceSettings: ObservableObject {
         let rawTheme = UserDefaults.standard.string(forKey: Keys.theme) ?? "system"
         self.themeMode = VeloThemePreference(rawValue: rawTheme) ?? .system
 
-        let rawMat = UserDefaults.standard.string(forKey: Keys.material) ?? "frosted"
-        self.materialStyle = VeloMaterialStyle(rawValue: rawMat) ?? .frosted
+        let rawPal = UserDefaults.standard.string(forKey: Keys.palette) ?? "monochrome"
+        self.palette = VeloColorPalette(rawValue: rawPal) ?? .monochrome
 
         self.reduceMotion = UserDefaults.standard.bool(forKey: Keys.reduceMotion)
     }
 }
 
-// MARK: - 2. 60fps.design / Linear / Family Spring Motion Dictionary & Haptics
+public extension Color {
+    init(hex: UInt32, alpha: Double = 1.0) {
+        let r = Double((hex >> 16) & 0xFF) / 255.0
+        let g = Double((hex >> 8) & 0xFF) / 255.0
+        let b = Double(hex & 0xFF) / 255.0
+        self.init(red: r, green: g, blue: b, opacity: alpha)
+    }
+}
+
+// MARK: - 2. Palette-Aware Token Resolver (Pure Solid 120fps Surfaces!)
+
+public struct VeloPaletteTokens {
+    public let canvas: Color
+    public let surface: Color
+    public let elevated: Color
+    public let divider: Color
+    public let border: Color
+    public let accent: Color
+    public let accentForeground: Color
+    public let accentSoft: Color
+    public let accentText: Color
+    public let ringPrimary: Color
+    public let ringSecondary: Color
+    public let heroTint: Color
+    public let codeBg: Color
+    public let codeHeader: Color
+    public let userBubble: Color
+
+    public static func resolve(_ palette: VeloColorPalette, scheme: ColorScheme) -> VeloPaletteTokens {
+        let dark = (scheme == .dark)
+        switch palette {
+        case .monochrome:
+            if dark {
+                return VeloPaletteTokens(
+                    canvas: Color(hex: 0x09090B),
+                    surface: Color(hex: 0x131316),
+                    elevated: Color(hex: 0x1D1D22),
+                    divider: Color.white.opacity(0.08),
+                    border: Color.white.opacity(0.11),
+                    accent: Color(hex: 0xF4F4F5),
+                    accentForeground: Color(hex: 0x09090B),
+                    accentSoft: Color.white.opacity(0.09),
+                    accentText: Color(hex: 0xE4E4E7),
+                    ringPrimary: Color(hex: 0xF4F4F5),
+                    ringSecondary: Color(hex: 0x8E8E98),
+                    heroTint: Color.white.opacity(0.06),
+                    codeBg: Color(hex: 0x0C0C0F),
+                    codeHeader: Color(hex: 0x15151A),
+                    userBubble: Color(hex: 0x202026)
+                )
+            } else {
+                return VeloPaletteTokens(
+                    canvas: Color(hex: 0xF6F6F4),
+                    surface: Color.white,
+                    elevated: Color(hex: 0xECECE9),
+                    divider: Color.black.opacity(0.07),
+                    border: Color.black.opacity(0.09),
+                    accent: Color(hex: 0x18181B),
+                    accentForeground: Color.white,
+                    accentSoft: Color.black.opacity(0.065),
+                    accentText: Color(hex: 0x18181B),
+                    ringPrimary: Color(hex: 0x18181B),
+                    ringSecondary: Color(hex: 0x71717A),
+                    heroTint: Color.black.opacity(0.035),
+                    codeBg: Color(hex: 0xF5F5F3),
+                    codeHeader: Color(hex: 0xEBEBE7),
+                    userBubble: Color(hex: 0xEAEAE6)
+                )
+            }
+
+        case .warm:
+            if dark {
+                return VeloPaletteTokens(
+                    canvas: Color(hex: 0x131210),
+                    surface: Color(hex: 0x1C1A17),
+                    elevated: Color(hex: 0x27241F),
+                    divider: Color(hex: 0xF5ECE0, alpha: 0.08),
+                    border: Color(hex: 0xF5ECE0, alpha: 0.12),
+                    accent: Color(hex: 0xD97757),
+                    accentForeground: Color(hex: 0x14110F),
+                    accentSoft: Color(hex: 0xD97757, alpha: 0.14),
+                    accentText: Color(hex: 0xE48C6E),
+                    ringPrimary: Color(hex: 0xD97757),
+                    ringSecondary: Color(hex: 0xC4A47C),
+                    heroTint: Color(hex: 0xD97757, alpha: 0.14),
+                    codeBg: Color(hex: 0x151311),
+                    codeHeader: Color(hex: 0x201D19),
+                    userBubble: Color(hex: 0x292520)
+                )
+            } else {
+                return VeloPaletteTokens(
+                    canvas: Color(hex: 0xF5F2EB),
+                    surface: Color(hex: 0xFFFDF9),
+                    elevated: Color(hex: 0xEBE6DC),
+                    divider: Color(hex: 0x2D2418, alpha: 0.08),
+                    border: Color(hex: 0x2D2418, alpha: 0.11),
+                    accent: Color(hex: 0xC96442),
+                    accentForeground: Color(hex: 0xFFFDF9),
+                    accentSoft: Color(hex: 0xC96442, alpha: 0.11),
+                    accentText: Color(hex: 0xB85636),
+                    ringPrimary: Color(hex: 0xC96442),
+                    ringSecondary: Color(hex: 0x8C7A64),
+                    heroTint: Color(hex: 0xC96442, alpha: 0.08),
+                    codeBg: Color(hex: 0xF6F2EA),
+                    codeHeader: Color(hex: 0xECE6DB),
+                    userBubble: Color(hex: 0xEDE7DC)
+                )
+            }
+
+        case .titanium:
+            if dark {
+                return VeloPaletteTokens(
+                    canvas: Color(hex: 0x080A0F),
+                    surface: Color(hex: 0x11141C),
+                    elevated: Color(hex: 0x1A1F2B),
+                    divider: Color(hex: 0xD2DEFF, alpha: 0.08),
+                    border: Color(hex: 0xD2DEFF, alpha: 0.12),
+                    accent: Color(hex: 0x8294FF),
+                    accentForeground: Color(hex: 0x090C14),
+                    accentSoft: Color(hex: 0x8294FF, alpha: 0.14),
+                    accentText: Color(hex: 0x9AA9FF),
+                    ringPrimary: Color(hex: 0x8294FF),
+                    ringSecondary: Color(hex: 0x64C2D4),
+                    heroTint: Color(hex: 0x8294FF, alpha: 0.14),
+                    codeBg: Color(hex: 0x0B0E14),
+                    codeHeader: Color(hex: 0x141824),
+                    userBubble: Color(hex: 0x1D2332)
+                )
+            } else {
+                return VeloPaletteTokens(
+                    canvas: Color(hex: 0xF3F5F9),
+                    surface: Color.white,
+                    elevated: Color(hex: 0xE8ECF4),
+                    divider: Color(hex: 0x141E3C, alpha: 0.075),
+                    border: Color(hex: 0x141E3C, alpha: 0.10),
+                    accent: Color(hex: 0x4C5FD5),
+                    accentForeground: Color.white,
+                    accentSoft: Color(hex: 0x4C5FD5, alpha: 0.10),
+                    accentText: Color(hex: 0x4456C4),
+                    ringPrimary: Color(hex: 0x4C5FD5),
+                    ringSecondary: Color(hex: 0x2B8CA3),
+                    heroTint: Color(hex: 0x4C5FD5, alpha: 0.08),
+                    codeBg: Color(hex: 0xF4F6FB),
+                    codeHeader: Color(hex: 0xE9EDF6),
+                    userBubble: Color(hex: 0xE7ECF7)
+                )
+            }
+
+        case .sage:
+            if dark {
+                return VeloPaletteTokens(
+                    canvas: Color(hex: 0x090C0B),
+                    surface: Color(hex: 0x111614),
+                    elevated: Color(hex: 0x1A221F),
+                    divider: Color(hex: 0xD7F0E4, alpha: 0.08),
+                    border: Color(hex: 0xD7F0E4, alpha: 0.11),
+                    accent: Color(hex: 0x47C98F),
+                    accentForeground: Color(hex: 0x07120D),
+                    accentSoft: Color(hex: 0x47C98F, alpha: 0.13),
+                    accentText: Color(hex: 0x62D6A2),
+                    ringPrimary: Color(hex: 0x47C98F),
+                    ringSecondary: Color(hex: 0x8AB8A4),
+                    heroTint: Color(hex: 0x47C98F, alpha: 0.13),
+                    codeBg: Color(hex: 0x0B0F0D),
+                    codeHeader: Color(hex: 0x141B18),
+                    userBubble: Color(hex: 0x1B2420)
+                )
+            } else {
+                return VeloPaletteTokens(
+                    canvas: Color(hex: 0xF2F5F3),
+                    surface: Color.white,
+                    elevated: Color(hex: 0xE5ECE8),
+                    divider: Color(hex: 0x0F2D20, alpha: 0.075),
+                    border: Color(hex: 0x0F2D20, alpha: 0.10),
+                    accent: Color(hex: 0x1D8A5E),
+                    accentForeground: Color.white,
+                    accentSoft: Color(hex: 0x1D8A5E, alpha: 0.10),
+                    accentText: Color(hex: 0x18754F),
+                    ringPrimary: Color(hex: 0x1D8A5E),
+                    ringSecondary: Color(hex: 0x5B8C79),
+                    heroTint: Color(hex: 0x1D8A5E, alpha: 0.08),
+                    codeBg: Color(hex: 0xF3F7F5),
+                    codeHeader: Color(hex: 0xE6EEE9),
+                    userBubble: Color(hex: 0xE6EFE9)
+                )
+            }
+        }
+    }
+}
+
+// MARK: - 3. Unified Single-Damping Motion Physics & Semantic Haptics
 
 public enum VeloMotion {
-    /// Linear-style zero-slop crisp snap for direct controls & toggles
-    public static let snappy: Animation = .spring(response: 0.24, dampingFraction: 0.78)
-    /// Family-style playful tactile pop for approvals, copy confirmation, and primary FAB
-    public static let bouncy: Animation = .spring(response: 0.34, dampingFraction: 0.64)
-    /// Arc-style fluid spatial morph for folders, drawers, and sliding pills
-    public static let smooth: Animation = .spring(response: 0.36, dampingFraction: 0.85)
-    /// Gentle staggered entrance for cards
-    public static let gentle: Animation = .spring(response: 0.44, dampingFraction: 0.88)
+    /// Unified Linear/Family crisp spring used across the entire app
+    public static let crisp: Animation = .spring(response: 0.28, dampingFraction: 0.82)
+    /// Slightly quicker snap for direct tap & pill toggles
+    public static let snappy: Animation = .spring(response: 0.22, dampingFraction: 0.84)
+    /// Slightly gentler morph for Family tray height & ring fill
+    public static let smooth: Animation = .spring(response: 0.36, dampingFraction: 0.86)
 }
 
 public enum VeloHaptics {
@@ -131,412 +331,213 @@ public enum VeloHaptics {
     }
 }
 
-// MARK: - 3. Aceternity / Magic UI Micro Dot-Grid Canvas Background (Hero / Empty States Only)
+// MARK: - 4. Official Manufacturer Vector SVG Brand Icon (Native Assets.xcassets)
 
-public struct VeloDotGridBackground: View {
-    @Environment(\.colorScheme) private var colorScheme
-    public var accent: Color = VeloTheme.accentViolet
+public struct VeloBrandIcon: View {
+    public let provider: String
+    public var size: CGFloat = 15
+    public var colored: Bool = true
 
-    public init(accent: Color = VeloTheme.accentViolet) {
-        self.accent = accent
-    }
-
-    public var body: some View {
-        ZStack {
-            // Subtle top radial ambient glow
-            RadialGradient(
-                colors: [
-                    accent.opacity(colorScheme == .dark ? 0.14 : 0.08),
-                    accent.opacity(colorScheme == .dark ? 0.04 : 0.02),
-                    Color.clear,
-                ],
-                center: UnitPoint(x: 0.5, y: 0.24),
-                startRadius: 12,
-                endRadius: 260
-            )
-            .ignoresSafeArea()
-
-            // Crisp 1px micro-dot pattern masked with radial fade so edges melt seamlessly
-            Canvas { context, size in
-                let spacing: CGFloat = 22
-                let dotColor = colorScheme == .dark
-                    ? Color.white.opacity(0.11)
-                    : Color.black.opacity(0.085)
-                let cols = Int(ceil(size.width / spacing))
-                let rows = Int(ceil(size.height / spacing))
-                for r in 0...rows {
-                    for c in 0...cols {
-                        let rect = CGRect(
-                            x: CGFloat(c) * spacing + 6,
-                            y: CGFloat(r) * spacing + 6,
-                            width: 1.4,
-                            height: 1.4
-                        )
-                        context.fill(Path(ellipseIn: rect), with: .color(dotColor))
-                    }
-                }
-            }
-            .mask(
-                RadialGradient(
-                    colors: [
-                        Color.white,
-                        Color.white.opacity(0.55),
-                        Color.clear,
-                    ],
-                    center: UnitPoint(x: 0.5, y: 0.32),
-                    startRadius: 20,
-                    endRadius: 290
-                )
-            )
-            .allowsHitTesting(false)
-        }
-    }
-}
-
-// MARK: - 4. Magic UI 1pt Rotating Border Beam (GPU 30fps TimelineView, Respects Reduce Motion)
-
-public struct VeloBorderBeamModifier: ViewModifier {
-    let active: Bool
-    let accent: Color
-    let cornerRadius: CGFloat
-    let lineWidth: CGFloat
-    let duration: Double
-
-    @Environment(\.accessibilityReduceMotion) private var sysReduceMotion
-    @ObservedObject private var appearance = VeloAppearanceSettings.shared
-
-    public func body(content: Content) -> some View {
-        let shouldAnimate = active && !sysReduceMotion && !appearance.reduceMotion
-        content.overlay {
-            if shouldAnimate {
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { ctx in
-                    let angle = Angle.degrees(
-                        ctx.date.timeIntervalSinceReferenceDate
-                            .truncatingRemainder(dividingBy: duration) / duration * 360.0
-                    )
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .stroke(
-                            AngularGradient(
-                                gradient: Gradient(stops: [
-                                    .init(color: .clear, location: 0.0),
-                                    .init(color: .clear, location: 0.72),
-                                    .init(color: accent.opacity(0.25), location: 0.83),
-                                    .init(color: accent.opacity(0.85), location: 0.93),
-                                    .init(color: .clear, location: 1.0),
-                                ]),
-                                center: .center,
-                                angle: angle
-                            ),
-                            lineWidth: lineWidth
-                        )
-                }
-                .allowsHitTesting(false)
-            } else if active {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(accent.opacity(0.45), lineWidth: lineWidth)
-                    .allowsHitTesting(false)
-            }
-        }
-    }
-}
-
-public extension View {
-    func veloBorderBeam(
-        active: Bool,
-        accent: Color,
-        cornerRadius: CGFloat = 16,
-        lineWidth: CGFloat = 1.25,
-        duration: Double = 3.6
-    ) -> some View {
-        modifier(
-            VeloBorderBeamModifier(
-                active: active,
-                accent: accent,
-                cornerRadius: cornerRadius,
-                lineWidth: lineWidth,
-                duration: duration
-            )
-        )
-    }
-}
-
-// MARK: - 5. Magic UI Shimmer Sweep Overlay (For Primary CTAs)
-
-public struct VeloShimmerSweepOverlay: View {
-    public var cornerRadius: CGFloat = 999
-    public var period: Double = 3.2
-    @Environment(\.accessibilityReduceMotion) private var sysReduceMotion
-    @ObservedObject private var appearance = VeloAppearanceSettings.shared
-
-    public init(cornerRadius: CGFloat = 999, period: Double = 3.2) {
-        self.cornerRadius = cornerRadius
-        self.period = period
-    }
-
-    public var body: some View {
-        if !sysReduceMotion && !appearance.reduceMotion {
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { ctx in
-                let cycle = ctx.date.timeIntervalSinceReferenceDate
-                    .truncatingRemainder(dividingBy: period) / period
-                // Sweep briskly across first 42% of cycle, rest calmly for remaining 58%
-                let progress = min(1.0, cycle / 0.42)
-                let visible = cycle < 0.42
-
-                GeometryReader { geo in
-                    if visible {
-                        LinearGradient(
-                            stops: [
-                                .init(color: .clear, location: 0.0),
-                                .init(color: Color.white.opacity(0.26), location: 0.48),
-                                .init(color: Color.white.opacity(0.40), location: 0.52),
-                                .init(color: .clear, location: 1.0),
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                        .frame(width: max(54, geo.size.width * 0.42))
-                        .rotationEffect(.degrees(14))
-                        .offset(x: -geo.size.width * 0.45 + CGFloat(progress) * (geo.size.width * 1.9))
-                    }
-                }
-                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            }
-            .allowsHitTesting(false)
-        }
-    }
-}
-
-// MARK: - 6. 60fps.design Stateless Radar Pulse Beacon
-
-public struct VeloPulseBeacon: View {
-    public let color: Color
-    public var active: Bool = true
-    public var size: CGFloat = 8
-
-    @Environment(\.accessibilityReduceMotion) private var sysReduceMotion
-    @ObservedObject private var appearance = VeloAppearanceSettings.shared
-
-    public init(color: Color, active: Bool = true, size: CGFloat = 8) {
-        self.color = color
-        self.active = active
+    public init(provider: String, size: CGFloat = 15, colored: Bool = true) {
+        self.provider = provider
         self.size = size
+        self.colored = colored
     }
 
-    public var body: some View {
-        let animate = active && !sysReduceMotion && !appearance.reduceMotion
-        ZStack {
-            if animate {
-                TimelineView(.animation(minimumInterval: 1.0 / 24.0)) { ctx in
-                    let p = ctx.date.timeIntervalSinceReferenceDate
-                        .truncatingRemainder(dividingBy: 2.1) / 2.1
-                    Circle()
-                        .stroke(color.opacity(max(0, (1.0 - p) * 0.65)), lineWidth: 1.3)
-                        .frame(width: size, height: size)
-                        .scaleEffect(1.0 + CGFloat(p) * 1.65)
-                }
-            } else {
-                Circle()
-                    .fill(color.opacity(0.22))
-                    .frame(width: size * 2.1, height: size * 2.1)
-            }
+    public init(category: VeloEngineCategory, size: CGFloat = 15, colored: Bool = true) {
+        self.provider = category.rawValue
+        self.size = size
+        self.colored = colored
+    }
 
-            Circle()
-                .fill(color)
-                .frame(width: size, height: size)
-                .shadow(color: color.opacity(0.55), radius: 3)
+    private var lower: String { provider.lowercased() }
+
+    public var body: some View {
+        Group {
+            if lower.contains("claude") {
+                if colored {
+                    Image("BrandClaude")
+                        .resizable()
+                        .renderingMode(.original)
+                } else {
+                    Image("BrandClaudeMono")
+                        .resizable()
+                        .renderingMode(.template)
+                }
+            } else if lower.contains("codex") || lower.contains("openai") || lower.contains("gpt") {
+                Image("BrandOpenAI")
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(colored ? Color.primary : Color.secondary)
+            } else if lower.contains("antigravity") || lower.contains("agy") {
+                Image("BrandAntigravity")
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(colored ? Color.primary : Color.secondary)
+            } else if lower.contains("gemini") {
+                if colored {
+                    Image("BrandGemini")
+                        .resizable()
+                        .renderingMode(.original)
+                } else {
+                    Image("BrandGeminiMono")
+                        .resizable()
+                        .renderingMode(.template)
+                }
+            } else if lower.contains("cursor") {
+                Image("BrandCursor")
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(colored ? Color.primary : Color.secondary)
+            } else if lower.contains("grok") || lower.contains("xai") {
+                Image("BrandGrok")
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(colored ? Color.primary : Color.secondary)
+            } else if lower.contains("opencode") {
+                Image("BrandOpenCode")
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(colored ? Color.primary : Color.secondary)
+            } else if lower.contains("copilot") {
+                Image("BrandCopilot")
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(colored ? Color.primary : Color.secondary)
+            } else if lower.contains("qwen") {
+                Image("BrandQwen")
+                    .resizable()
+                    .renderingMode(.original)
+            } else {
+                Image(systemName: "terminal")
+                    .resizable()
+                    .foregroundStyle(Color.secondary)
+            }
         }
-        .frame(width: size * 2.6, height: size * 2.6)
+        .aspectRatio(contentMode: .fit)
+        .frame(width: size, height: size)
     }
 }
 
-// MARK: - 7. HeroUI + Aceternity Surface & Ambient Aura Card Modifier
+// MARK: - 5. Pure Solid 120fps Surface Modifier (ZERO Live Blur / Dynamic Shadow Inside Scroll!)
 
-public struct VeloSurfaceModifier: ViewModifier {
+public struct VeloSolidCardModifier: ViewModifier {
     let cornerRadius: CGFloat
-    let auraAccent: Color?
     let elevated: Bool
 
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var appearance = VeloAppearanceSettings.shared
 
     public func body(content: Content) -> some View {
+        let tokens = VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        let baseFill = elevated ? VeloTheme.elevatedSurface(colorScheme) : VeloTheme.cardSurface(colorScheme)
-
         content
-            .background {
-                ZStack {
-                    switch appearance.materialStyle {
-                    case .matte:
-                        shape.fill(baseFill)
-                    case .frosted:
-                        shape
-                            .fill(.ultraThinMaterial)
-                            .overlay(shape.fill(baseFill.opacity(colorScheme == .dark ? 0.78 : 0.86)))
-                    case .specular:
-                        shape
-                            .fill(.ultraThinMaterial)
-                            .overlay(shape.fill(baseFill.opacity(colorScheme == .dark ? 0.68 : 0.80)))
-                    }
-
-                    // Aceternity subtle top-leading brand aura
-                    if let auraAccent, appearance.materialStyle != .matte {
-                        let auraStrength: Double = appearance.materialStyle == .specular
-                            ? (colorScheme == .dark ? 0.14 : 0.08)
-                            : (colorScheme == .dark ? 0.08 : 0.045)
-                        shape.fill(
-                            RadialGradient(
-                                colors: [auraAccent.opacity(auraStrength), Color.clear],
-                                center: .topLeading,
-                                startRadius: 4,
-                                endRadius: 150
-                            )
-                        )
-                    }
-                }
-            }
-            .overlay(
-                shape.stroke(
-                    appearance.materialStyle == .matte
-                        ? AnyShapeStyle(VeloTheme.hairline(colorScheme))
-                        : AnyShapeStyle(VeloTheme.specularRim(colorScheme)),
-                    lineWidth: appearance.materialStyle == .specular ? 1.05 : 0.85
-                )
-            )
-            .shadow(
-                color: colorScheme == .dark
-                    ? Color.black.opacity(appearance.materialStyle == .matte ? 0.0 : 0.24)
-                    : Color.black.opacity(appearance.materialStyle == .matte ? 0.03 : 0.06),
-                radius: appearance.materialStyle == .specular ? 12 : 6,
-                x: 0,
-                y: appearance.materialStyle == .specular ? 5 : 2
-            )
+            .background(elevated ? tokens.elevated : tokens.surface, in: shape)
+            .overlay(shape.stroke(tokens.divider, lineWidth: 0.75))
     }
 }
 
 public extension View {
+    /// 120fps pure-solid card surface — safe inside ScrollView & LazyVStack.
     func veloSurface(
         cornerRadius: CGFloat = 16,
         aura: Color? = nil,
         elevated: Bool = false
     ) -> some View {
-        modifier(VeloSurfaceModifier(cornerRadius: cornerRadius, auraAccent: aura, elevated: elevated))
+        modifier(VeloSolidCardModifier(cornerRadius: cornerRadius, elevated: elevated))
     }
 }
 
-// MARK: - 8. Family-Style Staggered Card Entrance
+// MARK: - 6. Copilot-Style Quota Ring Gauge (One-Shot Smooth Draw on Appear, Zero Idle Polling)
 
-public struct VeloStaggerAppearModifier: ViewModifier {
-    let index: Int
-    @State private var shown = false
-    @Environment(\.accessibilityReduceMotion) private var sysReduceMotion
-    @ObservedObject private var appearance = VeloAppearanceSettings.shared
+public struct VeloQuotaRingView: View {
+    public let remainingPercent: Double
+    public let ringColor: Color
+    public let centerCaption: String
+    public var size: CGFloat = 82
 
-    public func body(content: Content) -> some View {
-        let skip = sysReduceMotion || appearance.reduceMotion
-        content
-            .opacity(skip || shown ? 1 : 0)
-            .offset(y: skip || shown ? 0 : 9)
-            .scaleEffect(skip || shown ? 1 : 0.985)
-            .onAppear {
-                guard !shown else { return }
-                if skip {
-                    shown = true
-                } else {
-                    let delay = Double(min(index, 6)) * 0.032
-                    withAnimation(VeloMotion.smooth.delay(delay)) {
-                        shown = true
-                    }
-                }
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var animatedFraction: CGFloat = 0
+
+    public init(
+        remainingPercent: Double,
+        ringColor: Color,
+        centerCaption: String,
+        size: CGFloat = 82
+    ) {
+        self.remainingPercent = remainingPercent
+        self.ringColor = ringColor
+        self.centerCaption = centerCaption
+        self.size = size
+    }
+
+    public var body: some View {
+        let clamped = max(0, min(100, remainingPercent))
+        let target = CGFloat(clamped / 100.0)
+
+        ZStack {
+            Circle()
+                .stroke(
+                    colorScheme == .dark ? Color.white.opacity(0.09) : Color.black.opacity(0.075),
+                    lineWidth: 6
+                )
+
+            Circle()
+                .trim(from: 0, to: max(0.03, animatedFraction))
+                .stroke(
+                    ringColor,
+                    style: StrokeStyle(lineWidth: 6, lineCap: .round)
+                )
+                .rotationEffect(.degrees(-90))
+
+            VStack(spacing: 1) {
+                Text("\(Int(clamped.rounded()))%")
+                    .font(.system(size: 17.5, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .contentTransition(.numericText())
+                Text(centerCaption)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(.secondary)
             }
+        }
+        .frame(width: size, height: size)
+        .onAppear {
+            withAnimation(VeloMotion.smooth) {
+                animatedFraction = target
+            }
+        }
+        .onChange(of: remainingPercent) { _, newVal in
+            withAnimation(VeloMotion.smooth) {
+                animatedFraction = CGFloat(max(0, min(100, newVal)) / 100.0)
+            }
+        }
     }
 }
 
-public extension View {
-    func veloStaggerAppear(index: Int) -> some View {
-        modifier(VeloStaggerAppearModifier(index: index))
-    }
-}
-
-// MARK: - 9. Quota Brand Gradients (1:1 Parity with Desktop SidebarQuotaBar)
+// MARK: - 7. Quota Brand Palette Helpers
 
 public enum VeloQuotaPalette {
+    public static func ringColor(for provider: String, status: String, tokens: VeloPaletteTokens, isFirst: Bool) -> Color {
+        if status == "exhausted" { return VeloTheme.coral }
+        if status == "warning" { return VeloTheme.amber }
+        return isFirst ? tokens.ringPrimary : tokens.ringSecondary
+    }
+
+    @MainActor
     public static func gradient(for provider: String, status: String) -> LinearGradient {
         if status == "exhausted" {
-            return LinearGradient(
-                colors: [Color(red: 0.86, green: 0.15, blue: 0.15), VeloTheme.coral],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
+            return LinearGradient(colors: [Color(hex: 0xDC2626), VeloTheme.coral], startPoint: .leading, endPoint: .trailing)
         }
         if status == "warning" {
-            return LinearGradient(
-                colors: [Color(red: 0.85, green: 0.47, blue: 0.02), VeloTheme.amber],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
+            return LinearGradient(colors: [Color(hex: 0xD97706), VeloTheme.amber], startPoint: .leading, endPoint: .trailing)
         }
-        switch provider {
-        case "antigravity":
-            return LinearGradient(
-                colors: [Color(red: 0.23, green: 0.51, blue: 0.96), Color(red: 0.38, green: 0.65, blue: 0.98)],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        case "cursor":
-            return LinearGradient(
-                colors: [Color(red: 0.55, green: 0.36, blue: 0.96), Color(red: 0.75, green: 0.52, blue: 0.99)],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        case "claude":
-            return LinearGradient(
-                colors: [Color(red: 0.85, green: 0.47, blue: 0.34), Color(red: 0.96, green: 0.62, blue: 0.04)],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        default:
-            return LinearGradient(
-                colors: [Color(red: 0.06, green: 0.73, blue: 0.51), VeloTheme.emerald],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        }
-    }
-
-    public static func accent(for provider: String) -> Color {
-        switch provider {
-        case "antigravity": return Color(red: 0.36, green: 0.58, blue: 0.98)
-        case "cursor": return Color(red: 0.65, green: 0.55, blue: 0.98)
-        case "claude": return Color(red: 0.85, green: 0.47, blue: 0.34)
-        case "codex": return Color(red: 0.06, green: 0.64, blue: 0.50)
-        default: return VeloTheme.emerald
-        }
-    }
-
-    public static func icon(for provider: String) -> String {
-        switch provider {
-        case "antigravity": return "atom"
-        case "cursor": return "cursorarrow.rays"
-        case "claude": return "sparkles"
-        case "codex": return "terminal.fill"
-        default: return "cpu"
-        }
+        let accent = VeloPaletteTokens.resolve(VeloAppearanceSettings.shared.palette, scheme: .dark).ringPrimary
+        return LinearGradient(colors: [accent.opacity(0.8), accent], startPoint: .leading, endPoint: .trailing)
     }
 
     public static func shortName(for provider: String, fallback: String) -> String {
         switch provider {
         case "antigravity": return "Antigravity"
-        case "cursor": return "Cursor"
-        case "claude": return "Claude"
-        case "codex": return "Codex"
-        default: return fallback
-        }
-    }
-
-    public static func compactTag(for provider: String, fallback: String) -> String {
-        switch provider {
-        case "antigravity": return "AGY"
         case "cursor": return "Cursor"
         case "claude": return "Claude"
         case "codex": return "Codex"
@@ -551,7 +552,27 @@ public enum VeloQuotaPalette {
     }
 }
 
-// MARK: - 10. Fast Lightweight Syntax Highlighter (Aligned with Desktop --tok-* Palette)
+// MARK: - 8. Async-Cached Syntax Highlighter (Zero Regex Execution During Scroll/Typing!)
+
+public final class VeloCodeHighlightCache {
+    public static let shared = VeloCodeHighlightCache()
+    private let cache = NSCache<NSString, NSAttributedString>()
+
+    private init() {
+        cache.countLimit = 180
+    }
+
+    public func cached(key: String) -> AttributedString? {
+        guard let ns = cache.object(forKey: key as NSString) else { return nil }
+        return try? AttributedString(ns, including: \.uiKit)
+    }
+
+    public func store(_ attr: AttributedString, key: String) {
+        if let ns = try? NSAttributedString(attr, including: \.uiKit) {
+            cache.setObject(ns, forKey: key as NSString)
+        }
+    }
+}
 
 public enum VeloCodeSyntaxHighlighter {
     private static let keywords: Set<String> = [
@@ -564,36 +585,43 @@ public enum VeloCodeSyntaxHighlighter {
         "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE", "CREATE", "TABLE", "JOIN", "ORDER", "BY",
     ]
 
-    public static func highlight(_ code: String, language: String, colorScheme: ColorScheme) -> AttributedString {
-        var result = AttributedString(code)
-        let isDark = colorScheme == .dark
-        let kwColor = isDark ? Color(red: 0.75, green: 0.52, blue: 0.99) : Color(red: 0.49, green: 0.23, blue: 0.93)
-        let strColor = isDark ? Color(red: 0.43, green: 0.91, blue: 0.72) : Color(red: 0.02, green: 0.47, blue: 0.34)
-        let numColor = isDark ? Color(red: 0.98, green: 0.75, blue: 0.14) : Color(red: 0.71, green: 0.33, blue: 0.04)
-        let comColor = Color.secondary.opacity(0.75)
-        let typeColor = isDark ? Color(red: 0.49, green: 0.83, blue: 0.99) : Color(red: 0.01, green: 0.41, blue: 0.63)
+    public static func highlightAsync(_ code: String, language: String, isDark: Bool) async -> AttributedString {
+        let key = "\(isDark ? "d" : "l")|\(language)|\(code.hashValue)|\(code.count)"
+        if let hit = VeloCodeHighlightCache.shared.cached(key: key) {
+            return hit
+        }
+        let computed = await Task.detached(priority: .userInitiated) {
+            compute(code, language: language, isDark: isDark)
+        }.value
+        VeloCodeHighlightCache.shared.store(computed, key: key)
+        return computed
+    }
 
-        // Cap syntax regex work on giant pastes to guarantee instant 120fps scrolling
+    private static func compute(_ code: String, language: String, isDark: Bool) -> AttributedString {
+        var result = AttributedString(code)
         guard code.count <= 14_000 else { return result }
+
+        let kwColor = isDark ? UIColor(red: 0.78, green: 0.62, blue: 0.98, alpha: 1) : UIColor(red: 0.45, green: 0.22, blue: 0.82, alpha: 1)
+        let strColor = isDark ? UIColor(red: 0.48, green: 0.86, blue: 0.68, alpha: 1) : UIColor(red: 0.07, green: 0.48, blue: 0.32, alpha: 1)
+        let numColor = isDark ? UIColor(red: 0.94, green: 0.74, blue: 0.34, alpha: 1) : UIColor(red: 0.68, green: 0.35, blue: 0.06, alpha: 1)
+        let comColor = UIColor.secondaryLabel.withAlphaComponent(0.72)
+        let typeColor = isDark ? UIColor(red: 0.56, green: 0.80, blue: 0.96, alpha: 1) : UIColor(red: 0.07, green: 0.40, blue: 0.62, alpha: 1)
 
         let nsCode = code as NSString
         let fullRange = NSRange(location: 0, length: nsCode.length)
 
-        func applyRegex(_ pattern: String, color: Color, options: NSRegularExpression.Options = []) {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { return }
+        func applyRegex(_ pattern: String, color: UIColor) {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
             for match in regex.matches(in: code, options: [], range: fullRange) {
                 guard let swiftRange = Range(match.range, in: code),
                       let attrRange = Range(swiftRange, in: result)
                 else { continue }
-                result[attrRange].foregroundColor = color
+                result[attrRange].foregroundColor = Color(color)
             }
         }
 
-        // 1. Types (Capitalized identifiers)
         applyRegex(#"\b[A-Z][A-Za-z0-9_]{1,32}\b"#, color: typeColor)
-        // 2. Numbers
         applyRegex(#"\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\b"#, color: numColor)
-        // 3. Keywords
         if let wordRegex = try? NSRegularExpression(pattern: #"\b[A-Za-z_][A-Za-z0-9_]*\b"#) {
             for match in wordRegex.matches(in: code, options: [], range: fullRange) {
                 let word = nsCode.substring(with: match.range)
@@ -601,18 +629,14 @@ public enum VeloCodeSyntaxHighlighter {
                       let swiftRange = Range(match.range, in: code),
                       let attrRange = Range(swiftRange, in: result)
                 else { continue }
-                result[attrRange].foregroundColor = kwColor
+                result[attrRange].foregroundColor = Color(kwColor)
             }
         }
-        // 4. Strings (double / single / backtick)
         applyRegex(#""(?:\\.|[^"\\])*""#, color: strColor)
         applyRegex(#"'(?:\\.|[^'\\])*'"#, color: strColor)
-        // 5. Comments (applied last so comments override embedded keywords/strings)
         applyRegex(#"//[^\n]*"#, color: comColor)
-        if language.lowercased() == "python" || language.lowercased() == "py"
-            || language.lowercased() == "bash" || language.lowercased() == "sh"
-            || language.lowercased() == "zsh" || language.lowercased() == "yaml"
-        {
+        let lang = language.lowercased()
+        if lang == "python" || lang == "py" || lang == "bash" || lang == "sh" || lang == "zsh" || lang == "yaml" {
             applyRegex(#"#[^\n]*"#, color: comColor)
         }
         applyRegex(#"/\*[\s\S]*?\*/"#, color: comColor)
@@ -621,31 +645,32 @@ public enum VeloCodeSyntaxHighlighter {
     }
 }
 
-// MARK: - 11. Appearance & Material Settings Sheet (Mirrors Desktop SettingsModal)
+// MARK: - 9. Appearance & Palette Settings Sheet (Monochrome Default + B / C / D)
 
 public struct VeloAppearanceSettingsSheet: View {
     @ObservedObject private var appearance = VeloAppearanceSettings.shared
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
-    @Namespace private var themeNamespace
+    @Namespace private var themeNS
 
     public init() {}
 
     public var body: some View {
+        let tokens = VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
         NavigationStack {
             ZStack {
-                VeloTheme.canvas(colorScheme)
-                    .ignoresSafeArea()
+                tokens.canvas.ignoresSafeArea()
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
-                        // 1. Theme Mode Sliding Control
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("外观主题")
-                                .font(.system(size: 12.5, weight: .semibold))
+                        // 1. Dark / Light / System
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("深浅模式")
+                                .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4)
 
-                            HStack(spacing: 6) {
+                            HStack(spacing: 4) {
                                 ForEach(VeloThemePreference.allCases) { mode in
                                     let selected = appearance.themeMode == mode
                                     Button {
@@ -654,24 +679,20 @@ public struct VeloAppearanceSettingsSheet: View {
                                             appearance.themeMode = mode
                                         }
                                     } label: {
-                                        HStack(spacing: 6) {
+                                        HStack(spacing: 5) {
                                             Image(systemName: mode.iconName)
-                                                .font(.system(size: 12.5, weight: .semibold))
+                                                .font(.system(size: 12, weight: .semibold))
                                             Text(mode.title)
                                                 .font(.system(size: 13, weight: .semibold))
                                         }
                                         .foregroundStyle(selected ? .primary : .secondary)
                                         .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 10)
+                                        .padding(.vertical, 9.5)
                                         .background {
                                             if selected {
-                                                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                                    .fill(VeloTheme.elevatedSurface(colorScheme))
-                                                    .overlay(
-                                                        RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                                            .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.9)
-                                                    )
-                                                    .matchedGeometryEffect(id: "themePill", in: themeNamespace)
+                                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                    .fill(tokens.elevated)
+                                                    .matchedGeometryEffect(id: "modePill", in: themeNS)
                                             }
                                         }
                                     }
@@ -679,82 +700,95 @@ public struct VeloAppearanceSettingsSheet: View {
                                 }
                             }
                             .padding(4)
-                            .veloSurface(cornerRadius: 15)
+                            .veloSurface(cornerRadius: 14)
                         }
 
-                        // 2. Surface Material Picker
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("表面材质")
-                                .font(.system(size: 12.5, weight: .semibold))
+                        // 2. Curated Color Palettes (A / B / C / D)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("主题色板")
+                                .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4)
 
-                            VStack(spacing: 9) {
-                                ForEach(VeloMaterialStyle.allCases) { style in
-                                    let active = appearance.materialStyle == style
+                            VStack(spacing: 0) {
+                                ForEach(Array(VeloColorPalette.allCases.enumerated()), id: \.element.id) { idx, pal in
+                                    let active = appearance.palette == pal
+                                    if idx > 0 {
+                                        Rectangle()
+                                            .fill(tokens.divider)
+                                            .frame(height: 0.7)
+                                            .padding(.leading, 56)
+                                    }
                                     Button {
                                         VeloHaptics.selection()
-                                        withAnimation(VeloMotion.snappy) {
-                                            appearance.materialStyle = style
+                                        withAnimation(VeloMotion.crisp) {
+                                            appearance.palette = pal
                                         }
                                     } label: {
                                         HStack(spacing: 12) {
-                                            materialSwatch(style)
-                                            VStack(alignment: .leading, spacing: 2.5) {
-                                                Text(style.title)
-                                                    .font(.system(size: 14, weight: .semibold))
+                                            HStack(spacing: -5) {
+                                                ForEach(Array(pal.swatchColors.enumerated()), id: \.offset) { _, c in
+                                                    Circle()
+                                                        .fill(c)
+                                                        .frame(width: 16, height: 16)
+                                                        .overlay(Circle().stroke(tokens.surface, lineWidth: 1.5))
+                                                }
+                                            }
+                                            .frame(width: 36)
+
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(pal.title)
+                                                    .font(.system(size: 14.5, weight: .semibold))
                                                     .foregroundStyle(.primary)
-                                                Text(style.subtitle)
-                                                    .font(.system(size: 12))
+                                                Text(pal.subtitle)
+                                                    .font(.system(size: 11.5))
                                                     .foregroundStyle(.secondary)
                                             }
+
                                             Spacer()
-                                            Image(systemName: active ? "checkmark.circle.fill" : "circle")
-                                                .font(.system(size: 18, weight: .medium))
-                                                .foregroundStyle(active ? VeloTheme.accentVioletSoft : Color.secondary.opacity(0.35))
-                                                .contentTransition(.symbolEffect(.replace))
+
+                                            if active {
+                                                Image(systemName: "checkmark")
+                                                    .font(.system(size: 13.5, weight: .bold))
+                                                    .foregroundStyle(tokens.accentText)
+                                            }
                                         }
-                                        .padding(13)
-                                        .veloSurface(
-                                            cornerRadius: 15,
-                                            aura: active ? VeloTheme.accentViolet : nil
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 15, style: .continuous)
-                                                .stroke(
-                                                    active ? VeloTheme.accentVioletSoft.opacity(0.55) : Color.clear,
-                                                    lineWidth: 1.2
-                                                )
-                                        )
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 12.5)
+                                        .contentShape(Rectangle())
                                     }
-                                    .buttonStyle(VeloPressableButtonStyle(scale: 0.985))
+                                    .buttonStyle(.plain)
                                 }
                             }
+                            .veloSurface(cornerRadius: 16)
                         }
 
-                        // 3. Motion Accessibility
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("动效与省电")
-                                .font(.system(size: 12.5, weight: .semibold))
+                        // 3. Motion Toggle
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("动效")
+                                .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4)
 
                             Toggle(isOn: $appearance.reduceMotion) {
-                                VStack(alignment: .leading, spacing: 2.5) {
+                                VStack(alignment: .leading, spacing: 2) {
                                     Text("减弱动态效果")
                                         .font(.system(size: 14, weight: .medium))
-                                    Text("暂停流光描边、扫光和入场弹性动画")
-                                        .font(.system(size: 12))
+                                    Text("关闭过渡缩放与环形描边动画")
+                                        .font(.system(size: 11.5))
                                         .foregroundStyle(.secondary)
                                 }
                             }
-                            .tint(VeloTheme.accentViolet)
-                            .padding(14)
-                            .veloSurface(cornerRadius: 15)
+                            .tint(tokens.accent)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 11)
+                            .veloSurface(cornerRadius: 16)
                         }
                     }
                     .padding(16)
                 }
             }
-            .navigationTitle("外观与材质")
+            .navigationTitle("外观与配色")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -765,34 +799,5 @@ public struct VeloAppearanceSettingsSheet: View {
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
-    }
-
-    private func materialSwatch(_ style: VeloMaterialStyle) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        return ZStack {
-            switch style {
-            case .matte:
-                shape.fill(VeloTheme.cardSurface(colorScheme))
-                    .overlay(shape.stroke(VeloTheme.hairline(colorScheme), lineWidth: 1))
-            case .frosted:
-                shape.fill(.ultraThinMaterial)
-                    .overlay(shape.fill(VeloTheme.accentViolet.opacity(0.08)))
-                    .overlay(shape.stroke(VeloTheme.specularRim(colorScheme), lineWidth: 1))
-            case .specular:
-                shape.fill(
-                    RadialGradient(
-                        colors: [VeloTheme.accentViolet.opacity(0.32), VeloTheme.cardSurface(colorScheme)],
-                        center: .topLeading,
-                        startRadius: 2,
-                        endRadius: 34
-                    )
-                )
-                .overlay(shape.stroke(VeloTheme.accentVioletSoft.opacity(0.55), lineWidth: 1.1))
-            }
-            Image(systemName: style == .matte ? "square.fill" : (style == .frosted ? "square.on.square" : "sparkles"))
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(style == .matte ? Color.secondary : VeloTheme.accentVioletSoft)
-        }
-        .frame(width: 38, height: 38)
     }
 }

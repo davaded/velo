@@ -24,29 +24,29 @@ public struct EngineBadgePill: View {
     public let category: VeloEngineCategory
     public var compact: Bool = false
 
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var appearance = VeloAppearanceSettings.shared
+
     public init(category: VeloEngineCategory, compact: Bool = false) {
         self.category = category
         self.compact = compact
     }
 
     public var body: some View {
-        HStack(spacing: compact ? 3.5 : 4.5) {
-            Image(systemName: category.iconName)
-                .font(.system(size: compact ? 9.5 : 10.5, weight: .semibold))
+        let tokens = VeloPaletteTokens.resolve(appearance.palette, scheme: colorScheme)
+        HStack(spacing: compact ? 4.5 : 5.5) {
+            VeloBrandIcon(category: category, size: compact ? 11.5 : 13, colored: true)
             Text(compact ? category.shortBadge : category.title)
                 .font(.system(size: compact ? 10.5 : 11.5, weight: .semibold))
+                .foregroundStyle(.primary)
                 .lineLimit(1)
         }
-        .foregroundStyle(category.accentColor)
-        .padding(.horizontal, compact ? 6.5 : 8.5)
-        .padding(.vertical, compact ? 2.5 : 4)
-        .background(
-            category.accentColor.opacity(0.13),
-            in: Capsule()
-        )
+        .padding(.horizontal, compact ? 7.5 : 9.5)
+        .padding(.vertical, compact ? 3 : 4.5)
+        .background(tokens.elevated, in: Capsule())
         .overlay(
             Capsule()
-                .stroke(category.accentColor.opacity(0.28), lineWidth: 0.75)
+                .stroke(tokens.divider, lineWidth: 0.75)
         )
     }
 }
