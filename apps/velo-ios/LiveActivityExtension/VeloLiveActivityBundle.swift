@@ -178,7 +178,7 @@ struct VeloSessionLiveActivity: Widget {
                     .frame(width: max(12, geo.size.width * fraction))
             }
         }
-        .frame(height: 3)
+        .frame(height: 3.5)
     }
 
     var body: some WidgetConfiguration {
@@ -309,7 +309,15 @@ struct VeloSessionLiveActivity: Widget {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 13)
-            .activityBackgroundTint(Color(red: 0.055, green: 0.06, blue: 0.085).opacity(0.96))
+            .background {
+                RadialGradient(
+                    colors: [accent.opacity(0.16), Color.clear],
+                    center: .topLeading,
+                    startRadius: 4,
+                    endRadius: 190
+                )
+            }
+            .activityBackgroundTint(Color(red: 0.039, green: 0.043, blue: 0.063).opacity(0.96))
             .activitySystemActionForegroundColor(.white)
             .widgetURL(URL(string: "velo://session/\(context.attributes.sessionId)"))
 

@@ -405,7 +405,7 @@ private enum VeloActivityStreamBuilder {
 
     static func isInternalNoise(_ item: TimelineEventItem) -> Bool {
         guard case .toolCall(_, _, _, let summary, _, _) = item.kind else { return false }
-        let s = (summary ?? "").lowercased()
+        let s = summary.lowercased()
         return s.contains(".gemini/antigravity-cli/mcp/")
             || s.contains(".gemini/antigravity/mcp/")
             || s.contains(".system_generated/steps/")
@@ -532,7 +532,7 @@ private enum VeloActivityStreamBuilder {
                     else if isRead || isSearch { activeCategory = "read" }
                 }
 
-                let s = (summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let s = summary.trimmingCharacters(in: .whitespacesAndNewlines)
                 if isEdit {
                     let base = s.split(separator: "/").last.map(String.init) ?? (s.isEmpty ? "file" : s)
                     if editCounts[base] == nil { editOrder.append(base) }
@@ -619,7 +619,7 @@ private enum VeloActivityStreamBuilder {
                     searchCount += 1
                 } else if lower.contains("edit") || lower.contains("write") || lower.contains("patch") || lower.contains("file_change") {
                     editCount += 1
-                    let shortName = (summary ?? "").split(separator: "/").last.map(String.init) ?? ""
+                    let shortName = summary.split(separator: "/").last.map(String.init) ?? ""
                     if !shortName.isEmpty, !editedFiles.contains(shortName) {
                         editedFiles.append(shortName)
                     }
@@ -680,7 +680,7 @@ private struct VeloExploreBatchRowView: View {
                 if isTurnRunning && output == nil {
                     activeVerb = workingVerb
                 }
-                let s = (summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let s = summary.trimmingCharacters(in: .whitespacesAndNewlines)
                 let shortT = isRead ? (s.split(separator: "/").last.map(String.init) ?? s) : String(s.prefix(24))
                 if !shortT.isEmpty, !targets.contains(shortT) {
                     targets.append(shortT)

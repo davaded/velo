@@ -23,6 +23,8 @@ public struct VeloAnalyticsHubSheet: View {
     @State private var pushLoaded: Bool = false
     @State private var newAutoNatural: String = ""
     @State private var showCreateAuto: Bool = false
+    @State private var refreshingQuotas: Bool = false
+    @Namespace private var hubTabNS
 
     public init(
         store: VeloStore,
@@ -42,12 +44,38 @@ public struct VeloAnalyticsHubSheet: View {
                     .ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    Picker("功能切换", selection: $selectedTab) {
+                    // 60fps.design Mercury Sliding Tab Bar
+                    HStack(spacing: 4) {
                         ForEach(HubTab.allCases) { t in
-                            Text(t.rawValue).tag(t)
+                            let active = selectedTab == t
+                            Button {
+                                VeloHaptics.selection()
+                                withAnimation(VeloMotion.snappy) {
+                                    selectedTab = t
+                                }
+                            } label: {
+                                Text(t.rawValue)
+                                    .font(.system(size: 12.5, weight: active ? .semibold : .medium))
+                                    .foregroundStyle(active ? .primary : .secondary)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background {
+                                        if active {
+                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                .fill(VeloTheme.elevatedSurface(colorScheme))
+                                                .overlay(
+                                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                        .stroke(VeloTheme.specularRim(colorScheme), lineWidth: 0.85)
+                                                )
+                                                .matchedGeometryEffect(id: "hubTabPill", in: hubTabNS)
+                                        }
+                                    }
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .padding(3.5)
+                    .veloSurface(cornerRadius: 13)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
 
@@ -104,85 +132,136 @@ public struct VeloAnalyticsHubSheet: View {
     @ViewBuilder
     private var analyticsSection: some View {
         if !store.quotaCards.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("配额窗口与接入模式")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.secondary)
+            let subscriptionCards = store.quotaCards.filter { $0.mode == "subscription" && !$0.windows.isEmpty }
+            let otherCards = store.quotaCards.filter { $0.mode != "subscription" || $0.windows.isEmpty }
 
-                ForEach(store.quotaCards) { card in
-                    VStack(alignment: .leading, spacing: 9) {
-                        HStack {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("订阅配额与速率窗口")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        VeloHaptics.tap()
+                        refreshingQuotas = true
+                        Task {
+                            await store.fetchQuotas()
+                            refreshingQuotas = false
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .rotationEffect(.degrees(refreshingQuotas ? 360 : 0))
+                                .animation(refreshingQuotas ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: refreshingQuotas)
+                            Text("刷新")
+                                .font(.system(size: 11.5, weight: .medium))
+                        }
+                        .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                ForEach(Array(subscriptionCards.enumerated()), id: \.element.id) { idx, card in
+                    let accent = VeloQuotaPalette.accent(for: card.provider)
+                    VStack(alignment: .leading, spacing: 11) {
+                        HStack(spacing: 9) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(accent.opacity(0.14))
+                                    .frame(width: 28, height: 28)
+                                Image(systemName: VeloQuotaPalette.icon(for: card.provider))
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(accent)
+                            }
                             Text(card.label)
                                 .font(.system(size: 14, weight: .bold))
                             Spacer()
                             Text(card.planBadge)
-                                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                 .foregroundStyle(.secondary)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2.5)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
                                 .background(VeloTheme.elevatedSurface(colorScheme), in: Capsule())
                         }
 
-                        if card.mode != "subscription" || card.windows.isEmpty {
-                            Text(
-                                card.summaryText
-                                    ?? (card.mode == "api_key"
-                                        ? "API Key 按量模式 · 无 5h/7d 速率窗口"
-                                        : "当前未登录该 CLI 账号")
-                            )
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                        } else {
+                        Rectangle()
+                            .fill(VeloTheme.hairline(colorScheme))
+                            .frame(height: 0.7)
+
+                        VStack(alignment: .leading, spacing: 10) {
                             ForEach(card.windows) { w in
                                 let rem = max(0, min(100, w.remainingPercent))
-                                let barColor: Color = {
-                                    if w.status == "exhausted" { return VeloTheme.coral }
-                                    if w.status == "warning" { return VeloTheme.amber }
-                                    switch card.provider {
-                                    case "antigravity": return Color(red: 0.38, green: 0.65, blue: 0.98)
-                                    case "cursor": return Color(red: 0.65, green: 0.55, blue: 0.98)
-                                    case "claude": return Color(red: 0.98, green: 0.57, blue: 0.24)
-                                    default: return VeloTheme.emerald
-                                    }
-                                }()
-                                let rightTxt: String = {
-                                    var parts: [String] = []
-                                    if let dt = w.detailText, !dt.isEmpty { parts.append(dt) }
-                                    parts.append("剩余 \(Int(rem.rounded()))%")
-                                    if !w.resetCountdownLabel.isEmpty { parts.append(w.resetCountdownLabel) }
-                                    return parts.joined(separator: " · ")
-                                }()
-
-                                VStack(alignment: .leading, spacing: 4) {
+                                VStack(alignment: .leading, spacing: 5) {
                                     HStack {
                                         Text(w.label)
-                                            .font(.system(size: 12))
-                                            .foregroundStyle(.secondary)
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(.primary)
                                         Spacer()
-                                        Text(rightTxt)
-                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                            .foregroundStyle(.secondary)
+                                        Text("\(Int(rem.rounded()))%")
+                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                            .foregroundStyle(VeloQuotaPalette.pctColor(for: w.status))
+                                            .contentTransition(.numericText())
                                     }
+
                                     GeometryReader { geo in
                                         ZStack(alignment: .leading) {
                                             Capsule()
                                                 .fill(VeloTheme.elevatedSurface(colorScheme))
                                             Capsule()
-                                                .fill(barColor)
+                                                .fill(VeloQuotaPalette.gradient(for: card.provider, status: w.status))
                                                 .frame(width: max(6, geo.size.width * CGFloat(rem / 100.0)))
+                                                .animation(VeloMotion.smooth, value: rem)
                                         }
                                     }
-                                    .frame(height: 6)
+                                    .frame(height: 5.5)
+
+                                    HStack {
+                                        Text(w.detailText ?? "已用 \(Int(w.usedPercent.rounded()))%")
+                                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                        Spacer(minLength: 4)
+                                        if !w.resetCountdownLabel.isEmpty {
+                                            HStack(spacing: 3) {
+                                                Image(systemName: "clock")
+                                                    .font(.system(size: 9.5))
+                                                Text(w.resetCountdownLabel)
+                                                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                            }
+                                            .foregroundStyle(.tertiary)
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    .padding(13)
-                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
-                    )
+                    .padding(14)
+                    .veloSurface(cornerRadius: 16, aura: accent)
+                    .veloStaggerAppear(index: idx)
+                }
+
+                if !otherCards.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(otherCards) { card in
+                                HStack(spacing: 6) {
+                                    Image(systemName: VeloQuotaPalette.icon(for: card.provider))
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(card.mode == "api_key" ? VeloQuotaPalette.accent(for: card.provider) : .secondary)
+                                    Text(card.label)
+                                        .font(.system(size: 11.5, weight: .semibold))
+                                        .foregroundStyle(.primary)
+                                    Text(card.planBadge)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6.5)
+                                .veloSurface(cornerRadius: 11)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -190,9 +269,9 @@ public struct VeloAnalyticsHubSheet: View {
         if let a = store.usageAnalytics {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 metricCard(
-                    title: "累计折算账单",
+                    title: "API 等效折算",
                     value: VeloFormatting.formatUsd(a.totalCostUsd),
-                    sub: "今日 \(VeloFormatting.formatUsd(a.todayCostUsd))",
+                    sub: "今日 \(VeloFormatting.formatUsd(a.todayCostUsd)) · 订阅不扣费",
                     accent: VeloTheme.emerald
                 )
                 metricCard(
@@ -205,7 +284,7 @@ public struct VeloAnalyticsHubSheet: View {
                     title: "缓存命中率",
                     value: String(format: "%.1f%%", a.cacheHitPct),
                     sub: "命中 \(VeloFormatting.formatCompactTokens(a.cacheReadTokens))",
-                    accent: .blue
+                    accent: Color(red: 0.38, green: 0.65, blue: 0.98)
                 )
                 metricCard(
                     title: "加权生成速率",
@@ -215,14 +294,70 @@ public struct VeloAnalyticsHubSheet: View {
                 )
             }
 
+            if !a.byModel.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("按模型 API 等效账单明细")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("$/1M Tokens")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+
+                    ForEach(a.byModel) { m in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: 8) {
+                                Text(m.model)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(VeloFormatting.formatUsd(m.costUsd))
+                                    .font(.system(size: 13.5, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(.primary)
+                                    .contentTransition(.numericText())
+                            }
+                            HStack(spacing: 8) {
+                                Text("\(m.provider) · \(m.turnsCount) 轮")
+                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(String(format: "$%.2f / $%.2f / $%.2f", m.inputPerM, m.cachedInputPerM, m.outputPerM))
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            HStack(spacing: 6) {
+                                Text("入 \(VeloFormatting.formatCompactTokens(m.uncachedInputTokens))")
+                                Text("·")
+                                Text("缓 \(VeloFormatting.formatCompactTokens(m.cacheReadTokens))")
+                                    .foregroundStyle(Color(red: 0.38, green: 0.65, blue: 0.98))
+                                Text("·")
+                                Text("出 \(VeloFormatting.formatCompactTokens(m.outputTokens))")
+                            }
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(12)
+                        .veloSurface(cornerRadius: 13)
+                    }
+                }
+            }
+
             VStack(alignment: .leading, spacing: 8) {
                 Text("按 AI 引擎账单与速率")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(.secondary)
 
                 ForEach(a.byProvider) { b in
                     HStack(spacing: 10) {
-                        VStack(alignment: .leading, spacing: 3) {
+                        Image(systemName: VeloQuotaPalette.icon(for: b.key))
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(VeloQuotaPalette.accent(for: b.key))
+                            .frame(width: 26, height: 26)
+                            .background(VeloQuotaPalette.accent(for: b.key).opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        VStack(alignment: .leading, spacing: 2.5) {
                             Text(b.label)
                                 .font(.system(size: 13.5, weight: .bold, design: .monospaced))
                             Text("\(b.sessionsCount) 会话 · \(b.turnsCount) 轮 · 缓存 \(Int(b.cacheHitPct))%")
@@ -230,28 +365,26 @@ public struct VeloAnalyticsHubSheet: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        VStack(alignment: .trailing, spacing: 3) {
+                        VStack(alignment: .trailing, spacing: 2.5) {
                             Text(VeloFormatting.formatUsd(b.costUsd))
                                 .font(.system(size: 13.5, weight: .semibold, design: .monospaced))
+                                .contentTransition(.numericText())
                             if b.avgTps > 0 {
                                 Text(String(format: "%.1f tok/s", b.avgTps))
                                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                                     .foregroundStyle(VeloTheme.accentVioletSoft)
+                                    .contentTransition(.numericText())
                             }
                         }
                     }
                     .padding(12)
-                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 13, style: .continuous)
-                            .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
-                    )
+                    .veloSurface(cornerRadius: 14)
                 }
             }
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("按项目文件夹统计")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(.secondary)
 
                 ForEach(a.byWorkspace) { w in
@@ -267,9 +400,10 @@ public struct VeloAnalyticsHubSheet: View {
                         Spacer()
                         Text(VeloFormatting.formatUsd(w.costUsd))
                             .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .contentTransition(.numericText())
                     }
                     .padding(12)
-                    .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    .veloSurface(cornerRadius: 14)
                 }
             }
         } else {
@@ -289,22 +423,19 @@ public struct VeloAnalyticsHubSheet: View {
                 .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
             Text(value)
-                .font(.system(size: 18, weight: .bold, design: .monospaced))
+                .font(.system(size: 18.5, weight: .bold, design: .monospaced))
                 .foregroundStyle(accent)
+                .contentTransition(.numericText())
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
             Text(sub)
-                .font(.system(size: 11))
+                .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(VeloTheme.cardSurface(colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(VeloTheme.hairline(colorScheme), lineWidth: 0.8)
-        )
+        .padding(12.5)
+        .veloSurface(cornerRadius: 15, aura: accent == .primary ? nil : accent)
     }
 
     // MARK: - 2. Global Full-Text SQLite Search

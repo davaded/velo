@@ -110,31 +110,31 @@ public enum VeloTheme {
 
     public static func canvas(_ scheme: ColorScheme) -> Color {
         scheme == .dark
-            ? Color(red: 0.043, green: 0.047, blue: 0.059) // #0B0C0F Obsidian
-            : Color(red: 0.965, green: 0.969, blue: 0.980) // #F6F7FA Editorial Light
+            ? Color(red: 0.028, green: 0.031, blue: 0.043) // #07080B Deep Obsidian
+            : Color(red: 0.962, green: 0.966, blue: 0.978) // #F5F6FA Editorial Light
     }
 
     public static func cardSurface(_ scheme: ColorScheme) -> Color {
         scheme == .dark
-            ? Color(red: 0.078, green: 0.084, blue: 0.108) // #14151B
+            ? Color(red: 0.064, green: 0.070, blue: 0.094) // #101218 Crisp Obsidian Card
             : Color.white
     }
 
     public static func elevatedSurface(_ scheme: ColorScheme) -> Color {
         scheme == .dark
-            ? Color(red: 0.110, green: 0.118, blue: 0.150) // #1C1E26
-            : Color(red: 0.941, green: 0.949, blue: 0.969) // #F0F2F7
+            ? Color(red: 0.096, green: 0.105, blue: 0.141) // #181B24 Elevated Control
+            : Color(red: 0.935, green: 0.944, blue: 0.966) // #EEF1F6
     }
 
     public static func codeSurface(_ scheme: ColorScheme) -> Color {
         scheme == .dark
-            ? Color(red: 0.055, green: 0.059, blue: 0.075) // #0E0F13
-            : Color(red: 0.957, green: 0.963, blue: 0.978)
+            ? Color(red: 0.043, green: 0.047, blue: 0.067) // #0B0C11 Code Bed
+            : Color(red: 0.955, green: 0.961, blue: 0.976)
     }
 
     public static func codeHeader(_ scheme: ColorScheme) -> Color {
         scheme == .dark
-            ? Color(red: 0.092, green: 0.098, blue: 0.125)
+            ? Color(red: 0.078, green: 0.084, blue: 0.114)
             : Color(red: 0.922, green: 0.931, blue: 0.955)
     }
 
@@ -1548,6 +1548,37 @@ public struct VeloUsageBucket: Identifiable, Equatable {
     }
 }
 
+public struct VeloModelCostBucket: Identifiable, Equatable {
+    public var id: String { "\(provider)-\(model)" }
+    public let model: String
+    public let provider: String
+    public let turnsCount: Int
+    public let inputTokens: Int
+    public let uncachedInputTokens: Int
+    public let cacheReadTokens: Int
+    public let outputTokens: Int
+    public let inputPerM: Double
+    public let cachedInputPerM: Double
+    public let outputPerM: Double
+    public let costUsd: Double
+
+    public static func fromJSON(_ d: [String: Any]) -> VeloModelCostBucket {
+        VeloModelCostBucket(
+            model: (d["model"] as? String) ?? "unknown",
+            provider: (d["provider"] as? String) ?? "agent",
+            turnsCount: VeloSessionItem.intValue(d["turns_count"]) ?? 0,
+            inputTokens: VeloSessionItem.intValue(d["input_tokens"]) ?? 0,
+            uncachedInputTokens: VeloSessionItem.intValue(d["uncached_input_tokens"]) ?? 0,
+            cacheReadTokens: VeloSessionItem.intValue(d["cache_read_tokens"]) ?? 0,
+            outputTokens: VeloSessionItem.intValue(d["output_tokens"]) ?? 0,
+            inputPerM: VeloSessionItem.doubleValue(d["input_per_m"]) ?? 0,
+            cachedInputPerM: VeloSessionItem.doubleValue(d["cached_input_per_m"]) ?? 0,
+            outputPerM: VeloSessionItem.doubleValue(d["output_per_m"]) ?? 0,
+            costUsd: VeloSessionItem.doubleValue(d["cost_usd"]) ?? 0
+        )
+    }
+}
+
 public struct VeloUsageAnalytics: Equatable {
     public let sessionsCount: Int
     public let turnsCount: Int
@@ -1561,10 +1592,12 @@ public struct VeloUsageAnalytics: Equatable {
     public let todayCostUsd: Double
     public let todayTokens: Int
     public let byProvider: [VeloUsageBucket]
+    public let byModel: [VeloModelCostBucket]
     public let byWorkspace: [VeloUsageBucket]
 
     public static func fromJSON(_ d: [String: Any]) -> VeloUsageAnalytics {
         let provArr = (d["by_provider"] as? [[String: Any]]) ?? []
+        let modelArr = (d["by_model"] as? [[String: Any]]) ?? []
         let wsArr = (d["by_workspace"] as? [[String: Any]]) ?? []
         return VeloUsageAnalytics(
             sessionsCount: VeloSessionItem.intValue(d["sessions_count"]) ?? 0,
@@ -1579,6 +1612,7 @@ public struct VeloUsageAnalytics: Equatable {
             todayCostUsd: VeloSessionItem.doubleValue(d["today_cost_usd"]) ?? 0,
             todayTokens: VeloSessionItem.intValue(d["today_tokens"]) ?? 0,
             byProvider: provArr.map(VeloUsageBucket.fromJSON),
+            byModel: modelArr.map(VeloModelCostBucket.fromJSON),
             byWorkspace: wsArr.map(VeloUsageBucket.fromJSON)
         )
     }
