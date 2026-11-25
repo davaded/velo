@@ -368,12 +368,10 @@ public struct VeloBrandIcon: View {
                 Image("BrandOpenAI")
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundStyle(colored ? Color.primary : Color.secondary)
             } else if lower.contains("antigravity") || lower.contains("agy") {
                 Image("BrandAntigravity")
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundStyle(colored ? Color.primary : Color.secondary)
             } else if lower.contains("gemini") {
                 if colored {
                     Image("BrandGemini")
@@ -388,22 +386,18 @@ public struct VeloBrandIcon: View {
                 Image("BrandCursor")
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundStyle(colored ? Color.primary : Color.secondary)
             } else if lower.contains("grok") || lower.contains("xai") {
                 Image("BrandGrok")
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundStyle(colored ? Color.primary : Color.secondary)
             } else if lower.contains("opencode") {
                 Image("BrandOpenCode")
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundStyle(colored ? Color.primary : Color.secondary)
             } else if lower.contains("copilot") {
                 Image("BrandCopilot")
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundStyle(colored ? Color.primary : Color.secondary)
             } else if lower.contains("qwen") {
                 Image("BrandQwen")
                     .resizable()
@@ -411,11 +405,11 @@ public struct VeloBrandIcon: View {
             } else {
                 Image(systemName: "terminal")
                     .resizable()
-                    .foregroundStyle(Color.secondary)
             }
         }
         .aspectRatio(contentMode: .fit)
         .frame(width: size, height: size)
+        .opacity(colored ? 1.0 : 0.65)
     }
 }
 
