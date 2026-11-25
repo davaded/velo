@@ -68,12 +68,12 @@ open /Applications/Velo.app
 
 | 引擎 | 接入协议 / 运行时 | 实时配额 | 独立 Worktree & Diff | 手机遥控 |
 | :--- | :--- | :---: | :---: | :---: |
-| **Claude Code** | 原生流式 CLI | — | 支持 | 支持 |
-| **OpenAI Codex** | `codex app-server` | — | 支持 | 支持 |
+| **Claude Code** | 原生流式 CLI | 5h / 7d | 支持 | 支持 |
+| **OpenAI Codex** | `codex app-server` | 5h / 7d | 支持 | 支持 |
 | **Google Antigravity** | `agy` ACP | 5h / 7d | 支持 | 支持 |
 | **Cursor Agent** | `cursor-agent` CLI | 30d | 支持 | 支持 |
-| **xAI Grok** | Grok CLI | — | 支持 | 支持 |
-| **自定义 Agent** | 通用 ACP / PTY | — | 支持 | 支持 |
+| **xAI Grok** | Grok CLI | API 用量 | 支持 | 支持 |
+| **自定义 Agent** | 通用 ACP / PTY | 网关 / API | 支持 | 支持 |
 
 ---
 

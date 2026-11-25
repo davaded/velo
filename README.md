@@ -68,12 +68,12 @@ Open **Pair Mobile** in Velo (or run `velo pair`) and scan the QR code from your
 
 | Engine | Runtime / Protocol | Live quotas | Worktree & diff | iPhone remote |
 | :--- | :--- | :---: | :---: | :---: |
-| **Claude Code** | Native streaming CLI | — | Yes | Yes |
-| **OpenAI Codex** | `codex app-server` | — | Yes | Yes |
+| **Claude Code** | Native streaming CLI | 5h / 7d | Yes | Yes |
+| **OpenAI Codex** | `codex app-server` | 5h / 7d | Yes | Yes |
 | **Google Antigravity** | `agy` ACP | 5h / 7d | Yes | Yes |
 | **Cursor Agent** | `cursor-agent` CLI | 30d | Yes | Yes |
-| **xAI Grok** | Grok CLI | — | Yes | Yes |
-| **Custom agents** | Generic ACP / PTY | — | Yes | Yes |
+| **xAI Grok** | Grok CLI | API usage | Yes | Yes |
+| **Custom agents** | Generic ACP / PTY | Gateway / API | Yes | Yes |
 
 ---
 
